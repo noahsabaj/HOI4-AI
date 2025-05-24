@@ -179,9 +179,6 @@ class UnifiedHOI4Learner:
         # 6. Execute action
         self.execute_action(action)
 
-        # 7. Brief pause for game to respond
-        time.sleep(0.2)
-
         # 8. Capture result
         next_screenshot = ImageGrab.grab()
         next_screenshot_resized = next_screenshot.resize((1280, 720))

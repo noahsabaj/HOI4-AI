@@ -10,10 +10,14 @@ import time
 import keyboard
 import pyautogui
 from PIL import ImageGrab
+import numpy as np
 from datetime import datetime
+from queue import Queue, Empty, Full
+from threading import Thread, Event
 import json
 import re
 from typing import Dict
+from src.utils.logger import get_logger
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -23,6 +27,21 @@ from src.ai.ultimate.ultimate_ai import UltimateHOI4AI
 
 # Import your existing evaluation system
 from src.strategy.evaluation import StrategicEvaluator
+
+# ── window-focus helper ─────────────────────────────────────────
+def _ensure_hoi4_window_foreground() -> None:
+    """
+    Bring the Hearts of Iron IV window to the foreground if it isn’t.
+    Works on Windows; NO-OP on other OSes.
+    """
+    try:
+        import pygetwindow as gw
+        win = next(w for w in gw.getWindowsWithTitle('Hearts of Iron') if w.isVisible)
+        if not win.isActive:
+            win.activate()
+    except Exception:
+        # don’t crash if pygetwindow missing or window not found
+        pass
 
 
 class UltimateTrainer:
@@ -36,15 +55,26 @@ class UltimateTrainer:
         ╔═══════════════════════════════════════════════════════════╗
         ║              Ultimate HOI4 AI Training System             ║
         ║                                                           ║
-        ║  DreamerV3 + RND + NEC = Autonomous Learning             ║
+        ║  DreamerV3 + RND + NEC = Autonomous Learning              ║
         ╚═══════════════════════════════════════════════════════════╝
         """)
 
-        # Initialize Ultimate AI
-        self.ai = UltimateHOI4AI()
+        # ── colour logger ──────────────────────────────────────────
+        self.log = get_logger("trainer")
+        self.log.info("🚀 Trainer initialized")
 
-        # Your existing evaluator
+        # Initialize Ultimate AI & evaluator
+        self.ai = UltimateHOI4AI()
         self.evaluator = StrategicEvaluator()
+
+        self.learn_queue = Queue(maxsize=64)  # holds (prev, act, next, r)
+        self.shutdown_event = Event()
+        self.learn_thread = Thread(
+            target=self._learner_loop,
+            name="learner-thread",
+            daemon=True,
+        )
+        self.learn_thread.start()
 
         # Training state
         self.is_training = False
@@ -54,32 +84,30 @@ class UltimateTrainer:
 
         # Metrics
         self.session_metrics = {
-            'actions_taken': 0,
-            'discoveries': [],
-            'key_moments': [],
-            'current_strategy': 'exploring'
+            "actions_taken": 0,
+            "discoveries": [],
+            "key_moments": [],
+            "current_strategy": "exploring",
         }
 
-        # Initialize strategic health tracking
+        # Strategic health tracking
         self.last_strategic_health = 0.0
 
-        # Auto-save interval
+        # Auto-save & status intervals
         self.last_save = time.time()
-        self.save_interval = 300  # 5 minutes
-
-        # Status display
+        self.save_interval = 300  # 5 min
         self.last_status_update = time.time()
-        self.status_interval = 10  # 10 seconds
+        self.status_interval = 10  # 10 s
 
     def run(self):
         """Main training loop"""
-        print("\n📋 Controls:")
-        print("  F5: Start/Resume Training")
-        print("  F6: Pause Training")
-        print("  F7: Save Progress")
-        print("  F8: Show Statistics")
-        print("  ESC (hold 2s): Exit")
-        print("\n🎮 Start HOI4 and press F5 when ready...")
+        self.log.info("📋 Controls:")
+        self.log.info("  F5: Start/Resume Training")
+        self.log.info("  F6: Pause Training")
+        self.log.info("  F7: Save Progress")
+        self.log.info("  F8: Show Statistics")
+        self.log.info("  ESC (hold 2s): Exit")
+        self.log.info("🎮 Start HOI4 and press F5 when ready...")
 
         # Control flags
         esc_start_time = None
@@ -127,53 +155,76 @@ class UltimateTrainer:
                 self.last_status_update = time.time()
 
             # Small delay to prevent CPU overuse
-            time.sleep(0.05)
+            time.sleep(0.005)
 
     def training_step(self):
-        """Single training step"""
+        """Single non-blocking env step with async learning."""
         try:
-            # Capture screenshot
+            t0 = time.perf_counter()
+
+            # 1. Screenshot
             screenshot = ImageGrab.grab()
+            t1 = time.perf_counter()
 
-            # Get AI decision
+            # 2. Decide
             action = self.ai.act(screenshot)
+            t2 = time.perf_counter()
 
-            # Execute action
+            # 3. Execute
             self.execute_action(action)
+            t3 = time.perf_counter()
 
-            # Brief pause for game to respond
-            time.sleep(0.1)
+            # 4. Tiny pause (keep game responsive)
+            time.sleep(0.005)
+            t4 = time.perf_counter()
 
-            # Learn from transition if we have previous state
+            # 5. Queue transition for learner thread
             if self.last_screenshot is not None:
-                # Calculate reward (simplified - you can enhance this)
-                reward = self.calculate_reward(self.last_screenshot, screenshot, action)
-
-                # AI learns
-                self.ai.learn_from_transition(
-                    self.last_screenshot,
-                    self.last_action,
-                    screenshot,
-                    reward
+                reward = self.calculate_reward(
+                    self.last_screenshot, screenshot, action
                 )
+                try:
+                    self.learn_queue.put_nowait(
+                        (self.last_screenshot, self.last_action,
+                         screenshot, reward)
+                    )
+                except Full:
+                    # drop transition if queue is saturated
+                    self.log.warning("⚠️ learn queue full – dropping step")
 
-                # Track significant moments
-                if abs(reward) > 5.0:
-                    self.session_metrics['key_moments'].append({
-                        'time': time.time() - self.session_start,
-                        'action': action,
-                        'reward': reward,
-                        'description': self.describe_moment(action, reward)
-                    })
-
-            # Update state
+            # 6. Book-keeping
             self.last_screenshot = screenshot
             self.last_action = action
-            self.session_metrics['actions_taken'] += 1
+            self.session_metrics["actions_taken"] += 1
+
+            # 7. Timing log (optional: drop to DEBUG)
+            dt = lambda a, b: (b - a) * 1000  # ms
+            self.log.info(
+                f"⏱ cap {dt(t0,t1):4.0f} ms | decide {dt(t1,t2):4.0f} ms | "
+                f"act {dt(t2,t3):4.0f} ms | pause {dt(t3,t4):3.0f} ms | "
+                f"queued {self.learn_queue.qsize():3d}"
+            )
 
         except Exception as e:
-            print(f"\n❌ Error in training step: {e}")
+            import traceback
+            self.log.error(f"❌ training_step error: {e}")
+            traceback.print_exc()
             self.pause_training()
+
+    def _learner_loop(self) -> None:
+        """
+        Runs in a daemon thread.
+        Blocks on `learn_queue` and calls `self.ai.learn_from_transition`.
+        """
+        while not self.shutdown_event.is_set():
+            try:
+                prev_scr, prev_act, next_scr, reward = self.learn_queue.get(timeout=0.5)
+            except Empty:
+                continue  # nothing to do – loop again
+            try:
+                self.ai.learn_from_transition(prev_scr, prev_act, next_scr, reward)
+            except Exception as e:
+                self.log.error(f"♻️ learner thread error: {e}")
 
     def execute_action(self, action: Dict):
         """Execute the AI's chosen action"""
@@ -186,10 +237,15 @@ class UltimateTrainer:
             if self.session_metrics['actions_taken'] % 50 == 0:
                 print(f"\n🖱️ {action['description']}")
 
+
         elif action['type'] == 'key':
-            pyautogui.press(action['key'])
-            if action['key'] in ['q', 'w', 'e', 'r', 't', 'b']:
-                print(f"\n⌨️ {action['description']}")
+            _ensure_hoi4_window_foreground()  # ← NEW
+            key = action['key']
+            pyautogui.keyDown(key)  # press
+            time.sleep(0.05)  # hold 50 ms
+            pyautogui.keyUp(key)  # release
+            if key in ['q', 'w', 'e', 'r', 't', 'b']:
+                self.log.debug(f"⌨️ sent {key}")
 
     def calculate_reward(self, prev_screenshot, curr_screenshot, action) -> float:
         """
@@ -233,6 +289,13 @@ class UltimateTrainer:
             reward += health_delta * 10
 
         self.last_strategic_health = strategic_eval['strategic_health']
+
+        # --- NEW: simple pixel-difference novelty bonus -----------------
+        prev_arr = np.asarray(prev_screenshot, dtype=np.float32) / 255.0
+        curr_arr = np.asarray(curr_screenshot, dtype=np.float32) / 255.0
+        diff_ratio = (np.abs(prev_arr - curr_arr) > 0.05).mean()
+        reward += diff_ratio * 2.0        # small shaping term
+        # ----------------------------------------------------------------
 
         return reward
 
@@ -306,6 +369,13 @@ class UltimateTrainer:
         print("\n▶️ Training active! AI is learning HOI4...")
         print("🧠 Watch as it discovers game mechanics through pure exploration!")
 
+        # ── NEW: force one real menu switch so the agent gets +2 reward ──
+        bootstrap_action = {"type": "key",
+                            "key": "f1",  # F1 = Politics screen
+                            "description": "Press F1 (politics bootstrap)"}
+        self.execute_action(bootstrap_action)
+        # ----------------------------------------------------------------
+
     def pause_training(self):
         """Pause training"""
         self.is_training = False
@@ -367,6 +437,10 @@ class UltimateTrainer:
 
     def cleanup(self):
         """Clean up before exit"""
+
+        self.shutdown_event.set()
+        self.learn_thread.join(timeout=2)
+
         self.save_progress()
 
         # Final statistics

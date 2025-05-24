@@ -12,6 +12,7 @@ Choose your AI mode:
 import os
 import sys
 import argparse
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"   # unsafe but unblocks Windows
 from datetime import datetime
 import time  # Add this import!
 
@@ -70,7 +71,7 @@ Examples:
     ╔═══════════════════════════════════════════════════════════╗
     ║                  HOI4 Self-Learning AI                    ║
     ║                                                           ║
-    ║  An AI that learns to play Hearts of Iron 4              ║
+    ║  An AI that learns to play Hearts of Iron 4               ║
     ║  through self-discovery and strategic planning            ║
     ╚═══════════════════════════════════════════════════════════╝
     """)

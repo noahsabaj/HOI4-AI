@@ -74,10 +74,13 @@ class RSSM(nn.Module):
         if embed is not None:
             posterior_logits = self.posterior_net(torch.cat([deter, embed], dim=-1))
             posterior = self._logits_to_dist(posterior_logits)
-            stoch = posterior.rsample()  # Use posterior during training
+            # draw categorical samples and convert to one-hot
+            stoch_idx = posterior.sample()  # shape: [batch, stoch_size]
+            stoch = F.one_hot(stoch_idx, num_classes=self.num_categories).float()
         else:
             posterior = None
-            stoch = prior.rsample()  # Use prior during imagination
+            stoch_idx = prior.sample()  # shape: [batch, stoch_size]
+            stoch = F.one_hot(stoch_idx, num_classes=self.num_categories).float()
 
         return {
             'stoch': stoch,
