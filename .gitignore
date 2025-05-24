@@ -8,6 +8,7 @@ __pycache__/
 venv/
 venv_gpu/
 .venv/
+build
 ENV/
 
 # PyCharm
