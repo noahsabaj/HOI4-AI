@@ -17,6 +17,9 @@ from threading import Thread, Event
 import json
 import re
 from typing import Dict
+
+from .hf_strategic_evaluator import HuggingFaceStrategicEvaluator
+
 from src.utils.logger import get_logger
 
 # Add project root to path
@@ -66,6 +69,14 @@ class UltimateTrainer:
         # Initialize Ultimate AI & evaluator
         self.ai = UltimateHOI4AI()
         self.evaluator = StrategicEvaluator()
+
+        # Use the reasoning-optimized Phi-4 mini model
+        print("  🤗 Initializing Phi-4 strategic evaluator...")
+        self.strategic_reasoner = HuggingFaceStrategicEvaluator(
+            model_name="microsoft/Phi-4-mini-reasoning",  # 3.8B, optimized for reasoning!
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            evaluation_frequency=30
+        )
 
         self.learn_queue = Queue(maxsize=64)  # holds (prev, act, next, r)
         self.shutdown_event = Event()
@@ -234,8 +245,20 @@ class UltimateTrainer:
                 action['y'],
                 button=action.get('button', 'left')
             )
-            if self.session_metrics['actions_taken'] % 50 == 0:
-                print(f"\n🖱️ {action['description']}")
+            # Log every 10th action or significant ones
+            if (self.session_metrics['actions_taken'] % 10 == 0 or
+                    any(keyword in action.get('description', '').lower()
+                        for keyword in ['factory', 'build', 'research', 'focus', 'production'])):
+                print(
+                    f"\n🖱️ [{self.session_metrics['actions_taken']}] {action['description']} at ({action['x']}, {action['y']})")
+
+        elif action['type'] == 'key':
+            _ensure_hoi4_window_foreground()
+            key = action['key']
+            pyautogui.keyDown(key)
+            time.sleep(0.05)
+            pyautogui.keyUp(key)
+            print(f"\n⌨️ [{self.session_metrics['actions_taken']}] Pressed {key} - {action.get('description', '')}")
 
 
         elif action['type'] == 'key':
@@ -247,10 +270,29 @@ class UltimateTrainer:
             if key in ['q', 'w', 'e', 'r', 't', 'b']:
                 self.log.debug(f"⌨️ sent {key}")
 
+    def log_game_state(self, ocr_data: Dict, screen_type: str):
+        """Log important game state information"""
+        # Only log every 20 actions to avoid spam
+        if self.session_metrics['actions_taken'] % 20 == 0:
+            date = ocr_data.get('date', 'Unknown')
+            pp = self.extract_number(ocr_data.get('political_power', '0'))
+
+            print(f"\n📊 Game State Check:")
+            print(f"   Date: {date}")
+            print(f"   Screen: {screen_type}")
+            print(f"   Political Power: {pp}")
+
+            # Log any factory info
+            factory_text = ocr_data.get('factories', '')
+            if factory_text:
+                print(f"   Factories: {factory_text}")
+
+            # Log first few OCR entries to debug
+            print(f"   OCR Keys: {list(ocr_data.keys())[:5]}...")
+
     def calculate_reward(self, prev_screenshot, curr_screenshot, action) -> float:
         """
-        Calculate reward for the transition
-        You can make this more sophisticated!
+        Calculate reward for the transition including DeepSeek-R1 evaluation
         """
         # Basic reward structure
         reward = -0.01  # Small negative for time pressure
@@ -258,6 +300,10 @@ class UltimateTrainer:
         # Use your existing OCR to detect changes
         prev_ocr = self.ai.ocr.extract_all_text(prev_screenshot)
         curr_ocr = self.ai.ocr.extract_all_text(curr_screenshot)
+
+        # After OCR extraction
+        curr_screen = self.detect_screen_type(curr_ocr)
+        self.log_game_state(curr_ocr, curr_screen)
 
         # Reward for changing screens (exploration)
         prev_screen = self.detect_screen_type(prev_ocr)
@@ -290,12 +336,38 @@ class UltimateTrainer:
 
         self.last_strategic_health = strategic_eval['strategic_health']
 
-        # --- NEW: simple pixel-difference novelty bonus -----------------
+        # Pixel-difference novelty bonus
         prev_arr = np.asarray(prev_screenshot, dtype=np.float32) / 255.0
         curr_arr = np.asarray(curr_screenshot, dtype=np.float32) / 255.0
         diff_ratio = (np.abs(prev_arr - curr_arr) > 0.05).mean()
-        reward += diff_ratio * 2.0        # small shaping term
-        # ----------------------------------------------------------------
+        reward += diff_ratio * 2.0
+
+        # === DEEPSEEK-R1 STRATEGIC EVALUATION ===
+        # Build comprehensive game state for R1
+        enhanced_game_state = {
+            **game_state,  # Your existing game state
+            'game_date': curr_ocr.get('date', 'Unknown'),
+            'political_power': curr_pp,
+            'screen_type': curr_screen,
+            'civilian_factories': game_state['factories'].get('civilian', 0),
+            'military_factories': game_state['factories'].get('military', 0),
+        }
+
+        # Record action and get strategic evaluation if triggered
+        strategic_reward = self.strategic_reasoner.record_action(action, enhanced_game_state)
+
+        if strategic_reward is not None:
+            # R1 provided strategic evaluation
+            reward += strategic_reward
+
+            # Log significant strategic rewards
+            if abs(strategic_reward) > 2.0:
+                self.session_metrics['key_moments'].append({
+                    'step': self.session_metrics['actions_taken'],
+                    'description': f"DeepSeek-R1 strategic insight: {strategic_reward:+.2f}",
+                    'reward': strategic_reward,
+                    'strategy': self.strategic_reasoner.get_current_strategy()
+                })
 
         return reward
 
@@ -427,11 +499,15 @@ class UltimateTrainer:
             runtime = (time.time() - self.session_start) / 60
             apm = self.session_metrics['actions_taken'] / runtime
 
+            # Get current strategy from DeepSeek-R1
+            current_strategy = self.strategic_reasoner.get_current_strategy()
+
             status = (
                 f"\r⚡ Actions: {self.session_metrics['actions_taken']} | "
                 f"APM: {apm:.1f} | "
                 f"Runtime: {runtime:.1f}m | "
-                f"Key Moments: {len(self.session_metrics['key_moments'])}"
+                f"Key Moments: {len(self.session_metrics['key_moments'])} | "
+                f"Phase: {current_strategy}"
             )
             print(status, end='', flush=True)
 
@@ -451,6 +527,20 @@ class UltimateTrainer:
         print(f"Total Runtime: {runtime:.1f} minutes")
         print(f"Total Actions: {self.session_metrics['actions_taken']:,}")
         print(f"Actions per Minute: {self.session_metrics['actions_taken'] / runtime:.1f}")
+
+        # === ADD THIS: DEEPSEEK-R1 STRATEGIC ANALYSIS ===
+        strategic_summary = self.strategic_reasoner.get_strategic_summary()
+
+        print(f"\n🧠 DeepSeek-R1 Strategic Analysis:")
+        print(f"  • Strategic evaluations performed: {strategic_summary['evaluations']}")
+        print(f"  • Average strategic score: {strategic_summary['average_reward']:+.2f}")
+        print(f"  • Current strategic phase: {strategic_summary['current_strategy']}")
+        print(f"  • Strategic decisions made: {strategic_summary['total_decisions']}")
+
+        if strategic_summary['recent_insights']:
+            print(f"\n💡 Recent Strategic Insights from DeepSeek-R1:")
+            for insight in strategic_summary['recent_insights'][-3:]:
+                print(f"  • {insight['insights']}")
 
         # Interesting discoveries
         if self.ai.curiosity.seen_screens:

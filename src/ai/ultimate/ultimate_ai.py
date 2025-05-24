@@ -24,6 +24,8 @@ from src.comprehension.engine import HOI4UnderstandingEngine
 from src.perception.ocr import HOI4OCR
 from src.strategy.evaluation import StrategicEvaluator
 
+from .simple_world_model import SimpleWorldModel, LATENT_SIZE, NUM_ACTIONS
+
 
 class ActionSpace:
     """Define HOI4 action space"""
@@ -141,23 +143,21 @@ class UltimateHOI4AI:
         # Action space
         self.action_size = ActionSpace.get_action_size()
 
-        # Core components
-        print("  📦 Loading world model...")
-        self.world_model = WorldModel(action_size=self.action_size).to(device)
-
         print("  🔍 Loading curiosity module...")
         self.curiosity = CombinedCuriosity(
-            observation_dim=1024,  # From world model encoder
+            observation_dim=LATENT_SIZE,  # From world model encoder
             rnd_weight=0.6,
             goal_weight=0.4
         )
 
+        # Simple world model for training
+        self.world_model = SimpleWorldModel().to(self.device)
+        self.wm_opt = torch.optim.Adam(self.world_model.parameters(), lr=2e-4)
+        self.global_step = 0
+
         # 🧠 Loading episodic memory with correct state_dim
-        state_dim = (
-                self.world_model.rssm.stoch_size *
-                self.world_model.rssm.num_categories +
-                self.world_model.rssm.deter_size
-        )
+        state_dim = LATENT_SIZE
+
         self.nec = NeuralEpisodicControl(
             state_dim=state_dim,
             key_dim=128,
@@ -269,15 +269,9 @@ class UltimateHOI4AI:
         if self.current_rssm_state is None:
             self.current_rssm_state = self._initialize_rssm_state()
 
-        # Update RSSM state
+        # Update state (SimpleWorldModel just stores the latent)
         if self.last_action is not None:
-            rssm_output = self.world_model.rssm(
-                self.current_rssm_state['stoch'],
-                self.current_rssm_state['deter'],
-                self.last_action,
-                encoded_obs
-            )
-            self.current_rssm_state = rssm_output
+            self.current_rssm_state = {'latent': encoded_obs.squeeze(0)}
 
         # Get full state representation
         state_features = self._get_state_features()
@@ -387,35 +381,9 @@ class UltimateHOI4AI:
     # Imagination-based planner (Dreamer-style)
     # ------------------------------------------------------------------
     def _imagination_policy(self, state_features: torch.Tensor) -> int:
-        """Batch-vectorised imagination:  10× faster than per-sample loop."""
-        horizon, num_samples = 8, 5
-
-        # Sample [N, H] action indices and one-hot them → [N, H, A]
-        seqs = torch.randint(0, self.action_size,
-                             (num_samples, horizon), device=self.device)
-        onehots = F.one_hot(seqs, num_classes=self.action_size).float()
-
-        # Clone the current latent once (batch dim 1)
-        start_state = {
-            "stoch": self.current_rssm_state["stoch"]
-            .repeat(num_samples, 1, 1),  # [N, S, C]
-            "deter": self.current_rssm_state["deter"]
-            .repeat(num_samples, 1)  # [N, D]
-        }
-
-        # Imagine all N sequences in parallel
-        with torch.no_grad():
-            imag = self.world_model.rssm.imagine(start_state, onehots)  # keys: stoch, deter
-
-            stoch_flat = rearrange(imag["stoch"], "n t s c -> (n t) (s c)")
-            deter_flat = rearrange(imag["deter"], "n t d   -> (n t) d")
-            feats = torch.cat([stoch_flat, deter_flat], dim=-1)  # [N·H, 1536]
-
-            rewards = self.world_model.reward_head(feats).view(num_samples, horizon)
-            returns = rewards.sum(dim=1)  # [N]
-
-        best_first_action = seqs[returns.argmax(), 0].item()
-        return best_first_action
+        """Simple random policy for now (no imagination with SimpleWorldModel)"""
+        # Just return a random action until world model is trained
+        return np.random.randint(0, self.action_size)
 
     def _exploration_policy(self, state_features: torch.Tensor) -> int:
         """Random exploration with bias toward untried actions"""
@@ -436,25 +404,14 @@ class UltimateHOI4AI:
     def _get_state_features(self) -> torch.Tensor:
         """Get current state features for NEC"""
         if self.current_rssm_state is None:
-            return torch.zeros(544, device=self.device)
+            return torch.zeros(LATENT_SIZE, device=self.device)
 
-        stoch_flat = self.current_rssm_state['stoch'].flatten()
-        deter = self.current_rssm_state['deter'].squeeze(0)
-
-        return torch.cat([stoch_flat, deter])
+        return self.current_rssm_state['latent'].squeeze(0)
 
     def _initialize_rssm_state(self) -> Dict:
-        """Initialize RSSM state"""
+        """Initialize state (for SimpleWorldModel)"""
         return {
-            'stoch': torch.zeros(
-                1, self.world_model.rssm.stoch_size,
-                self.world_model.rssm.num_categories,
-                device=self.device
-            ),
-            'deter': torch.zeros(
-                1, self.world_model.rssm.deter_size,
-                device=self.device
-            )
+            'latent': torch.zeros(1, LATENT_SIZE, device=self.device)
         }
 
     def _check_memory(self, state_features: torch.Tensor, game_info: Dict):
@@ -506,15 +463,35 @@ class UltimateHOI4AI:
         )
 
     def _train_world_model(self):
-        """Train world model on replay buffer"""
-        if len(self.replay_buffer) < 1000:
+        """Train SimpleWorldModel on replay buffer"""
+        if len(self.replay_buffer) < 256:
             return
 
         # Sample batch
         batch = self.replay_buffer.sample(8)
 
-        # TODO: Implement world model training
-        # This would involve reconstructing observations and predicting rewards
+        # The replay buffer stores observations as 256-d encoded vectors
+        # We need to train the model to predict next states and rewards
+
+        obs = batch['obs'].to(self.device)
+        actions = batch['action'].to(self.device)
+        rewards = batch['reward'].to(self.device)
+        next_obs = batch['next_obs'].to(self.device)
+
+        # For SimpleWorldModel, we'll just train reward prediction for now
+        with torch.no_grad():
+            current_latent = obs  # Already encoded
+
+        # Simple training: predict rewards from states
+        pred_rewards = self.world_model.reward_head(current_latent).squeeze()
+        loss = F.mse_loss(pred_rewards, rewards)
+
+        self.wm_opt.zero_grad()
+        loss.backward()
+        self.wm_opt.step()
+
+        if self.total_steps % 1000 == 0:
+            self.log.info(f"🧠 World model loss: {loss.item():.4f}")
 
     def _train_curiosity(self):
         """Train RND predictor"""
