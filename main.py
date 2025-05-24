@@ -219,10 +219,11 @@ def run_understanding_mode(args):
 
     if args.gui:
         # Run with GUI
-        from main_understanding import UnderstandingBasedHOI4AI
-        ai = UnderstandingBasedHOI4AI()
-        ai.run()
-    else:
+        print("GUI mode for understanding is being refactored.")
+        print("Running in console mode instead...")
+        args.gui = False
+
+    if not args.gui:
         # Run without GUI
         from src.comprehension.curiosity import CuriosityDrivenLearner
         from PIL import ImageGrab
