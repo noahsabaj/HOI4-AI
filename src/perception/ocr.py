@@ -152,7 +152,7 @@ class HOI4OCR:
         return extracted
 
     def extract_numbers(self, text):
-        """Extract numbers from text (PP, factories, etc)"""
+        """Extract numbers from text (PP, factories, etc.)"""
         import re
         numbers = re.findall(r'-?\d+\.?\d*', text)
         return [float(n) if '.' in n else int(n) for n in numbers]
