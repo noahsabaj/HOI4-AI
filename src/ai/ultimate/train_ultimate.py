@@ -10,6 +10,7 @@ import time
 import keyboard
 import pyautogui
 from PIL import ImageGrab
+import torch
 import numpy as np
 from datetime import datetime
 from queue import Queue, Empty, Full
