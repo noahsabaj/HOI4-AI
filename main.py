@@ -5,16 +5,21 @@ HOI4 AI - Multiple Learning Approaches
 Choose your AI mode:
 1. Strategic: Learns to win through reinforcement learning
 2. Understanding: Explores and comprehends game mechanics
-3. Integrated: Combines understanding with strategic learning (RECOMMENDED)
+3. Integrated: Combines understanding with strategic learning
+4. Ultimate: DreamerV3 + RND + NEC (NEWEST AND BEST!)
 """
 
 import os
 import sys
 import argparse
 from datetime import datetime
+import time  # Add this import!
 
 # Add src to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Import for ultimate mode
+from src.ai.ultimate.train_ultimate import UltimateTrainer
 
 
 def main():
@@ -23,7 +28,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py --mode integrated    # Best of both worlds (RECOMMENDED)
+  python main.py --mode ultimate      # DreamerV3 + RND + NEC (RECOMMENDED!)
+  python main.py --mode integrated    # Understanding + Strategic
   python main.py --mode strategic     # Pure reinforcement learning
   python main.py --mode understanding  # Pure exploration and comprehension
   python main.py --mode record        # Record your gameplay
@@ -33,9 +39,9 @@ Examples:
 
     parser.add_argument(
         '--mode',
-        choices=['strategic', 'understanding', 'integrated', 'record', 'analyze'],
-        default='integrated',
-        help='AI mode to run (default: integrated)'
+        choices=['strategic', 'understanding', 'integrated', 'ultimate', 'record', 'analyze'],
+        default='ultimate',
+        help='AI mode to run (default: ultimate)'
     )
 
     parser.add_argument(
@@ -75,7 +81,9 @@ Examples:
     os.makedirs('configs', exist_ok=True)
 
     # Route to appropriate mode
-    if args.mode == 'integrated':
+    if args.mode == 'ultimate':
+        run_ultimate_mode(args)
+    elif args.mode == 'integrated':
         run_integrated_mode(args)
     elif args.mode == 'strategic':
         run_strategic_mode(args)
@@ -85,6 +93,24 @@ Examples:
         run_recording_mode()
     elif args.mode == 'analyze':
         run_analysis_mode()
+
+
+def run_ultimate_mode(args):
+    """Run the Ultimate AI mode with DreamerV3 + RND + NEC"""
+    print(f"\n🚀 ULTIMATE AI MODE - DreamerV3 + RND + NEC")
+    print(f"{'=' * 60}")
+    print(f"This mode features:")
+    print(f"  ✓ World model that learns game dynamics")
+    print(f"  ✓ Curiosity-driven exploration (RND)")
+    print(f"  ✓ Fast learning from experience (NEC)")
+    print(f"  ✓ Persistent memory across games")
+    print(f"  ✓ Pure self-play learning")
+
+    # Create trainer
+    trainer = UltimateTrainer()
+
+    # Run training loop
+    trainer.run()
 
 
 def run_integrated_mode(args):
@@ -356,6 +382,7 @@ def show_understanding_report(ai):
 
 def show_final_report(ai, session_start):
     """Show final report for integrated mode"""
+    import time  # Add import here too
     duration = (time.time() - session_start) / 60
 
     print(f"\n{'=' * 60}")
