@@ -1,0 +1,9 @@
+{
+  "timestamp": "2025-05-23T20:07:51.565039",
+  "runtime_minutes": 5.004103446006775,
+  "total_actions": 381,
+  "actions_per_minute": 76.13751476381533,
+  "average_reward": 0.9921259842519682,
+  "positive_reward_percentage": 81.36482939632546,
+  "exploration_rate": 0.2
+}
