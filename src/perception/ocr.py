@@ -1,15 +1,18 @@
-# src/perception/ocr_engine.py - HOI4-specific OCR
+# src/perception/ocr.py - HOI4-specific OCR with platform detection
 import pytesseract
 from PIL import Image, ImageGrab, ImageEnhance, ImageFilter
 import numpy as np
 import time
 import json
+import os
+import platform
+import sys
 
 
 class HOI4OCR:
     def __init__(self):
-        # Tesseract path
-        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+        # Platform-specific Tesseract configuration
+        self._configure_tesseract()
 
         # HOI4 UI regions (1920x1080)
         self.regions = {
@@ -31,6 +34,54 @@ class HOI4OCR:
             'brightness': 1.2,
             'denoise': True
         }
+
+    def _configure_tesseract(self):
+        """Configure Tesseract based on platform"""
+        system = platform.system()
+
+        if system == 'Windows':
+            # Try environment variable first
+            tesseract_path = os.environ.get('TESSERACT_PATH')
+
+            if not tesseract_path:
+                # Try common Windows installation paths
+                possible_paths = [
+                    r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                    r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                    r'C:\Tesseract-OCR\tesseract.exe',
+                    os.path.expanduser(r'~\AppData\Local\Tesseract-OCR\tesseract.exe')
+                ]
+
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        tesseract_path = path
+                        break
+
+                if not tesseract_path:
+                    print("⚠️ Tesseract not found in common locations!")
+                    print("Please install Tesseract OCR or set TESSERACT_PATH environment variable")
+                    print("Download from: https://github.com/UB-Mannheim/tesseract/wiki")
+                    sys.exit(1)
+
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            print(f"✅ Tesseract configured: {tesseract_path}")
+
+        elif system in ['Linux', 'Darwin']:  # Darwin is macOS
+            # On Linux/Mac, tesseract is usually in PATH
+            try:
+                # Test if tesseract is available
+                import subprocess
+                subprocess.run(['tesseract', '--version'],
+                               capture_output=True, check=True)
+                print("✅ Tesseract found in system PATH")
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                print("⚠️ Tesseract not found!")
+                print("Install with:")
+                if system == 'Linux':
+                    print("  sudo apt-get install tesseract-ocr")
+                else:  # macOS
+                    print("  brew install tesseract")
+                sys.exit(1)
 
     def preprocess_for_ocr(self, image):
         """Enhance image for better OCR accuracy on HOI4 text"""
