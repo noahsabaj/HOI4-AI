@@ -1,9 +1,11 @@
-# main.py - Simple entry point for the HOI4 AI
+# main.py - Unified entry point for all HOI4 AI modes
 """
-HOI4 AI - Learn to Win WWII Through Self-Play
+HOI4 AI - Multiple Learning Approaches
 
-This AI discovers optimal strategies for Hearts of Iron 4 through
-pure reinforcement learning, without any hard-coded strategies.
+Choose your AI mode:
+1. Strategic: Learns to win through reinforcement learning
+2. Understanding: Explores and comprehends game mechanics
+3. Integrated: Combines understanding with strategic learning (RECOMMENDED)
 """
 
 import os
@@ -14,115 +16,283 @@ from datetime import datetime
 # Add src to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.core.learner import UnifiedHOI4Learner
-from src.utils.recorder import SmartHOI4Recorder
-
 
 def main():
-    parser = argparse.ArgumentParser(description='HOI4 Self-Learning AI')
-    parser.add_argument('--mode', choices=['learn', 'record', 'analyze'],
-                        default='learn',
-                        help='Mode to run the AI in')
-    parser.add_argument('--model', type=str,
-                        default='models/hoi4_unified.pth',
-                        help='Model file to load/save')
-    parser.add_argument('--games', type=int,
-                        default=1000,
-                        help='Number of games to play (0 for infinite)')
+    parser = argparse.ArgumentParser(
+        description='HOI4 Self-Learning AI - Choose your approach',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --mode integrated    # Best of both worlds (RECOMMENDED)
+  python main.py --mode strategic     # Pure reinforcement learning
+  python main.py --mode understanding  # Pure exploration and comprehension
+  python main.py --mode record        # Record your gameplay
+  python main.py --mode analyze       # Analyze what the AI has learned
+        """
+    )
+
+    parser.add_argument(
+        '--mode',
+        choices=['strategic', 'understanding', 'integrated', 'record', 'analyze'],
+        default='integrated',
+        help='AI mode to run (default: integrated)'
+    )
+
+    parser.add_argument(
+        '--model',
+        type=str,
+        default=None,
+        help='Model file to load (mode-specific defaults used if not specified)'
+    )
+
+    parser.add_argument(
+        '--games',
+        type=int,
+        default=0,
+        help='Number of games to play (0 for infinite)'
+    )
+
+    parser.add_argument(
+        '--gui',
+        action='store_true',
+        help='Show GUI window for understanding mode'
+    )
 
     args = parser.parse_args()
 
     print("""
-    ╔═══════════════════════════════════════════╗
-    ║        HOI4 Self-Learning AI              ║
-    ║                                           ║
-    ║  Teaching AI to win WWII through          ║
-    ║  strategic self-discovery                 ║
-    ╚═══════════════════════════════════════════╝
+    ╔═══════════════════════════════════════════════════════════╗
+    ║                  HOI4 Self-Learning AI                    ║
+    ║                                                           ║
+    ║  An AI that learns to play Hearts of Iron 4              ║
+    ║  through self-discovery and strategic planning            ║
+    ╚═══════════════════════════════════════════════════════════╝
     """)
 
-    if args.mode == 'learn':
-        run_learning_mode(args)
+    # Create necessary directories
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('models/memory', exist_ok=True)
+    os.makedirs('configs', exist_ok=True)
+
+    # Route to appropriate mode
+    if args.mode == 'integrated':
+        run_integrated_mode(args)
+    elif args.mode == 'strategic':
+        run_strategic_mode(args)
+    elif args.mode == 'understanding':
+        run_understanding_mode(args)
     elif args.mode == 'record':
         run_recording_mode()
     elif args.mode == 'analyze':
         run_analysis_mode()
 
 
-def run_learning_mode(args):
-    """Run the AI in learning mode"""
-    print(f"\n🧠 LEARNING MODE")
-    print(f"{'=' * 50}")
-    print(f"Model: {args.model}")
-    print(f"Target Games: {args.games if args.games > 0 else 'Infinite'}")
+def run_integrated_mode(args):
+    """Run the integrated AI that combines understanding with strategy"""
+    print(f"\n🧠 INTEGRATED MODE - Best of Both Worlds")
+    print(f"{'=' * 60}")
+    print(f"This mode combines:")
+    print(f"  ✓ Systematic exploration to understand the game")
+    print(f"  ✓ Strategic learning to win")
+    print(f"  ✓ Shared memory between both systems")
+    print(f"  ✓ Neural network optimization")
+
+    from src.ai.integrated_ai import IntegratedHOI4AI
+    import keyboard
+    import time
+    from PIL import ImageGrab
+
+    # Initialize AI
+    model_path = args.model or 'models/hoi4_integrated.pth'
+    ai = IntegratedHOI4AI(model_path)
+
     print(f"\n📋 Instructions:")
-    print(f"1. Start HOI4 and load as Germany (1936)")
-    print(f"2. Set game to windowed mode")
-    print(f"3. Press F5 to begin learning")
-    print(f"\nThe AI will discover how to:")
-    print(f"  • Build an optimal economy")
-    print(f"  • Choose the right focuses")
-    print(f"  • Time military expansion")
-    print(f"  • Win the war\n")
+    print(f"1. Start HOI4 in windowed mode")
+    print(f"2. Load as Germany (1936)")
+    print(f"3. Pause the game")
+    print(f"4. Press F5 to start")
+    print(f"\nControls:")
+    print(f"  F5: Start/Resume")
+    print(f"  F6: Pause")
+    print(f"  F7: Save Progress")
+    print(f"  F8: Show Understanding Report")
+    print(f"  ESC (hold): Stop")
 
-    # Create necessary directories
-    os.makedirs('models', exist_ok=True)
-    os.makedirs('models/memory', exist_ok=True)
+    playing = False
+    session_start = time.time()
 
-    # Initialize and run learner
-    learner = UnifiedHOI4Learner(model_path=args.model)
+    print("\n⏸️ Press F5 to begin...")
+
+    while True:
+        # Check controls
+        if keyboard.is_pressed('f5') and not playing:
+            print("\n▶️ AI Active!")
+            playing = True
+            time.sleep(0.3)
+
+        elif keyboard.is_pressed('f6') and playing:
+            print("\n⏸️ Paused")
+            playing = False
+            time.sleep(0.3)
+
+        elif keyboard.is_pressed('f7'):
+            ai.save_integrated_knowledge()
+            time.sleep(0.3)
+
+        elif keyboard.is_pressed('f8'):
+            show_understanding_report(ai)
+            time.sleep(0.3)
+
+        elif keyboard.is_pressed('escape'):
+            if not hasattr(run_integrated_mode, '_esc_held'):
+                run_integrated_mode._esc_held = time.time()
+            elif time.time() - run_integrated_mode._esc_held > 2:
+                print("\n🛑 Stopping...")
+                break
+        else:
+            run_integrated_mode._esc_held = None
+
+        # Main loop
+        if playing:
+            try:
+                # Capture screen
+                screenshot = ImageGrab.grab()
+
+                # Get AI decision
+                action = ai.decide_action(screenshot)
+
+                # Show explanation
+                if ai.metrics['actions_taken'] % 10 == 0:
+                    print(f"\n{ai.explain_decision(action)}")
+
+                # Execute action
+                import pyautogui
+                if action['type'] == 'click':
+                    pyautogui.click(action['x'], action['y'], button=action.get('button', 'left'))
+                elif action['type'] == 'key':
+                    pyautogui.press(action['key'])
+
+                # Brief pause
+                time.sleep(0.2)
+
+                # Periodic reports
+                if ai.metrics['actions_taken'] % 100 == 0:
+                    show_progress_report(ai)
+
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                time.sleep(1)
+
+    # Final save
+    ai.save_integrated_knowledge()
+    show_final_report(ai, session_start)
+
+
+def run_strategic_mode(args):
+    """Run pure strategic learning mode"""
+    print(f"\n🎯 STRATEGIC MODE - Pure Reinforcement Learning")
+    print(f"{'=' * 60}")
+    print(f"This mode focuses on winning through trial and error")
+
+    from src.ai.learner import UnifiedHOI4Learner
+
+    model_path = args.model or 'models/hoi4_unified.pth'
+    learner = UnifiedHOI4Learner(model_path)
 
     try:
         if args.games > 0:
-            # Play specific number of games
             for game_num in range(args.games):
                 print(f"\n🎮 Starting Game {game_num + 1}/{args.games}")
                 learner.play_and_learn()
-
-                # Check if we've discovered winning strategies
-                insights = learner.memory.get_discovery_insights()
-                if insights['victories'] > 0:
-                    win_rate = insights['victories'] / (game_num + 1)
-                    print(f"\n🏆 Current Win Rate: {win_rate:.1%}")
-
-                    if win_rate > 0.8:  # 80% win rate
-                        print("\n🎉 AI has mastered HOI4!")
-                        print("Discovered strategies are saved in models/memory/")
-                        break
         else:
-            # Infinite learning
             learner.play_and_learn()
-
     except KeyboardInterrupt:
-        print("\n\n⏸️ Learning interrupted by user")
+        print("\n⏸️ Interrupted")
         learner.save_progress()
-        print("✅ Progress saved!")
 
-    # Final report
-    print_final_report(learner)
+
+def run_understanding_mode(args):
+    """Run pure understanding/exploration mode"""
+    print(f"\n🔍 UNDERSTANDING MODE - Pure Exploration")
+    print(f"{'=' * 60}")
+    print(f"This mode focuses on understanding game mechanics")
+
+    if args.gui:
+        # Run with GUI
+        from main_understanding import UnderstandingBasedHOI4AI
+        ai = UnderstandingBasedHOI4AI()
+        ai.run()
+    else:
+        # Run without GUI
+        from src.comprehension.curiosity import CuriosityDrivenLearner
+        from PIL import ImageGrab
+        import pyautogui
+        import keyboard
+        import time
+
+        learner = CuriosityDrivenLearner()
+        playing = False
+
+        print("\nPress F5 to start, F6 to pause...")
+
+        while True:
+            if keyboard.is_pressed('f5') and not playing:
+                playing = True
+                print("\n▶️ Exploring...")
+
+            elif keyboard.is_pressed('f6') and playing:
+                playing = False
+                print("\n⏸️ Paused")
+
+            elif keyboard.is_pressed('escape'):
+                break
+
+            if playing:
+                screenshot = ImageGrab.grab()
+                ocr_data = learner.ocr.extract_all_text(screenshot)
+                state_tensor = convert_screenshot_to_tensor(screenshot)
+
+                action = learner.decide_action_with_curiosity(state_tensor, ocr_data)
+
+                # Execute
+                if action['type'] == 'click':
+                    pyautogui.click(action['x'], action['y'])
+                elif action['type'] == 'key':
+                    pyautogui.press(action['key'])
+
+                time.sleep(0.3)
 
 
 def run_recording_mode():
-    """Record gameplay for initial training data"""
+    """Record gameplay for training data"""
     print(f"\n📹 RECORDING MODE")
-    print(f"{'=' * 50}")
-    print(f"This mode records your gameplay to give the AI")
-    print(f"initial examples to learn from.\n")
+    print(f"{'=' * 60}")
 
+    from src.utils.recorder import SmartHOI4Recorder
     recorder = SmartHOI4Recorder()
     recorder.start_recording()
-
-    print("\n✅ Recording complete!")
-    print("You can now run in learning mode to train the AI")
 
 
 def run_analysis_mode():
     """Analyze what the AI has learned"""
     print(f"\n📊 ANALYSIS MODE")
-    print(f"{'=' * 50}")
+    print(f"{'=' * 60}")
 
-    # Load memory system
-    from src.core.memory import StrategicMemory
+    # Check what model files exist
+    model_files = {
+        'Strategic': 'models/hoi4_unified.pth',
+        'Understanding': 'models/understanding.pkl',
+        'Integrated': 'models/hoi4_integrated.pth',
+        'Memory': 'models/memory/'
+    }
+
+    print("\n📁 Available Models:")
+    for name, path in model_files.items():
+        exists = "✅" if os.path.exists(path) else "❌"
+        print(f"  {exists} {name}: {path}")
+
+    # Load and analyze memories
+    from src.ai.memory import StrategicMemory
     memory = StrategicMemory()
 
     insights = memory.get_discovery_insights()
@@ -130,69 +300,105 @@ def run_analysis_mode():
     print(f"\n📈 Learning Statistics:")
     print(f"  Total Games: {insights['total_games']}")
     print(f"  Victories: {insights['victories']}")
-    print(f"  Win Rate: {insights['victories'] / max(1, insights['total_games']):.1%}")
+    if insights['total_games'] > 0:
+        print(f"  Win Rate: {insights['victories'] / insights['total_games']:.1%}")
 
     if insights['top_winning_patterns']:
-        print(f"\n🎯 Discovered Winning Patterns:")
-        for i, pattern in enumerate(insights['top_winning_patterns'], 1):
-            print(f"\n  {i}. {pattern['pattern']}")
-            print(f"     Success Rate: {pattern['success_rate']:.1%}")
-            print(f"     Used {pattern['occurrences']} times")
+        print(f"\n🎯 Top Winning Patterns:")
+        for i, pattern in enumerate(insights['top_winning_patterns'][:5], 1):
+            print(f"  {i}. {pattern['pattern']}")
+            print(f"     Success: {pattern['success_rate']:.1%} ({pattern['occurrences']} times)")
 
-    if insights['optimal_factory_targets']:
-        print(f"\n🏭 Optimal Factory Targets:")
-        for year, targets in sorted(insights['optimal_factory_targets'].items()):
-            print(f"  {year}: {targets['civilian']} civilian factories")
-            print(f"         (based on {targets['based_on_games']} games)")
+    # Check understanding
+    if os.path.exists('models/understanding.pkl'):
+        import pickle
+        with open('models/understanding.pkl', 'rb') as f:
+            understanding_data = pickle.load(f)
 
-    print(f"\n💡 Strategic Discoveries:")
-    discoveries = memory.discovered_conditions
-    if discoveries:
-        for discovery in discoveries[:5]:
-            print(f"  • {discovery.name}")
-    else:
-        print(f"  No major discoveries yet - keep playing!")
+        print(f"\n🧠 Understanding Progress:")
+        print(f"  Concepts Discovered: {len(understanding_data.get('concepts', {}))}")
+        print(
+            f"  Causal Links Found: {sum(len(links) for links in understanding_data.get('causal_model', {}).values())}")
+        print(f"  Menus Mapped: {len(understanding_data.get('menu_hierarchy', {}))}")
 
 
-def print_final_report(learner):
-    """Print final learning report"""
-    print(f"\n{'=' * 50}")
-    print(f"📊 FINAL LEARNING REPORT")
+def show_progress_report(ai):
+    """Show progress during integrated mode"""
+    print(f"\n📊 Progress Report")
+    print(f"{'=' * 40}")
+    print(f"Actions: {ai.metrics['actions_taken']} total")
+    print(f"  • Meaningful: {ai.metrics['meaningful_actions']}")
+    print(f"  • Exploration: {ai.metrics['exploration_actions']}")
+    print(f"  • Strategic: {ai.metrics['strategic_actions']}")
+    print(f"Understanding: {ai.metrics['understanding_level']:.1%}")
+    print(f"Strategic Health: {ai.metrics['strategic_confidence']:.1%}")
+
+
+def show_understanding_report(ai):
+    """Show what the AI understands"""
+    understanding = ai.understanding.explain_understanding()
+
+    print(f"\n🧠 Understanding Report")
     print(f"{'=' * 50}")
+    print(f"Confidence Level: {understanding['confidence_level']:.1%}")
 
-    metrics = learner.metrics
-    print(f"\n🎮 Games Played: {metrics['games_played']}")
-    print(f"🏆 Victories: {metrics['total_victories']}")
-    print(f"📈 Win Rate: {metrics['total_victories'] / max(1, metrics['games_played']):.1%}")
-    print(f"🎯 Actions Taken: {metrics['actions_taken']:,}")
-    print(f"🧠 Strategic Discoveries: {metrics['strategic_discoveries']}")
+    print(f"\nConcepts ({len(understanding['concepts'])}):")
+    for name, info in list(understanding['concepts'].items())[:5]:
+        print(f"  • {name}: {info['confidence']:.0%} confidence")
 
-    insights = learner.memory.get_discovery_insights()
-    if insights['top_winning_patterns']:
-        print(f"\n✨ Top Strategy Discovered:")
-        top = insights['top_winning_patterns'][0]
-        print(f"   {top['pattern']} ({top['success_rate']:.1%} success)")
+    print(f"\nCausal Understanding:")
+    for action, info in list(understanding['causal_understanding'].items())[:5]:
+        print(f"  • {action} → {info['effects']}")
 
-    print(f"\n💾 All progress saved in:")
-    print(f"   • Neural Network: models/hoi4_unified.pth")
-    print(f"   • Strategic Memory: models/memory/")
-    print(f"   • Learning Metrics: models/metrics.json")
+    print(f"\nMenus Mapped: {len(understanding['menu_map'])}")
 
-    print(f"\n🚀 Next Steps:")
-    print(f"   1. Run more games to improve win rate")
-    print(f"   2. Analyze discovered strategies")
-    print(f"   3. Watch the AI play autonomously!")
+
+def show_final_report(ai, session_start):
+    """Show final report for integrated mode"""
+    duration = (time.time() - session_start) / 60
+
+    print(f"\n{'=' * 60}")
+    print(f"📊 FINAL SESSION REPORT")
+    print(f"{'=' * 60}")
+    print(f"Duration: {duration:.1f} minutes")
+    print(f"Total Actions: {ai.metrics['actions_taken']}")
+    print(f"Actions/Minute: {ai.metrics['actions_taken'] / duration:.1f}")
+    print(f"\nAction Breakdown:")
+    print(
+        f"  • Meaningful: {ai.metrics['meaningful_actions']} ({ai.metrics['meaningful_actions'] / max(1, ai.metrics['actions_taken']) * 100:.1f}%)")
+    print(f"  • Exploration: {ai.metrics['exploration_actions']}")
+    print(f"  • Strategic: {ai.metrics['strategic_actions']}")
+    print(f"\nFinal Understanding: {ai.metrics['understanding_level']:.1%}")
+    print(f"Strategic Confidence: {ai.metrics['strategic_confidence']:.1%}")
+
+
+def convert_screenshot_to_tensor(screenshot):
+    """Convert screenshot to tensor"""
+    import torch
+    import numpy as np
+
+    screenshot_resized = screenshot.resize((1280, 720))
+    img_array = np.array(screenshot_resized)
+    img_tensor = torch.tensor(img_array, dtype=torch.float32)
+    img_tensor = img_tensor.permute(2, 0, 1) / 255.0
+    return img_tensor.unsqueeze(0)
 
 
 if __name__ == "__main__":
+    import time
+
     try:
         main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Goodbye!")
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        print(f"\n💡 Make sure:")
-        print(f"   • HOI4 is running in windowed mode")
-        print(f"   • You have CUDA installed (for GPU)")
-        print(f"   • All dependencies are installed")
+        print("\n💡 Troubleshooting:")
+        print("  1. Make sure HOI4 is running in windowed mode")
+        print("  2. Install Tesseract OCR for text recognition")
+        print("  3. Run as administrator if needed")
+        print("  4. Check that all dependencies are installed")
         import traceback
 
         traceback.print_exc()
+        input("\nPress Enter to exit...")

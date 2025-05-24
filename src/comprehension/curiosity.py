@@ -1,12 +1,12 @@
-# src/core/curiosity_learner.py - AI that learns through curiosity and understanding
+# src/comprehension/curiosity.py - AI that learns through curiosity and understanding
 import torch
 import numpy as np
 from typing import Dict, List, Optional
 import time
 from dataclasses import dataclass
 
-from src.comprehension.understanding_engine import HOI4UnderstandingEngine
-from src.core.brain import HOI4Brain
+from src.comprehension.engine import HOI4UnderstandingEngine
+from src.ai.brain import HOI4Brain
 from src.perception.ocr import HOI4OCR
 
 

@@ -1,4 +1,4 @@
-# src/comprehension/understanding_engine.py - True game understanding
+# src/comprehension/engine.py - True game understanding
 import numpy as np
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
