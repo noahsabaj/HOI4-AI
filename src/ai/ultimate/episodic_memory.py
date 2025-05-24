@@ -41,16 +41,14 @@ class DifferentiableMemory(nn.Module):
         # Current size
         self.size = 0
 
-        # FAISS index for fast k-NN search
-        self.index = faiss.IndexFlatL2(key_size)
+        # ── FAISS index that supports {add, remove}_with_ids ────────────
+        base_index = faiss.IndexFlatL2(key_size)  # plain L2 index
+        self.index = faiss.IndexIDMap(base_index)  # adds ID mapping layer
 
-        # For GPU if available
+        # (optional) push to GPU – comment out if you stay on faiss-cpu
         if device == 'cuda' and faiss.get_num_gpus() > 0:
-            self.index = faiss.index_cpu_to_gpu(
-                faiss.StandardGpuResources(),
-                0,
-                self.index
-            )
+            gpu_res = faiss.StandardGpuResources()
+            self.index = faiss.index_cpu_to_gpu(gpu_res, 0, self.index)
 
     def write(self, key: torch.Tensor, value: torch.Tensor) -> None:
         """

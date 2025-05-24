@@ -1,6 +1,6 @@
 # src/strategy/evaluation.py - Victory condition understanding
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from dataclasses import dataclass
 import re
 

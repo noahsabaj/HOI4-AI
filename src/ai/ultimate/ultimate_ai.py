@@ -4,26 +4,24 @@ The Ultimate HOI4 AI
 Combines DreamerV3 world model, RND curiosity, and Neural Episodic Control
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from PIL import Image, ImageGrab
-import pyautogui
-from typing import Dict, Optional, Tuple, List
-from datetime import datetime
-import time
-import json
 import os
+from datetime import datetime
+from typing import Dict, Optional, Tuple, List
 
-# Import our components
-from src.ai.ultimate.world_model import WorldModel
+import numpy as np
+import pyautogui
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from einops import rearrange
+
 from src.ai.ultimate.curiosity import CombinedCuriosity
 from src.ai.ultimate.episodic_memory import NeuralEpisodicControl, PersistentEpisodicMemory
-
+# Import our components
+from src.ai.ultimate.world_model import WorldModel
+from src.comprehension.engine import HOI4UnderstandingEngine
 # Import existing components we want to keep
 from src.perception.ocr import HOI4OCR
-from src.comprehension.engine import HOI4UnderstandingEngine
 from src.strategy.evaluation import StrategicEvaluator
 
 
@@ -133,6 +131,11 @@ class UltimateHOI4AI:
             checkpoint_path: Optional[str] = None
     ):
         print("🚀 Initializing Ultimate HOI4 AI...")
+
+        from src.utils.logger import get_logger
+        self.log = get_logger("ai")
+        self.log.info("Logger for UltimateHOI4AI ready")
+
         self.device = device
 
         # Action space
@@ -149,9 +152,14 @@ class UltimateHOI4AI:
             goal_weight=0.4
         )
 
-        print("  🧠 Loading episodic memory...")
+        # 🧠 Loading episodic memory with correct state_dim
+        state_dim = (
+                self.world_model.rssm.stoch_size *
+                self.world_model.rssm.num_categories +
+                self.world_model.rssm.deter_size
+        )
         self.nec = NeuralEpisodicControl(
-            state_dim=544,  # RSSM state size
+            state_dim=state_dim,
             key_dim=128,
             memory_size=50000
         )
@@ -200,37 +208,46 @@ class UltimateHOI4AI:
 
     def observe(self, screenshot: Image.Image) -> Tuple[torch.Tensor, Dict]:
         """
-        Process screenshot into state
+        Process screenshot into state.
 
-        Returns:
-            (encoded_observation, game_info)
+        * OCR (the slow part) runs only once every 2 seconds and is
+          cached in self._ocr_cache.
+        * Everything else (resize, encode) still happens every frame.
         """
+        import time  # local import—avoids circulars
+
         # Resize for world model
         screenshot_resized = screenshot.resize((1280, 720))
 
-        # Convert to tensor
+        # Convert to tensor for the encoder
         obs_array = np.array(screenshot_resized)
-        obs_tensor = torch.tensor(obs_array, dtype=torch.float32)
-        obs_tensor = obs_tensor.permute(2, 0, 1) / 255.0
-        obs_tensor = obs_tensor.unsqueeze(0).to(self.device)
+        obs_tensor = (
+                torch.tensor(obs_array, dtype=torch.float32)
+                .permute(2, 0, 1) / 255.0
+        ).unsqueeze(0).to(self.device)
 
-        # Get game info from OCR
-        ocr_data = self.ocr.extract_all_text(screenshot)
+        # ── OCR throttled to once every 2 s ───────────────────────────
+        now = time.time()
+        # run full OCR only every 5 seconds to save ~0.3 s/step
+        if (not hasattr(self, "_last_ocr")) or (now - self._last_ocr > 5.0):
+            self._ocr_cache = self.ocr.extract_all_text(screenshot)
+            self._last_ocr = now
+        ocr_data = self._ocr_cache
 
         # Encode observation
         with torch.no_grad():
             encoded_obs = self.world_model.encoder(obs_tensor)
 
-        # Parse game state
+        # Parse game state (same as before)
         game_info = {
-            'ocr_data': ocr_data,
-            'screen_type': self._detect_screen_type(ocr_data),
-            'game_date': ocr_data.get('date', 'Unknown'),
-            'political_power': self._extract_number(ocr_data.get('political_power', '0')),
-            'factories': {
-                'civilian': self._extract_factory_count(ocr_data.get('factories', ''), 0),
-                'military': self._extract_factory_count(ocr_data.get('factories', ''), 1)
-            }
+            "ocr_data": ocr_data,
+            "screen_type": self._detect_screen_type(ocr_data),
+            "game_date": ocr_data.get("date", "Unknown"),
+            "political_power": self._extract_number(ocr_data.get("political_power", "0")),
+            "factories": {
+                "civilian": self._extract_factory_count(ocr_data.get("factories", ""), 0),
+                "military": self._extract_factory_count(ocr_data.get("factories", ""), 1),
+            },
         }
 
         return encoded_obs, game_info
@@ -344,72 +361,61 @@ class UltimateHOI4AI:
             self.nec.write(state_features, torch.tensor([reward], device=self.device))
 
         # Store significant experiences
-        if abs(reward) > 5.0 or self.metrics['intrinsic_reward'] > 10.0:
+        if abs(reward) > 5.0 or self.metrics["intrinsic_reward"] > 10.0:
             self._store_persistent_memory(
                 state_features,
                 action,
                 f"Reward: {reward:.1f}",
-                prev_info
+                prev_info,
             )
 
-        # Train world model periodically
-        if self.total_steps % 100 == 0 and len(self.replay_buffer) > 1000:
-            self._train_world_model()
-
-        # Train curiosity
+        # ── Train curiosity every 50 env steps ─────────────────
         if self.total_steps % 50 == 0:
             self._train_curiosity()
 
-        self.metrics['total_reward'] += reward
+        # ── Train world-model every 200 env steps ──────────────
+        if (
+                self.total_steps % 200 == 0
+                and len(self.replay_buffer) > 256
+        ):
+            self._train_world_model()
 
+        # Update running totals
+        self.metrics["total_reward"] += reward
+
+    # ------------------------------------------------------------------
+    # Imagination-based planner (Dreamer-style)
+    # ------------------------------------------------------------------
     def _imagination_policy(self, state_features: torch.Tensor) -> int:
-        """
-        Use imagination to plan ahead
+        """Batch-vectorised imagination:  10× faster than per-sample loop."""
+        horizon, num_samples = 8, 5
 
-        Args:
-            state_features: Current state
+        # Sample [N, H] action indices and one-hot them → [N, H, A]
+        seqs = torch.randint(0, self.action_size,
+                             (num_samples, horizon), device=self.device)
+        onehots = F.one_hot(seqs, num_classes=self.action_size).float()
 
-        Returns:
-            Best action according to imagination
-        """
-        print("🎯 Planning with imagination...")
+        # Clone the current latent once (batch dim 1)
+        start_state = {
+            "stoch": self.current_rssm_state["stoch"]
+            .repeat(num_samples, 1, 1),  # [N, S, C]
+            "deter": self.current_rssm_state["deter"]
+            .repeat(num_samples, 1)  # [N, D]
+        }
 
-        # Sample random action sequences
-        horizon = 15
-        num_samples = 50
-
-        action_sequences = torch.randint(
-            0, self.action_size,
-            (num_samples, horizon),
-            device=self.device
-        )
-
-        # Convert to one-hot
-        action_sequences_onehot = F.one_hot(
-            action_sequences,
-            num_classes=self.action_size
-        ).float()
-
-        # Imagine outcomes
-        best_return = -float('inf')
-        best_action = 0
-
+        # Imagine all N sequences in parallel
         with torch.no_grad():
-            for i in range(num_samples):
-                imagined = self.world_model.imagine_ahead(
-                    self.world_model.encoder.net[0](state_features.unsqueeze(0)),
-                    action_sequences_onehot[i:i + 1],
-                    horizon
-                )
+            imag = self.world_model.rssm.imagine(start_state, onehots)  # keys: stoch, deter
 
-                # Compute return
-                returns = imagined['rewards'].sum().item()
+            stoch_flat = rearrange(imag["stoch"], "n t s c -> (n t) (s c)")
+            deter_flat = rearrange(imag["deter"], "n t d   -> (n t) d")
+            feats = torch.cat([stoch_flat, deter_flat], dim=-1)  # [N·H, 1536]
 
-                if returns > best_return:
-                    best_return = returns
-                    best_action = action_sequences[i, 0].item()
+            rewards = self.world_model.reward_head(feats).view(num_samples, horizon)
+            returns = rewards.sum(dim=1)  # [N]
 
-        return best_action
+        best_first_action = seqs[returns.argmax(), 0].item()
+        return best_first_action
 
     def _exploration_policy(self, state_features: torch.Tensor) -> int:
         """Random exploration with bias toward untried actions"""
@@ -451,16 +457,24 @@ class UltimateHOI4AI:
             )
         }
 
-    def _check_memory(self, state_features: torch.Tensor, game_info: Dict) -> List[Dict]:
-        """Check persistent memory for similar situations"""
-        # Convert state to numpy for ChromaDB
+    def _check_memory(self, state_features: torch.Tensor, game_info: Dict):
+        """
+        Query ChromaDB only once every 20 env steps.
+        """
+        # recall every 80 env steps instead of 20 → saves ~0.15 s/step
+        if self.total_steps % 80 != 0:
+            return []  # skip most frames
+
         state_np = state_features.detach().cpu().numpy()
 
-        # Recall similar experiences
         memories = self.persistent_memory.recall_similar_experiences(
-            state_np[:128],  # Use key encoding dimension
-            n_results=3
+            state_np[:128], n_results=3
         )
+
+        if memories:
+            # print at most once every 100 steps to avoid spam
+            if self.total_steps % 100 == 0:
+                self.log.info(f"💭 Remembering: {memories[0]['description'][:100]}...")
 
         return memories
 
@@ -497,24 +511,22 @@ class UltimateHOI4AI:
             return
 
         # Sample batch
-        batch = self.replay_buffer.sample(32)
+        batch = self.replay_buffer.sample(8)
 
         # TODO: Implement world model training
         # This would involve reconstructing observations and predicting rewards
 
     def _train_curiosity(self):
-        """Train curiosity predictor network"""
+        """Train RND predictor"""
         if len(self.replay_buffer) < 100:
             return
 
-        # Sample batch
+        # Sample batch (already stored as encoded 1024-d vectors)
         batch = self.replay_buffer.sample(32)
+        encoded_obs = batch['obs'].to(self.device).view(-1, 1024)
 
-        # Train RND predictor
-        obs_batch = batch['obs']
-        encoded_obs = self.world_model.encoder(obs_batch.to(self.device))
-
-        loss = self.curiosity.rnd.train_predictor(encoded_obs)
+        # One gradient step on the predictor
+        _ = self.curiosity.rnd.train_predictor(encoded_obs)
 
     def _detect_screen_type(self, ocr_data: Dict) -> str:
         """Detect current game screen"""

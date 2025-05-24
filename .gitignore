@@ -18,6 +18,8 @@ recordings/
 models/*.pth
 models/*.pt
 data/text_corpus/
+checkpoints/
+hoi4_persistent_memory/
 screenshots/
 *.log
 *.png
