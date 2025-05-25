@@ -541,7 +541,7 @@ class UltimateTrainer:
         if strategic_summary['recent_insights']:
             print(f"\n💡 Recent Strategic Insights from DeepSeek-R1:")
             for insight in strategic_summary['recent_insights'][-3:]:
-                print(f"  • {insight['insights']}")
+                print(f"  • {insight.get('insight', 'No insight text')}")
 
         # Interesting discoveries
         if self.ai.curiosity.seen_screens:
