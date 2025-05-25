@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-LATENT_SIZE = 256
+LATENT_SIZE = 1024
 NUM_ACTIONS = 64  # expand if you ever have >64 discrete actions
 
 class SimpleWorldModel(nn.Module):
@@ -37,7 +37,7 @@ class SimpleWorldModel(nn.Module):
         self.dynamics = nn.Sequential(
             nn.Linear(LATENT_SIZE + NUM_ACTIONS, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, LATENT_SIZE)
+            nn.Linear(512, 1024)
         )
 
         # ── reward predictor ───────────────────────────────────────
