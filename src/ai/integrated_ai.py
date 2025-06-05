@@ -20,6 +20,9 @@ from PIL import ImageGrab
 import pyautogui
 import keyboard
 
+# Replace ChromaDB references with:
+from src.ai.ultimate.fast_memory import FastEpisodicMemory
+
 # Import all our components
 from src.ai.brain import HOI4Brain
 from src.ai.learner import UnifiedHOI4Learner
