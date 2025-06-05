@@ -1,5 +1,4 @@
-# Create a Python .gitignore
-echo "# Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,8 +7,10 @@ __pycache__/
 venv/
 venv_gpu/
 .venv/
-build
 ENV/
+build/
+*.egg-info/
+dist/
 
 # PyCharm
 .idea/
@@ -28,7 +29,28 @@ screenshots/
 
 # OS
 .DS_Store
-Thumbs.db" > .gitignore
+Thumbs.db
 
-#LMBD
-hoi4_lmdb
+# LMDB
+hoi4_lmdb/
+
+# C++ build artifacts
+*.pyd
+*.dll
+*.lib
+*.exp
+*.obj
+src/native/build/
+src/native/libs/
+src/native/temp.*/
+
+# Tesseract data
+tessdata/
+
+# Test files
+src/native/test_*.py
+src/native/diagnose_*.py
+src/native/deep_diagnose.py
+
+# UI memory
+models/ui_memory.json

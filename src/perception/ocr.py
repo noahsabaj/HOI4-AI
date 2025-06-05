@@ -13,7 +13,23 @@ import hashlib
 
 # Try to import fast OCR
 try:
+    # Add the native directory to path
+    import sys
+    import os
+
+    native_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'native')
+    if native_path not in sys.path:
+        sys.path.insert(0, native_path)
+
+    # Add the libs directory to DLL search path
+    libs_path = os.path.join(native_path, 'libs')
+    if os.path.exists(libs_path):
+        os.add_dll_directory(libs_path)  # Windows 3.8+ feature
+        # Also add to PATH for older Python versions
+        os.environ['PATH'] = libs_path + os.pathsep + os.environ['PATH']
+
     import fast_ocr
+
     FAST_OCR_AVAILABLE = True
     print("✅ Fast OCR module loaded - 10x speed boost enabled!")
 except ImportError:

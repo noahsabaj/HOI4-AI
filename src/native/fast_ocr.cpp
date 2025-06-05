@@ -26,6 +26,7 @@ public:
         const char* tessdata_paths[] = {
             "C:\\Program Files\\Tesseract-OCR\\tessdata",
             "C:\\vcpkg\\installed\\x64-windows\\share\\tessdata",
+            ".\\tessdata",  // Current directory
             nullptr
         };
 
@@ -60,8 +61,11 @@ public:
             {"division_count", {1700, 900, 200, 50}}
         };
 
-        // Scale to actual resolution
-        for (const auto& [name, coords] : base_regions) {
+        // Scale to actual resolution - avoiding structured bindings for C++11 compatibility
+        for (auto it = base_regions.begin(); it != base_regions.end(); ++it) {
+            const std::string& name = it->first;
+            const std::vector<int>& coords = it->second;
+
             regions[name] = {
                 (int)(coords[0] * scale_x),
                 (int)(coords[1] * scale_y),
@@ -123,8 +127,11 @@ public:
 
         uint8_t* data = static_cast<uint8_t*>(buf.ptr);
 
-        // Extract each region
-        for (const auto& [name, coords] : regions) {
+        // Extract each region - avoiding structured bindings
+        for (auto it = regions.begin(); it != regions.end(); ++it) {
+            const std::string& name = it->first;
+            const std::vector<int>& coords = it->second;
+
             std::string text = extract_region_internal(
                 data, coords[0], coords[1], coords[2], coords[3]
             );
