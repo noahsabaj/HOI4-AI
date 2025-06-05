@@ -35,6 +35,9 @@ class FastPolicy:
             'War Preparation': self._get_war_weights(),
         }
 
+        self.action_sequences = deque(maxlen=100)  # Track longer sequences
+        self.loop_detector = {}  # Track repeating patterns
+
     def act(self,
             encoded_obs: torch.Tensor,
             cached_strategy: str = 'exploring',
@@ -81,20 +84,30 @@ class FastPolicy:
                 elif suggestion['action'] == 'open_production':
                     weights[self._get_key_idx('t')] *= 2.0
 
-        # Anti-stuck mechanism
+        # Enhanced loop detection
         if self.last_action_idx is not None:
-            self.action_history.append(self.last_action_idx)
+            self.action_sequences.append(self.last_action_idx)
 
-            # Check if stuck (repeated actions)
-            if len(self.action_history) >= 10:
-                recent = list(self.action_history)[-10:]
-                if len(set(recent)) < 3:  # Less than 3 unique actions
-                    self.stuck_counter += 1
-                    # Heavily penalize recent actions
-                    for idx in set(recent):
-                        weights[idx] *= 0.1
-                else:
-                    self.stuck_counter = max(0, self.stuck_counter - 1)
+            # Check for various loop patterns
+            if len(self.action_sequences) >= 20:
+                # Check 2-action loops (w,t,w,t...)
+                last_20 = list(self.action_sequences)[-20:]
+                pattern_2 = [last_20[i:i + 2] for i in range(0, 18, 2)]
+                if len(set(map(tuple, pattern_2))) == 1:
+                    print("🚨 2-ACTION LOOP DETECTED!")
+                    return self._force_random_exploration()
+
+                # Check 3-action loops
+                pattern_3 = [last_20[i:i + 3] for i in range(0, 18, 3)]
+                if len(set(map(tuple, pattern_3))) == 1:
+                    print("🚨 3-ACTION LOOP DETECTED!")
+                    return self._force_random_exploration()
+
+                # Check if stuck on same 2-3 actions
+                unique_in_20 = len(set(last_20))
+                if unique_in_20 <= 2:
+                    print(f"🚨 STUCK ON {unique_in_20} ACTIONS!")
+                    return self._force_random_exploration()
 
         # Add exploration noise
         if np.random.random() < self.exploration_boost:
@@ -119,10 +132,14 @@ class FastPolicy:
         weights = np.ones(self.action_space.get_action_size())
 
         # Prefer menu keys
-        for key in ['f1', 'f2', 'f3', 'f4', 'f5', 'q', 'w', 'e', 'r', 't']:
+        for key in ['f1', 'f2', 'f3', 'f4', 'f5', 'q', 'w', 'e', 'r', 't', 'b', 'v', 'n']:
             idx = self._get_key_idx(key)
             if idx is not None:
-                weights[idx] = 3.0
+                # Lower weight for already discovered menus
+                if hasattr(self, 'discovered_menus') and key in self.discovered_menus:
+                    weights[idx] = 1.5  # Still some chance, but lower
+                else:
+                    weights[idx] = 5.0  # High priority for undiscovered
 
         return weights
 
@@ -140,6 +157,28 @@ class FastPolicy:
             weights[i] = 2.0
 
         return weights
+
+    def _force_random_exploration(self):
+        """Force a completely different action"""
+        # Clear history to reset
+        self.action_sequences.clear()
+        self.stuck_counter = 0
+
+        # Pick something we haven't done recently
+        all_actions = list(range(self.action_space.get_action_size()))
+
+        # Get recent actions if we have any
+        if len(self.action_sequences) > 0:
+            recent = set(list(self.action_sequences)[-50:])
+        else:
+            recent = set()
+
+        # Remove recent actions from choices
+        choices = [a for a in all_actions if a not in recent]
+        if not choices:
+            choices = all_actions
+
+        return np.random.choice(choices)
 
     def _get_military_weights(self) -> np.ndarray:
         """Weights for military transition (1938)"""
