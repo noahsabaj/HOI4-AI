@@ -12,12 +12,12 @@ import sys
 from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 # Import our components
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from src.core.brain import HOI4Brain
-from src.core.memory import StrategicMemory, GameMemory
+from src.ai.brain import HOI4Brain
+from src.ai.memory import StrategicMemory, GameMemory
 from src.perception.ocr import HOI4OCR
 from src.strategy.evaluation import StrategicEvaluator
 

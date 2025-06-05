@@ -20,11 +20,12 @@ import re
 from typing import Dict
 from src.config import CONFIG
 from .hf_strategic_evaluator import HuggingFaceStrategicEvaluator
+from src.utils.common import extract_number, detect_screen_type
 from src.utils.logger import get_logger
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 # Import our Ultimate AI
-from src.ai.ultimate.ultimate_ai import UltimateHOI4AI
+from .ultimate_ai import UltimateHOI4AI, ActionSpace
 # Import your existing evaluation system
 from src.strategy.evaluation import StrategicEvaluator
 

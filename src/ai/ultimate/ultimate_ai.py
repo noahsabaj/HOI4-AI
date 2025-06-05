@@ -15,6 +15,11 @@ import torch.nn.functional as F
 from PIL import Image
 from einops import rearrange
 
+# Add this line with the other imports at the top:
+from src.config import CONFIG
+
+from src.utils.common import extract_number, detect_screen_type
+
 # Import our components
 from .curiosity import CombinedCuriosity
 from .episodic_memory import NeuralEpisodicControl
@@ -243,17 +248,22 @@ class UltimateHOI4AI:
 
         # ── OCR throttled to once every 2 s ───────────────────────────
         now = time.time()
+
+        current_hash = hash(screenshot.tobytes()[::1000])  # Sample pixels for change detection
+        screen_changed = not hasattr(self, '_last_screen_hash') or current_hash != self._last_screen_hash
+
         # run full OCR only every 5 seconds to save ~0.3 s/step
-        if (not hasattr(self, "_last_ocr")) or (now - self._last_ocr > 5.0):
+        if screen_changed or (not hasattr(self, "_last_ocr")) or (now - self._last_ocr > 5.0):
             self._ocr_cache = self.ocr.extract_all_text(screenshot)
             self._last_ocr = now
+            self._last_screen_hash = current_hash
         ocr_data = self._ocr_cache
 
         # Encode observation
         with torch.no_grad():
             encoded_obs = self.world_model.encoder(obs_tensor)
 
-        # Parse game state (same as before)
+        # Parse game state
         game_info = {
             "ocr_data": ocr_data,
             "screen_type": detect_screen_type(ocr_data),
@@ -267,8 +277,6 @@ class UltimateHOI4AI:
 
         # Cache observation
         self._last_observation = (encoded_obs, game_info)
-        return encoded_obs, game_info
-
         return encoded_obs, game_info
 
     def act(self, screenshot: Image.Image) -> Dict:
@@ -539,12 +547,6 @@ class UltimateHOI4AI:
             return 'trade'
         else:
             return 'main_map'
-
-    def _extract_number(self, text: str) -> int:
-        """Extract number from text"""
-        import re
-        match = re.search(r'(\d+)', text)
-        return int(match.group(1)) if match else 0
 
     def _extract_factory_count(self, text: str, index: int) -> int:
         """Extract factory count from text"""

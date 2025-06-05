@@ -29,3 +29,6 @@ screenshots/
 # OS
 .DS_Store
 Thumbs.db" > .gitignore
+
+#LMBD
+hoi4_lmdb

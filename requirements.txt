@@ -1,0 +1,16 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+Pillow>=9.5.0
+pyautogui>=0.9.50
+keyboard>=0.13.5
+pytesseract>=0.3.10
+opencv-python>=4.7.0
+chromadb>=0.4.0
+faiss-cpu>=1.7.4
+einops>=0.6.0
+tensordict>=0.1.0
+rich>=13.0.0
+transformers>=4.30.0
+lmdb>=1.4.0         # Add this!
+pybind11>=2.11.0    # For C++ extensions
