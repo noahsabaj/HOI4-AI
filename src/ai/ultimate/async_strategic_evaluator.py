@@ -48,6 +48,7 @@ class AsyncStrategicEvaluator:
 
         # Start thread
         self.eval_thread.start()
+        print(f"✅ Strategic evaluator thread started (will evaluate every {evaluation_interval}s)")
 
     def record_action(self, action: Dict, game_state: Dict):
         """Non-blocking action recording"""
@@ -82,10 +83,15 @@ class AsyncStrategicEvaluator:
 
     def _evaluation_loop(self):
         """Background thread that runs Phi-4 evaluation"""
+        print("🧵 Strategic evaluator thread running...")
+        evaluations_done = 0
+
         while not self.shutdown_event.is_set():
             try:
                 # Get evaluation request (blocks for 0.5s if empty)
                 request = self.eval_queue.get(timeout=0.5)
+                evaluations_done += 1
+                print(f"🔍 Strategic evaluation #{evaluations_done} starting...")
 
                 # Run expensive Phi-4 evaluation (2-5 seconds)
                 game_state = request['game_state']
