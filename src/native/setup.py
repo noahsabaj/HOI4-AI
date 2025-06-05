@@ -1,18 +1,11 @@
-# Build script for fast_ocr module
+from setuptools import setup, Extension
 from pybind11.setup_helpers import Pybind11Extension, build_ext
-from setuptools import setup
+import pybind11
 import os
 
 # vcpkg paths
 vcpkg_root = r"C:\vcpkg"
 vcpkg_installed = os.path.join(vcpkg_root, "installed", "x64-windows")
-
-# Check what libraries are available
-lib_dir = os.path.join(vcpkg_installed, "lib")
-print(f"Looking for libraries in: {lib_dir}")
-if os.path.exists(lib_dir):
-    libs = [f for f in os.listdir(lib_dir) if f.endswith('.lib')]
-    print(f"Found libraries: {[l for l in libs if 'tess' in l or 'lept' in l]}")
 
 ext_modules = [
     Pybind11Extension(
@@ -20,18 +13,24 @@ ext_modules = [
         ["fast_ocr.cpp"],
         include_dirs=[
             os.path.join(vcpkg_installed, "include"),
+            pybind11.get_include(),
         ],
+        libraries=["tesseract55", "leptonica-1.85.0"],
         library_dirs=[
             os.path.join(vcpkg_installed, "lib"),
         ],
-        libraries=["tesseract55", "leptonica-1.85.0"],  # Correct library names!
-        cxx_std=17,  # Changed from 11 to 17
+        cxx_std=17,
         define_macros=[("_CRT_SECURE_NO_WARNINGS", None)],
     ),
 ]
 
 setup(
-    name="fast_ocr",
+    name="hoi4_fast_ocr",
+    version="1.0.0",
+    author="HOI4 AI Project",
+    description="Fast OCR module for HOI4 AI",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
+    zip_safe=False,
+    python_requires=">=3.8",
 )
