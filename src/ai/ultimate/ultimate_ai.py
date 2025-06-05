@@ -17,6 +17,7 @@ from einops import rearrange
 
 # Add this line with the other imports at the top:
 from src.config import CONFIG
+from src.perception.dynamic_ocr import DynamicOCR
 
 from src.utils.common import extract_number, detect_screen_type
 
@@ -32,92 +33,108 @@ from ...comprehension.engine import HOI4UnderstandingEngine
 from ...perception.ocr import HOI4OCR
 from ...strategy.evaluation import StrategicEvaluator
 
+
 class ActionSpace:
-    """Define HOI4 action space"""
+    """Dynamic action space that grows as AI discovers UI elements"""
 
-    # Common HOI4 keys
-    KEYS = [
-        'space',  # Pause/unpause
-        'escape',  # Back/menu
-        'q',  # Politics
-        'w',  # Research
-        'e',  # Diplomacy
-        'r',  # Trade
-        't',  # Production
-        'y',  # Logistics
-        'b',  # Build mode
-        'v',  # Army
-        'n',  # Navy
-        'm',  # Air
-        '1', '2', '3', '4', '5',  # Speed controls
-        'tab',  # Cycle
-        'enter',  # Confirm
-        'delete',  # Delete unit
-    ]
+    def __init__(self, ocr_instance):
+        self.ocr = ocr_instance
+        self.base_keys = [
+            'space',  # Pause/unpause
+            'escape',  # Back/menu
+            'q',  # Politics
+            'w',  # Research
+            'e',  # Diplomacy
+            'r',  # Trade
+            't',  # Production
+            'y',  # Logistics
+            'b',  # Build mode
+            'v',  # Army
+            'n',  # Navy
+            'm',  # Air
+            '1', '2', '3', '4', '5',  # Speed controls
+            'tab',  # Cycle
+            'enter',  # Confirm
+            'delete',  # Delete unit
+            'f1', 'f2', 'f3', 'f4', 'f5',  # Function keys for menus
+        ]
+        self.exploration_grid_size = 10
 
-    # Important screen regions (resolution independent)
-    @staticmethod
-    def get_click_regions():
-        # Get current screen size
-        import pyautogui
-        width, height = pyautogui.size()
+    def get_action_size(self):
+        """Dynamic size based on discovered UI elements"""
+        discovered_buttons = sum(1 for elem in self.ocr.ui_elements.values()
+                                 if elem.get('type') == 'button' and elem['confidence'] > 0.7)
+        # Keys + discovered buttons + exploration grid
+        return len(self.base_keys) + discovered_buttons + (self.exploration_grid_size * self.exploration_grid_size)
 
-        # Scale positions based on screen size
-        return {
-            'top_bar': (width // 2, height * 0.03),  # Center of top bar
-            'left_menu': (width * 0.05, height // 2),  # Left side menu
-            'main_map': (width // 2, height // 2),  # Center of map
-            'bottom_bar': (width // 2, height * 0.97),  # Bottom UI
-            'production': (width * 0.05, height * 0.19),  # Production button
-            'construction': (width * 0.05, height * 0.28),  # Construction button
-            'research': (width * 0.05, height * 0.37),  # Research button
-            'focus': (width * 0.05, height * 0.46),  # Focus tree button
-        }
-
-    CLICK_REGIONS = property(get_click_regions)
-
-    @staticmethod
-    def get_action_size():
-        # Click positions (8 regions) + Keys (20) + Click types (2: right, middle)
-        return 8 + len(ActionSpace.KEYS) + 2
-
-    @staticmethod
-    def decode_action(action_idx: int) -> Dict:
+    def decode_action(self, action_idx: int) -> Dict:
         """Convert action index to executable action"""
-        click_regions = ActionSpace.get_click_regions()
-        num_regions = len(click_regions)
-        num_keys = len(ActionSpace.KEYS)
 
-        if action_idx < num_regions:
-            # Click action
-            region_name = list(click_regions.keys())[action_idx]
-            x, y = click_regions[region_name]
-            return {
-                'type': 'click',
-                'x': int(x),
-                'y': int(y),
-                'button': 'left',
-                'description': f'Click {region_name}'
-            }
-        elif action_idx < num_regions + num_keys:
-            # Key action
-            key_idx = action_idx - num_regions
+        # First N actions are keys
+        if action_idx < len(self.base_keys):
             return {
                 'type': 'key',
-                'key': ActionSpace.KEYS[key_idx],
-                'description': f'Press {ActionSpace.KEYS[key_idx]}'
+                'key': self.base_keys[action_idx],
+                'description': f'Press {self.base_keys[action_idx]}'
             }
-        else:
-            # Right/middle click
-            width, height = pyautogui.size()
-            click_type = ['right', 'middle'][action_idx - num_regions - num_keys]
+
+        # Next actions are discovered buttons
+        button_actions = [
+            (name, data) for name, data in self.ocr.ui_elements.items()
+            if data.get('type') == 'button' and data['confidence'] > 0.7
+        ]
+
+        button_idx = action_idx - len(self.base_keys)
+        if button_idx < len(button_actions):
+            name, data = button_actions[button_idx]
+            x, y = data['click_position']
             return {
                 'type': 'click',
-                'x': width // 2,
-                'y': height // 2,
-                'button': click_type,
-                'description': f'{click_type} click'
+                'x': x,
+                'y': y,
+                'button': 'left',
+                'description': f'Click learned {name} button'
             }
+
+        # Remaining actions are exploration clicks
+        import pyautogui
+        width, height = pyautogui.size()
+        exploration_idx = action_idx - len(self.base_keys) - len(button_actions)
+
+        # Systematic exploration pattern
+        grid_x = exploration_idx % self.exploration_grid_size
+        grid_y = (exploration_idx // self.exploration_grid_size) % self.exploration_grid_size
+
+        # Add some randomness to exact position within grid cell
+        import random
+        cell_width = width / self.exploration_grid_size
+        cell_height = height / self.exploration_grid_size
+
+        x = int((grid_x + random.uniform(0.2, 0.8)) * cell_width)
+        y = int((grid_y + random.uniform(0.2, 0.8)) * cell_height)
+
+        return {
+            'type': 'click',
+            'x': x,
+            'y': y,
+            'button': 'left',
+            'description': f'Explore click at grid ({grid_x},{grid_y})'
+        }
+
+    def get_discovered_actions_info(self) -> Dict:
+        """Get information about discovered actions for debugging"""
+        discovered_buttons = [
+            name for name, data in self.ocr.ui_elements.items()
+            if data.get('type') == 'button' and data['confidence'] > 0.7
+        ]
+
+        return {
+            'total_actions': self.get_action_size(),
+            'key_actions': len(self.base_keys),
+            'discovered_buttons': len(discovered_buttons),
+            'button_names': discovered_buttons,
+            'exploration_slots': self.exploration_grid_size * self.exploration_grid_size
+        }
 
 
 class UltimateHOI4AI:
@@ -178,7 +195,7 @@ class UltimateHOI4AI:
 
         # Keep existing components
         print("  👁️ Loading perception...")
-        self.ocr = HOI4OCR()
+        self.ocr = DynamicOCR()
         self.understanding = HOI4UnderstandingEngine()
         self.evaluator = StrategicEvaluator()
 
@@ -389,6 +406,24 @@ class UltimateHOI4AI:
                 f"Reward: {reward:.1f}",
                 prev_info,
             )
+
+        # ========== NEW CODE STARTS HERE ==========
+        # Learn button locations from successful actions
+        if action['type'] == 'click' and reward > 0:
+            # Extract button name from description if available
+            desc = action.get('description', '')
+            if 'Click' in desc:
+                button_name = desc.replace('Click ', '').lower()
+                self.ocr.learn_button_location(
+                    button_name,
+                    (action['x'], action['y']),
+                    success=True
+                )
+
+        # Save UI memory periodically
+        if self.total_steps % 100 == 0:
+            self.ocr.save_ui_memory()
+        # ========== NEW CODE ENDS HERE ==========
 
         # ── Train curiosity every 50 env steps ─────────────────
         if self.total_steps % 50 == 0:

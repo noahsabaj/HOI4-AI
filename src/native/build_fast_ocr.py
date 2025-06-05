@@ -1,27 +1,25 @@
+# Build script for fast_ocr module
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
 import os
 
-# Find Tesseract installation
-tesseract_path = r"C:\Program Files\Tesseract-OCR"
-if not os.path.exists(tesseract_path):
-    print("ERROR: Tesseract not found at", tesseract_path)
-    print("Please install Tesseract-OCR or update the path")
-    exit(1)
+# vcpkg paths
+vcpkg_root = r"C:\vcpkg"
+vcpkg_installed = os.path.join(vcpkg_root, "installed", "x64-windows")
 
 ext_modules = [
     Pybind11Extension(
         "fast_ocr",
         ["fast_ocr.cpp"],
         include_dirs=[
-            os.path.join(tesseract_path, "include"),
+            os.path.join(vcpkg_installed, "include"),
         ],
         library_dirs=[
-            os.path.join(tesseract_path, "lib"),
-            tesseract_path,  # Sometimes DLLs are in root
+            os.path.join(vcpkg_installed, "lib"),
         ],
-        libraries=["libtesseract", "libleptonica"],  # Windows lib names
+        libraries=["tesseract41", "leptonica-1.84.1"],  # Windows lib names
         cxx_std=11,
+        define_macros=[("_CRT_SECURE_NO_WARNINGS", None)],
     ),
 ]
 
