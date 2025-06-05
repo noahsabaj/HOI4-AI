@@ -105,9 +105,27 @@ class FastPolicy:
 
                 # Check if stuck on same 2-3 actions
                 unique_in_20 = len(set(last_20))
+                # SUPER AGGRESSIVE INTERVENTION for W/T spam
                 if unique_in_20 <= 2:
-                    print(f"🚨 STUCK ON {unique_in_20} ACTIONS!")
-                    return self._force_random_exploration()
+                    # Check if it's specifically W and T
+                    action_set = set(last_20)
+                    w_idx = self._get_key_idx('w')
+                    t_idx = self._get_key_idx('t')
+
+                    if w_idx in action_set and t_idx in action_set and len(action_set) <= 3:
+                        print("🚨🚨🚨 SEVERE W/T LOOP - FORCING DRASTIC ACTION!")
+
+                        # Force a completely different key
+                        forced_keys = ['b', 'v', 'q', 'e', 'r', 'f1', 'f2', 'f3']
+                        forced_key = np.random.choice(forced_keys)
+                        forced_idx = self._get_key_idx(forced_key)
+
+                        # Clear action history
+                        self.action_sequences.clear()
+                        self.stuck_counter = 0
+
+                        print(f"💊 FORCING KEY: {forced_key}")
+                        return forced_idx if forced_idx is not None else self._force_random_exploration()
 
         # Add exploration noise
         if np.random.random() < self.exploration_boost:
