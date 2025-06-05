@@ -21,8 +21,24 @@ public:
     FastOCR(int width = 3840, int height = 2160) : screen_width(width), screen_height(height) {
         // Initialize Tesseract
         ocr = std::make_unique<tesseract::TessBaseAPI>();
-        if (ocr->Init(nullptr, "eng", tesseract::OEM_LSTM_ONLY)) {
-            throw std::runtime_error("Could not initialize Tesseract");
+
+        // Try to find tessdata - check common locations
+        const char* tessdata_paths[] = {
+            "C:\\Program Files\\Tesseract-OCR\\tessdata",
+            "C:\\vcpkg\\installed\\x64-windows\\share\\tessdata",
+            nullptr
+        };
+
+        bool init_success = false;
+        for (int i = 0; tessdata_paths[i] != nullptr; i++) {
+            if (ocr->Init(tessdata_paths[i], "eng", tesseract::OEM_LSTM_ONLY) == 0) {
+                init_success = true;
+                break;
+            }
+        }
+
+        if (!init_success) {
+            throw std::runtime_error("Could not initialize Tesseract - tessdata not found");
         }
 
         // Optimize for speed
