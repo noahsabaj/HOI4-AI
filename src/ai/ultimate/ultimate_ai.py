@@ -31,7 +31,6 @@ from .world_model import WorldModel
 from .simple_world_model import SimpleWorldModel, LATENT_SIZE, NUM_ACTIONS
 
 # Import existing components
-from ...comprehension.engine import HOI4UnderstandingEngine
 from ...perception.ocr import HOI4OCR
 from ...strategy.evaluation import StrategicEvaluator
 
@@ -206,7 +205,6 @@ class UltimateHOI4AI:
         # Keep existing components
         print("  👁️ Loading perception...")
         self.ocr = DynamicOCR()
-        self.understanding = HOI4UnderstandingEngine()
         self.evaluator = StrategicEvaluator()
 
         # Optimizers
@@ -534,7 +532,7 @@ class UltimateHOI4AI:
 
         # Simple training: predict rewards from states
         pred_rewards = self.world_model.reward_head(current_latent).squeeze()
-        loss = F.mse_loss(pred_rewards, rewards)
+        loss = F.mse_loss(pred_rewards, rewards.float())
 
         self.wm_opt.zero_grad()
         loss.backward()
