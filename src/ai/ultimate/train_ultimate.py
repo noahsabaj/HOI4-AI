@@ -68,13 +68,15 @@ class UltimateTrainer:
         self.ai = UltimateHOI4AI()
         self.evaluator = StrategicEvaluator()
 
-        # Use the reasoning-optimized Phi-4 mini model
-        print("  🤗 Initializing Phi-4 strategic evaluator...")
-        self.strategic_reasoner = HuggingFaceStrategicEvaluator(
-            model_name="microsoft/Phi-4-mini-reasoning",  # 3.8B, optimized for reasoning!
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            evaluation_frequency=30
+        # New code
+        print("  🤗 Initializing Async Phi-4 strategic evaluator...")
+        from .async_strategic_evaluator import AsyncStrategicEvaluator
+        self.strategic_reasoner = AsyncStrategicEvaluator(
+            evaluation_interval=60.0  # Evaluate every 60 seconds
         )
+
+        # Add trainer reference to AI for accessing cached advice
+        self.ai._trainer_ref = self
 
         self.learn_queue = Queue(maxsize=64)  # holds (prev, act, next, r)
         self.shutdown_event = Event()
@@ -167,58 +169,55 @@ class UltimateTrainer:
             time.sleep(0.005)
 
     def training_step(self):
-        """Single non-blocking env step with async learning."""
+        """Single non-blocking env step with async learning"""
         try:
+            # 1. Screenshot (target: <100ms)
             t0 = time.perf_counter()
-
-            # 1. Screenshot
             screenshot = ImageGrab.grab()
             t1 = time.perf_counter()
 
-            # 2. Decide
+            # 2. Fast decision (target: <50ms)
             action = self.ai.act(screenshot)
             t2 = time.perf_counter()
 
-            # 3. Execute
+            # 3. Execute (target: <100ms)
             self.execute_action(action)
             t3 = time.perf_counter()
 
-            # 4. Tiny pause (keep game responsive)
-            time.sleep(0.005)
-            t4 = time.perf_counter()
-
-            # 5. Queue transition for learner thread
+            # 4. Queue for learning (non-blocking)
             if self.last_screenshot is not None:
-                reward = self.calculate_reward(
+                # Fast reward calculation
+                reward = self.calculate_reward_fast(
                     self.last_screenshot, screenshot, action
                 )
+
                 try:
                     self.learn_queue.put_nowait(
-                        (self.last_screenshot, self.last_action,
-                         screenshot, reward)
+                        (self.last_screenshot, self.last_action, screenshot, reward)
                     )
                 except Full:
-                    # drop transition if queue is saturated
-                    self.log.warning("⚠️ learn queue full – dropping step")
+                    pass  # Drop if queue full
 
-            # 6. Book-keeping
+            # 5. Update state
             self.last_screenshot = screenshot
             self.last_action = action
             self.session_metrics["actions_taken"] += 1
 
-            # 7. Timing log (optional: drop to DEBUG)
-            dt = lambda a, b: (b - a) * 1000  # ms
-            self.log.info(
-                f"⏱ cap {dt(t0,t1):4.0f} ms | decide {dt(t1,t2):4.0f} ms | "
-                f"act {dt(t2,t3):4.0f} ms | pause {dt(t3,t4):3.0f} ms | "
-                f"queued {self.learn_queue.qsize():3d}"
-            )
+            # 6. Log performance (only if slow)
+            total_ms = (time.perf_counter() - t0) * 1000
+            if total_ms > 200:  # Only log if slower than 200ms
+                dt = lambda a, b: (b - a) * 1000
+                self.log.info(
+                    f"⏱ cap {dt(t0, t1):.0f}ms | "
+                    f"dec {dt(t1, t2):.0f}ms | "
+                    f"act {dt(t2, t3):.0f}ms | "
+                    f"tot {total_ms:.0f}ms"
+                )
 
         except Exception as e:
+            self.log.error(f"❌ Step error: {e}")
             import traceback
-            self.log.error(f"❌ training_step error: {e}")
             traceback.print_exc()
-            self.pause_training()
 
     def _learner_loop(self) -> None:
         """
@@ -257,16 +256,6 @@ class UltimateTrainer:
             time.sleep(0.05)
             pyautogui.keyUp(key)
             print(f"\n⌨️ [{self.session_metrics['actions_taken']}] Pressed {key} - {action.get('description', '')}")
-
-
-        elif action['type'] == 'key':
-            _ensure_hoi4_window_foreground()  # ← NEW
-            key = action['key']
-            pyautogui.keyDown(key)  # press
-            time.sleep(0.05)  # hold 50 ms
-            pyautogui.keyUp(key)  # release
-            if key in ['q', 'w', 'e', 'r', 't', 'b']:
-                self.log.debug(f"⌨️ sent {key}")
 
     def log_game_state(self, ocr_data: Dict, screen_type: str):
         """Log important game state information"""
@@ -351,21 +340,51 @@ class UltimateTrainer:
             'military_factories': game_state['factories'].get('military', 0),
         }
 
-        # Record action and get strategic evaluation if triggered
-        strategic_reward = self.strategic_reasoner.record_action(action, enhanced_game_state)
+        # New non-blocking code
+        # Record action (non-blocking)
+        self.strategic_reasoner.record_action(action, enhanced_game_state)
 
-        if strategic_reward is not None:
-            # R1 provided strategic evaluation
-            reward += strategic_reward
+        # Get cached reward modifier (instant)
+        strategic_modifier = self.strategic_reasoner.get_reward_modifier()
+        reward += strategic_modifier
 
-            # Log significant strategic rewards
-            if abs(strategic_reward) > 2.0:
-                self.session_metrics['key_moments'].append({
-                    'step': self.session_metrics['actions_taken'],
-                    'description': f"DeepSeek-R1 strategic insight: {strategic_reward:+.2f}",
-                    'reward': strategic_reward,
-                    'strategy': self.strategic_reasoner.get_current_strategy()
-                })
+        # Log significant modifiers
+        if abs(strategic_modifier) > 2.0:
+            advice = self.strategic_reasoner.get_cached_advice()
+            self.session_metrics['key_moments'].append({
+                'step': self.session_metrics['actions_taken'],
+                'description': f"Strategic insight: {advice.get('reasoning', 'N/A')}",
+                'reward': strategic_modifier,
+                'strategy': advice['strategy']
+            })
+
+        return reward
+
+    def calculate_reward_fast(self, prev_screenshot, curr_screenshot, action) -> float:
+        """
+        Fast reward calculation (<10ms)
+        Heavy computation done async in strategic evaluator
+        """
+        # Base time penalty
+        reward = -0.01
+
+        # Quick pixel difference check (novelty)
+        # Downsample for speed
+        prev_small = np.array(prev_screenshot.resize((128, 72)))
+        curr_small = np.array(curr_screenshot.resize((128, 72)))
+
+        # Fast difference calculation
+        diff = np.abs(prev_small.astype(np.float32) - curr_small.astype(np.float32))
+        novelty = (diff > 20).mean()  # Threshold for change
+        reward += novelty * 2.0
+
+        # Bonus for certain action types (heuristic)
+        if action['type'] == 'key' and action['key'] in ['b', 't', 'w', 'v']:
+            reward += 0.5  # Likely useful keys
+
+        # Get async strategic modifier
+        strategic_modifier = self.strategic_reasoner.get_reward_modifier()
+        reward += strategic_modifier
 
         return reward
 
@@ -497,7 +516,8 @@ class UltimateTrainer:
             apm = self.session_metrics['actions_taken'] / runtime
 
             # Get current strategy from DeepSeek-R1
-            current_strategy = self.strategic_reasoner.get_current_strategy()
+            advice = self.strategic_reasoner.get_cached_advice()
+            current_strategy = advice['strategy']
 
             status = (
                 f"\r⚡ Actions: {self.session_metrics['actions_taken']} | "
@@ -510,7 +530,10 @@ class UltimateTrainer:
 
     def cleanup(self):
         """Clean up before exit"""
+        # Shutdown async components first
+        self.strategic_reasoner.shutdown()
 
+        # Then existing cleanup
         self.shutdown_event.set()
         self.learn_thread.join(timeout=2)
 

@@ -1,6 +1,26 @@
 # src/config.py - Centralized configuration for HOI4 AI
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
+
+
+@dataclass
+class PerformanceConfig:
+    """Performance tuning for Ultimate AI"""
+    # Threading
+    learning_thread_priority: float = 0.3  # Lower priority for learning
+    eval_thread_priority: float = 0.2  # Lowest for strategic eval
+
+    # Timing targets (ms)
+    target_frame_time: float = 50.0  # 20 FPS minimum
+    target_decision_time: float = 20.0  # Fast policy budget
+    target_action_time: float = 100.0  # Execution budget
+
+    # Caching
+    strategy_cache_duration: float = 60.0  # Strategic advice validity
+
+    # Queue sizes
+    learn_queue_size: int = 64
+    eval_queue_size: int = 10
 
 
 @dataclass
@@ -31,6 +51,9 @@ class HOI4Config:
 
     # Action space
     action_keys: list = None  # Set in __post_init__
+
+    # Performance configuration
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
 
     def __post_init__(self):
         # Create directories if they don't exist

@@ -5,6 +5,7 @@ Combines DreamerV3 world model, RND curiosity, and Neural Episodic Control
 """
 
 import os
+import time
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 
@@ -22,6 +23,7 @@ from src.perception.dynamic_ocr import DynamicOCR
 from src.utils.common import extract_number, detect_screen_type
 
 # Import our components
+from .fast_policy import FastPolicy
 from .curiosity import CombinedCuriosity
 from .episodic_memory import NeuralEpisodicControl
 from .fast_memory import FastEpisodicMemory  # NEW: LMDB memory
@@ -172,6 +174,9 @@ class UltimateHOI4AI:
 
         # Initialize action space with OCR
         self.action_space = ActionSpace(self.ocr)
+        # Fast decision policy
+        print("  ⚡ Loading fast policy...")
+        self.fast_policy = FastPolicy(self.action_space, device=self.device)
         self.action_size = self.action_space.get_action_size()
 
         print("  🔍 Loading curiosity module...")
@@ -306,7 +311,7 @@ class UltimateHOI4AI:
 
     def act(self, screenshot: Image.Image) -> Dict:
         """
-        Main decision function
+        Fast decision function (<50ms total)
 
         Args:
             screenshot: Current game screenshot
@@ -314,61 +319,47 @@ class UltimateHOI4AI:
         Returns:
             Action to execute
         """
-        # Observe
+        start_time = time.perf_counter()
+
+        # Observe (cached OCR)
         encoded_obs, game_info = self.observe(screenshot)
 
-        # Initialize RSSM state if needed
-        if self.current_rssm_state is None:
-            self.current_rssm_state = self._initialize_rssm_state()
+        # Get cached strategic advice (instant)
+        from ..ultimate.train_ultimate import UltimateTrainer
+        trainer = getattr(self, '_trainer_ref', None)
 
-        # Update state (SimpleWorldModel just stores the latent)
-        if self.last_action is not None:
-            self.current_rssm_state = {'latent': encoded_obs.squeeze(0)}
-
-        # Get full state representation
-        state_features = self._get_state_features()
-
-        # Check persistent memory
-        memories = self._check_memory(state_features, game_info)
-        if memories:
-            print(f"💭 Remembering: {memories[0]['description'][:100]}...")
-
-        # Compute curiosity
-        intrinsic_reward = self.curiosity.compute_reward(
-            encoded_obs,
-            game_info['screen_type'],
-            achieved_goal=False
-        )
-
-        # Get Q-value from NEC
-        q_value = self.nec.q_value(state_features)
-
-        # Decide action
-        if intrinsic_reward > 2.0:
-            # High novelty - explore!
-            print(f"🔍 High curiosity ({intrinsic_reward.item():.2f}) - exploring!")
-            action_idx = self._exploration_policy(state_features)
-        elif q_value > 0.5 and np.random.random() > 0.2:
-            # Good Q-value - exploit
-            print(f"💡 Good memory (Q={q_value.item():.2f}) - exploiting!")
-            action_idx = self._exploitation_policy(state_features)
+        if trainer and hasattr(trainer, 'strategic_reasoner'):
+            advice = trainer.strategic_reasoner.get_cached_advice()
+            strategy = advice['strategy']
+            suggestions = advice.get('suggestions', [])
         else:
-            # Imagine and plan
-            action_idx = self._imagination_policy(state_features)
+            strategy = 'exploring'
+            suggestions = []
+
+        # Fast decision (<20ms)
+        action_idx = self.fast_policy.act(
+            encoded_obs,
+            cached_strategy=strategy,
+            cached_suggestions=suggestions
+        )
 
         # Decode action
         action = self.action_space.decode_action(action_idx)
 
-        # Store for next step
+        # Update last action for learning
         self.last_action = F.one_hot(
             torch.tensor([action_idx], device=self.device),
             num_classes=self.action_size
         ).float()
 
         # Update metrics
-        self.metrics['intrinsic_reward'] += intrinsic_reward.item()
         self.episode_steps += 1
         self.total_steps += 1
+
+        # Log timing
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        if elapsed_ms > 50:
+            print(f"⚠️ Slow frame: {elapsed_ms:.1f}ms")
 
         return action
 
@@ -454,16 +445,6 @@ class UltimateHOI4AI:
         """Simple random policy for now (no imagination with SimpleWorldModel)"""
         # Just return a random action until world model is trained
         return np.random.randint(0, self.action_size)
-
-    def _exploration_policy(self, state_features: torch.Tensor) -> int:
-        """Random exploration with bias toward untried actions"""
-        # Prefer clicking on areas we haven't explored much
-        if np.random.random() < 0.7:
-            # Click somewhere
-            return np.random.randint(0, 8)  # 8 click regions
-        else:
-            # Press a key
-            return np.random.randint(8, 8 + len(ActionSpace.KEYS))
 
     def _exploitation_policy(self, state_features: torch.Tensor) -> int:
         """Exploit learned knowledge"""
