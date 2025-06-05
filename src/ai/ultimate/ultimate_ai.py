@@ -390,21 +390,27 @@ class UltimateHOI4AI:
             torch.tensor([False])  # Episode not done
         )
 
+        # Initialize state_features before using it
+        state_features = None
+
         # Update NEC
         if self.current_rssm_state is not None:
             state_features = self._get_state_features()
             self.nec.write(state_features, torch.tensor([reward], device=self.device))
+        else:
+            # If no RSSM state, use encoded observation as features
+            state_features = prev_obs.squeeze(0)
 
         # Store significant experiences
         if abs(reward) > 5.0 or self.metrics["intrinsic_reward"] > 10.0:
-            self._store_persistent_memory(
-                state_features,
-                action,
-                f"Reward: {reward:.1f}",
-                prev_info,
-            )
+            if state_features is not None:
+                self._store_persistent_memory(
+                    state_features,
+                    action,
+                    f"Reward: {reward:.1f}",
+                    prev_info,
+                )
 
-        # ========== NEW CODE STARTS HERE ==========
         # Learn button locations from successful actions
         if action['type'] == 'click' and reward > 0:
             # Extract button name from description if available
@@ -420,13 +426,12 @@ class UltimateHOI4AI:
         # Save UI memory periodically
         if self.total_steps % 100 == 0:
             self.ocr.save_ui_memory()
-        # ========== NEW CODE ENDS HERE ==========
 
-        # ── Train curiosity every 50 env steps ─────────────────
+        # Train curiosity every 50 env steps
         if self.total_steps % 50 == 0:
             self._train_curiosity()
 
-        # ── Train world-model every 200 env steps ──────────────
+        # Train world-model every 200 env steps
         if (
                 self.total_steps % 200 == 0
                 and len(self.replay_buffer) > 256

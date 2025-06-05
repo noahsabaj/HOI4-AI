@@ -279,7 +279,6 @@ class UltimateTrainer:
                     f"\n🖱️ [{self.session_metrics['actions_taken']}] {action['description']} at ({action['x']}, {action['y']})")
 
         elif action['type'] == 'key':
-            _ensure_hoi4_window_foreground()
             key = action['key']
             pyautogui.keyDown(key)
             time.sleep(0.05)
@@ -418,8 +417,10 @@ class UltimateTrainer:
         if len(recent_actions) > 0:
             w_t_count = recent_actions.count('w') + recent_actions.count('t')
             if w_t_count > 15:
-                reward -= 5.0  # Heavy penalty
+                reward -= 10.0  # HEAVIER penalty
                 print(f"⚠️ W/T spam detected: {w_t_count}/20 actions")
+            elif w_t_count > 10:
+                reward -= 5.0  # Medium penalty
 
         # Bonus for certain action types (heuristic)
         if action['type'] == 'key' and action['key'] in ['b', 't', 'w', 'v']:
