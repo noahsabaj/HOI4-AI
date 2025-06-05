@@ -18,17 +18,13 @@ from threading import Thread, Event
 import json
 import re
 from typing import Dict
-
+from src.config import CONFIG
 from .hf_strategic_evaluator import HuggingFaceStrategicEvaluator
-
 from src.utils.logger import get_logger
-
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-
 # Import our Ultimate AI
 from src.ai.ultimate.ultimate_ai import UltimateHOI4AI
-
 # Import your existing evaluation system
 from src.strategy.evaluation import StrategicEvaluator
 
@@ -107,7 +103,7 @@ class UltimateTrainer:
 
         # Auto-save & status intervals
         self.last_save = time.time()
-        self.save_interval = 300  # 5 min
+        self.save_interval = 300  # 5 min, could move to CONFIG later
         self.last_status_update = time.time()
         self.status_interval = 10  # 10 s
 
@@ -457,8 +453,7 @@ class UltimateTrainer:
     def save_progress(self):
         """Save current progress"""
         # Save AI checkpoint
-        checkpoint_path = f"checkpoints/ultimate_ai_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
-        os.makedirs('checkpoints', exist_ok=True)
+        checkpoint_path = f"{CONFIG.checkpoint_dir}/ultimate_ai_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
         self.ai.save_checkpoint(checkpoint_path)
 
         # Save session metrics

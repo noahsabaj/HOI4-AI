@@ -15,17 +15,17 @@ import torch.nn.functional as F
 from PIL import Image
 from einops import rearrange
 
-from src.ai.ultimate.curiosity import CombinedCuriosity
-from src.ai.ultimate.episodic_memory import NeuralEpisodicControl, PersistentEpisodicMemory
 # Import our components
-from src.ai.ultimate.world_model import WorldModel
-from src.comprehension.engine import HOI4UnderstandingEngine
-# Import existing components we want to keep
-from src.perception.ocr import HOI4OCR
-from src.strategy.evaluation import StrategicEvaluator
-
+from .curiosity import CombinedCuriosity
+from .episodic_memory import NeuralEpisodicControl
+from .fast_memory import FastEpisodicMemory  # NEW: LMDB memory
+from .world_model import WorldModel
 from .simple_world_model import SimpleWorldModel, LATENT_SIZE, NUM_ACTIONS
 
+# Import existing components
+from ...comprehension.engine import HOI4UnderstandingEngine
+from ...perception.ocr import HOI4OCR
+from ...strategy.evaluation import StrategicEvaluator
 
 class ActionSpace:
     """Define HOI4 action space"""
@@ -140,6 +140,10 @@ class UltimateHOI4AI:
 
         self.device = device
 
+        # Frame skipping for performance
+        self.frame_skip = CONFIG.frame_skip
+        self.frame_counter = 0
+
         # Action space
         self.action_size = ActionSpace.get_action_size()
 
@@ -165,7 +169,7 @@ class UltimateHOI4AI:
         )
 
         print("  💾 Loading persistent memory...")
-        self.persistent_memory = PersistentEpisodicMemory()
+        self.persistent_memory = FastEpisodicMemory()
 
         # Keep existing components
         print("  👁️ Loading perception...")
@@ -206,6 +210,11 @@ class UltimateHOI4AI:
 
         print("✅ Ultimate HOI4 AI ready!")
 
+    def should_process_frame(self) -> bool:
+        """Determine if current frame should be processed"""
+        self.frame_counter += 1
+        return self.frame_counter % self.frame_skip == 0
+
     def observe(self, screenshot: Image.Image) -> Tuple[torch.Tensor, Dict]:
         """
         Process screenshot into state.
@@ -215,6 +224,12 @@ class UltimateHOI4AI:
         * Everything else (resize, encode) still happens every frame.
         """
         import time  # local import—avoids circulars
+
+        # Skip frames for performance
+        if not self.should_process_frame():
+            # Return cached observation if skipping
+            if hasattr(self, '_last_observation'):
+                return self._last_observation
 
         # Resize for world model
         screenshot_resized = screenshot.resize((1280, 720))
@@ -241,7 +256,7 @@ class UltimateHOI4AI:
         # Parse game state (same as before)
         game_info = {
             "ocr_data": ocr_data,
-            "screen_type": self._detect_screen_type(ocr_data),
+            "screen_type": detect_screen_type(ocr_data),
             "game_date": ocr_data.get("date", "Unknown"),
             "political_power": self._extract_number(ocr_data.get("political_power", "0")),
             "factories": {
@@ -249,6 +264,10 @@ class UltimateHOI4AI:
                 "military": self._extract_factory_count(ocr_data.get("factories", ""), 1),
             },
         }
+
+        # Cache observation
+        self._last_observation = (encoded_obs, game_info)
+        return encoded_obs, game_info
 
         return encoded_obs, game_info
 
@@ -435,30 +454,29 @@ class UltimateHOI4AI:
 
         return memories
 
-    def _store_persistent_memory(
-            self,
-            state_features: torch.Tensor,
-            action: Dict,
-            outcome: str,
-            game_info: Dict
-    ):
+    def _store_persistent_memory(self, state_features: torch.Tensor, action: Dict, outcome: str, game_info: Dict):
         """Store important experience in persistent memory"""
         # Use NEC key encoder
         with torch.no_grad():
             key_encoding = self.nec.encode_key(state_features)
+
+        # Extract reward from outcome
+        reward = 10.0 if "success" in outcome.lower() else -1.0
 
         context = {
             'game_date': game_info.get('game_date', 'Unknown'),
             'political_power': game_info.get('political_power', 0),
             'civilian_factories': game_info.get('factories', {}).get('civilian', 0),
             'military_factories': game_info.get('factories', {}).get('military', 0),
-            'screen_type': game_info.get('screen_type', 'unknown')
+            'screen_type': game_info.get('screen_type', 'unknown'),
+            'outcome': outcome
         }
 
-        self.persistent_memory.store_key_experience(
+        # Use the new fast memory
+        self.persistent_memory.store_experience(
             key_encoding.cpu().numpy(),
             action,
-            outcome,
+            reward,
             context
         )
 
