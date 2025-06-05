@@ -50,6 +50,20 @@ class FastPolicy:
         Returns:
             action_idx: Index into action space
         """
+        # Auto-unpause detection
+        if not hasattr(self, 'frames_since_change'):
+            self.frames_since_change = 0
+
+        # Simple heuristic: if nothing changed, try spacebar
+        if encoded_obs.std() < 0.1:  # Very low variance = static screen
+            self.frames_since_change += 1
+            if self.frames_since_change > 30:  # About 1 second of no change
+                print("🎮 Game might be paused, trying spacebar...")
+                self.frames_since_change = 0
+                return self._get_key_idx('space')
+        else:
+            self.frames_since_change = 0
+
         start_time = time.perf_counter()
 
         # Get action weights for current strategy

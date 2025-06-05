@@ -184,12 +184,28 @@ class UltimateTrainer:
             self.execute_action(action)
             t3 = time.perf_counter()
 
+            # NEW: Track what menus we've discovered
+            if action['type'] == 'key' and action['key'] in ['q', 'w', 'e', 'r', 't', 'b', 'v', 'n', 'm']:
+                if not hasattr(self, 'discovered_menus'):
+                    self.discovered_menus = set()
+                if action['key'] not in self.discovered_menus:
+                    self.discovered_menus.add(action['key'])
+                    print(f"🎉 NEW MENU DISCOVERED: {action['key']} ({len(self.discovered_menus)}/9)")
+
             # 4. Queue for learning (non-blocking)
             if self.last_screenshot is not None:
                 # Fast reward calculation
                 reward = self.calculate_reward_fast(
                     self.last_screenshot, screenshot, action
                 )
+
+                # NEW: Also update strategic evaluator with game state
+                game_state = {
+                    'game_date': 'Unknown',  # We'll get this from OCR later
+                    'screen_type': 'unknown',
+                    'action_count': self.session_metrics["actions_taken"]
+                }
+                self.strategic_reasoner.record_action(action, game_state)
 
                 try:
                     self.learn_queue.put_nowait(
@@ -381,6 +397,16 @@ class UltimateTrainer:
         # Bonus for certain action types (heuristic)
         if action['type'] == 'key' and action['key'] in ['b', 't', 'w', 'v']:
             reward += 0.5  # Likely useful keys
+
+        # Penalize clicking in dead zones
+        if action['type'] == 'click':
+            x, y = action['x'], action['y']
+            # Don't reward clicking on map (usually doesn't do anything useful early)
+            if 500 < x < 3340 and 200 < y < 1800:
+                reward -= 0.5  # Discourage aimless map clicking
+            # Reward UI areas
+            elif x < 500 or x > 3340 or y < 200 or y > 1800:
+                reward += 0.5  # Encourage UI exploration
 
         # Get async strategic modifier
         strategic_modifier = self.strategic_reasoner.get_reward_modifier()
