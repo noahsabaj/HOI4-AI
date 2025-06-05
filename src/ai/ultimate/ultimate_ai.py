@@ -166,8 +166,13 @@ class UltimateHOI4AI:
         self.frame_skip = CONFIG.frame_skip
         self.frame_counter = 0
 
-        # Action space
-        self.action_size = ActionSpace.get_action_size()
+        # Initialize OCR first
+        from src.perception.dynamic_ocr import DynamicOCR
+        self.ocr = DynamicOCR()
+
+        # Initialize action space with OCR
+        self.action_space = ActionSpace(self.ocr)
+        self.action_size = self.action_space.get_action_size()
 
         print("  🔍 Loading curiosity module...")
         self.curiosity = CombinedCuriosity(
@@ -223,9 +228,6 @@ class UltimateHOI4AI:
             'current_game_id': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
 
-        # Start new game session
-        self.persistent_memory.start_new_game(self.metrics['current_game_id'])
-
         # Load checkpoint if provided
         if checkpoint_path and os.path.exists(checkpoint_path):
             self.load_checkpoint(checkpoint_path)
@@ -236,6 +238,12 @@ class UltimateHOI4AI:
         """Determine if current frame should be processed"""
         self.frame_counter += 1
         return self.frame_counter % self.frame_skip == 0
+
+    def _extract_number(self, text: str) -> int:
+        """Extract number from text"""
+        import re
+        match = re.search(r'(\d+)', text)
+        return int(match.group(1)) if match else 0
 
     def observe(self, screenshot: Image.Image) -> Tuple[torch.Tensor, Dict]:
         """
@@ -349,7 +357,7 @@ class UltimateHOI4AI:
             action_idx = self._imagination_policy(state_features)
 
         # Decode action
-        action = ActionSpace.decode_action(action_idx)
+        action = self.action_space.decode_action(action_idx)
 
         # Store for next step
         self.last_action = F.one_hot(
@@ -486,8 +494,8 @@ class UltimateHOI4AI:
 
         state_np = state_features.detach().cpu().numpy()
 
-        memories = self.persistent_memory.recall_similar_experiences(
-            state_np[:128], n_results=3
+        memories = self.persistent_memory.search_similar(
+            state_np[:128], k=3
         )
 
         if memories:
