@@ -558,7 +558,7 @@ class UltimateTrainer:
                 print(f"  • {moment['description']} (reward: {moment['reward']:.1f})")
 
         # Get successful strategies from persistent memory
-        strategies = self.ai.persistent_memory.get_successful_strategies()
+        strategies = []
         if strategies:
             print(f"\n💡 Learned Strategies:")
             for strategy in strategies[:5]:
