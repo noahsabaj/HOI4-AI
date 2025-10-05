@@ -1,4 +1,4 @@
-# HOI4 Self-Learning AI 🧠🎮
+# HOI4 Self-Learning AI
 
 An autonomous AI system that learns to play Hearts of Iron 4 through pure self-play and exploration, without any human demonstrations or hardcoded strategies.
 
@@ -6,7 +6,7 @@ An autonomous AI system that learns to play Hearts of Iron 4 through pure self-p
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## 🌟 Features
+## Features
 
 ### Ultimate AI Mode (Recommended)
 - **DreamerV3-Inspired World Model**: Learns game dynamics through imagination
@@ -20,7 +20,7 @@ An autonomous AI system that learns to play Hearts of Iron 4 through pure self-p
 - **Strategic Memory**: "I remember from 3 games ago..." moments
 - **Multi-Modal Perception**: OCR + Vision + Game State Understanding
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Python 3.8 or higher
@@ -64,7 +64,7 @@ python main.py --mode ultimate
 - **F8**: Show Statistics
 - **ESC** (hold 2s): Stop AI
 
-## 🎯 AI Modes
+## AI Modes
 
 ### Ultimate Mode (Default)
 Combines all cutting-edge technologies:
@@ -79,7 +79,7 @@ Combines all cutting-edge technologies:
 - `--mode integrated`: Combines understanding with strategy
 - `--mode record`: Record your gameplay for analysis
 
-## 📊 What to Expect
+## What to Expect
 
 ### Timeline
 - **First 5 minutes**: Random exploration, discovering UI elements
@@ -89,12 +89,12 @@ Combines all cutting-edge technologies:
 - **After multiple games**: Cross-game learning and optimization
 
 ### Milestones to Watch For
-- 🎉 "Discovered new screen: production" - Finding game menus
-- 💡 "I remember: Game 1: Built factory..." - Using past experience
-- 🔍 "High curiosity (2.34) - exploring!" - Discovering new mechanics
-- 🏭 "Factory growth: +1" - Successfully building infrastructure
+- "Discovered new screen: production" - Finding game menus
+- "I remember: Game 1: Built factory..." - Using past experience
+- "High curiosity (2.34) - exploring!" - Discovering new mechanics
+- "Factory growth: +1" - Successfully building infrastructure
 
-## 🏗️ Architecture
+## Architecture
 
 ### Core Components
 
@@ -134,7 +134,7 @@ The AI automatically adapts to any screen resolution. No configuration needed!
 ### Game Speed
 The AI controls game speed automatically. Start with the game paused.
 
-## 📈 Monitoring Progress
+## Monitoring Progress
 
 ### Statistics (F8)
 - Total steps taken
@@ -147,7 +147,7 @@ The AI controls game speed automatically. Start with the game paused.
 - `hoi4_persistent_memory/`: Cross-game memories
 - `models/`: Trained model files
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -175,7 +175,7 @@ The AI controls game speed automatically. Start with the game paused.
 python main.py --mode ultimate --debug
 ```
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Areas of interest:
 - Multi-country support (currently optimized for Germany)
@@ -183,7 +183,7 @@ Contributions are welcome! Areas of interest:
 - Performance optimizations
 - Additional game mechanics understanding
 
-## 📚 Technical Details
+## Technical Details
 
 ### Learning Algorithm
 The Ultimate AI uses a combination of:
@@ -198,21 +198,17 @@ The Ultimate AI uses a combination of:
 - Persistent cross-game memory
 - Causal relationship discovery
 
-## 📄 License
+## License
 
 MIT License - See LICENSE file for details
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - DreamerV3 paper (Hafner et al., 2023)
 - Random Network Distillation (Burda et al., 2018)
 - Neural Episodic Control (Pritzel et al., 2017)
 - The HOI4 modding community
 
-## 📧 Contact
+## Contact
 
 For questions or collaboration: [noahsabaj@gmail.com]
-
----
-
-*"The AI that learns to conquer the world, one click at a time."* 🌍
