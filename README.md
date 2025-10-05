@@ -200,7 +200,7 @@ The Ultimate AI uses a combination of:
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT License - See [LICENSE](LICENSE) file for details
 
 ## Acknowledgments
 
