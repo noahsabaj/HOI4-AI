@@ -118,7 +118,7 @@ Combines all cutting-edge technologies:
 - **Persistent Memory**: Cross-game learning with ChromaDB
 - **Training Loop**: Manages the learning process
 
-## 🔧 Configuration
+## Configuration
 
 ### Performance Tuning
 ```python
