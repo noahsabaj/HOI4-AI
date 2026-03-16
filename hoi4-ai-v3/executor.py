@@ -84,10 +84,14 @@ def dispatch_action(
     action_type = action.get("action", "")
 
     if action_type == "click":
+        if "x" not in action or "y" not in action:
+            return False  # Missing coordinates, skip
         execute_click(action["x"], action["y"], window_info, model_width, model_height)
         return False
 
     elif action_type == "key":
+        if "key" not in action:
+            return False  # Missing key name, skip
         execute_key(action["key"], window_info)
         return False
 
