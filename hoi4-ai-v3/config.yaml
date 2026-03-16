@@ -1,0 +1,24 @@
+ollama:
+  model: "qwen3.5:35b"
+  endpoint: "http://localhost:11434"
+
+game:
+  window_title: "Hearts of Iron"
+  speed: 4
+  cycle_wait_seconds: 10
+
+timing:
+  action_delay_ms: 500
+  max_substeps: 15
+  max_consecutive_failures: 3
+
+display:
+  capture_width: 1280
+  capture_height: 720
+
+executor:
+  backend: "xdotool"
+
+logging:
+  max_cycles: 100
+  screenshot_format: "jpeg"
