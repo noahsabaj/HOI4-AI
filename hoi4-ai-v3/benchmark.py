@@ -33,7 +33,7 @@ start = time.time()
 resp = requests.post(
     "http://localhost:11434/api/chat",
     json={
-        "model": "qwen3.5:35b",
+        "model": "qwen3.5:9b",
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt, "images": [b64]},
