@@ -215,7 +215,12 @@ def main() -> None:
         if window_info is None:
             time.sleep(2)
 
+    if not executor.check_xdotool():
+        print("ERROR: xdotool is not installed. Install with: sudo apt install xdotool")
+        return
+
     print(f"Found game window: {window_info}")
+    print("IMPORTANT: The game should be UNPAUSED when you start this agent.")
     print("Starting agent loop. Press Ctrl+C to stop.")
 
     cycle_num = 0
@@ -223,7 +228,7 @@ def main() -> None:
 
     try:
         while True:
-            # Pause the game
+            # Pause the game (assumes game is currently running/unpaused)
             executor.execute_key("space", window_info)
             time.sleep(0.5)
 

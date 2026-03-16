@@ -39,11 +39,27 @@ def execute_click(
 
 
 def execute_key(key: str, window_info: dict) -> None:
-    """Send a keystroke to the game window."""
+    """Send a keystroke to the game window.
+
+    Single character keys are lowercased to avoid xdotool interpreting
+    uppercase as Shift+key (e.g., "W" would send Shift+w).
+    """
+    # Normalize: single chars to lowercase, multi-char keys (Escape, F1) unchanged
+    if len(key) == 1:
+        key = key.lower()
     subprocess.run(
         ["xdotool", "key", "--window", window_info["window_id"], key],
         timeout=5
     )
+
+
+def check_xdotool() -> bool:
+    """Check if xdotool is installed. Returns True if available."""
+    try:
+        subprocess.run(["xdotool", "version"], capture_output=True, timeout=5)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def escape_cleanup(window_info: dict, presses: int = 2) -> None:
