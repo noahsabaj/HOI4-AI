@@ -5,24 +5,29 @@ import vision
 
 
 class TestFindGameWindow:
-    def test_returns_window_info_when_found(self):
-        mock_result = MagicMock()
-        mock_result.stdout = "12345678\n"
-        mock_result.returncode = 0
+    def test_returns_window_info_with_frame_extents(self):
+        mock_search = MagicMock()
+        mock_search.stdout = "12345678\n"
+        mock_search.returncode = 0
 
-        # --shell format: KEY=VALUE lines
         mock_geo = MagicMock()
         mock_geo.stdout = "WINDOW=12345678\nX=100\nY=200\nWIDTH=1920\nHEIGHT=1080\nSCREEN=0\n"
         mock_geo.returncode = 0
 
-        with patch("subprocess.run", side_effect=[mock_result, mock_geo]):
+        mock_xprop = MagicMock()
+        mock_xprop.stdout = "_NET_FRAME_EXTENTS(CARDINAL) = 0, 0, 30, 0\n"
+        mock_xprop.returncode = 0
+
+        with patch("subprocess.run", side_effect=[mock_search, mock_geo, mock_xprop]):
             info = vision.find_game_window("Hearts of Iron")
 
         assert info["window_id"] == "12345678"
+        # X unchanged (no left frame), Y adjusted by title bar (30px)
         assert info["x"] == 100
-        assert info["y"] == 200
+        assert info["y"] == 230
+        # Height reduced by title bar
         assert info["width"] == 1920
-        assert info["height"] == 1080
+        assert info["height"] == 1050
 
     def test_returns_none_when_not_found(self):
         mock_result = MagicMock()

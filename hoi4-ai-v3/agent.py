@@ -220,6 +220,8 @@ def main() -> None:
         return
 
     print(f"Found game window: {window_info}")
+    if window_info.get("frame", {}).get("top", 0) > 0:
+        print(f"Title bar detected: {window_info['frame']['top']}px — capture adjusted")
     print("Starting agent loop. Press Ctrl+C to stop.")
     print("Pause the game before starting — the agent takes over from there.")
 
