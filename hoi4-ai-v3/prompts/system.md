@@ -24,6 +24,8 @@ Signal that the game should unpause and let time pass:
 
 The screenshot is 1280x720 pixels. Top-left is (0,0). Bottom-right is (1280,720). Output click coordinates in this space.
 
+The screenshot has a yellow coordinate grid overlaid every 100 pixels, with labels along the top and left edges. Use these grid lines to estimate precise click coordinates. For example, if a button appears just right of the "400" vertical line and just below the "300" horizontal line, output approximately x=410, y=310.
+
 ## HOI4 Hotkeys
 
 - W — Open construction menu
