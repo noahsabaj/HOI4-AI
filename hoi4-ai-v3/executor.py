@@ -91,7 +91,7 @@ def dispatch_action(
         execute_key(action["key"], window_info)
         return False
 
-    elif action_type == "done":
+    elif action_type in ("done", "unpause"):
         return True
 
     return False
