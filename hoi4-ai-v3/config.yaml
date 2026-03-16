@@ -1,5 +1,5 @@
 ollama:
-  model: "qwen3.5:35b"
+  model: "qwen3.5:9b"
   endpoint: "http://localhost:11434"
 
 game:
