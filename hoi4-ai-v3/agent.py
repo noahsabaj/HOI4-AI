@@ -63,7 +63,7 @@ ACTION_SCHEMA = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["click", "key", "done"]
+            "enum": ["click", "key", "done", "unpause"]
         },
         "x": {"type": "integer"},
         "y": {"type": "integer"},
@@ -220,23 +220,24 @@ def main() -> None:
         return
 
     print(f"Found game window: {window_info}")
-    print("IMPORTANT: The game should be UNPAUSED when you start this agent.")
     print("Starting agent loop. Press Ctrl+C to stop.")
+    print("Pause the game before starting — the agent takes over from there.")
 
     cycle_num = 0
     consecutive_failures = 0
 
     try:
         while True:
-            # Pause the game (assumes game is currently running/unpaused)
-            executor.execute_key("space", window_info)
-            time.sleep(0.5)
+            # First cycle: game should already be paused by the user.
+            # Subsequent cycles: we just paused it at the bottom of the loop.
+            # Either way, game is paused here — run the decision cycle.
+            print(f"\n--- Cycle {cycle_num} ---")
 
-            # Run decision cycle
             success = run_cycle(config, system_prompt, window_info, cycle_num, log_dir)
 
             if success:
                 consecutive_failures = 0
+                print(f"Cycle {cycle_num} complete.")
             else:
                 consecutive_failures += 1
                 print(f"Cycle {cycle_num} failed ({consecutive_failures} consecutive)")
@@ -247,9 +248,12 @@ def main() -> None:
                     executor.full_reset(window_info)
                     consecutive_failures = 0
 
-            # Unpause and wait
-            executor.execute_key("space", window_info)
+            # Unpause, let the game run, then pause again
+            executor.execute_key("space", window_info)  # unpause
+            print(f"Game running for {config['game']['cycle_wait_seconds']}s...")
             time.sleep(config["game"]["cycle_wait_seconds"])
+            executor.execute_key("space", window_info)  # pause
+            time.sleep(0.5)
 
             # Rotate logs
             rotate_logs(log_dir, config["logging"]["max_cycles"])
