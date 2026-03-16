@@ -8,6 +8,32 @@ import mss
 from PIL import Image, ImageDraw, ImageFont
 
 
+def get_frame_extents(window_id: str) -> dict:
+    """Get window frame/decoration sizes via xprop.
+
+    Returns dict with left, right, top, bottom pixel offsets.
+    The 'top' value is the title bar height.
+    """
+    try:
+        result = subprocess.run(
+            ["xprop", "-id", window_id, "_NET_FRAME_EXTENTS"],
+            capture_output=True, text=True, timeout=5
+        )
+        # Output: _NET_FRAME_EXTENTS(CARDINAL) = left, right, top, bottom
+        if "=" in result.stdout and "not found" not in result.stdout:
+            values = result.stdout.split("=")[1].strip().split(",")
+            extents = {
+                "left": int(values[0].strip()),
+                "right": int(values[1].strip()),
+                "top": int(values[2].strip()),
+                "bottom": int(values[3].strip()),
+            }
+            return extents
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, IndexError):
+        pass
+    return {"left": 0, "right": 0, "top": 0, "bottom": 0}
+
+
 def find_game_window(title: str) -> dict | None:
     """Find the HOI4 game window by title. Returns window info dict or None."""
     try:
@@ -20,13 +46,7 @@ def find_game_window(title: str) -> dict | None:
 
         window_id = result.stdout.strip().split("\n")[0]
 
-        # Use --shell for machine-parseable output:
-        # WINDOW=12345678
-        # X=100
-        # Y=200
-        # WIDTH=1920
-        # HEIGHT=1080
-        # SCREEN=0
+        # Use --shell for machine-parseable output
         geo = subprocess.run(
             ["xdotool", "getwindowgeometry", "--shell", window_id],
             capture_output=True, text=True, timeout=5
@@ -44,12 +64,29 @@ def find_game_window(title: str) -> dict | None:
         if not all(k in vals for k in ("X", "Y", "WIDTH", "HEIGHT")):
             return None
 
+        # Get frame extents to adjust for title bar / window decorations
+        frame = get_frame_extents(window_id)
+
+        # getwindowgeometry returns frame position; adjust to client area
+        client_x = int(vals["X"]) + frame["left"]
+        client_y = int(vals["Y"]) + frame["top"]
+        client_w = int(vals["WIDTH"]) - frame["left"] - frame["right"]
+        client_h = int(vals["HEIGHT"]) - frame["top"] - frame["bottom"]
+
+        # If frame subtraction makes dimensions negative/zero, ignore the adjustment
+        if client_w <= 0 or client_h <= 0:
+            client_x = int(vals["X"])
+            client_y = int(vals["Y"])
+            client_w = int(vals["WIDTH"])
+            client_h = int(vals["HEIGHT"])
+
         return {
             "window_id": window_id,
-            "x": int(vals["X"]),
-            "y": int(vals["Y"]),
-            "width": int(vals["WIDTH"]),
-            "height": int(vals["HEIGHT"]),
+            "x": client_x,
+            "y": client_y,
+            "width": client_w,
+            "height": client_h,
+            "frame": frame,
         }
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
