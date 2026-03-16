@@ -5,52 +5,19 @@ __pycache__/
 *.so
 .Python
 venv/
-venv_gpu/
 .venv/
 ENV/
 build/
 *.egg-info/
 dist/
 
-# PyCharm
+# IDE
 .idea/
-
-# Project specific
-recordings/
-models/*.pth
-models/*.pt
-data/text_corpus/
-checkpoints/
-hoi4_persistent_memory/
-screenshots/
-*.log
-*.png
-*.jpg
 
 # OS
 .DS_Store
 Thumbs.db
 
-# LMDB
-hoi4_lmdb/
-
-# C++ build artifacts
-*.pyd
-*.dll
-*.lib
-*.exp
-*.obj
-src/native/build/
-src/native/libs/
-src/native/temp.*/
-
-# Tesseract data
-tessdata/
-
-# Test files
-src/native/test_*.py
-src/native/diagnose_*.py
-src/native/deep_diagnose.py
-
-# UI memory
-models/ui_memory.json
+# HOI4-AI v3
+hoi4-ai-v3/logs/
+.pytest_cache/
