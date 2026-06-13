@@ -13,11 +13,16 @@ dist/
 
 # IDE
 .idea/
+.vscode/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# HOI4-AI v3
-hoi4-ai-v3/logs/
+# Test / tooling
 .pytest_cache/
+
+# HOI4-AI v4 runtime artifacts
+runs/                       # per-cycle JSONL traces + screenshots
+config/calibration.toml     # machine-specific (resolution + click-points)
+eval/corpus/                # large labeled screenshot corpus (kept out of git)
