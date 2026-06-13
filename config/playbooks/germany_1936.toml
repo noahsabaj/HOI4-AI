@@ -1,0 +1,64 @@
+# Germany 1936 — Milestone-1 playbook (construction + research).
+#
+# Ordered, idempotent goals. Each build/research goal is SELF-CONTAINED: the tool
+# opens the needed panel (and selects the building) on its own, so there is no
+# fragile ordered-setup coupling. Strict order: a goal gates the next until its
+# precondition is visible; build goals wait on a free civ slot, and the controller
+# advances in-game time until one frees.
+#
+# Strategy (solved early-game meta): never leave a research slot idle; build
+# civilian factories into high-slot states first. Civ->mil switchover and more
+# states/techs are future additions (enum member + calibrated point, no code change).
+
+# --- research: fill every slot ---
+[[goal]]
+id = "research_construction_1"
+tool = "assign_research"
+tech = "construction_1"
+precondition = "idle_research_slot"
+
+[[goal]]
+id = "research_industry_1"
+tool = "assign_research"
+tech = "industry_1"
+precondition = "idle_research_slot"
+
+[[goal]]
+id = "research_electronics_1"
+tool = "assign_research"
+tech = "electronics_1"
+precondition = "idle_research_slot"
+
+# --- construction: civilian factories into high-slot states ---
+[[goal]]
+id = "build_ruhr"
+tool = "build_in_state"
+building = "civilian_factory"
+state = "ruhr"
+precondition = "free_civ_slot"
+
+[[goal]]
+id = "build_saxony"
+tool = "build_in_state"
+building = "civilian_factory"
+state = "saxony"
+precondition = "free_civ_slot"
+
+[[goal]]
+id = "build_rhineland"
+tool = "build_in_state"
+building = "civilian_factory"
+state = "rhineland"
+precondition = "free_civ_slot"
+
+[[goal]]
+id = "build_westphalia"
+tool = "build_in_state"
+building = "civilian_factory"
+state = "westphalia"
+precondition = "free_civ_slot"
+
+# --- leave the UI at a clean home state ---
+[[goal]]
+id = "close_panels"
+tool = "close_panels"

@@ -1,0 +1,27 @@
+# HOI4-AI v4 runtime configuration.
+# mode: "robust" (deterministic verification) | "purist" (VLM verifies too — seam only)
+mode = "robust"
+
+[llm]
+backend = "ollama"                  # "ollama" (native vision) | "openai_compat" (LM Studio / llama.cpp)
+endpoint = "http://localhost:11434"
+model = "gemma4:e4b"                # see docs/v4-design.md for the model rationale
+timeout_s = 120.0
+
+[display]
+width = 2560                        # locked client resolution (assert at startup)
+height = 1440
+
+[timing]
+action_dwell_ms = 40               # pause between mouse move and click
+max_retries = 2                    # bounded retries per tool before recover/halt
+ncc_threshold = 0.75               # template-match confidence floor; below => UNCERTAIN
+run_speed = 4                      # HOI4 speed to advance time at
+cycle_days = 7                     # in-game days to advance between decision checks
+
+[paths]
+calibration = "config/calibration.toml"
+templates = "templates"
+playbook = "config/playbooks/germany_1936.toml"
+trace_dir = "runs"
+corpus = "eval/corpus"
