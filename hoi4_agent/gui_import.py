@@ -55,7 +55,8 @@ def collect_elements(data, source: str) -> list[GuiElement]:
             pos = node.get("position")
             if isinstance(name, str) and isinstance(pos, dict):
                 x, y = _as_int(pos.get("x")), _as_int(pos.get("y"))
-                size = node.get("size") if isinstance(node.get("size"), dict) else {}
+                raw_size = node.get("size")
+                size: dict = raw_size if isinstance(raw_size, dict) else {}
                 w = _as_int(size.get("width")) or _as_int(size.get("x"))
                 h = _as_int(size.get("height")) or _as_int(size.get("y"))
                 if x is not None and y is not None:
