@@ -51,6 +51,16 @@ class OpenAICompatBackend:
         if r.status_code != 200:
             raise BrainError(f"HTTP {r.status_code}: {r.text[:200]}")
         try:
-            return r.json()["choices"][0]["message"]["content"]
+            message = r.json()["choices"][0]["message"]
+            text = message["content"]
         except (ValueError, KeyError, IndexError) as e:
             raise BrainError(f"malformed response: {r.text[:200]}") from e
+        if not text.strip():
+            # Thinking models (e.g. Holo 3.1 / qwen3.5): the chat template opens a
+            # <think> block, the schema grammar forces pure JSON so </think> never
+            # appears, and the server files the entire output under
+            # reasoning_content, leaving content empty.
+            text = message.get("reasoning_content") or ""
+        if not text.strip():
+            raise BrainError(f"empty completion (no content or reasoning_content): {r.text[:200]}")
+        return text

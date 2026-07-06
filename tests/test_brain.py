@@ -108,3 +108,39 @@ def test_backend_receives_one_image_and_schema():
     Brain(be).read_number(CROP, "free")
     assert be.calls[0]["n_images"] == 1
     assert be.calls[0]["schema"]["properties"]["value"]["type"] == "integer"
+
+
+def _openai_compat_chat(monkeypatch, message: dict) -> str | Exception:
+    """Drive OpenAICompatBackend.chat against a canned /v1/chat/completions message."""
+    from hoi4_agent.brain import openai_compat as oc
+
+    class FakeResponse:
+        status_code = 200
+        text = "canned"
+
+        def json(self):
+            return {"choices": [{"message": message}]}
+
+    monkeypatch.setattr(oc.requests, "post", lambda *a, **k: FakeResponse())
+    be = oc.OpenAICompatBackend("http://localhost:1234", "holo-3.1-9b")
+    return be.chat(images=[], system="s", user="u", schema={"type": "object"})
+
+
+def test_openai_compat_returns_content(monkeypatch):
+    msg = {"role": "assistant", "content": '{"value": 1}'}
+    assert _openai_compat_chat(monkeypatch, msg) == '{"value": 1}'
+
+
+def test_openai_compat_falls_back_to_reasoning_content(monkeypatch):
+    # Thinking models under a schema grammar: content empty, JSON lands in
+    # reasoning_content (never-closed <think> block).
+    msg = {"role": "assistant", "content": "", "reasoning_content": '{"value": 1}'}
+    assert _openai_compat_chat(monkeypatch, msg) == '{"value": 1}'
+
+
+def test_openai_compat_raises_on_fully_empty_completion(monkeypatch):
+    from hoi4_agent.errors import BrainError
+
+    msg = {"role": "assistant", "content": "", "reasoning_content": ""}
+    with pytest.raises(BrainError):
+        _openai_compat_chat(monkeypatch, msg)
