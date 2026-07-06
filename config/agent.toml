@@ -40,8 +40,10 @@ model = "holo-3.1-4b"
 timeout_s = 120.0
 
 [display]
-width = 2560                        # locked client resolution (assert at startup)
-height = 1440
+width = 3840                        # locked client resolution (assert at startup)
+height = 2160                       # native 4K, borderless-style at (0,0); hoi4.exe has the
+                                    # HIGHDPIAWARE compat flag set (else Windows DPI-stretches
+                                    # windowed mode 1.5x and capture sees blur, not pixels)
 
 [timing]
 action_dwell_ms = 40               # pause between mouse move and click

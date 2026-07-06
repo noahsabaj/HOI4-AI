@@ -22,6 +22,11 @@ GLYPH_PREFIX = "glyph_"
 # template file names use words for characters that can't appear in filenames
 _GLYPH_CHAR_NAMES = {"dot": "."}
 _FG_DELTA = 40.0  # gray-level deviation from background median that counts as ink
+# Anti-aliased text (4K UI) leaves faint ink bridging glyph gaps: at a low delta
+# neighbours merge into one box. Readers walk this ladder until every segmented
+# glyph classifies; calibrate uses it to find the count that matches the typed
+# string. (Verified live 2026-07-06: HOI4 top-bar date needed delta≈115.)
+DELTA_LADDER = (40.0, 70.0, 100.0, 130.0)
 
 
 def _foreground_mask(gray: np.ndarray, delta: float = _FG_DELTA) -> np.ndarray:
@@ -84,18 +89,21 @@ class GlyphReader:
         return best_char if best_score >= self.threshold else None
 
     def read_text(self, crop: Image.Image) -> str | None:
-        """All glyphs left-to-right, or None if any glyph is unknown."""
+        """All glyphs left-to-right, or None if any glyph is unknown.
+
+        Walks DELTA_LADDER: a segmentation only counts when EVERY box
+        classifies above threshold — merged boxes fail classification, so the
+        next (stricter) delta gets a chance instead of a guess.
+        """
         gray = to_gray_f32(crop)
-        boxes = glyph_boxes(gray)
-        if not boxes:
-            return None
-        chars = []
-        for x0, y0, x1, y1 in boxes:
-            c = self._classify(crop.crop((x0, y0, x1, y1)))
-            if c is None:
-                return None
-            chars.append(c)
-        return "".join(chars)
+        for delta in DELTA_LADDER:
+            boxes = glyph_boxes(gray, delta)
+            if not boxes:
+                continue
+            chars = [self._classify(crop.crop(box)) for box in boxes]
+            if all(c is not None for c in chars):
+                return "".join(c for c in chars if c is not None)
+        return None
 
     # --- Reader protocol ---
     def read_number(self, crop: Image.Image, field: str) -> int | None:
