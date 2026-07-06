@@ -231,11 +231,17 @@ class Goal:
 
 @dataclass(frozen=True, slots=True)
 class PlaybookState:
-    """Persisted progress; survives restarts."""
+    """Persisted progress; survives restarts.
+
+    ``pending_etas`` are predicted completion dates (tech value -> date string)
+    used purely as WAKE-UP hints for time advance — correctness always comes
+    from perception, never from a prediction.
+    """
 
     completed_goal_ids: tuple[str, ...] = ()
     last_seen_date: GameDate | None = None
     cycle_count: int = 0
+    pending_etas: tuple[tuple[str, str], ...] = ()
 
     def with_completed(self, goal_id: str) -> "PlaybookState":
         if goal_id in self.completed_goal_ids:
@@ -248,11 +254,23 @@ class PlaybookState:
     def advance_cycle(self) -> "PlaybookState":
         return replace(self, cycle_count=self.cycle_count + 1)
 
+    def with_eta(self, key: str, date: GameDate) -> "PlaybookState":
+        kept = tuple((k, v) for k, v in self.pending_etas if k != key)
+        return replace(self, pending_etas=kept + ((key, date.to_str()),))
+
+    def drop_etas_through(self, date: GameDate | None) -> "PlaybookState":
+        """Retire ETAs that have arrived — as wake hints their job is done."""
+        if date is None:
+            return self
+        kept = tuple((k, v) for k, v in self.pending_etas if GameDate.from_str(v) > date)
+        return self if kept == self.pending_etas else replace(self, pending_etas=kept)
+
     def to_dict(self) -> dict:
         return {
             "completed_goal_ids": list(self.completed_goal_ids),
             "last_seen_date": self.last_seen_date.to_str() if self.last_seen_date else None,
             "cycle_count": self.cycle_count,
+            "pending_etas": [list(e) for e in self.pending_etas],
         }
 
     @classmethod
@@ -262,6 +280,7 @@ class PlaybookState:
             completed_goal_ids=tuple(d.get("completed_goal_ids", ())),
             last_seen_date=GameDate.from_str(ds) if ds else None,
             cycle_count=int(d.get("cycle_count", 0)),
+            pending_etas=tuple((str(k), str(v)) for k, v in d.get("pending_etas", ())),
         )
 
 

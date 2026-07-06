@@ -2,9 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from hoi4_agent.enums import GermanState, PreconditionKind, ToolName
+from hoi4_agent.enums import GermanState, PreconditionKind, Tech, ToolName
 from hoi4_agent.errors import ConfigError
-from hoi4_agent.playbook.loader import load_playbook, parse_goals
+from hoi4_agent.playbook.loader import (
+    load_playbook,
+    load_research_days,
+    parse_goals,
+    parse_research_days,
+)
 from hoi4_agent.playbook.select import all_done, expired_goal, next_pending_goal
 from hoi4_agent.playbook.state import load_state, save_state
 from hoi4_agent.schemas import GameDate, Goal, PlaybookState, Precondition, WorldState
@@ -40,6 +45,17 @@ def test_parse_goals_rejects_unknown_keys():
     # A typo'd key must fail loudly, not silently load as a default.
     with pytest.raises(ConfigError, match="needs_judgement"):
         parse_goals({"goal": [{"id": "x", "tool": "observe", "needs_judgement": True}]})
+
+
+def test_research_days_table():
+    days = load_research_days(PLAYBOOK)
+    assert days[Tech.CONSTRUCTION_1] == 170
+    assert all(v > 0 for v in days.values())
+    assert parse_research_days({}) == {}  # optional table
+    with pytest.raises(ConfigError):
+        parse_research_days({"research_days": {"not_a_tech": 100}})
+    with pytest.raises(ConfigError):
+        parse_research_days({"research_days": {"industry_1": 0}})
 
 
 def test_parse_goals_rejects_invalid_precondition_date():

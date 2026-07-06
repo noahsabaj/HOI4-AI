@@ -83,6 +83,13 @@ def test_which_tech_and_yes_no():
     assert _brain('{"answer":"no"}').yes_no(CROP, "good?") is False
 
 
+def test_consult_recovery_validates_options():
+    opts = ["press_escape", "press_map_mode", "none"]
+    assert _brain('{"action":"press_escape"}').consult_recovery(CROP, opts) == "press_escape"
+    with pytest.raises(EnumError):
+        _brain('{"action":"reboot"}').consult_recovery(CROP, opts)
+
+
 def test_encode_image_is_base64_str():
     s = encode_image(CROP)
     assert isinstance(s, str) and len(s) > 0

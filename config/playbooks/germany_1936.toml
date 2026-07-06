@@ -15,6 +15,19 @@
 # first. Civ->mil switchover and more states/techs are future additions
 # (enum member + calibrated point, no code change).
 
+# Approximate research durations (in-game days) — WAKE-UP HINTS for the time
+# advance only; the agent still verifies slot state by perception. Rough 1936
+# no-bonus values; precision is unimportant.
+[research_days]
+construction_1 = 170
+construction_2 = 190
+construction_3 = 210
+industry_1 = 170
+industry_2 = 190
+electronics_1 = 170
+radar_1 = 190
+land_doctrine_1 = 140
+
 # --- research: fill the three 1936 slots in priority order ---
 [[goal]]
 id = "research_construction_1"

@@ -59,6 +59,7 @@ def run(
     state_path: str | None = None,
     max_cycles: int = 1000,
     max_failures: int = 5,
+    research_days: dict[Tech, int] | None = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> PlaybookState:
@@ -66,6 +67,7 @@ def run(
     ctx.geometry.assert_resolution(ctx.config.display.width, ctx.config.display.height)
     failures = 0
     cycles = 0
+    streak = 0  # consecutive time-advances with no successful action (backoff input)
 
     def _drain_actions() -> tuple[dict, ...]:
         drain = getattr(ctx.input, "drain", None)
@@ -84,13 +86,18 @@ def run(
         return str(writer.path) if writer else None
 
     def _advance_time(world: WorldState) -> GameDate | None:
-        target = world.date.plus_days(ctx.config.timing.cycle_days) if world.date else None
+        nonlocal streak
+        target, reason = cadence.compute_advance_target(
+            world.date, state.pending_etas, ctx.config.timing.cycle_days,
+            ctx.config.timing.max_advance_days, streak,
+        )
+        streak += 1
         last = cadence.run_to_date(ctx, target, sleep=sleep)
         res = ToolResult(
             ToolName.OBSERVE, Verdict.OK, pre=world,
             assertion=(
                 f"advanced time toward {target.to_str() if target else 'blind polls'}"
-                f" (last read {last.to_str() if last else 'none'})"
+                f" [{reason}] (last read {last.to_str() if last else 'none'})"
             ),
         )
         _append(build_record(
@@ -98,6 +105,21 @@ def run(
             kind="advance", actions=_drain_actions(),
         ))
         return last
+
+    def _recover_and_trace(world: WorldState | None) -> bool:
+        """Deterministic recovery, escalating once to a traced VLM consult."""
+        recovered, consult = recovery.recover_with_consult(ctx)
+        if consult is not None:
+            res = ToolResult(
+                ToolName.OBSERVE, Verdict.OK if recovered else Verdict.FAILED,
+                pre=world, assertion=f"recovery consult -> {consult['hint']}",
+            )
+            _append(build_record(
+                cycle=state.cycle_count, ts=clock(), result=res, mode=ctx.mode.value,
+                kind="consult", vlm_used=True, prompt=consult["prompt"],
+                raw=consult["raw"], actions=_drain_actions(),
+            ))
+        return recovered
 
     _drain_actions()  # discard any pre-loop input noise
 
@@ -110,6 +132,7 @@ def run(
             if not pause_res.ok:
                 raise ControllerError(f"cannot pause the game: {pause_res.assertion}")
             world = ctx.perceive()
+            state = state.drop_etas_through(world.date)  # arrived wake-hints are spent
 
             # Inner selection round: a repeatable goal that reports NotReady is
             # stepped past (cycle_skip) and the NEXT goal tried in the same
@@ -160,6 +183,16 @@ def run(
 
                 if result.verdict is Verdict.OK:
                     failures = 0
+                    streak = 0  # the world moved; backoff starts over
+                    if (
+                        goal.tool is ToolName.ASSIGN_RESEARCH
+                        and research_days
+                        and intent.tech is not None
+                        and world.date is not None
+                        and intent.tech in research_days
+                    ):
+                        eta = world.date.plus_days(research_days[intent.tech])
+                        state = state.with_eta(intent.tech.value, eta)
                     if not goal.repeatable:  # repeatables are re-offered forever
                         state = state.with_completed(goal.id)
                     break
@@ -171,7 +204,7 @@ def run(
                     _advance_time(world)
                     break
                 failures += 1
-                recovered = recovery.recover(ctx)
+                recovered = _recover_and_trace(world)
                 if not recovered or failures >= max_failures:
                     raise HaltAndFlag(
                         f"halting after {failures} consecutive failures at goal "
@@ -193,7 +226,7 @@ def run(
                 cycle=state.cycle_count, ts=clock(), result=err_result, goal=goal,
                 mode=ctx.mode.value, kind="error", actions=_drain_actions(),
             ))
-            recovered = recovery.recover(ctx)
+            recovered = _recover_and_trace(world)
             if not recovered or failures >= max_failures:
                 raise HaltAndFlag(
                     f"halting after {failures} consecutive failures: {e}",

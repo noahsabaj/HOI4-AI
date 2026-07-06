@@ -33,6 +33,7 @@ class TimingConfig:
     ncc_threshold: float
     run_speed: int
     cycle_days: int
+    max_advance_days: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,9 @@ class Config:
     display: DisplayConfig
     timing: TimingConfig
     paths: PathsConfig
+    # [recovery] vlm_consult: one bounded VLM hint when deterministic recovery
+    # fails, before halt-and-flag. Default on; explicit in agent.toml.
+    recovery_vlm_consult: bool = True
 
 
 def _require(table: dict, key: str, section: str):
@@ -133,7 +137,9 @@ def load_config(path: str | Path = "config/agent.toml", llm_profile: str | None 
             ncc_threshold=float(_require(tim, "ncc_threshold", "timing")),
             run_speed=int(_require(tim, "run_speed", "timing")),
             cycle_days=int(_require(tim, "cycle_days", "timing")),
+            max_advance_days=int(_require(tim, "max_advance_days", "timing")),
         ),
+        recovery_vlm_consult=bool(raw.get("recovery", {}).get("vlm_consult", True)),
         paths=PathsConfig(
             calibration=_require(paths, "calibration", "paths"),
             templates=_require(paths, "templates", "paths"),

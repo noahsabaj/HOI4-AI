@@ -59,6 +59,17 @@ def test_playbook_state_transitions():
     assert s2.cycle_count == 1
 
 
+def test_pending_etas_roundtrip_and_ops():
+    s = PlaybookState().with_eta("industry_1", GameDate(1936, 4, 1))
+    s = s.with_eta("industry_1", GameDate(1936, 5, 1))  # replaces, not appends
+    s = s.with_eta("construction_1", GameDate(1936, 3, 1))
+    assert dict(s.pending_etas) == {"industry_1": "1936.05.01", "construction_1": "1936.03.01"}
+    assert PlaybookState.from_dict(s.to_dict()) == s
+    spent = s.drop_etas_through(GameDate(1936, 3, 15))
+    assert dict(spent.pending_etas) == {"industry_1": "1936.05.01"}
+    assert s.drop_etas_through(None) is s  # unreadable date: nothing changes
+
+
 def test_trace_record_roundtrip():
     r = TraceRecord(cycle=1, ts=1.0, verdict="ok", plan_step="x", actions=({"tool": "observe"},))
     assert TraceRecord.from_dict(r.to_dict()) == r
