@@ -44,7 +44,8 @@ python -m hoi4_agent.cli.main smoke-test --offline   # end-to-end with fakes
 
 # Live (after installing HOI4 + Ollama):
 python -m hoi4_agent.cli.main smoke-test   # validate the Windows I/O layer
-python -m hoi4_agent.cli.main calibrate    # one-time: record ROIs + click-points
+python -m hoi4_agent.cli.main calibrate    # wizard: record ROIs + click-points (B=back, K=keep, S=skip)
+python -m hoi4_agent.cli.main calibrate --only glyphs   # redo a subset (rois|points|templates|glyphs)
 python -m hoi4_agent.cli.main eval         # M0: measure model perception on crops
 python -m hoi4_agent.cli.main run          # play Germany-1936 construction + research
 ```

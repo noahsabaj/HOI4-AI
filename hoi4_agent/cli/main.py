@@ -157,7 +157,7 @@ def cmd_smoke(cfg: Config, args) -> int:
 def cmd_calibrate(cfg: Config, args) -> int:
     from . import calibrate
 
-    return calibrate.run(cfg, args.title)
+    return calibrate.run(cfg, args.title, only=args.only)
 
 
 def cmd_save_audit(cfg: Config, args) -> int:
@@ -220,6 +220,10 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("calibrate", help="record ROIs + click-points -> calibration.toml")
     s.add_argument("--title", default="Hearts of Iron")
+    s.add_argument("--only", default=None,
+                   help="redo a subset over the existing calibration: comma-separated "
+                        "rois|points|templates|glyphs, narrowable like points:techs, "
+                        "points:industry_1, templates:pause_on, rois:date")
     s.set_defaults(func=cmd_calibrate)
 
     s = sub.add_parser("eval", help="M0: score the model's perception on the corpus")
