@@ -19,9 +19,22 @@ def _engine(*texts: str):
     return run
 
 
+class _V3Output:
+    """Shape of rapidocr v2+/v3 results: an object with a .txts tuple."""
+
+    def __init__(self, *txts: str) -> None:
+        self.txts = tuple(txts)
+
+
 def test_read_number_single_digit_run():
     assert OcrReader(engine=_engine("37")).read_number(CROP, "x") == 37
     assert OcrReader(engine=_engine("Queue: 12")).read_number(CROP, "x") == 12
+
+
+def test_v3_output_shape_supported():
+    assert OcrReader(engine=lambda _img: _V3Output("37")).read_number(CROP, "x") == 37
+    assert OcrReader(engine=lambda _img: _V3Output()).read_number(CROP, "x") is None
+    assert OcrReader(engine=lambda _img: _V3Output("1936.", "1.", "14")).read_date(CROP) is not None
 
 
 def test_read_number_ambiguous_is_none():
@@ -66,8 +79,21 @@ def test_chain_reader_order_and_none_skipping():
     assert calls == ["a", "b"]  # c never consulted; None entry skipped
 
 
+def _rapidocr_importable() -> bool:
+    # Import check only — constructing the engine (model load) belongs in the test.
+    try:
+        import rapidocr  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            import rapidocr_onnxruntime  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+
 @pytest.mark.skipif(
-    not OcrReader().available(), reason="rapidocr not installed (optional [ocr] extra)"
+    not _rapidocr_importable(), reason="rapidocr not installed (optional [ocr] extra)"
 )
 def test_real_engine_smoke():
     from PIL import ImageDraw

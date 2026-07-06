@@ -14,7 +14,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4", "mypy>=1.10"]
 # Optional OCR middle tier for numeric reads (glyphs -> OCR -> VLM).
-ocr = ["rapidocr-onnxruntime>=1.4"]
+# (rapidocr v2+ is the maintained package with py3.13+ support; the legacy
+# rapidocr-onnxruntime import path is also handled if already installed.)
+ocr = ["rapidocr>=2.0", "onnxruntime>=1.17"]
 
 [tool.setuptools.packages.find]
 # Flat layout with a sibling config/ dir: name the package explicitly so
