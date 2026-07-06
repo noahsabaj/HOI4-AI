@@ -44,7 +44,15 @@ def preflight(
     if not any(templates.has(n) for n in SPEED_TEMPLATES):
         warnings.append("no speed_1..speed_5 templates: game speed will read as unreadable")
     if not any(n.startswith(GLYPH_TEMPLATE_PREFIX) for n in templates.names()):
-        warnings.append("no glyph_* templates: numeric reads fall back to the VLM (slow, less reliable)")
+        from .perception.ocr import OcrReader
+
+        if OcrReader().available():
+            warnings.append("no glyph_* templates: numeric reads fall back to OCR, then the VLM")
+        else:
+            warnings.append(
+                "no glyph_* templates: numeric reads fall back to the VLM (slow, less "
+                'reliable) — `pip install -e ".[ocr]"` adds a faster OCR middle tier'
+            )
 
     # --- calibration ----------------------------------------------------------
     for name in ROI_NAMES:
