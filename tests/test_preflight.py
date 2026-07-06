@@ -74,6 +74,27 @@ def test_grounding_enabled_warns_to_validate_first(cfg):
     assert any("grounding" in w and "M0" in w for w in warnings)
 
 
+def test_tech_tabs_covers_every_tech():
+    # invariant: a tech with no tab mapping would be unreachable (executor + preflight
+    # both key off TECH_TABS) — so every Tech member must be present
+    from hoi4_agent.enums import TECH_TABS, Tech
+
+    assert set(TECH_TABS) == set(Tech)
+
+
+def test_uncalibrated_research_tab_blocks_run(cfg):
+    goals = load_playbook(PLAYBOOK)
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    # drop the engineering tab point while electronics_1/radar_1 stay calibrated
+    no_eng = dataclasses.replace(
+        calib, research_tabs={k: v for k, v in calib.research_tabs.items() if k != "engineering"}
+    )
+    errors, _ = preflight(cfg, no_eng, _full_templates(), goals)
+    assert any("engineering" in e and "tab" in e for e in errors)
+    # and it names the fix
+    assert any("--only tabs" in e for e in errors)
+
+
 def test_invalid_goal_and_empty_judgment_options(cfg):
     calib = default_calibration(cfg.display.width, cfg.display.height)
     bad = Goal(id="bad", tool=ToolName.ASSIGN_RESEARCH)  # tech missing, no judgment

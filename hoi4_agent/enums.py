@@ -76,9 +76,35 @@ class MapMode(StrEnum):
     DEFAULT = "default"     # F1 / default map mode = the calibrated "home view"
 
 
+class ResearchTab(StrEnum):
+    """Research-panel tabs. A tech's calibrated click-point is a screen position
+    that only lands correctly when the tech's tab is the one showing, and HOI4
+    remembers the last-opened tab across panel opens — so the executor selects
+    the tab before clicking the tech. Members carry the tabs M1 techs live on;
+    extending research to a new tab is an enum member + a calibrated tab-point."""
+
+    INDUSTRY = "industry"           # construction, industry, synthetic oil
+    ENGINEERING = "engineering"     # electronic engineering (radio/radar), forts, atomic
+    LAND_DOCTRINE = "land_doctrine"
+
+
 class PreconditionKind(StrEnum):
     ALWAYS = "always"
     FREE_CIV_SLOT = "free_civ_slot"            # free_civ_slots >= 1
     IDLE_RESEARCH_SLOT = "idle_research_slot"  # idle_research_slots >= 1
     DATE_BEFORE = "date_before"                # date < param
     DATE_AFTER = "date_after"                  # date >= param
+
+
+# Which research tab each tech lives on. Every Tech MUST appear here (asserted in
+# tests) so a tech can never be assigned without first selecting its tab.
+TECH_TABS: dict[Tech, ResearchTab] = {
+    Tech.CONSTRUCTION_1: ResearchTab.INDUSTRY,
+    Tech.CONSTRUCTION_2: ResearchTab.INDUSTRY,
+    Tech.CONSTRUCTION_3: ResearchTab.INDUSTRY,
+    Tech.INDUSTRY_1: ResearchTab.INDUSTRY,
+    Tech.INDUSTRY_2: ResearchTab.INDUSTRY,
+    Tech.ELECTRONICS_1: ResearchTab.ENGINEERING,
+    Tech.RADAR_1: ResearchTab.ENGINEERING,
+    Tech.LAND_DOCTRINE_1: ResearchTab.LAND_DOCTRINE,
+}

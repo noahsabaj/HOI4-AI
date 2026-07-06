@@ -23,7 +23,7 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
-from ..enums import PanelId, ToolName, Verdict
+from ..enums import TECH_TABS, PanelId, ToolName, Verdict
 from ..errors import (
     AgentError,
     AssignResearchError,
@@ -294,6 +294,18 @@ def _assign_research(intent: Intent, ctx: "AgentContext") -> ToolResult:
     if intent.tech is None:  # pragma: no cover - validate_intent guarantees it
         return _failed(ToolName.ASSIGN_RESEARCH, pre, pre,
                        IntentValidationError("assign_research", "missing tech"))
+    # Select the tech's research tab BEFORE resolving/clicking its point: tech
+    # points (and the grounding crop) are relative to the open tab, which HOI4
+    # remembers across panel opens. Preflight guarantees the tab is calibrated.
+    tab = TECH_TABS.get(intent.tech)
+    if tab is None:  # pragma: no cover - TECH_TABS covers all Tech (asserted in tests)
+        return _failed(ToolName.ASSIGN_RESEARCH, pre, pre,
+                       AssignResearchError(f"no research-tab mapping for {intent.tech.value}"))
+    tab_point = ctx.calibration.research_tab_point(tab)
+    if tab_point is None:
+        return _failed(ToolName.ASSIGN_RESEARCH, pre, pre,
+                       AssignResearchError(f"research tab {tab.value!r} has no calibrated point"))
+    _click_pt(ctx, tab_point[0], tab_point[1])
     point_crop: CropRect | None = None
     try:
         point: tuple[int, int] | None = ctx.calibration.tech_point(intent.tech)

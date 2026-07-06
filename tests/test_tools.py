@@ -1,4 +1,6 @@
-from hoi4_agent.enums import GermanState, PanelId, Tech, ToolName, Verdict
+import dataclasses
+
+from hoi4_agent.enums import GermanState, PanelId, ResearchTab, Tech, ToolName, Verdict
 from hoi4_agent.errors import BuildInStateError, IntentValidationError, NotReadyError, PreconditionError
 from hoi4_agent.schemas import Intent, WorldState
 from hoi4_agent.tools.executor import execute
@@ -113,6 +115,31 @@ def test_assign_research_ok_and_precondition(scripted_ctx):
     assert r.verdict is Verdict.FAILED
     assert isinstance(r.error, PreconditionError)
     assert isinstance(r.error, NotReadyError)  # a wait-state, not a defect
+
+
+def test_assign_research_selects_tab_before_clicking_tech(scripted_ctx):
+    # tech points are tab-relative: the tab must be clicked before the tech
+    states = [
+        _ws(open_panel=RES),
+        _ws(open_panel=RES, idle_research_slots=2),
+        _ws(open_panel=RES, idle_research_slots=1),
+    ]
+    ctx, inp = scripted_ctx(states)
+    r = execute(Intent(ToolName.ASSIGN_RESEARCH, tech=Tech.ELECTRONICS_1), ctx)
+    assert r.verdict is Verdict.OK
+    tab_pt = ctx.calibration.research_tab_point(ResearchTab.ENGINEERING)  # electronics -> engineering
+    tech_pt = ctx.calibration.tech_point(Tech.ELECTRONICS_1)
+    assert tab_pt in inp.clicks and tech_pt in inp.clicks
+    assert inp.clicks.index(tab_pt) < inp.clicks.index(tech_pt)
+
+
+def test_assign_research_missing_tab_point_fails_without_clicking_tech(scripted_ctx):
+    states = [_ws(open_panel=RES), _ws(open_panel=RES, idle_research_slots=2)]
+    ctx, inp = scripted_ctx(states)
+    ctx.calibration = dataclasses.replace(ctx.calibration, research_tabs={})
+    r = execute(Intent(ToolName.ASSIGN_RESEARCH, tech=Tech.INDUSTRY_1), ctx)
+    assert r.verdict is Verdict.FAILED
+    assert ctx.calibration.tech_point(Tech.INDUSTRY_1) not in inp.clicks  # never reached the tech
 
 
 def test_ensure_paused(scripted_ctx):

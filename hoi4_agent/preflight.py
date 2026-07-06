@@ -20,7 +20,7 @@ from .calibration import (
     Calibration,
 )
 from .config import Config
-from .enums import GermanState, Tech, ToolName
+from .enums import TECH_TABS, GermanState, Tech, ToolName
 from .errors import IntentValidationError
 from .perception.templates import TemplateStore
 from .schemas import Goal, validate_intent
@@ -85,6 +85,29 @@ def preflight(
     buildings = sorted({g.building for g in goals if g.building is not None}, key=lambda b: b.value)
     for missing in calibration.missing_points_for(states, techs, buildings):
         errors.append(f"no calibrated click-point for playbook-referenced {missing}")
+
+    # --- research tabs: tech points are tab-relative, so every tab holding a
+    # calibrated tech needs its own calibrated click-point, or the executor
+    # can't select it and the tech click lands on whatever tab is showing.
+    # Checks ALL calibrated techs (not just fixed goals): the judgment refill
+    # goal can pick any tech that has a point.
+    tech_by_value = {t.value: t for t in Tech}
+    needed_tabs = set()
+    for tv in calibration.tech_points:
+        t = tech_by_value.get(tv)
+        if t is None:
+            continue
+        tab = TECH_TABS.get(t)
+        if tab is None:  # pragma: no cover - TECH_TABS covers all Tech (asserted in tests)
+            errors.append(f"tech {tv!r} is calibrated but has no known research tab")
+        else:
+            needed_tabs.add(tab)
+    for tab in sorted(needed_tabs, key=lambda x: x.value):
+        if tab.value not in calibration.research_tabs:
+            errors.append(
+                f"research tab {tab.value!r} has calibrated techs but no tab click-point "
+                "— run `calibrate --only tabs`"
+            )
 
     for g in goals:
         if g.needs_judgment:
