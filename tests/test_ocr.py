@@ -49,6 +49,12 @@ def test_read_date_parses_and_validates():
     assert OcrReader(engine=_engine("gibberish")).read_date(CROP) is None
 
 
+def test_read_date_hoi4_topbar_format():
+    # what the HOI4 top bar actually renders (incl. the clock, which is ignored)
+    assert OcrReader(engine=_engine("12:00, 1 Jan, 1936")).read_date(CROP) == GameDate(1936, 1, 1)
+    assert OcrReader(engine=_engine("04:00,", "11 Nov,", "1942")).read_date(CROP) == GameDate(1942, 11, 11)
+
+
 def test_unavailable_without_engine(monkeypatch):
     import hoi4_agent.perception.ocr as ocr_mod
 

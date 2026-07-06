@@ -42,6 +42,22 @@ def test_gamedate_order_and_str():
     assert GameDate(1936, 1, 1).to_str() == "1936.01.01"
 
 
+def test_gamedate_from_ui_text_ymd_and_hoi4_topbar():
+    # numeric Y.M.D (the original design assumption)
+    assert GameDate.from_ui_text("1936.1.1") == GameDate(1936, 1, 1)
+    assert GameDate.from_ui_text("1936. 1. 14") == GameDate(1936, 1, 14)
+    # HOI4's actual top-bar rendering: clock, day, month NAME, year
+    assert GameDate.from_ui_text("12:00, 1 Jan, 1936") == GameDate(1936, 1, 1)
+    assert GameDate.from_ui_text("04:00, 28 Dec, 1943") == GameDate(1943, 12, 28)
+    assert GameDate.from_ui_text("12:00,1Jan,1936") == GameDate(1936, 1, 1)  # glyph text: no spaces
+    assert GameDate.from_ui_text("11 September 1939") == GameDate(1939, 9, 11)  # full month word
+    # never guess
+    assert GameDate.from_ui_text("1936.13.1") is None  # month out of range
+    assert GameDate.from_ui_text("1 Foo 1936") is None  # unknown month word
+    assert GameDate.from_ui_text("1936.1") is None
+    assert GameDate.from_ui_text("gibberish") is None
+
+
 def test_gamedate_plus_days_rolls_over():
     assert GameDate(1936, 1, 25).plus_days(10) == GameDate(1936, 2, 5)
     assert GameDate(1936, 12, 25).plus_days(10) == GameDate(1937, 1, 5)

@@ -15,7 +15,6 @@ from PIL import Image
 
 from ..schemas import GameDate
 
-_DATE_RE = re.compile(r"(\d{4})\D{1,3}(\d{1,2})\D{1,3}(\d{1,2})")
 _DIGITS_RE = re.compile(r"\d+")
 
 
@@ -91,10 +90,4 @@ class OcrReader:
         text = self._read_text(crop)
         if text is None:
             return None
-        m = _DATE_RE.search(text)
-        if m is None:
-            return None
-        try:
-            return GameDate(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            return None
+        return GameDate.from_ui_text(text)

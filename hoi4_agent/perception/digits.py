@@ -108,14 +108,7 @@ class GlyphReader:
         s = self.read_text(crop)
         if s is None:
             return None
-        parts = [p for p in s.split(".") if p]
-        if len(parts) != 3:
-            return None
-        try:
-            y, m, d = (int(p) for p in parts)
-            return GameDate(y, m, d)  # range-checked; bad month/day -> ValueError
-        except ValueError:
-            return None
+        return GameDate.from_ui_text(s)
 
 
 class ChainReader:
