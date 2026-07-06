@@ -1,5 +1,6 @@
 # HOI4-AI v4 runtime configuration.
-# mode: "robust" (deterministic verification) | "purist" (VLM verifies too — seam only)
+# mode: "robust" (deterministic verification). "purist" (VLM verifies too) is a
+# designed seam that is NOT implemented — the loader rejects it.
 mode = "robust"
 
 [llm]
@@ -14,6 +15,8 @@ height = 1440
 
 [timing]
 action_dwell_ms = 40               # pause between mouse move and click
+settle_ms = 150                    # wait after any injected input before re-perceiving
+verify_read_retries = 2            # extra re-READS (never re-clicks) when a verify metric is unreadable
 max_retries = 2                    # bounded retries per tool before recover/halt
 ncc_threshold = 0.75               # template-match confidence floor; below => UNCERTAIN
 run_speed = 4                      # HOI4 speed to advance time at

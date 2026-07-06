@@ -15,6 +15,23 @@ def test_writer_append_and_read(tmp_path):
     assert records == [r1, r2]
 
 
+def test_input_recorder_journals_and_drains():
+    from hoi4_agent.geometry import WindowGeometry
+    from hoi4_agent.io.backends import InputRecorder, RecordingInput
+
+    inner = RecordingInput()
+    rec = InputRecorder(inner)
+    geo = WindowGeometry(1, 0, 0, 10, 10)
+    rec.focus(geo)
+    rec.key("t")
+    rec.click(geo, geo.full_crop(), 500, 500)
+    events = rec.drain()
+    assert [e["kind"] for e in events] == ["focus", "key", "click"]
+    assert events[1]["name"] == "t"
+    assert rec.drain() == []  # drained
+    assert inner.keys == ["t"] and inner.clicks == [(500, 500)]  # delegated through
+
+
 def test_save_frame_disabled_returns_none(tmp_path):
     from PIL import Image
 

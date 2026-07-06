@@ -44,7 +44,6 @@ class ToolName(StrEnum):
     ENSURE_PAUSED = "ensure_paused"
     SET_SPEED = "set_speed"
     OPEN_CONSTRUCTION = "open_construction"
-    SELECT_BUILDING = "select_building"
     BUILD_IN_STATE = "build_in_state"
     OPEN_RESEARCH = "open_research"
     ASSIGN_RESEARCH = "assign_research"
@@ -52,10 +51,12 @@ class ToolName(StrEnum):
 
 
 class PanelId(StrEnum):
+    """Mutually-exclusive main panels. Blocking overlays (event popup, pause
+    menu) are independent WorldState booleans, not panel classifications."""
+
     NONE = "none"            # home / map, no panel open
     CONSTRUCTION = "construction"
     RESEARCH = "research"
-    EVENT_POPUP = "event_popup"
 
 
 class Verdict(StrEnum):
@@ -66,14 +67,9 @@ class Verdict(StrEnum):
 
 class AgentMode(StrEnum):
     ROBUST = "robust"       # deterministic verification (default)
-    PURIST = "purist"       # VLM verifies too (designed seam, not built in M1)
-
-
-class DecisionType(StrEnum):
-    WHICH_STATE = "which_state"
-    WHICH_TECH = "which_tech"
-    READ_NUMBER = "read_number"
-    YES_NO = "yes_no"
+    # "purist" (VLM verifies too) is a designed seam, not built: load_config
+    # REJECTS it rather than silently running robust behavior under that name.
+    PURIST = "purist"
 
 
 class MapMode(StrEnum):

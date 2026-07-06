@@ -1,16 +1,21 @@
 # Germany 1936 — Milestone-1 playbook (construction + research).
 #
-# Ordered, idempotent goals. Each build/research goal is SELF-CONTAINED: the tool
-# opens the needed panel (and selects the building) on its own, so there is no
-# fragile ordered-setup coupling. Strict order: a goal gates the next until its
-# precondition is visible; build goals wait on a free civ slot, and the controller
-# advances in-game time until one frees.
+# Ordered goals. Each build/research goal is SELF-CONTAINED: the tool opens the
+# needed panel (and selects the building) on its own, so there is no fragile
+# ordered-setup coupling. One-shot goals gate strictly (a goal blocks the next
+# until its precondition is visible); REPEATABLE goals never block — when not
+# ready they are stepped past, and they are re-offered every cycle.
 #
-# Strategy (solved early-game meta): never leave a research slot idle; build
-# civilian factories into high-slot states first. Civ->mil switchover and more
-# states/techs are future additions (enum member + calibrated point, no code change).
+# Strategy (solved early-game meta): never leave a research slot idle — the
+# three one-shot goals fill the 1936 slots in priority order, then the
+# repeatable "refill" goal re-fires whenever a completed tech frees a slot,
+# with the model choosing the best available tech (re-assigning a FIXED tech
+# would click an already-researching entry and verify-fail, so refill is a
+# judgment call by design). Build civilian factories into high-slot states
+# first. Civ->mil switchover and more states/techs are future additions
+# (enum member + calibrated point, no code change).
 
-# --- research: fill every slot ---
+# --- research: fill the three 1936 slots in priority order ---
 [[goal]]
 id = "research_construction_1"
 tool = "assign_research"
@@ -28,6 +33,14 @@ id = "research_electronics_1"
 tool = "assign_research"
 tech = "electronics_1"
 precondition = "idle_research_slot"
+
+# --- research: refill any slot that frees up (never blocks later goals) ---
+[[goal]]
+id = "research_refill"
+tool = "assign_research"
+precondition = "idle_research_slot"
+repeatable = true
+needs_judgment = true
 
 # --- construction: civilian factories into high-slot states ---
 [[goal]]

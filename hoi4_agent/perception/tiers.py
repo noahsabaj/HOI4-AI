@@ -52,8 +52,13 @@ def classify_panel(
     templates: TemplateStore,
     threshold: float,
 ) -> tuple[PanelId, float]:
+    """Argmax over the mutually-exclusive MAIN panels only.
+
+    Blocking overlays (event popup, pause menu) are detected independently by
+    ``detect_popup`` / ``detect_pause_menu`` — inside an argmax a popup could be
+    masked by a stronger panel score and become invisible while blocking input.
+    """
     candidates = {
-        PanelId.EVENT_POPUP: "event_popup",
         PanelId.CONSTRUCTION: "construction_panel",
         PanelId.RESEARCH: "research_panel",
     }
@@ -67,6 +72,45 @@ def classify_panel(
     return PanelId.NONE, best_score
 
 
+def _roi_present(
+    full_img: Image.Image,
+    geo: WindowGeometry,
+    calib: Calibration,
+    templates: TemplateStore,
+    roi_name: str,
+    threshold: float,
+) -> tuple[bool, float]:
+    score = roi_score(full_img, geo, calib, templates, roi_name)
+    return score >= threshold, score
+
+
+def detect_popup(
+    full_img: Image.Image,
+    geo: WindowGeometry,
+    calib: Calibration,
+    templates: TemplateStore,
+    threshold: float,
+) -> tuple[bool, float]:
+    """Independent event-popup check — never competes with panel scores."""
+    return _roi_present(full_img, geo, calib, templates, "event_popup", threshold)
+
+
+def detect_pause_menu(
+    full_img: Image.Image,
+    geo: WindowGeometry,
+    calib: Calibration,
+    templates: TemplateStore,
+    threshold: float,
+) -> tuple[bool, float]:
+    """The escape/game menu — otherwise undetectable and it swallows hotkeys."""
+    return _roi_present(full_img, geo, calib, templates, "pause_menu", threshold)
+
+
+# Minimum score separation between pause_on/pause_off before we trust the argmax
+# — the two templates share most of their pixels, so a near-tie is a guess.
+PAUSE_MARGIN = 0.05
+
+
 def read_pause(
     full_img: Image.Image,
     geo: WindowGeometry,
@@ -76,10 +120,35 @@ def read_pause(
 ) -> tuple[bool | None, float]:
     """True if paused, False if running, None if uncertain.
 
-    Uses ``pause_on`` / ``pause_off`` templates over the ``pause`` ROI.
+    Uses ``pause_on`` / ``pause_off`` templates over the ``pause`` ROI. Uncertain
+    when both score below ``threshold`` OR when they score within PAUSE_MARGIN
+    of each other (a coin-flip must never become a fact).
     """
     on = roi_score(full_img, geo, calib, templates, "pause", "pause_on")
     off = roi_score(full_img, geo, calib, templates, "pause", "pause_off")
-    if max(on, off) < threshold:
-        return None, max(on, off)
-    return (on >= off), max(on, off)
+    best = max(on, off)
+    if best < threshold or abs(on - off) < PAUSE_MARGIN:
+        return None, best
+    return (on > off), best
+
+
+def read_speed(
+    full_img: Image.Image,
+    geo: WindowGeometry,
+    calib: Calibration,
+    templates: TemplateStore,
+    threshold: float,
+) -> tuple[int | None, float]:
+    """Game speed 1..5 via whole-ROI template argmax (``speed_1``..``speed_5``).
+
+    Deterministic T0: the indicator renders as chevrons, not digits, so it is a
+    5-way template classification, not a numeric read.
+    """
+    best_speed, best_score = None, 0.0
+    for s in range(1, 6):
+        score = roi_score(full_img, geo, calib, templates, "speed", f"speed_{s}")
+        if score > best_score:
+            best_speed, best_score = s, score
+    if best_score >= threshold:
+        return best_speed, best_score
+    return None, best_score

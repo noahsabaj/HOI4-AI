@@ -19,6 +19,9 @@ from ..trace.writer import JsonlTraceWriter
 
 def run_offline(cfg: Config) -> int:
     """Drive the real controller end-to-end against the in-memory FakeGame."""
+    from ..brain.decide import Brain
+    from ..brain.llm import ScriptedBackend
+
     calib = default_calibration(cfg.display.width, cfg.display.height)
     fg = FakeGame(calibration=calib)
     ctx = AgentContext(
@@ -28,9 +31,12 @@ def run_offline(cfg: Config) -> int:
         capture=fg,
         calibration=calib,
         templates=TemplateStore(),
-        brain=None,
+        # Scripted judgment: the playbook's repeatable research_refill goal asks
+        # the brain to pick a tech; offline that answer is canned.
+        brain=Brain(ScriptedBackend(['{"tech": "industry_2"}'])),
         mode=cfg.mode,
         perceive=fg.perceive,
+        sleep=lambda _s: None,  # no real settle delays against the fake
     )
     goals = load_playbook(cfg.paths.playbook)
     tmp = Path(tempfile.mkdtemp(prefix="hoi4_smoke_"))
@@ -40,8 +46,10 @@ def run_offline(cfg: Config) -> int:
                     sleep=lambda _s: None)
     done = all_done(goals, final)
     records = JsonlTraceWriter.read(trace)
-    print(f"[offline smoke] completed={done} goals={len(final.completed_goal_ids)}/{len(goals)} "
-          f"cycles={final.cycle_count} queue={fg.queue} trace_lines={len(records)}")
+    one_shots = sum(1 for g in goals if not g.repeatable)
+    print(f"[offline smoke] completed={done} one-shot goals={len(final.completed_goal_ids)}/{one_shots} "
+          f"(+{len(goals) - one_shots} repeatable) cycles={final.cycle_count} "
+          f"queue={fg.queue} trace_lines={len(records)}")
     print(f"[offline smoke] trace: {trace}")
     return 0 if done else 1
 
@@ -70,7 +78,7 @@ def run_live(cfg: Config, title: str = "Hearts of Iron") -> int:
     print("[live smoke] DPI:", win.ensure_dpi_aware())
     locator, capture, inp = win.build_io(cfg.timing.action_dwell_ms)
 
-    geo = step("find_window", lambda: locator.find(title))
+    geo = step("find_window", lambda: locator.find(title, (cfg.display.width, cfg.display.height)))
     if geo is None:
         print("[live smoke] game window not found — is HOI4 running?")
         return 1
@@ -91,11 +99,63 @@ def run_live(cfg: Config, title: str = "Hearts of Iron") -> int:
         std = float(np.asarray(img.convert("L")).std())
         return f"saved {p} (std={std:.1f}{' — possibly exclusive fullscreen!' if std < 1 else ''})"
 
+    def _move_cursor_center():
+        inp.click(geo, geo.full_crop(), 500, 500)
+        return win.Win32Input.get_cursor_pos()
+
+    def _pause_toggle():
+        inp.key("space")
+        inp.key("space")
+        return "sent space x2"
+
+    def _key_f1():
+        inp.key("f1")
+        return "sent f1"
+
     step("capture", _capture)
     step("focus", lambda: inp.focus(geo))
-    step("move_cursor_center", lambda: (inp.click(geo, geo.full_crop(), 500, 500), win.Win32Input.get_cursor_pos())[1])
-    step("key_pause_toggle", lambda: (inp.key("space"), inp.key("space"), "sent space x2")[2])
-    step("key_f1", lambda: (inp.key("f1"), "sent f1")[1])
+    step("move_cursor_center", _move_cursor_center)
+    step("key_pause_toggle", _pause_toggle)
+    step("key_f1", _key_f1)
 
+    def _verify_hotkeys() -> None:
+        """The tooling macros.py demands: press each panel hotkey, let perception
+        confirm the panel actually opened, then reset. Needs calibration+templates."""
+        nonlocal ok
+        from ..calibration import load_calibration
+        from ..context import AgentContext
+        from ..enums import ToolName
+        from ..errors import AgentError
+        from ..schemas import Intent
+        from ..tools.executor import execute
+
+        try:
+            calib = load_calibration(cfg.paths.calibration)
+        except AgentError as e:
+            print(f"[live smoke] hotkey verification SKIPPED: {e}")
+            return
+        templates = TemplateStore.load_dir(cfg.paths.templates)
+        missing = [n for n in ("construction_panel", "research_panel") if not templates.has(n)]
+        if missing:
+            print(f"[live smoke] hotkey verification SKIPPED: missing templates {missing} (run calibrate)")
+            return
+        ctx = AgentContext.build(
+            config=cfg, geometry=geo, input=inp, capture=capture,
+            calibration=calib, templates=templates, brain=None,
+        )
+        print("[live smoke] hotkey verification (opens/closes panels in-game):")
+        for label, intent in (
+            ("construction (T)", Intent(ToolName.OPEN_CONSTRUCTION)),
+            ("research (W)", Intent(ToolName.OPEN_RESEARCH)),
+            ("close/reset (Esc + map mode)", Intent(ToolName.CLOSE_PANELS)),
+        ):
+            r = execute(intent, ctx)
+            if r.ok:
+                print(f"[live smoke]   PASS hotkey {label}: {r.assertion}")
+            else:
+                ok = False
+                print(f"[live smoke]   FAIL hotkey {label}: {r.verdict.value} — {r.assertion}")
+
+    _verify_hotkeys()
     print(f"[live smoke] {'ALL PASS' if ok else 'SOME FAILURES'}")
     return 0 if ok else 1

@@ -25,11 +25,21 @@ from .errors import IntentValidationError
 # --- in-game date -----------------------------------------------------------
 @dataclass(frozen=True, slots=True, order=True)
 class GameDate:
-    """Ordered by (year, month, day) — drives date-based cadence."""
+    """Ordered by (year, month, day) — drives date-based cadence.
+
+    Month/day are range-checked at construction so a misread (e.g. a VLM
+    hallucinating month 13) can never become an orderable-but-wrong date.
+    """
 
     year: int
     month: int
     day: int
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.month <= 12):
+            raise ValueError(f"month {self.month} out of range 1..12")
+        if not (1 <= self.day <= 31):
+            raise ValueError(f"day {self.day} out of range 1..31")
 
     @classmethod
     def from_str(cls, s: str) -> "GameDate":
@@ -56,6 +66,13 @@ class GameDate:
 class Precondition:
     kind: PreconditionKind = PreconditionKind.ALWAYS
     date: GameDate | None = None
+
+    @property
+    def handler_enforced(self) -> bool:
+        """True if the tool handler re-checks this precondition itself (slot facts
+        are only readable with their panel open, so the self-contained tool — which
+        opens that panel — is the place that can actually decide)."""
+        return self.kind in (PreconditionKind.FREE_CIV_SLOT, PreconditionKind.IDLE_RESEARCH_SLOT)
 
     def satisfied(self, world: "WorldState") -> bool | None:
         """True/False if decidable from the world, or None if the needed fact is uncertain."""
@@ -84,7 +101,7 @@ class Intent:
     paused: bool | None = None
 
     def to_dict(self) -> dict:
-        d = {"tool": self.tool.value}
+        d: dict[str, object] = {"tool": self.tool.value}
         for k in ("building", "state", "tech"):
             v = getattr(self, k)
             if v is not None:
@@ -98,7 +115,6 @@ class Intent:
 
 # tool -> required arg attribute(s)
 _REQUIRED_ARGS: dict[ToolName, tuple[str, ...]] = {
-    ToolName.SELECT_BUILDING: ("building",),
     ToolName.BUILD_IN_STATE: ("state",),
     ToolName.ASSIGN_RESEARCH: ("tech",),
     ToolName.SET_SPEED: ("speed",),
@@ -140,6 +156,7 @@ class WorldState:
     idle_research_slots: int | None = None
     construction_queue_len: int | None = None
     event_popup: bool = False
+    pause_menu: bool = False
     confidence: dict[str, float] = field(default_factory=dict)
     captured_at: float = 0.0
 
@@ -153,6 +170,7 @@ class WorldState:
             "idle_research_slots": self.idle_research_slots,
             "construction_queue_len": self.construction_queue_len,
             "event_popup": self.event_popup,
+            "pause_menu": self.pause_menu,
             "confidence": dict(self.confidence),
             "captured_at": self.captured_at,
         }
@@ -169,6 +187,10 @@ class ToolResult:
     error: Exception | None = None
     retries: int = 0
     latency_s: float = 0.0
+    # False only when an UNCERTAIN result was produced AFTER a non-idempotent
+    # mutation (e.g. clicked, then couldn't read the effect): re-executing the
+    # handler could repeat the mutation, so retry must not re-run it.
+    retry_safe: bool = True
 
     @property
     def ok(self) -> bool:
@@ -249,6 +271,7 @@ class TraceRecord:
     cycle: int
     ts: float
     verdict: str
+    kind: str = "action"  # "action" | "advance" | "error"
     date: str | None = None
     plan_step: str | None = None
     pre_screenshot: str | None = None

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import requests
 
-from ..errors import BrainError, OllamaTimeoutError, OllamaUnavailableError
+from ..errors import BackendTimeoutError, BackendUnavailableError, BrainError
 
 
 class OpenAICompatBackend:
@@ -43,9 +43,9 @@ class OpenAICompatBackend:
                 timeout=timeout or self.timeout_s,
             )
         except requests.exceptions.ConnectionError as e:
-            raise OllamaUnavailableError(f"cannot reach server at {self.endpoint}") from e
+            raise BackendUnavailableError(f"cannot reach server at {self.endpoint}") from e
         except requests.exceptions.Timeout as e:
-            raise OllamaTimeoutError(f"call timed out after {timeout or self.timeout_s}s") from e
+            raise BackendTimeoutError(f"call timed out after {timeout or self.timeout_s}s") from e
         except requests.exceptions.RequestException as e:  # pragma: no cover
             raise BrainError(f"request failed: {e}") from e
         if r.status_code != 200:

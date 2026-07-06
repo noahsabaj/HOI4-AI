@@ -25,9 +25,9 @@ def cfg():
 def scripted_ctx(cfg):
     """Factory: build an AgentContext whose perceive() pops scripted WorldStates."""
 
-    def _make(states):
+    def _make(states, focus_ok: bool = True):
         it = iter(states)
-        inp = RecordingInput()
+        inp = RecordingInput(focus_ok=focus_ok)
         ctx = AgentContext(
             config=cfg,
             geometry=WindowGeometry(1, 0, 0, cfg.display.width, cfg.display.height),
@@ -37,7 +37,8 @@ def scripted_ctx(cfg):
             templates=TemplateStore(),
             brain=None,
             mode=cfg.mode,
-            perceive=lambda read_numbers=True: next(it),
+            perceive=lambda read_numbers=True, fields=None: next(it),
+            sleep=lambda _s: None,
         )
         return ctx, inp
 

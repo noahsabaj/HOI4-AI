@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import requests
 
-from ..errors import BrainError, OllamaTimeoutError, OllamaUnavailableError
+from ..errors import BackendTimeoutError, BackendUnavailableError, BrainError
 
 
 class OllamaBackend:
@@ -31,9 +31,9 @@ class OllamaBackend:
                 timeout=timeout or self.timeout_s,
             )
         except requests.exceptions.ConnectionError as e:
-            raise OllamaUnavailableError(f"cannot reach Ollama at {self.endpoint}") from e
+            raise BackendUnavailableError(f"cannot reach Ollama at {self.endpoint}") from e
         except requests.exceptions.Timeout as e:
-            raise OllamaTimeoutError(f"Ollama call timed out after {timeout or self.timeout_s}s") from e
+            raise BackendTimeoutError(f"Ollama call timed out after {timeout or self.timeout_s}s") from e
         except requests.exceptions.RequestException as e:  # pragma: no cover - rare
             raise BrainError(f"Ollama request failed: {e}") from e
         if r.status_code != 200:

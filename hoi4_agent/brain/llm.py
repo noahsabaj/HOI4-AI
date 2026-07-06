@@ -24,10 +24,19 @@ class LLMBackend(Protocol):
         ...
 
 
-def encode_image(img: Image.Image, fmt: str = "JPEG", quality: int = 70) -> str:
-    """PIL image -> base64 string (JPEG by default)."""
+def encode_image(img: Image.Image, fmt: str = "PNG", quality: int = 85) -> str:
+    """PIL image -> base64 string.
+
+    PNG by default: numeric crops are tiny and JPEG artifacts on 20-px digits
+    corrupt exactly the reads everything depends on. Pass ``fmt="JPEG"`` for
+    full-frame judgment images where size matters (quality applies then).
+    """
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format=fmt, quality=quality)
+    rgb = img.convert("RGB")
+    if fmt.upper() == "JPEG":
+        rgb.save(buf, format="JPEG", quality=quality)
+    else:
+        rgb.save(buf, format=fmt)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
