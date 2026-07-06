@@ -16,6 +16,11 @@ dev = ["pytest>=7.0", "ruff>=0.4", "mypy>=1.10"]
 # Optional OCR middle tier for numeric reads (glyphs -> OCR -> VLM).
 ocr = ["rapidocr-onnxruntime>=1.4"]
 
+[tool.setuptools.packages.find]
+# Flat layout with a sibling config/ dir: name the package explicitly so
+# setuptools auto-discovery doesn't refuse the build.
+include = ["hoi4_agent*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
