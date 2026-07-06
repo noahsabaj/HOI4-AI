@@ -160,6 +160,52 @@ def cmd_calibrate(cfg: Config, args) -> int:
     return calibrate.run(cfg, args.title)
 
 
+def cmd_save_audit(cfg: Config, args) -> int:
+    from ..eval.savefile import read_save_facts
+    from ..trace.writer import JsonlTraceWriter
+
+    facts = read_save_facts(args.save, country=args.country)
+    print(f"save facts for {facts.country}:")
+    print(f"  date:                {facts.date or '(not found)'}")
+    print(f"  researching:         {', '.join(facts.researching) if facts.researching else '(not found)'}")
+    print(f"  civilian factories:  {facts.civilian_factories if facts.civilian_factories is not None else '(not found)'}")
+    print(f"  construction lines:  {facts.construction_lines if facts.construction_lines is not None else '(not found)'}")
+    if facts.missing:
+        print(f"  could not extract:   {', '.join(facts.missing)} (schema drift? inspect the save)")
+
+    if args.trace:
+        records = JsonlTraceWriter.read(args.trace)
+        traced_date = next((r.date for r in reversed(records) if r.date), None)
+        if traced_date is None or facts.date is None:
+            print("trace cross-check: skipped (no date on one side)")
+        elif traced_date == facts.date:
+            print(f"trace cross-check: MATCH (both {traced_date})")
+        else:
+            print(f"trace cross-check: MISMATCH (trace {traced_date} vs save {facts.date})")
+    return 0
+
+
+def cmd_gui_import(cfg: Config, args) -> int:
+    from ..calibration import dump_toml
+    from ..gui_import import draft_calibration, load_elements
+
+    elements = load_elements(args.path)
+    print(f"parsed {len(elements)} positioned element(s)")
+    calib, report = draft_calibration(elements, args.width, args.height)
+    for roi, source in report["mapped"].items():
+        print(f"  mapped {roi!r} <- {source}")
+    for line in report["skipped"]:
+        print(f"  skipped {line}")
+    print(f"  still needing manual calibration: {', '.join(report['unmapped_rois']) or 'none'}")
+    if args.out:
+        Path(args.out).write_text(dump_toml(calib), encoding="utf-8")
+        print(f"wrote DRAFT calibration to {args.out} — hand-verify with `calibrate` before use")
+    if not report["mapped"]:
+        print("no elements matched ELEMENT_MAP — extend hoi4_agent/gui_import.py with "
+              "names from your game version's interface/*.gui")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="hoi4_agent")
     p.add_argument("--config", default="config/agent.toml")
@@ -184,6 +230,19 @@ def main(argv=None) -> int:
     s = sub.add_parser("replay", help="re-run saved trace frames through the model")
     s.add_argument("trace")
     s.set_defaults(func=cmd_replay)
+
+    s = sub.add_parser("save-audit", help="parse a text HOI4 save for ground-truth facts")
+    s.add_argument("save", help="path to a non-ironman .hoi4 save file")
+    s.add_argument("--country", default="GER")
+    s.add_argument("--trace", default=None, help="trace.jsonl to cross-check against")
+    s.set_defaults(func=cmd_save_audit)
+
+    s = sub.add_parser("gui-import", help="EXPERIMENTAL: draft calibration from .gui interface files")
+    s.add_argument("path", help=".gui file or directory containing them")
+    s.add_argument("--out", default=None, help="write the draft calibration TOML here")
+    s.add_argument("--width", type=int, default=2560)
+    s.add_argument("--height", type=int, default=1440)
+    s.set_defaults(func=cmd_gui_import)
 
     s = sub.add_parser("run", help="play Germany-1936 construction + research")
     s.add_argument("--title", default="Hearts of Iron")
