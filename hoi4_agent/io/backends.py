@@ -15,7 +15,9 @@ from ..geometry import CropRect, WindowGeometry
 
 @runtime_checkable
 class WindowLocator(Protocol):
-    def find(self, title_substr: str) -> WindowGeometry | None: ...
+    def find(
+        self, title_substr: str, expected_client: tuple[int, int] | None = None
+    ) -> WindowGeometry | None: ...
 
 
 @runtime_checkable
@@ -37,7 +39,9 @@ class StubLocator:
     def __init__(self, geo: WindowGeometry | None) -> None:
         self._geo = geo
 
-    def find(self, title_substr: str) -> WindowGeometry | None:
+    def find(
+        self, title_substr: str, expected_client: tuple[int, int] | None = None
+    ) -> WindowGeometry | None:
         return self._geo
 
 
@@ -69,6 +73,35 @@ class RecordingInput:
 
 # A null backend is just a recorder you ignore.
 NullInput = RecordingInput
+
+
+class InputRecorder:
+    """Wraps a real InputBackend and journals every event for the trace.
+
+    ``drain()`` returns-and-clears, so the controller can attribute the events
+    between two drains to one cycle's TraceRecord.
+    """
+
+    def __init__(self, inner: InputBackend) -> None:
+        self.inner = inner
+        self._events: list[dict] = []
+
+    def focus(self, geo: WindowGeometry) -> bool:
+        ok = bool(self.inner.focus(geo))
+        self._events.append({"kind": "focus", "ok": ok})
+        return ok
+
+    def key(self, name: str) -> None:
+        self.inner.key(name)
+        self._events.append({"kind": "key", "name": name})
+
+    def click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int) -> None:
+        self.inner.click(geo, crop, nx, ny)
+        self._events.append({"kind": "click", "nx": nx, "ny": ny})
+
+    def drain(self) -> list[dict]:
+        out, self._events = self._events, []
+        return out
 
 
 class FakeCapture:

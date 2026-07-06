@@ -35,9 +35,13 @@ def ncc(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def match_resized(roi: Image.Image, template_gray: np.ndarray) -> float:
-    """NCC of an ROI crop against a stored template, resizing the ROI to match."""
+    """NCC of an ROI crop against a stored template, resizing the ROI to match.
+
+    BILINEAR explicitly: PIL's resize default is NEAREST, whose aliasing noise
+    depresses NCC whenever the ROI and template sizes differ.
+    """
     th, tw = template_gray.shape
-    roi_gray = to_gray_f32(roi.resize((tw, th)))
+    roi_gray = to_gray_f32(roi.resize((tw, th), Image.Resampling.BILINEAR))
     return ncc(roi_gray, template_gray)
 
 

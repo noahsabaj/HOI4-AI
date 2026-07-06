@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from ..config import Config, load_config
@@ -19,7 +20,7 @@ def _build_live_ctx(cfg: Config, title: str):
     from ..perception.templates import TemplateStore
 
     locator, capture, inp = win.build_io(cfg.timing.action_dwell_ms)
-    geo = locator.find(title)
+    geo = locator.find(title, (cfg.display.width, cfg.display.height))
     if geo is None:
         return None
     calib = load_calibration(cfg.paths.calibration)
@@ -33,26 +34,45 @@ def _build_live_ctx(cfg: Config, title: str):
 
 def cmd_run(cfg: Config, args) -> int:
     from ..controller.loop import run
+    from ..io.backends import InputRecorder
     from ..playbook.loader import load_playbook
     from ..playbook.state import load_state
+    from ..preflight import preflight
     from ..trace.writer import JsonlTraceWriter
 
     ctx = _build_live_ctx(cfg, args.title)
     if ctx is None:
         print("game window not found — is HOI4 running at the configured resolution?")
         return 1
+    ctx.input = InputRecorder(ctx.input)  # journal every key/click into the trace
     goals = load_playbook(cfg.paths.playbook)
+
+    errors, warnings = preflight(cfg, ctx.calibration, ctx.templates, goals)
+    for warning in warnings:
+        print(f"preflight WARN: {warning}")
+    if errors:
+        for err in errors:
+            print(f"preflight ERROR: {err}")
+        print(f"preflight: {len(errors)} error(s) — not starting the live loop.")
+        return 1
+
     out = Path(cfg.paths.trace_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    state_path = str(out / "plan_state.json")
+    # One directory per run (trace + frames); plan state stays shared for resume.
+    run_dir = out / time.strftime("run_%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out / "plan_state.json"
+    if args.fresh and state_path.exists():
+        state_path.unlink()
+        print("(--fresh: cleared plan_state.json)")
     state = load_state(state_path)
-    with JsonlTraceWriter(out / "trace.jsonl", screenshot_dir=out / "frames") as w:
+    with JsonlTraceWriter(run_dir / "trace.jsonl", screenshot_dir=run_dir / "frames") as w:
         try:
-            final = run(ctx, goals, state, writer=w, state_path=state_path, max_cycles=args.max_cycles)
+            final = run(ctx, goals, state, writer=w, state_path=str(state_path), max_cycles=args.max_cycles)
         except HaltAndFlag as e:
             print(f"HALTED: {e}\ntrace: {e.trace_ref}")
             return 2
     print("done. completed:", list(final.completed_goal_ids))
+    print(f"trace: {run_dir / 'trace.jsonl'}")
     return 0
 
 
@@ -72,12 +92,25 @@ def cmd_eval(cfg: Config, args) -> int:
 
 def cmd_replay(cfg: Config, args) -> int:
     from ..brain.decide import Brain, build_backend
+    from ..calibration import load_calibration
     from ..eval.replay import replay
 
     brain = Brain(build_backend(cfg.llm))
+    # Saved frames are full client captures; feed the model the calibrated date
+    # crop (the same tight region the live loop reads), not the whole frame.
+    date_frac = None
+    try:
+        date_frac = load_calibration(cfg.paths.calibration).rois.get("date")
+    except AgentError:
+        print("(no calibration found — probing full frames)")
 
     def probe(img):
-        d = brain.read_date(img)
+        crop = img
+        if date_frac is not None:
+            fx0, fy0, fx1, fy1 = date_frac
+            w, h = img.size
+            crop = img.crop((round(fx0 * w), round(fy0 * h), round(fx1 * w), round(fy1 * h)))
+        d = brain.read_date(crop)
         return d.to_str() if d else None
 
     print(json.dumps(replay(args.trace, probe), indent=2))
@@ -120,6 +153,7 @@ def main(argv=None) -> int:
     s = sub.add_parser("run", help="play Germany-1936 construction + research")
     s.add_argument("--title", default="Hearts of Iron")
     s.add_argument("--max-cycles", type=int, default=1000)
+    s.add_argument("--fresh", action="store_true", help="discard persisted plan state and start over")
     s.set_defaults(func=cmd_run)
 
     args = p.parse_args(argv)

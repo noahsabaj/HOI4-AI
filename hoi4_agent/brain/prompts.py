@@ -2,12 +2,13 @@
 
 Each returns ``(system, user, schema)``. Schemas constrain the model's structured
 output; enum lists are generated from live enum members so schema and validator
-cannot drift. The model is always fed a tight crop, never the full frame.
+cannot drift. READ prompts (numbers/dates) see a tight ROI crop; DECISION
+prompts (which state/tech) see the full frame — a map choice needs the map.
 """
 
 from __future__ import annotations
 
-from ..enums import GermanState, Tech
+from ..enums import BuildingType, GermanState, Tech
 
 _SYSTEM_READ = (
     "You read a small cropped region of a Hearts of Iron IV screenshot and report "
@@ -49,10 +50,13 @@ def date_prompt() -> tuple[str, str, dict]:
     return _SYSTEM_READ, user, schema
 
 
-def which_state_prompt(options: list[GermanState]) -> tuple[str, str, dict]:
+def which_state_prompt(
+    options: list[GermanState], building: BuildingType | None = None
+) -> tuple[str, str, dict]:
     values = [o.value for o in options]
+    building_label = (building or BuildingType.CIVILIAN_FACTORY).value.replace("_", " ")
     user = (
-        "Pick the single best German state to build a civilian factory in — prefer "
+        f"Pick the single best German state to build a {building_label} in — prefer "
         "the state with the most free building slots. Choose exactly one of: "
         f"{values}. Reply {{\"state\": \"<one of the options>\"}}."
     )

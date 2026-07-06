@@ -44,10 +44,37 @@ def test_read_date_ok_and_sentinel():
     assert _brain('{"year":-1,"month":0,"day":0}').read_date(CROP) is None
 
 
+def test_read_date_out_of_range_is_none():
+    # A hallucinated month/day must become uncertain, not an orderable wrong date.
+    assert _brain('{"year":1936,"month":13,"day":1}').read_date(CROP) is None
+    assert _brain('{"year":1936,"month":1,"day":40}').read_date(CROP) is None
+
+
+def test_last_exchange_recorded_for_trace():
+    b = _brain('{"value": 3}')
+    assert b.last_raw is None
+    b.read_number(CROP, "free_civ_slots")
+    assert b.last_raw == '{"value": 3}'
+    assert b.last_prompt is not None and "free_civ_slots" in b.last_prompt
+
+
 def test_which_state_valid_and_invalid():
     assert _brain('{"state":"ruhr"}').which_state(CROP, list(GermanState)) is GermanState.RUHR
     with pytest.raises(EnumError):
         _brain('{"state":"atlantis"}').which_state(CROP, list(GermanState))
+
+
+def test_which_state_prompt_names_the_actual_building():
+    from hoi4_agent.brain.llm import ScriptedBackend
+    from hoi4_agent.enums import BuildingType
+
+    be = ScriptedBackend(['{"state":"ruhr"}'])
+    Brain(be).which_state(CROP, list(GermanState), BuildingType.MILITARY_FACTORY)
+    assert "military factory" in be.calls[0]["user"]
+
+    be2 = ScriptedBackend(['{"state":"ruhr"}'])
+    Brain(be2).which_state(CROP, list(GermanState))  # default stays civilian
+    assert "civilian factory" in be2.calls[0]["user"]
 
 
 def test_which_tech_and_yes_no():

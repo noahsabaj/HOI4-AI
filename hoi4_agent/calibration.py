@@ -26,10 +26,31 @@ ROI_NAMES = (
     "construction_panel",
     "research_panel",
     "event_popup",
+    "pause_menu",
     "free_civ_slots",
     "idle_research_slots",
     "construction_queue",
 )
+
+# Template PNGs perception matches against. REQUIRED ones break T0 (panel/pause/
+# blocking-overlay classification) when absent — preflight refuses to run live
+# without them. Optional ones degrade gracefully: speed falls back to
+# unreadable, numeric reads fall back to the VLM (preflight warns).
+REQUIRED_TEMPLATES = (
+    "construction_panel",
+    "research_panel",
+    "event_popup",
+    "pause_menu",
+    "pause_on",
+    "pause_off",
+)
+SPEED_TEMPLATES = tuple(f"speed_{s}" for s in range(1, 6))
+GLYPH_TEMPLATE_PREFIX = "glyph_"
+
+# Named UI click-points (calibrated, optional — features degrade without them):
+#   event_option   — an event popup's first/default option button (dismissal)
+#   minimap_anchor — a fixed minimap spot over Germany (camera re-anchoring)
+UI_POINT_NAMES = ("event_option", "minimap_anchor")
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +61,7 @@ class Calibration:
     building_buttons: dict[str, tuple[int, int]] = field(default_factory=dict)
     state_points: dict[str, tuple[int, int]] = field(default_factory=dict)
     tech_points: dict[str, tuple[int, int]] = field(default_factory=dict)
+    ui_points: dict[str, tuple[int, int]] = field(default_factory=dict)
     home_map_mode: str = MapMode.DEFAULT.value
 
     def roi(self, name: str) -> tuple[float, float, float, float]:
@@ -55,6 +77,10 @@ class Calibration:
 
     def tech_point(self, t: Tech) -> tuple[int, int]:
         return self._pt(self.tech_points, t.value, "tech")
+
+    def ui_point(self, name: str) -> tuple[int, int] | None:
+        """Optional named UI point; None means the feature degrades gracefully."""
+        return self.ui_points.get(name)
 
     @staticmethod
     def _pt(d: dict[str, tuple[int, int]], key: str, kind: str) -> tuple[int, int]:
@@ -98,6 +124,7 @@ def load_calibration(path: str | Path) -> Calibration:
         building_buttons={k: _as_point(v) for k, v in raw.get("building_buttons", {}).items()},
         state_points={k: _as_point(v) for k, v in raw.get("state_points", {}).items()},
         tech_points={k: _as_point(v) for k, v in raw.get("tech_points", {}).items()},
+        ui_points={k: _as_point(v) for k, v in raw.get("ui_points", {}).items()},
         home_map_mode=raw.get("home_view", {}).get("map_mode", MapMode.DEFAULT.value),
     )
 
@@ -112,6 +139,7 @@ def dump_toml(c: Calibration) -> str:
         ("building_buttons", c.building_buttons),
         ("state_points", c.state_points),
         ("tech_points", c.tech_points),
+        ("ui_points", c.ui_points),
     ):
         lines.append(f"[{section}]")
         for k, (x, y) in d.items():
@@ -136,6 +164,7 @@ def default_calibration(width: int = 2560, height: int = 1440) -> Calibration:
         "construction_panel": (0.00, 0.10, 0.22, 0.95),
         "research_panel": (0.10, 0.10, 0.95, 0.85),
         "event_popup": (0.30, 0.30, 0.70, 0.70),
+        "pause_menu": (0.35, 0.25, 0.65, 0.75),
         "free_civ_slots": (0.02, 0.12, 0.20, 0.16),
         "idle_research_slots": (0.10, 0.86, 0.95, 0.92),
         "construction_queue": (0.78, 0.12, 0.98, 0.90),
@@ -156,5 +185,6 @@ def default_calibration(width: int = 2560, height: int = 1440) -> Calibration:
         building_buttons=grid([b.value for b in BuildingType], 220),
         state_points=grid([s.value for s in GermanState], 450),
         tech_points=grid([t.value for t in Tech], 350),
+        ui_points={"event_option": (500, 620), "minimap_anchor": (930, 930)},
         home_map_mode=MapMode.DEFAULT.value,
     )

@@ -35,3 +35,10 @@ def test_invalid_mode(tmp_path):
     bad.write_text('mode = "wat"\n', encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(bad)
+
+
+def test_purist_mode_is_rejected_not_silently_robust(tmp_path):
+    bad = tmp_path / "purist.toml"
+    bad.write_text('mode = "purist"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="purist"):
+        load_config(bad)

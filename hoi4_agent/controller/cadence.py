@@ -3,7 +3,8 @@
 Pause is toggled only when the observed state differs from the desired one (the
 tool ``ensure_paused`` enforces this). Time advance unpauses, sets the run speed,
 and polls the *screen-read* in-game date until it reaches the target — never a
-blind fixed sleep that can drift.
+blind fixed sleep that can drift. Every poll reads only the date (one field, one
+deterministic read on the glyph path), not the full fact set.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import time
 from typing import TYPE_CHECKING, Callable
 
 from ..enums import ToolName
+from ..errors import ControllerError
 from ..schemas import GameDate, Intent, ToolResult
 from ..tools.executor import execute
 
@@ -19,7 +21,7 @@ if TYPE_CHECKING:
     from ..context import AgentContext
 
 POLL_WAIT_S = 2.0       # real seconds between date reads while time advances
-BLIND_POLLS = 3         # if the date is unreadable, advance this many polls then re-pause
+BLIND_POLLS = 3         # with no target, advance only this many polls then re-pause
 
 
 def ensure_paused(ctx: "AgentContext", desired: bool) -> ToolResult:
@@ -36,22 +38,32 @@ def run_to_date(
 ) -> GameDate | None:
     """Advance in-game time until the read date >= target, then re-pause.
 
-    If ``target`` is None (date currently unreadable), advance a few blind polls so
-    *some* time passes, then re-pause. Returns the last date read (or None).
+    If ``target`` is None (date unreadable at the call site), advance exactly
+    ``BLIND_POLLS`` polls so *some* time passes, then re-pause — regardless of
+    whether the date becomes readable mid-advance. Returns the last date read.
+
+    Raises ControllerError if the game cannot be re-paused afterward (the loop's
+    failure path recovers/halts rather than acting with time running).
     """
-    execute(Intent(ToolName.ENSURE_PAUSED, paused=False), ctx)
-    execute(Intent(ToolName.SET_SPEED, speed=ctx.config.timing.run_speed), ctx)
+    unpaused = execute(Intent(ToolName.ENSURE_PAUSED, paused=False), ctx)
+    if not unpaused.ok:
+        # Could not unpause: no time can pass, so don't poll for it. The game is
+        # still paused, which is the safe state — report nothing advanced.
+        return None
+    execute(Intent(ToolName.SET_SPEED, speed=ctx.config.timing.run_speed), ctx)  # best-effort
     last: GameDate | None = None
     polls = 0
     while polls < max_polls:
-        world = ctx.perceive()
+        world = ctx.perceive(fields={"date"})
         if world.date is not None:
             last = world.date
             if target is not None and world.date >= target:
                 break
-        elif target is None and polls >= BLIND_POLLS:
+        if target is None and polls >= BLIND_POLLS:
             break
         polls += 1
         sleep(wait_s)
-    execute(Intent(ToolName.ENSURE_PAUSED, paused=True), ctx)
+    repaused = execute(Intent(ToolName.ENSURE_PAUSED, paused=True), ctx)
+    if not repaused.ok:
+        raise ControllerError(f"failed to re-pause after time advance: {repaused.assertion}")
     return last

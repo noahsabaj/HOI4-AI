@@ -20,7 +20,7 @@ import mss
 from PIL import Image
 
 from ..errors import AgentError
-from ..geometry import NORM_SCALE, CropRect, WindowGeometry
+from ..geometry import CropRect, WindowGeometry
 
 # --- DLL handles (guarded so the module imports anywhere) -------------------
 try:
@@ -150,10 +150,36 @@ def ensure_dpi_aware() -> str:
 _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
+def rank_window_candidates(
+    candidates: list[tuple[int, str, WindowGeometry]],
+    title_substr: str,
+    expected_client: tuple[int, int] | None,
+) -> WindowGeometry | None:
+    """Pick the best (z_index, title, geometry) candidate.
+
+    Ranking (lower wins): exact title match > client size == expected > Z-order.
+    Substring matching alone is dangerous — a browser tab, the Paradox launcher,
+    or the agent's own terminal (whose title can echo the command line) all
+    contain "Hearts of Iron"; the game is the one at the locked resolution.
+    Pure function so the ranking is unit-testable off-Windows.
+    """
+    want = title_substr.strip().lower()
+    best: tuple[tuple[int, int, int], WindowGeometry] | None = None
+    for z, title, geo in candidates:
+        exact = 0 if title.strip().lower() == want else 1
+        size_ok = 0 if (expected_client and (geo.client_w, geo.client_h) == expected_client) else 1
+        score = (exact, size_ok, z)
+        if best is None or score < best[0]:
+            best = (score, geo)
+    return best[1] if best else None
+
+
 class Win32Locator:
-    def find(self, title_substr: str) -> WindowGeometry | None:
+    def find(
+        self, title_substr: str, expected_client: tuple[int, int] | None = None
+    ) -> WindowGeometry | None:
         _require()
-        hwnds: list[int] = []
+        found: list[tuple[int, str]] = []  # (hwnd, title) in Z-order
 
         def _cb(hwnd, _lparam):
             if not _user32.IsWindowVisible(hwnd):
@@ -164,27 +190,47 @@ class Win32Locator:
             buf = ctypes.create_unicode_buffer(length + 1)
             _user32.GetWindowTextW(hwnd, buf, length + 1)
             if title_substr.lower() in buf.value.lower():
-                hwnds.append(hwnd)
+                found.append((hwnd, buf.value))
             return True
 
         _user32.EnumWindows(_WNDENUMPROC(_cb), 0)
-        if not hwnds:
+        if not found:
             return None
-        hwnd = hwnds[0]
 
-        rect = wintypes.RECT()
-        if not _user32.GetClientRect(hwnd, ctypes.byref(rect)):
-            return None
-        pt = wintypes.POINT(0, 0)
-        if not _user32.ClientToScreen(hwnd, ctypes.byref(pt)):
-            return None
-        return WindowGeometry(
-            hwnd=int(hwnd),
-            screen_left=int(pt.x),
-            screen_top=int(pt.y),
-            client_w=int(rect.right),
-            client_h=int(rect.bottom),
-        )
+        kernel32 = ctypes.windll.kernel32
+        console_hwnd = int(kernel32.GetConsoleWindow() or 0)
+        our_pid = int(kernel32.GetCurrentProcessId())
+
+        def _is_own_window(hwnd) -> bool:
+            if int(hwnd) == console_hwnd:
+                return True
+            pid = wintypes.DWORD(0)
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value) == our_pid
+
+        def _geometry_of(hwnd) -> WindowGeometry | None:
+            rect = wintypes.RECT()
+            if not _user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                return None
+            pt = wintypes.POINT(0, 0)
+            if not _user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+                return None
+            return WindowGeometry(
+                hwnd=int(hwnd),
+                screen_left=int(pt.x),
+                screen_top=int(pt.y),
+                client_w=int(rect.right),
+                client_h=int(rect.bottom),
+            )
+
+        candidates: list[tuple[int, str, WindowGeometry]] = []
+        for z, (hwnd, title) in enumerate(found):
+            if _is_own_window(hwnd):  # never target the terminal running the agent
+                continue
+            geo = _geometry_of(hwnd)
+            if geo is not None:
+                candidates.append((z, title, geo))
+        return rank_window_candidates(candidates, title_substr, expected_client)
 
 
 # --- capture ----------------------------------------------------------------
@@ -222,13 +268,21 @@ class Win32Input:
         return _user32.GetForegroundWindow() == hwnd
 
     def key(self, name: str) -> None:
+        """Press and release with a real hold between the two injections.
+
+        HOI4 (like most DX games) polls input state per frame; a down+up batched
+        into one SendInput call can land inside a single frame and never be seen.
+        """
         _require()
         sc = SCANCODES.get(_normalize_key(name))
         if sc is None:
             raise AgentError(f"no scancode for key {name!r}")
         scan, extended = sc
         base = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if extended else 0)
-        self._send([_kbd(scan, base), _kbd(scan, base | KEYEVENTF_KEYUP)])
+        self._send([_kbd(scan, base)])
+        if self.dwell_s:
+            time.sleep(self.dwell_s)
+        self._send([_kbd(scan, base | KEYEVENTF_KEYUP)])
 
     def click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int) -> None:
         _require()
@@ -237,10 +291,11 @@ class Win32Input:
         self._send([_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)])
         if self.dwell_s:
             time.sleep(self.dwell_s)
-        self._send([
-            _mouse(ax, ay, MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
-            _mouse(ax, ay, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
-        ])
+        # Down and up injected separately with a held button between (see key()).
+        self._send([_mouse(ax, ay, MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)])
+        if self.dwell_s:
+            time.sleep(self.dwell_s)
+        self._send([_mouse(ax, ay, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)])
 
     @staticmethod
     def get_cursor_pos() -> tuple[int, int]:

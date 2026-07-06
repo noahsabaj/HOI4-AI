@@ -13,7 +13,8 @@ from hoi4_agent.schemas import (
 
 def test_validate_intent_ok():
     validate_intent(Intent(ToolName.BUILD_IN_STATE, state=GermanState.RUHR))
-    validate_intent(Intent(ToolName.SELECT_BUILDING, building=BuildingType.CIVILIAN_FACTORY))
+    validate_intent(Intent(ToolName.BUILD_IN_STATE, building=BuildingType.CIVILIAN_FACTORY,
+                           state=GermanState.RUHR))
     validate_intent(Intent(ToolName.ASSIGN_RESEARCH, tech=Tech.INDUSTRY_1))
     validate_intent(Intent(ToolName.ENSURE_PAUSED, paused=True))
     validate_intent(Intent(ToolName.SET_SPEED, speed=4))
@@ -25,7 +26,6 @@ def test_validate_intent_ok():
     [
         Intent(ToolName.BUILD_IN_STATE),  # missing state
         Intent(ToolName.ASSIGN_RESEARCH),  # missing tech
-        Intent(ToolName.SELECT_BUILDING),  # missing building
         Intent(ToolName.SET_SPEED, speed=9),  # out of range
         Intent(ToolName.ENSURE_PAUSED, paused=None),  # missing bool
     ],

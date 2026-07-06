@@ -22,6 +22,33 @@ def test_build_input_structs():
     assert m.type == win.INPUT_MOUSE and m.u.mi.dx == 123
 
 
+def test_rank_window_candidates_prefers_exact_title_then_size():
+    from hoi4_agent.geometry import WindowGeometry
+
+    game = WindowGeometry(1, 0, 0, 2560, 1440)
+    launcher = WindowGeometry(2, 0, 0, 1024, 768)
+    browser = WindowGeometry(3, 0, 0, 2496, 1322)
+    # Z-order puts the browser tab and launcher FIRST — the old first-match
+    # locator would have clicked into them.
+    candidates = [
+        (0, "Hearts of Iron IV — Wiki - Firefox", browser),
+        (1, "Paradox Launcher: Hearts of Iron IV", launcher),
+        (2, "Hearts of Iron IV", game),
+    ]
+    got = win.rank_window_candidates(candidates, "Hearts of Iron", (2560, 1440))
+    assert got is game  # size match beats Z-order
+
+    # Exact title beats everything, even without a size hint.
+    got = win.rank_window_candidates(candidates, "hearts of iron iv", None)
+    assert got is game
+
+    # No size hint, no exact match: fall back to Z-order (old behavior).
+    got = win.rank_window_candidates(candidates[:2], "Hearts of Iron", None)
+    assert got is browser
+
+    assert win.rank_window_candidates([], "Hearts of Iron", None) is None
+
+
 # --- DLL-backed parts (Windows only) ---
 winonly = pytest.mark.skipif(not win.available(), reason="Windows only")
 

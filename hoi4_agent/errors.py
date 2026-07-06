@@ -38,26 +38,16 @@ class TemplateMissingError(PerceptionError):
         super().__init__(f"no template/ROI named {name!r}")
 
 
-class NccUncertainError(PerceptionError):
-    """A template match scored below threshold — treat as uncertain, never success."""
-
-    def __init__(self, roi: str, score: float, threshold: float) -> None:
-        self.roi = roi
-        self.score = score
-        self.threshold = threshold
-        super().__init__(f"NCC for {roi!r} = {score:.3f} < threshold {threshold:.3f}")
-
-
 # --- brain / LLM ------------------------------------------------------------
 class BrainError(AgentError):
     """Base for LLM/model failures."""
 
 
-class OllamaUnavailableError(BrainError):
+class BackendUnavailableError(BrainError):
     """Could not reach the model endpoint (connection refused / DNS / etc.)."""
 
 
-class OllamaTimeoutError(BrainError):
+class BackendTimeoutError(BrainError):
     """The model call exceeded its timeout."""
 
 
@@ -100,6 +90,14 @@ class PreconditionError(ToolError):
     pass
 
 
+class NotReadyError(PreconditionError):
+    """Precondition not *yet* satisfied (e.g. no free slot right now).
+
+    A wait-state, not a defect: the controller advances in-game time instead of
+    counting a failure or running recovery.
+    """
+
+
 class PostconditionError(ToolError):
     pass
 
@@ -120,10 +118,6 @@ class PanelOpenError(ToolError):
         self.expected = expected
 
 
-class BuildingSelectError(ToolError):
-    pass
-
-
 class BuildInStateError(ToolError):
     pass
 
@@ -139,12 +133,6 @@ class ResetFailedError(ToolError):
 # --- controller -------------------------------------------------------------
 class ControllerError(AgentError):
     pass
-
-
-class StuckError(ControllerError):
-    def __init__(self, reason: str, trace_ref: str | None = None) -> None:
-        self.trace_ref = trace_ref
-        super().__init__(reason)
 
 
 class HaltAndFlag(ControllerError):

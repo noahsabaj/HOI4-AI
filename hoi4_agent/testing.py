@@ -31,6 +31,7 @@ class FakeGame:
         date: GameDate | None = None,
         max_free_civ: int = 3,
         days_per_tick: int = 7,
+        research_frees_every: int = 0,
     ) -> None:
         self.calib = calibration or default_calibration()
         self.geometry = geometry or WindowGeometry(1, 0, 0, self.calib.width or 2560, self.calib.height or 1440)
@@ -43,17 +44,35 @@ class FakeGame:
         self.queue = 0
         self.selected_building: str | None = None
         self.event_popup = False
+        self.popup_needs_click = True
+        self.pause_menu = False
         self.max_free_civ = max_free_civ
         self.days_per_tick = days_per_tick
+        # research_frees_every=N: every Nth unpaused tick a running tech
+        # "completes" and frees a research slot (0 = never). Lets tests exercise
+        # the repeatable refill goal.
+        self.research_frees_every = research_frees_every
+        self._ticks = 0
         self.input_calls: list[tuple] = []
         self._points: list[tuple[str, str, int, int]] = []
         for cat, d in (
             ("building", self.calib.building_buttons),
             ("state", self.calib.state_points),
             ("tech", self.calib.tech_points),
+            ("ui", self.calib.ui_points),
         ):
             for name, (nx, ny) in d.items():
                 self._points.append((cat, name, nx, ny))
+
+    def spawn_popup(self, needs_click: bool = True) -> None:
+        """Simulate a game event window; most real ones need an option click."""
+        self.event_popup = True
+        self.popup_needs_click = needs_click
+
+    @property
+    def _blocked(self) -> bool:
+        """Blocking overlays swallow panel hotkeys, like the real game."""
+        return self.pause_menu or self.event_popup
 
     # --- InputBackend ---
     def focus(self, geo) -> bool:
@@ -62,24 +81,45 @@ class FakeGame:
     def key(self, name: str) -> None:
         self.input_calls.append(("key", name))
         if name == "space":
-            self.paused = not self.paused
+            if not self.pause_menu:  # the game menu swallows space
+                self.paused = not self.paused
         elif name == "+":
             self.speed = min(5, self.speed + 1)
         elif name == "-":
             self.speed = max(1, self.speed - 1)
         elif name == "t":
-            self.open_panel = PanelId.CONSTRUCTION
+            if not self._blocked:
+                self.open_panel = PanelId.CONSTRUCTION
         elif name == "w":
-            self.open_panel = PanelId.RESEARCH
+            if not self._blocked:
+                self.open_panel = PanelId.RESEARCH
         elif name == "f1":
-            self.open_panel = PanelId.NONE
+            if not self._blocked:
+                self.open_panel = PanelId.NONE
         elif name == "escape":
-            self.open_panel = PanelId.NONE
-            self.event_popup = False
+            # Priority mirrors the real game: a click-required popup ignores
+            # escape; the menu closes; a panel closes; escape at HOME opens the
+            # pause menu (the v3-era trap reset_to_home must survive).
+            if self.event_popup:
+                if not self.popup_needs_click:
+                    self.event_popup = False
+            elif self.pause_menu:
+                self.pause_menu = False
+            elif self.open_panel is not PanelId.NONE:
+                self.open_panel = PanelId.NONE
+            else:
+                self.pause_menu = True
 
     def click(self, geo, crop, nx: int, ny: int) -> None:
         self.input_calls.append(("click", nx, ny))
         cat, name = self._nearest(nx, ny)
+        if cat == "ui":
+            if name == "event_option" and self.event_popup:
+                self.event_popup = False
+            # minimap_anchor: pans the camera; no observable state change here.
+            return
+        if self.event_popup or self.pause_menu:
+            return  # overlays swallow clicks that aren't on their own buttons
         if cat == "building":
             self.selected_building = name
         elif cat == "state":
@@ -105,20 +145,37 @@ class FakeGame:
         return Image.new("RGB", (8, 8), color=(20, 20, 40))
 
     # --- perceive (wired as ctx.perceive) ---
-    def perceive(self, read_numbers: bool = True) -> WorldState:
+    def perceive(self, read_numbers: bool = True, fields=None) -> WorldState:
+        """Mirrors the real ``perceive`` contract: ``fields`` selects numeric
+        facts, and slot/queue counters are context-gated to their panel — so the
+        offline controller exercises the same attempt/NotReady paths as live."""
         if not self.paused:
             # Simulate in-game time passing + completions freeing capacity.
             self.date = self.date.plus_days(self.days_per_tick)
             if self.free_civ < self.max_free_civ:
                 self.free_civ += 1
+            self._ticks += 1
+            if self.research_frees_every and self._ticks % self.research_frees_every == 0:
+                self.idle_research = min(self.idle_research + 1, 3)
+        if not read_numbers:
+            want: set[str] = set()
+        elif fields is None:
+            want = {"date", "free_civ_slots", "idle_research_slots", "construction_queue", "speed"}
+        else:
+            want = set(fields)
+
+        def gated(field: str, panel: PanelId) -> bool:
+            return field in want and self.open_panel is panel
+
         return WorldState(
-            date=self.date if read_numbers else None,
+            date=self.date if "date" in want else None,
             paused=self.paused,
-            speed=self.speed if read_numbers else None,
+            speed=self.speed if "speed" in want else None,
             open_panel=self.open_panel,
-            free_civ_slots=self.free_civ if read_numbers else None,
-            idle_research_slots=self.idle_research if read_numbers else None,
-            construction_queue_len=self.queue if read_numbers else None,
+            free_civ_slots=self.free_civ if gated("free_civ_slots", PanelId.CONSTRUCTION) else None,
+            idle_research_slots=self.idle_research if gated("idle_research_slots", PanelId.RESEARCH) else None,
+            construction_queue_len=self.queue if gated("construction_queue", PanelId.CONSTRUCTION) else None,
             event_popup=self.event_popup,
+            pause_menu=self.pause_menu,
             confidence={"panel": 1.0, "pause": 1.0},
         )

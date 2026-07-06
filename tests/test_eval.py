@@ -1,8 +1,10 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from hoi4_agent.enums import GermanState, Tech
+from hoi4_agent.errors import ConfigError
 from hoi4_agent.eval.corpus import load_corpus
 from hoi4_agent.eval.m0_perception import score_model
 from hoi4_agent.eval.replay import replay
@@ -55,6 +57,36 @@ def test_corpus_and_score(tmp_path):
 
 def test_load_corpus_missing_dir():
     assert load_corpus("/no/such/dir/xyz") == []
+
+
+def test_corpus_rejects_unlabeled_png(tmp_path):
+    # Regression: a stray PNG with no sidecar once scored as CORRECT and could
+    # silently inflate M0 accuracy to 1.0. Ground truth is strict now.
+    _img(tmp_path / "stray.png")
+    with pytest.raises(ConfigError, match="stray"):
+        load_corpus(tmp_path)
+
+
+def test_corpus_rejects_bad_sidecars(tmp_path):
+    _img(tmp_path / "a.png")
+    _label(tmp_path / "a.toml", 'task = "not_a_task"\nexpected = 1\n')
+    with pytest.raises(ConfigError, match="not_a_task"):
+        load_corpus(tmp_path)
+    _label(tmp_path / "a.toml", 'task = "read_number"\n')  # no expected
+    with pytest.raises(ConfigError, match="expected"):
+        load_corpus(tmp_path)
+
+
+def test_unknown_task_counts_as_wrong_not_correct(tmp_path):
+    # Defense for direct callers that bypass load_corpus validation.
+    from hoi4_agent.eval.corpus import CorpusItem
+
+    png = tmp_path / "x.png"
+    _img(png)
+    item = CorpusItem(png, {"task": "bogus", "expected": None})
+    report = score_model([item], FakeBrain())
+    assert report["correct"] == 0 and report["total"] == 1
+    assert report["mismatches"][0]["got"].startswith("ERROR:")
 
 
 def test_replay(tmp_path):

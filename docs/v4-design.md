@@ -1,8 +1,7 @@
 # HOI4-AI v4 — design summary
 
-The authoritative, detailed plan lives at
-`.claude/plans/rebuild-the-entire-project-typed-wren.md`. This file is a short,
-in-repo pointer plus the load-bearing ideas.
+The in-repo record of the load-bearing design ideas. (The original build plan
+lived outside the repo; this summary stands alone.)
 
 ## The one principle
 

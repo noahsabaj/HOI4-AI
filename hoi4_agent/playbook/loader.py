@@ -25,6 +25,12 @@ def _coerce(field: str, value, enum_cls):
         raise ConfigError(f"goal {field}={value!r} not in {allowed}") from e
 
 
+_ALLOWED_GOAL_KEYS = frozenset({
+    "id", "tool", "building", "state", "tech", "speed", "paused",
+    "precondition", "precondition_date", "repeatable", "needs_judgment",
+})
+
+
 def _precondition(g: dict) -> Precondition:
     kind_s = g.get("precondition", "always")
     try:
@@ -33,7 +39,10 @@ def _precondition(g: dict) -> Precondition:
         raise ConfigError(f"unknown precondition {kind_s!r}") from e
     date = None
     if "precondition_date" in g:
-        date = GameDate.from_str(g["precondition_date"])
+        try:
+            date = GameDate.from_str(g["precondition_date"])
+        except ValueError as e:
+            raise ConfigError(f"bad precondition_date {g['precondition_date']!r}: {e}") from e
     if kind in (PreconditionKind.DATE_BEFORE, PreconditionKind.DATE_AFTER) and date is None:
         raise ConfigError(f"precondition {kind_s} requires precondition_date")
     return Precondition(kind=kind, date=date)
@@ -50,6 +59,12 @@ def parse_goals(raw: dict) -> list[Goal]:
             raise ConfigError(f"goal #{i} missing 'id' or 'tool'")
         if g["id"] in seen_ids:
             raise ConfigError(f"duplicate goal id {g['id']!r}")
+        unknown = set(g) - _ALLOWED_GOAL_KEYS
+        if unknown:
+            raise ConfigError(
+                f"goal {g['id']!r} has unknown key(s) {sorted(unknown)} "
+                f"(allowed: {sorted(_ALLOWED_GOAL_KEYS)})"
+            )
         seen_ids.add(g["id"])
         goals.append(
             Goal(

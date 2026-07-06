@@ -1,11 +1,17 @@
 """The closed control loop.
 
 Each cycle: ensure paused -> perceive -> pick the next actionable goal. If one is
-actionable, act-with-retry and verify; on OK mark progress, on failure recover or
-halt-and-flag (bounded — never a silent loop). If nothing is actionable, advance
-in-game time (date-driven) and re-check — that wait is the event-driven "wake when
-a slot frees" behaviour. The VLM is touched only inside tools (T1 reads / T2
-judgment); sequential actionable goals run back-to-back while paused.
+actionable, act-with-retry and verify; on OK mark progress, on NOT-READY advance
+in-game time (a wait-state, not a failure), on failure recover or halt-and-flag
+(bounded — never a silent loop). The whole cycle body runs under an ``AgentError``
+catch, so an infra failure (model endpoint down mid-perceive) becomes a counted,
+recovered, traced failure instead of a raw crash — ``HaltAndFlag`` is the only
+way out.
+
+Observability: every cycle appends a TraceRecord — actions with pre/post frames,
+the resolved intent, the judgment prompt/raw output when the VLM was consulted,
+and the exact input events injected; time-advance and error cycles get their own
+record kinds. That is what makes the JSONL trace actually replayable.
 """
 
 from __future__ import annotations
@@ -15,10 +21,10 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
 from ..enums import GermanState, Tech, ToolName, Verdict
-from ..errors import HaltAndFlag
-from ..playbook.select import all_done, next_pending_goal
+from ..errors import AgentError, ControllerError, HaltAndFlag, NotReadyError
+from ..playbook.select import all_done, expired_goal, next_pending_goal
 from ..playbook.state import save_state
-from ..schemas import Goal, Intent, PlaybookState, WorldState
+from ..schemas import GameDate, Goal, Intent, PlaybookState, ToolResult, WorldState
 from ..trace.record import build_record
 from . import cadence, recovery
 
@@ -32,13 +38,15 @@ def _resolve_intent(ctx: "AgentContext", goal: Goal, world: WorldState) -> tuple
     intent = goal.to_intent()
     if not goal.needs_judgment:
         return intent, False
+    if ctx.brain is None:
+        raise ControllerError(f"goal {goal.id!r} needs judgment but no brain is wired")
     crop = ctx.capture.grab(ctx.geometry)
     if goal.tool is ToolName.BUILD_IN_STATE and intent.state is None:
-        options = [s for s in GermanState if s.value in ctx.calibration.state_points]
-        return replace(intent, state=ctx.brain.which_state(crop, options)), True
+        state_opts = [s for s in GermanState if s.value in ctx.calibration.state_points]
+        return replace(intent, state=ctx.brain.which_state(crop, state_opts, goal.building)), True
     if goal.tool is ToolName.ASSIGN_RESEARCH and intent.tech is None:
-        options = [t for t in Tech if t.value in ctx.calibration.tech_points]
-        return replace(intent, tech=ctx.brain.which_tech(crop, options)), True
+        tech_opts = [t for t in Tech if t.value in ctx.calibration.tech_points]
+        return replace(intent, tech=ctx.brain.which_tech(crop, tech_opts)), True
     return intent, False
 
 
@@ -59,56 +67,146 @@ def run(
     failures = 0
     cycles = 0
 
+    def _drain_actions() -> tuple[dict, ...]:
+        drain = getattr(ctx.input, "drain", None)
+        return tuple(drain()) if callable(drain) else ()
+
+    def _save_frame(name: str) -> str | None:
+        if writer is None:
+            return None
+        return writer.save_frame(ctx.capture.grab(ctx.geometry), name)
+
+    def _append(record) -> None:
+        if writer is not None:
+            writer.append(record)
+
+    def _trace_ref() -> str | None:
+        return str(writer.path) if writer else None
+
+    def _advance_time(world: WorldState) -> GameDate | None:
+        target = world.date.plus_days(ctx.config.timing.cycle_days) if world.date else None
+        last = cadence.run_to_date(ctx, target, sleep=sleep)
+        res = ToolResult(
+            ToolName.OBSERVE, Verdict.OK, pre=world,
+            assertion=(
+                f"advanced time toward {target.to_str() if target else 'blind polls'}"
+                f" (last read {last.to_str() if last else 'none'})"
+            ),
+        )
+        _append(build_record(
+            cycle=state.cycle_count, ts=clock(), result=res, mode=ctx.mode.value,
+            kind="advance", actions=_drain_actions(),
+        ))
+        return last
+
+    _drain_actions()  # discard any pre-loop input noise
+
     while not all_done(goals, state) and cycles < max_cycles:
         cycles += 1
-        cadence.ensure_paused(ctx, True)
-        world = ctx.perceive()
-        goal = next_pending_goal(goals, state, world)
+        world: WorldState | None = None
+        goal: Goal | None = None
+        try:
+            pause_res = cadence.ensure_paused(ctx, True)
+            if not pause_res.ok:
+                raise ControllerError(f"cannot pause the game: {pause_res.assertion}")
+            world = ctx.perceive()
 
-        if goal is None:
-            # Nothing actionable now -> let in-game time pass, then re-check.
-            target = world.date.plus_days(ctx.config.timing.cycle_days) if world.date else None
-            cadence.run_to_date(ctx, target, sleep=sleep)
-            state = state.with_date(world.date).advance_cycle()
-            if state_path:
-                save_state(state_path, state)
-            continue
+            # Inner selection round: a repeatable goal that reports NotReady is
+            # stepped past (cycle_skip) and the NEXT goal tried in the same
+            # cycle — "refill research when possible" must never starve builds.
+            cycle_skip: set[str] = set()
+            while True:
+                goal = next_pending_goal(goals, state, world, skip=cycle_skip)
 
-        intent, vlm_used = _resolve_intent(ctx, goal, world)
-        result = recovery.act_with_retry(ctx, intent, ctx.config.timing.max_retries)
+                if goal is None:
+                    expired = expired_goal(goals, state, world)
+                    if expired is not None:
+                        # A missed date_before window can never re-open; waiting
+                        # on it would advance time forever. Skip it, loudly.
+                        state = state.with_completed(expired.id)
+                        gate = expired.precondition.date
+                        res = ToolResult(
+                            expired.tool, Verdict.FAILED, pre=world,
+                            assertion=f"date_before {gate.to_str() if gate else '?'} window "
+                                      f"expired at {world.date.to_str() if world.date else '?'} — skipped",
+                        )
+                        _append(build_record(
+                            cycle=state.cycle_count, ts=clock(), result=res, goal=expired,
+                            mode=ctx.mode.value, kind="skipped", actions=_drain_actions(),
+                        ))
+                        break
+                    # Nothing actionable now -> let in-game time pass, re-check next cycle.
+                    last = _advance_time(world)
+                    if last is not None:  # the tail records world.date — keep it fresh
+                        world = replace(world, date=last)
+                    break
 
-        if writer is not None:
-            writer.append(
-                build_record(
-                    cycle=state.cycle_count,
-                    ts=clock(),
-                    result=result,
-                    goal=goal,
-                    mode=ctx.mode.value,
-                    vlm_used=vlm_used,
-                )
-            )
+                pre_path = _save_frame(f"c{state.cycle_count:05d}_pre.jpg")
+                intent, vlm_used = _resolve_intent(ctx, goal, world)
+                result = recovery.act_with_retry(ctx, intent, ctx.config.timing.max_retries)
+                post_path = _save_frame(f"c{state.cycle_count:05d}_post.jpg")
 
-        if result.verdict is Verdict.OK:
-            failures = 0
-            state = state.with_completed(goal.id)
-        else:
+                prompt = raw = None
+                if vlm_used and ctx.brain is not None:
+                    prompt = getattr(ctx.brain, "last_prompt", None)
+                    raw = getattr(ctx.brain, "last_raw", None)
+
+                _append(build_record(
+                    cycle=state.cycle_count, ts=clock(), result=result, goal=goal,
+                    intent=intent, mode=ctx.mode.value, vlm_used=vlm_used,
+                    pre_path=pre_path, post_path=post_path, prompt=prompt, raw=raw,
+                    actions=_drain_actions(),
+                ))
+
+                if result.verdict is Verdict.OK:
+                    failures = 0
+                    if not goal.repeatable:  # repeatables are re-offered forever
+                        state = state.with_completed(goal.id)
+                    break
+                if isinstance(result.error, NotReadyError):
+                    if goal.repeatable:
+                        cycle_skip.add(goal.id)
+                        continue  # same cycle: give the next goal its chance
+                    # A one-shot gates strictly: wait for the game.
+                    _advance_time(world)
+                    break
+                failures += 1
+                recovered = recovery.recover(ctx)
+                if not recovered or failures >= max_failures:
+                    raise HaltAndFlag(
+                        f"halting after {failures} consecutive failures at goal "
+                        f"{goal.id!r}: {result.assertion}",
+                        trace_ref=_trace_ref(),
+                    )
+                break
+        except HaltAndFlag:
+            raise
+        except AgentError as e:
+            # Infra/controller error mid-cycle: counted, traced, recovered — loud
+            # but bounded. This is the catch the error hierarchy promises.
             failures += 1
+            err_result = ToolResult(
+                goal.tool if goal else ToolName.OBSERVE, Verdict.FAILED,
+                pre=world, assertion=str(e), error=e,
+            )
+            _append(build_record(
+                cycle=state.cycle_count, ts=clock(), result=err_result, goal=goal,
+                mode=ctx.mode.value, kind="error", actions=_drain_actions(),
+            ))
             recovered = recovery.recover(ctx)
             if not recovered or failures >= max_failures:
                 raise HaltAndFlag(
-                    f"halting after {failures} consecutive failures at goal "
-                    f"{goal.id!r}: {result.assertion}",
-                    trace_ref=str(writer.path) if writer else None,
-                )
+                    f"halting after {failures} consecutive failures: {e}",
+                    trace_ref=_trace_ref(),
+                ) from e
 
-        state = state.with_date(world.date).advance_cycle()
+        state = state.with_date(world.date if world else None).advance_cycle()
         if state_path:
             save_state(state_path, state)
 
     if cycles >= max_cycles and not all_done(goals, state):
         raise HaltAndFlag(
             f"hit max_cycles={max_cycles} before completing playbook",
-            trace_ref=str(writer.path) if writer else None,
+            trace_ref=_trace_ref(),
         )
     return state

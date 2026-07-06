@@ -27,6 +27,8 @@ class DisplayConfig:
 @dataclass(frozen=True, slots=True)
 class TimingConfig:
     action_dwell_ms: int
+    settle_ms: int
+    verify_read_retries: int
     max_retries: int
     ncc_threshold: float
     run_speed: int
@@ -71,6 +73,9 @@ def load_config(path: str | Path = "config/agent.toml") -> Config:
         mode = AgentMode(raw.get("mode", "robust"))
     except ValueError as e:
         raise ConfigError(f"invalid mode: {raw.get('mode')!r}") from e
+    if mode is AgentMode.PURIST:
+        # Accepting-but-ignoring a mode would be config that lies; fail loudly.
+        raise ConfigError("mode 'purist' is a designed seam, not implemented — use 'robust'")
 
     llm = raw.get("llm", {})
     disp = raw.get("display", {})
@@ -91,6 +96,8 @@ def load_config(path: str | Path = "config/agent.toml") -> Config:
         ),
         timing=TimingConfig(
             action_dwell_ms=int(_require(tim, "action_dwell_ms", "timing")),
+            settle_ms=int(_require(tim, "settle_ms", "timing")),
+            verify_read_retries=int(_require(tim, "verify_read_retries", "timing")),
             max_retries=int(_require(tim, "max_retries", "timing")),
             ncc_threshold=float(_require(tim, "ncc_threshold", "timing")),
             run_speed=int(_require(tim, "run_speed", "timing")),

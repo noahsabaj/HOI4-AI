@@ -21,14 +21,16 @@ def _run_task(brain, img: Image.Image, labels: dict):
         got = brain.read_date(img)
         return (got.to_str() if got else None), expected
     if task == "which_state":
-        opts = [GermanState(s) for s in labels.get("options", [s.value for s in GermanState])]
-        return brain.which_state(img, opts).value, expected
+        state_opts = [GermanState(s) for s in labels.get("options", [s.value for s in GermanState])]
+        return brain.which_state(img, state_opts).value, expected
     if task == "which_tech":
-        opts = [Tech(t) for t in labels.get("options", [t.value for t in Tech])]
-        return brain.which_tech(img, opts).value, expected
+        tech_opts = [Tech(t) for t in labels.get("options", [t.value for t in Tech])]
+        return brain.which_tech(img, tech_opts).value, expected
     if task == "yes_no":
         return ("yes" if brain.yes_no(img, labels.get("question", "?")) else "no"), expected
-    return None, expected
+    # load_corpus validates tasks, but guard direct callers: an unknown task
+    # must count as WRONG (via the caller's except), never as silently correct.
+    raise ValueError(f"unknown corpus task {task!r}")
 
 
 def score_model(corpus: list[CorpusItem], brain) -> dict:
