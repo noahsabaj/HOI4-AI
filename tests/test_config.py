@@ -106,6 +106,23 @@ def test_invalid_mode(tmp_path):
         load_config(bad)
 
 
+def test_grounding_profile_resolution(tmp_path):
+    f = tmp_path / "cfg.toml"
+    f.write_text(PROFILE_TOML + '\n[grounding]\nprofile = "b"\n', encoding="utf-8")
+    cfg = load_config(f)
+    assert cfg.grounding is not None and cfg.grounding.model == "model-b"
+    assert cfg.llm.model == "model-a"  # judgment brain untouched
+
+    f2 = tmp_path / "cfg2.toml"
+    f2.write_text(PROFILE_TOML + '\n[grounding]\nprofile = ""\n', encoding="utf-8")
+    assert load_config(f2).grounding is None  # empty = disabled
+
+    f3 = tmp_path / "cfg3.toml"
+    f3.write_text(PROFILE_TOML + '\n[grounding]\nprofile = "nope"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown llm profile"):
+        load_config(f3)
+
+
 def test_purist_mode_is_rejected_not_silently_robust(tmp_path):
     bad = tmp_path / "purist.toml"
     bad.write_text('mode = "purist"\n', encoding="utf-8")

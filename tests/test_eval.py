@@ -28,6 +28,9 @@ class FakeBrain:
     def yes_no(self, crop, question):
         return True
 
+    def locate(self, crop, instruction):
+        return (500, 500)
+
 
 def _img(path: Path):
     Image.new("RGB", (16, 16), (30, 30, 30)).save(path)
@@ -74,6 +77,32 @@ def test_corpus_rejects_bad_sidecars(tmp_path):
         load_corpus(tmp_path)
     _label(tmp_path / "a.toml", 'task = "read_number"\n')  # no expected
     with pytest.raises(ConfigError, match="expected"):
+        load_corpus(tmp_path)
+
+
+def test_locate_scored_by_distance_tolerance(tmp_path):
+    _img(tmp_path / "near.png")
+    _label(tmp_path / "near.toml",
+           'task = "locate"\ninstruction = "the Ruhr state"\nexpected = [510, 520]\n')
+    _img(tmp_path / "far.png")
+    _label(tmp_path / "far.toml",
+           'task = "locate"\ninstruction = "the Ruhr state"\nexpected = [600, 600]\n')
+    _img(tmp_path / "tight.png")
+    _label(tmp_path / "tight.toml",
+           'task = "locate"\ninstruction = "x"\nexpected = [510, 520]\ntolerance = 5\n')
+
+    report = score_model(load_corpus(tmp_path), FakeBrain())  # FakeBrain says (500, 500)
+    assert report["per_task"]["locate"]["correct"] == 1  # near within default 25; others out
+    assert report["per_task"]["locate"]["total"] == 3
+
+
+def test_locate_labels_validated(tmp_path):
+    _img(tmp_path / "a.png")
+    _label(tmp_path / "a.toml", 'task = "locate"\nexpected = [1, 2]\n')  # no instruction
+    with pytest.raises(ConfigError, match="instruction"):
+        load_corpus(tmp_path)
+    _label(tmp_path / "a.toml", 'task = "locate"\ninstruction = "x"\nexpected = 5\n')
+    with pytest.raises(ConfigError, match="must be"):
         load_corpus(tmp_path)
 
 

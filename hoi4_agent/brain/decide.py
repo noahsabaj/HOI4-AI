@@ -95,6 +95,15 @@ class Brain:
             raise EnumError("action", action, options)
         return action
 
+    def locate(self, crop: Image.Image, instruction: str) -> tuple[int, int]:
+        """Grounding: center of the described element, 0-1000 normalized on ``crop``."""
+        system, user, schema = prompts.locate_prompt(instruction)
+        d = self._ask(crop, system, user, schema, fmt="JPEG")
+        x, y = coerce_int(d.get("x")), coerce_int(d.get("y"))
+        if not (0 <= x <= 1000 and 0 <= y <= 1000):
+            raise SchemaError(f"locate ({x}, {y}) outside the 0..1000 crop-normalized range")
+        return x, y
+
 
 def build_backend(cfg: LLMConfig) -> LLMBackend:
     if cfg.backend == "ollama":

@@ -28,7 +28,7 @@ from PIL import Image
 
 from ..errors import ConfigError
 
-KNOWN_TASKS = ("read_number", "read_date", "which_state", "which_tech", "yes_no")
+KNOWN_TASKS = ("read_number", "read_date", "which_state", "which_tech", "yes_no", "locate")
 
 
 @dataclass(frozen=True)
@@ -58,5 +58,14 @@ def load_corpus(directory: str | Path) -> list[CorpusItem]:
             )
         if "expected" not in labels:
             raise ConfigError(f"corpus label {sidecar.name}: missing 'expected'")
+        if task == "locate":
+            if "instruction" not in labels:
+                raise ConfigError(f"corpus label {sidecar.name}: locate needs an 'instruction'")
+            exp = labels["expected"]
+            if not (isinstance(exp, list) and len(exp) == 2):
+                raise ConfigError(
+                    f"corpus label {sidecar.name}: locate 'expected' must be [x, y] "
+                    "(0-1000 normalized on the image)"
+                )
         items.append(CorpusItem(png, labels))
     return items

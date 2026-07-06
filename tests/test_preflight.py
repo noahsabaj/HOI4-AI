@@ -63,6 +63,17 @@ def test_missing_roi_and_click_point_reported(cfg):
     assert any("'date'" in e and "ROI" in e for e in errors)
 
 
+def test_grounding_enabled_warns_to_validate_first(cfg):
+    import dataclasses
+
+    goals = load_playbook(PLAYBOOK)
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    grounded_cfg = dataclasses.replace(cfg, grounding=cfg.llm)
+    errors, warnings = preflight(grounded_cfg, calib, _full_templates(), goals)
+    assert errors == []
+    assert any("grounding" in w and "M0" in w for w in warnings)
+
+
 def test_invalid_goal_and_empty_judgment_options(cfg):
     calib = default_calibration(cfg.display.width, cfg.display.height)
     bad = Goal(id="bad", tool=ToolName.ASSIGN_RESEARCH)  # tech missing, no judgment

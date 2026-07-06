@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from ..enums import MapMode, PanelId
 from ..errors import ResetFailedError
+from . import grounding
 
 if TYPE_CHECKING:
     from ..context import AgentContext
@@ -51,20 +52,32 @@ def reset_to_home(ctx: "AgentContext") -> "WorldState":
         ctx.input.key(key)
         ctx.sleep(ctx.config.timing.settle_ms / 1000.0)
 
-    def _click(nx: int, ny: int) -> None:
-        ctx.input.click(ctx.geometry, ctx.geometry.full_crop(), nx, ny)
+    def _click(nx: int, ny: int, crop=None) -> None:
+        ctx.input.click(ctx.geometry, crop or ctx.geometry.full_crop(), nx, ny)
         ctx.sleep(ctx.config.timing.settle_ms / 1000.0)
+
+    def _dismiss_popup() -> None:
+        # Popups usually need an option click, not escape: calibrated point
+        # first, grounded locate second, escape as the last resort.
+        option = ctx.calibration.ui_point("event_option")
+        if option is not None:
+            _click(*option)
+            return
+        crop = grounding.roi_crop(ctx, "event_popup")
+        located = grounding.locate_point(
+            ctx, "the first (topmost) option button of the event window", crop
+        )
+        if located is not None:
+            _click(*located, crop=crop)
+        else:
+            _press(HOTKEYS["back"])
 
     if not ctx.input.focus(ctx.geometry):
         raise ResetFailedError("cannot focus the game window")
     world = ctx.perceive(read_numbers=False)
     for _ in range(MAX_ESCAPES):
         if world.event_popup:
-            option = ctx.calibration.ui_point("event_option")
-            if option is not None:
-                _click(*option)  # popups usually need an option click, not escape
-            else:
-                _press(HOTKEYS["back"])
+            _dismiss_popup()
         elif world.pause_menu or world.open_panel is not PanelId.NONE:
             _press(HOTKEYS["back"])
         else:

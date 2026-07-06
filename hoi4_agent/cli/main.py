@@ -26,9 +26,10 @@ def _build_live_ctx(cfg: Config, title: str):
     calib = load_calibration(cfg.paths.calibration)
     templates = TemplateStore.load_dir(cfg.paths.templates)
     brain = Brain(build_backend(cfg.llm))
+    grounding_brain = Brain(build_backend(cfg.grounding)) if cfg.grounding is not None else None
     return AgentContext.build(
         config=cfg, geometry=geo, input=inp, capture=capture,
-        calibration=calib, templates=templates, brain=brain,
+        calibration=calib, templates=templates, brain=brain, locator=grounding_brain,
     )
 
 
