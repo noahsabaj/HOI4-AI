@@ -4,9 +4,39 @@
 mode = "robust"
 
 [llm]
+# Active model profile. Interim default is the free Ollama cloud model; after
+# the live M0 shootout (`eval --all-profiles`), switch to the best LOCAL
+# profile that clears >=90% on read tasks and retire the cloud default.
+profile = "gemma4-cloud"
+
+[llm.profiles.gemma4-cloud]         # interim: Ollama free cloud (31B, thinking)
 backend = "ollama"                  # "ollama" (native vision) | "openai_compat" (LM Studio / llama.cpp)
 endpoint = "http://localhost:11434"
-model = "gemma4:31b-cloud"          # interim: Ollama free cloud (31B, thinking). Local fallback: gemma4:e4b-it-qat
+model = "gemma4:31b-cloud"
+timeout_s = 120.0
+
+[llm.profiles.gemma4-local]         # generalist, ~6 GB VRAM
+backend = "ollama"
+endpoint = "http://localhost:11434"
+model = "gemma4:e4b-it-qat"
+timeout_s = 120.0
+
+[llm.profiles.qwen3vl-4b]           # best small ScreenSpot-Pro score in Ollama library
+backend = "ollama"
+endpoint = "http://localhost:11434"
+model = "qwen3-vl:4b"
+timeout_s = 120.0
+
+[llm.profiles.holo31-9b]            # GUI-agent specialist (GGUF via LM Studio / llama.cpp server)
+backend = "openai_compat"
+endpoint = "http://localhost:1234"
+model = "holo-3.1-9b"
+timeout_s = 120.0
+
+[llm.profiles.holo31-4b]            # smaller Holo, ~3 GB at Q4
+backend = "openai_compat"
+endpoint = "http://localhost:1234"
+model = "holo-3.1-4b"
 timeout_s = 120.0
 
 [display]
