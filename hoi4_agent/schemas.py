@@ -8,6 +8,7 @@ args it needs, with real enum members — so a malformed intent never reaches I/
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field, replace
 
 from .enums import (
@@ -20,6 +21,16 @@ from .enums import (
     Verdict,
 )
 from .errors import IntentValidationError
+
+# Date shapes that appear in UI-read text. Numeric Y.M.D ("1936.1.1") is the
+# format the original design assumed; the HOI4 top bar actually renders
+# "12:00, 1 Jan, 1936" (day, month NAME, year), so both are accepted.
+_YMD_UI_RE = re.compile(r"(\d{4})\D{1,3}(\d{1,2})\D{1,3}(\d{1,2})")
+_DMY_UI_RE = re.compile(r"(\d{1,2})\s*,?\s*([A-Za-z]{3,9})\.?,?\s*(\d{4})")
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
 # --- in-game date -----------------------------------------------------------
@@ -49,6 +60,31 @@ class GameDate:
             raise ValueError(f"bad date {s!r} (want YYYY.MM.DD or YYYY-MM-DD)")
         y, m, d = (int(p) for p in parts)
         return cls(y, m, d)
+
+    @classmethod
+    def from_ui_text(cls, text: str) -> "GameDate | None":
+        """Parse a date out of noisy UI-read text, or None — never guess.
+
+        Accepts numeric Y.M.D ("1936. 1. 14") and the HOI4 top-bar rendering
+        ("12:00, 1 Jan, 1936" — the clock is ignored). Out-of-range values
+        read as None so a misread can't become an orderable-but-wrong date.
+        """
+        m = _YMD_UI_RE.search(text)
+        if m:
+            try:
+                return cls(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                return None
+        m = _DMY_UI_RE.search(text)
+        if m:
+            month = _MONTHS.get(m.group(2)[:3].lower())
+            if month is None:
+                return None
+            try:
+                return cls(int(m.group(3)), month, int(m.group(1)))
+            except ValueError:
+                return None
+        return None
 
     def to_str(self) -> str:
         return f"{self.year:04d}.{self.month:02d}.{self.day:02d}"

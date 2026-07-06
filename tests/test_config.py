@@ -14,7 +14,8 @@ def test_load_real_config():
     assert cfg.mode is AgentMode.ROBUST
     assert cfg.llm.backend in ("ollama", "openai_compat")
     assert cfg.llm.model  # non-empty
-    assert (cfg.display.width, cfg.display.height) == (2560, 1440)
+    # the locked resolution tracks the operator's monitor — assert sanity, not a value
+    assert cfg.display.width > 0 and cfg.display.height > 0
     assert cfg.timing.max_retries >= 0
 
 
