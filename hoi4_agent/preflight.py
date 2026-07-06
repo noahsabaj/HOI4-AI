@@ -54,6 +54,12 @@ def preflight(
                 'reliable) — `pip install -e ".[ocr]"` adds a faster OCR middle tier'
             )
 
+    if config.grounding is not None:
+        warnings.append(
+            f"grounding fallback enabled ({config.grounding.model}) — validate locate-task "
+            "accuracy in M0 before trusting grounded clicks"
+        )
+
     # --- calibration ----------------------------------------------------------
     for name in ROI_NAMES:
         if name not in calibration.rois:

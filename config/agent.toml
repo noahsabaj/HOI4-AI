@@ -56,6 +56,13 @@ max_advance_days = 56              # cap for the quiet-world advance backoff (7 
 [recovery]
 vlm_consult = true                 # one bounded VLM hint when deterministic recovery fails, before halting
 
+[grounding]
+# Locator model for click-points missing from calibration (crop-then-ground
+# fallback; verified by the same postconditions as calibrated clicks). Name an
+# [llm.profiles.*] entry, e.g. "holo31-9b" — but only after locate tasks clear
+# M0. Empty = disabled.
+profile = ""
+
 [paths]
 calibration = "config/calibration.toml"
 templates = "templates"

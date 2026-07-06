@@ -167,6 +167,82 @@ def test_focus_failure_sends_no_input(scripted_ctx):
     assert inp.keys == [] and inp.clicks == []
 
 
+def _grounded_ctx(cfg, states, calib, locator_response):
+    import dataclasses  # noqa: F401  (kept for symmetry with callers)
+
+    from PIL import Image
+
+    from hoi4_agent.brain.decide import Brain
+    from hoi4_agent.brain.llm import ScriptedBackend
+    from hoi4_agent.calibration import default_calibration  # noqa: F401
+    from hoi4_agent.context import AgentContext
+    from hoi4_agent.geometry import WindowGeometry
+    from hoi4_agent.io.backends import FakeCapture, RecordingInput
+    from hoi4_agent.perception.templates import TemplateStore
+
+    it = iter(states)
+    inp = RecordingInput()
+    ctx = AgentContext(
+        config=cfg,
+        geometry=WindowGeometry(1, 0, 0, cfg.display.width, cfg.display.height),
+        input=inp,
+        capture=FakeCapture(Image.new("RGB", (64, 64))),
+        calibration=calib,
+        templates=TemplateStore(),
+        brain=None,
+        mode=cfg.mode,
+        perceive=lambda read_numbers=True, fields=None: next(it),
+        sleep=lambda _s: None,
+        locator=Brain(ScriptedBackend([locator_response])) if locator_response else None,
+    )
+    return ctx, inp
+
+
+def test_build_grounds_state_point_when_uncalibrated(cfg):
+    import dataclasses
+
+    from hoi4_agent.calibration import default_calibration
+
+    calib = dataclasses.replace(
+        default_calibration(cfg.display.width, cfg.display.height), state_points={}
+    )
+    states = [
+        _ws(open_panel=CON),
+        _ws(open_panel=CON, construction_queue_len=1, free_civ_slots=2),
+        _ws(open_panel=CON, construction_queue_len=2),
+    ]
+    ctx, inp = _grounded_ctx(cfg, states, calib, '{"x": 640, "y": 320}')
+    r = execute(Intent(ToolName.BUILD_IN_STATE, state=GermanState.RUHR), ctx)
+    assert r.verdict is Verdict.OK  # grounded click still verified by queue +1
+    assert (640, 320) in inp.clicks
+
+    # Without a locator, the missing point is the same hard failure as before.
+    ctx2, inp2 = _grounded_ctx(cfg, [_ws(open_panel=CON)], calib, None)
+    r2 = execute(Intent(ToolName.BUILD_IN_STATE, state=GermanState.RUHR), ctx2)
+    assert r2.verdict is Verdict.FAILED
+    assert inp2.clicks == []
+
+
+def test_reset_dismisses_popup_via_grounded_click(cfg):
+    import dataclasses
+
+    from hoi4_agent.calibration import default_calibration
+    from hoi4_agent.tools.macros import reset_to_home
+
+    calib = dataclasses.replace(
+        default_calibration(cfg.display.width, cfg.display.height), ui_points={}
+    )
+    states = [
+        _ws(event_popup=True),  # reset's first look
+        _ws(),                  # after the grounded option click
+        _ws(),                  # final assert after map-mode key
+    ]
+    ctx, inp = _grounded_ctx(cfg, states, calib, '{"x": 500, "y": 800}')
+    reset_to_home(ctx)
+    assert (500, 800) in inp.clicks  # popup dismissed by locate, not escape
+    assert "escape" not in inp.keys
+
+
 def test_build_blocked_by_event_popup(scripted_ctx):
     # A popup over the open panel swallows clicks: fail (recovery dismisses it),
     # never click through it.

@@ -38,6 +38,9 @@ class AgentContext:
     mode: AgentMode
     perceive: Callable[..., WorldState]
     sleep: Callable[[float], None] = field(default=time.sleep)
+    # Optional GUI-grounding specialist for click-points the calibration table
+    # lacks (see tools/grounding.py). None = calibrated points only.
+    locator: Brain | None = None
 
     @classmethod
     def build(
@@ -51,6 +54,7 @@ class AgentContext:
         templates: TemplateStore,
         brain: Brain | None,
         sleep: Callable[[float], None] = time.sleep,
+        locator: Brain | None = None,
     ) -> "AgentContext":
         ctx = cls(
             config=config,
@@ -63,6 +67,7 @@ class AgentContext:
             mode=config.mode,
             perceive=lambda read_numbers=True, fields=None: WorldState(),  # replaced below
             sleep=sleep,
+            locator=locator,
         )
 
         # Numeric read chain: deterministic glyphs, then OCR (if the optional

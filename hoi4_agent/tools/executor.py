@@ -37,8 +37,9 @@ from ..errors import (
     SpeedSetError,
     TemplateMissingError,
 )
+from ..geometry import CropRect
 from ..schemas import Intent, ToolResult, validate_intent
-from . import macros
+from . import grounding, macros
 
 if TYPE_CHECKING:
     from ..context import AgentContext
@@ -77,8 +78,8 @@ def _press(ctx: "AgentContext", key: str) -> None:
     _settle(ctx)
 
 
-def _click_pt(ctx: "AgentContext", nx: int, ny: int) -> None:
-    ctx.input.click(ctx.geometry, ctx.geometry.full_crop(), nx, ny)
+def _click_pt(ctx: "AgentContext", nx: int, ny: int, crop: CropRect | None = None) -> None:
+    ctx.input.click(ctx.geometry, crop or ctx.geometry.full_crop(), nx, ny)
     _settle(ctx)
 
 
@@ -216,10 +217,14 @@ def _build_in_state(intent: Intent, ctx: "AgentContext") -> ToolResult:
     if intent.state is None:  # pragma: no cover - validate_intent guarantees it
         return _failed(ToolName.BUILD_IN_STATE, w, w,
                        IntentValidationError("build_in_state", "missing state"))
+    point: tuple[int, int] | None = None
+    point_crop: CropRect | None = None
     try:
-        nx, ny = ctx.calibration.state_point(intent.state)
+        point = ctx.calibration.state_point(intent.state)
     except TemplateMissingError as e:
-        return _failed(ToolName.BUILD_IN_STATE, w, w, e)
+        if ctx.locator is None:
+            return _failed(ToolName.BUILD_IN_STATE, w, w, e)
+        # no calibrated point: ground on the map crop AFTER the camera anchor
 
     pre_q, pre = _read_until(
         ctx, lambda w: w.construction_queue_len, fields={"construction_queue", "free_civ_slots"}
@@ -234,13 +239,22 @@ def _build_in_state(intent: Intent, ctx: "AgentContext") -> ToolResult:
             ToolName.BUILD_IN_STATE, pre, pre,
             NotReadyError("no free civilian factory", observed=pre.free_civ_slots),
         )
-    # Re-anchor the camera so the calibrated state point is valid regardless of
-    # any pan drift (minimap clicks pan without selecting). Zoom is assumed
-    # unchanged — the agent never scrolls; calibrate and run at the same zoom.
+    # Re-anchor the camera so the state point is valid regardless of pan drift
+    # (minimap clicks pan without selecting). Zoom is assumed unchanged — the
+    # agent never scrolls; calibrate and run at the same zoom.
     anchor = ctx.calibration.ui_point("minimap_anchor")
     if anchor is not None:
         _click_pt(ctx, *anchor)
-    _click_pt(ctx, nx, ny)
+    if point is None:
+        point_crop = grounding.map_crop(ctx)
+        state_name = intent.state.value.replace("_", " ").title()
+        point = grounding.locate_point(ctx, f"the German state of {state_name} on the map", point_crop)
+        if point is None:
+            return _failed(
+                ToolName.BUILD_IN_STATE, pre, pre,
+                BuildInStateError(f"no calibrated point and grounding failed for {intent.state.value}"),
+            )
+    _click_pt(ctx, *point, crop=point_crop)
     post_q, post = _read_until(ctx, lambda w: w.construction_queue_len, fields={"construction_queue"})
     if post_q is None:
         return _uncertain(
@@ -280,11 +294,23 @@ def _assign_research(intent: Intent, ctx: "AgentContext") -> ToolResult:
     if intent.tech is None:  # pragma: no cover - validate_intent guarantees it
         return _failed(ToolName.ASSIGN_RESEARCH, pre, pre,
                        IntentValidationError("assign_research", "missing tech"))
+    point_crop: CropRect | None = None
     try:
-        nx, ny = ctx.calibration.tech_point(intent.tech)
+        point: tuple[int, int] | None = ctx.calibration.tech_point(intent.tech)
     except TemplateMissingError as e:
-        return _failed(ToolName.ASSIGN_RESEARCH, pre, pre, e)
-    _click_pt(ctx, nx, ny)
+        if ctx.locator is None:
+            return _failed(ToolName.ASSIGN_RESEARCH, pre, pre, e)
+        point_crop = grounding.roi_crop(ctx, "research_panel")
+        tech_name = intent.tech.value.replace("_", " ")
+        point = grounding.locate_point(
+            ctx, f"the '{tech_name}' technology entry in the research panel", point_crop
+        )
+    if point is None:
+        return _failed(
+            ToolName.ASSIGN_RESEARCH, pre, pre,
+            AssignResearchError(f"no calibrated point and grounding failed for {intent.tech.value}"),
+        )
+    _click_pt(ctx, point[0], point[1], crop=point_crop)
     post_idle, post = _read_until(ctx, lambda w: w.idle_research_slots, fields={"idle_research_slots"})
     if post_idle is None:
         return _uncertain(

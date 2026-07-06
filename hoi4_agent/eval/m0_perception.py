@@ -28,9 +28,24 @@ def _run_task(brain, img: Image.Image, labels: dict):
         return brain.which_tech(img, tech_opts).value, expected
     if task == "yes_no":
         return ("yes" if brain.yes_no(img, labels.get("question", "?")) else "no"), expected
+    if task == "locate":
+        return brain.locate(img, labels.get("instruction", "?")), expected
     # load_corpus validates tasks, but guard direct callers: an unknown task
     # must count as WRONG (via the caller's except), never as silently correct.
     raise ValueError(f"unknown corpus task {task!r}")
+
+
+def _is_correct(task: str, got, expected, labels: dict) -> bool:
+    """Locate is scored by pixel distance (0-1000 space); everything else by value."""
+    if task == "locate" and isinstance(got, tuple):
+        try:
+            gx, gy = got
+            ex, ey = expected
+            tolerance = float(labels.get("tolerance", 25))
+        except (TypeError, ValueError):
+            return False
+        return ((gx - ex) ** 2 + (gy - ey) ** 2) ** 0.5 <= tolerance
+    return str(got) == str(expected)
 
 
 def score_model(corpus: list[CorpusItem], brain) -> dict:
@@ -45,7 +60,7 @@ def score_model(corpus: list[CorpusItem], brain) -> dict:
             got, expected = f"ERROR:{type(e).__name__}", item.labels.get("expected")
         ct = per_task.setdefault(task, [0, 0])
         ct[1] += 1
-        if str(got) == str(expected):
+        if _is_correct(task, got, expected, item.labels):
             ct[0] += 1
         else:
             mismatches.append(

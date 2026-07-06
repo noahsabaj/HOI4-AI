@@ -83,6 +83,14 @@ def test_which_tech_and_yes_no():
     assert _brain('{"answer":"no"}').yes_no(CROP, "good?") is False
 
 
+def test_locate_valid_and_out_of_range():
+    assert _brain('{"x": 640, "y": 320}').locate(CROP, "the Ruhr state") == (640, 320)
+    with pytest.raises(SchemaError):
+        _brain('{"x": 1200, "y": 0}').locate(CROP, "the Ruhr state")
+    with pytest.raises(SchemaError):
+        _brain('{"x": "left", "y": 0}').locate(CROP, "the Ruhr state")
+
+
 def test_consult_recovery_validates_options():
     opts = ["press_escape", "press_map_mode", "none"]
     assert _brain('{"action":"press_escape"}').consult_recovery(CROP, opts) == "press_escape"

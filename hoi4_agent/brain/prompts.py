@@ -92,6 +92,34 @@ def yes_no_prompt(question: str) -> tuple[str, str, dict]:
     return _SYSTEM_DECIDE, user, schema
 
 
+def locate_prompt(instruction: str) -> tuple[str, str, dict]:
+    """Grounding: find one UI element on a (pre-cropped) image.
+
+    Callers must crop-then-ground: hand the model the smallest region that can
+    contain the target (map area, research panel, popup), never the full frame.
+    Coordinates are 0-1000 normalized on the supplied image, matching
+    ``geometry.NORM_SCALE`` so the executor can click them directly.
+    """
+    system = (
+        "You precisely locate user-interface elements in screenshots of "
+        "Hearts of Iron IV. Output JSON only, no commentary."
+    )
+    user = (
+        f"Locate {instruction}. Reply with the CENTER of the target as "
+        '{"x": X, "y": Y}, integers normalized to 0-1000 on this image '
+        "(0,0 is the top-left corner; 1000,1000 the bottom-right)."
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "x": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+        },
+        "required": ["x", "y"],
+    }
+    return system, user, schema
+
+
 def recovery_prompt(options: list[str]) -> tuple[str, str, dict]:
     """One bounded hint when deterministic recovery failed (stuck-consultant)."""
     user = (

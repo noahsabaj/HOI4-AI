@@ -55,6 +55,9 @@ class Config:
     # [recovery] vlm_consult: one bounded VLM hint when deterministic recovery
     # fails, before halt-and-flag. Default on; explicit in agent.toml.
     recovery_vlm_consult: bool = True
+    # [grounding] profile: locator model for click-points the calibration table
+    # lacks (crop-then-ground fallback). None = disabled (the default).
+    grounding: LLMConfig | None = None
 
 
 def _require(table: dict, key: str, section: str):
@@ -140,6 +143,11 @@ def load_config(path: str | Path = "config/agent.toml", llm_profile: str | None 
             max_advance_days=int(_require(tim, "max_advance_days", "timing")),
         ),
         recovery_vlm_consult=bool(raw.get("recovery", {}).get("vlm_consult", True)),
+        grounding=(
+            _resolve_llm(raw, grounding_profile)
+            if (grounding_profile := raw.get("grounding", {}).get("profile") or None)
+            else None
+        ),
         paths=PathsConfig(
             calibration=_require(paths, "calibration", "paths"),
             templates=_require(paths, "templates", "paths"),
