@@ -22,6 +22,13 @@ def test_build_input_structs():
     assert m.type == win.INPUT_MOUSE and m.u.mi.dx == 123
 
 
+def test_capture_backend_registry():
+    assert set(win.CAPTURE_BACKENDS) == {"mss", "printwindow"}
+    assert win.CAPTURE_BACKENDS["printwindow"] is win.PrintWindowCapture
+    # PrintWindow flag values are load-bearing (PW_CLIENTONLY | PW_RENDERFULLCONTENT)
+    assert win.PW_CLIENTONLY == 0x1 and win.PW_RENDERFULLCONTENT == 0x2
+
+
 def test_rank_window_candidates_prefers_exact_title_then_size():
     from hoi4_agent.geometry import WindowGeometry
 

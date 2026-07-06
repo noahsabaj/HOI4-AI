@@ -56,6 +56,12 @@ max_advance_days = 56              # cap for the quiet-world advance backoff (7 
 [recovery]
 vlm_consult = true                 # one bounded VLM hint when deterministic recovery fails, before halting
 
+[capture]
+# "mss" (desktop region) | "printwindow" (window renders itself into our bitmap:
+# immune to overlays/notifications/occlusion). Validate printwindow via the live
+# smoke's capture_printwindow step (black frame = unsupported) before switching.
+backend = "mss"
+
 [grounding]
 # Locator model for click-points missing from calibration (crop-then-ground
 # fallback; verified by the same postconditions as calibrated clicks). Name an

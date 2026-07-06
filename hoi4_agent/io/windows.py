@@ -243,6 +243,89 @@ class MssCapture:
         return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
 
+# PrintWindow flags
+PW_CLIENTONLY = 0x1
+PW_RENDERFULLCONTENT = 0x2  # Win 8.1+: DWM-composited content (DX games incl.)
+DIB_RGB_COLORS = 0
+BI_RGB = 0
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+class PrintWindowCapture:
+    """Capture the game window's own contents via PrintWindow + a DIB section.
+
+    Unlike desktop-region capture (mss), this is immune to notifications,
+    overlays, and occlusion — the window renders itself into our bitmap.
+    Validate with the live smoke's ``capture_printwindow`` step before flipping
+    ``[capture] backend`` (some render paths produce black frames).
+    """
+
+    def grab(self, geo: WindowGeometry, crop: CropRect | None = None) -> Image.Image:
+        _require()
+        gdi32 = ctypes.windll.gdi32
+        hwnd = geo.hwnd
+        w, h = geo.client_w, geo.client_h
+        hdc_win = _user32.GetDC(hwnd)
+        if not hdc_win:
+            raise AgentError("PrintWindowCapture: GetDC failed (window gone?)")
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_win)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h  # negative = top-down rows
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = BI_RGB
+        bits = ctypes.c_void_p()
+        hbmp = gdi32.CreateDIBSection(
+            hdc_win, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(bits), None, 0
+        )
+        if not hbmp:
+            gdi32.DeleteDC(hdc_mem)
+            _user32.ReleaseDC(hwnd, hdc_win)
+            raise AgentError("PrintWindowCapture: CreateDIBSection failed")
+        old = gdi32.SelectObject(hdc_mem, hbmp)
+        try:
+            ok = _user32.PrintWindow(hwnd, hdc_mem, PW_CLIENTONLY | PW_RENDERFULLCONTENT)
+            if not ok:
+                raise AgentError("PrintWindowCapture: PrintWindow failed for this window")
+            buf = ctypes.string_at(bits, w * h * 4)
+            img = Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
+        finally:
+            gdi32.SelectObject(hdc_mem, old)
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            _user32.ReleaseDC(hwnd, hdc_win)
+        if crop is not None:
+            img = img.crop((
+                crop.client_x0, crop.client_y0,
+                crop.client_x0 + crop.crop_w, crop.client_y0 + crop.crop_h,
+            ))
+        return img
+
+
+CAPTURE_BACKENDS = {"mss": MssCapture, "printwindow": PrintWindowCapture}
+
+
 # --- input ------------------------------------------------------------------
 class Win32Input:
     def __init__(self, dwell_ms: int = 40) -> None:
@@ -336,7 +419,10 @@ def _to_virtual_abs(sx: int, sy: int) -> tuple[int, int]:
     return ax, ay
 
 
-def build_io(dwell_ms: int = 40) -> tuple[Win32Locator, MssCapture, Win32Input]:
+def build_io(dwell_ms: int = 40, capture_backend: str = "mss"):
     """Set DPI awareness and return (locator, capture, input) for the live agent."""
     ensure_dpi_aware()
-    return Win32Locator(), MssCapture(), Win32Input(dwell_ms=dwell_ms)
+    capture_cls = CAPTURE_BACKENDS.get(capture_backend)
+    if capture_cls is None:
+        raise AgentError(f"unknown capture backend {capture_backend!r} (want {sorted(CAPTURE_BACKENDS)})")
+    return Win32Locator(), capture_cls(), Win32Input(dwell_ms=dwell_ms)

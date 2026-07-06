@@ -63,7 +63,7 @@ def run(cfg: Config, title: str = "Hearts of Iron") -> int:
         print("calibrate: Windows only")
         return 1
     win.ensure_dpi_aware()
-    locator, capture, _inp = win.build_io(cfg.timing.action_dwell_ms)
+    locator, capture, _inp = win.build_io(cfg.timing.action_dwell_ms, cfg.capture_backend)
     geo = locator.find(title, (cfg.display.width, cfg.display.height))
     if geo is None:
         print("game window not found — is HOI4 running?")

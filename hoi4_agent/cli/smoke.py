@@ -77,7 +77,7 @@ def run_live(cfg: Config, title: str = "Hearts of Iron") -> int:
             return None
 
     print("[live smoke] DPI:", win.ensure_dpi_aware())
-    locator, capture, inp = win.build_io(cfg.timing.action_dwell_ms)
+    locator, capture, inp = win.build_io(cfg.timing.action_dwell_ms, cfg.capture_backend)
 
     geo = step("find_window", lambda: locator.find(title, (cfg.display.width, cfg.display.height)))
     if geo is None:
@@ -100,6 +100,18 @@ def run_live(cfg: Config, title: str = "Hearts of Iron") -> int:
         std = float(np.asarray(img.convert("L")).std())
         return f"saved {p} (std={std:.1f}{' — possibly exclusive fullscreen!' if std < 1 else ''})"
 
+    def _capture_printwindow():
+        # Validates the occlusion-immune backend regardless of [capture] backend,
+        # so the operator knows whether flipping the config is safe.
+        import numpy as np
+
+        img = win.PrintWindowCapture().grab(geo)
+        p = out / "smoke_capture_printwindow.png"
+        img.save(p)
+        std = float(np.asarray(img.convert("L")).std())
+        note = " — black frame: PrintWindow unsupported for this window" if std < 1 else ""
+        return f"saved {p} (std={std:.1f}{note})"
+
     def _move_cursor_center():
         inp.click(geo, geo.full_crop(), 500, 500)
         return win.Win32Input.get_cursor_pos()
@@ -114,6 +126,7 @@ def run_live(cfg: Config, title: str = "Hearts of Iron") -> int:
         return "sent f1"
 
     step("capture", _capture)
+    step("capture_printwindow", _capture_printwindow)
     step("focus", lambda: inp.focus(geo))
     step("move_cursor_center", _move_cursor_center)
     step("key_pause_toggle", _pause_toggle)
