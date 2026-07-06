@@ -118,27 +118,33 @@ class GlyphReader:
             return None
 
 
-class FallbackReader:
-    """Glyphs first, VLM second — each read falls back independently."""
+class ChainReader:
+    """Try each reader in order per call: glyphs -> OCR -> VLM.
 
-    def __init__(self, primary, fallback) -> None:
-        self.primary = primary
-        self.fallback = fallback
+    None entries are skipped, so callers can wire optional tiers directly
+    (``ChainReader([glyphs_or_none, ocr_or_none, brain_or_none])``).
+    """
+
+    def __init__(self, readers) -> None:
+        self.readers = [r for r in readers if r is not None]
 
     def read_number(self, crop: Image.Image, field: str) -> int | None:
-        if self.primary is not None:
-            v = self.primary.read_number(crop, field)
+        for r in self.readers:
+            v = r.read_number(crop, field)
             if v is not None:
                 return v
-        if self.fallback is not None:
-            return self.fallback.read_number(crop, field)
         return None
 
     def read_date(self, crop: Image.Image) -> GameDate | None:
-        if self.primary is not None:
-            v = self.primary.read_date(crop)
+        for r in self.readers:
+            v = r.read_date(crop)
             if v is not None:
                 return v
-        if self.fallback is not None:
-            return self.fallback.read_date(crop)
         return None
+
+
+class FallbackReader(ChainReader):
+    """Two-tier chain (primary -> fallback), kept for its self-describing name."""
+
+    def __init__(self, primary, fallback) -> None:
+        super().__init__([primary, fallback])

@@ -19,7 +19,8 @@ from .config import Config
 from .enums import AgentMode
 from .geometry import WindowGeometry
 from .io.backends import CaptureBackend, InputBackend
-from .perception.digits import FallbackReader, GlyphReader
+from .perception.digits import ChainReader, GlyphReader
+from .perception.ocr import OcrReader
 from .perception.perceive import perceive as _perceive
 from .perception.templates import TemplateStore
 from .schemas import WorldState
@@ -64,8 +65,15 @@ class AgentContext:
             sleep=sleep,
         )
 
+        # Numeric read chain: deterministic glyphs, then OCR (if the optional
+        # extra is installed), then the VLM as the last resort.
         glyphs = GlyphReader(templates, threshold=config.timing.ncc_threshold)
-        reader = FallbackReader(glyphs if glyphs.available() else None, brain)
+        ocr = OcrReader()
+        reader = ChainReader([
+            glyphs if glyphs.available() else None,
+            ocr if ocr.available() else None,
+            brain,
+        ])
 
         def _do(read_numbers: bool = True, fields=None) -> WorldState:
             return _perceive(
