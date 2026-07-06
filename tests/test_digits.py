@@ -61,6 +61,20 @@ def test_read_number_exact():
     assert reader.read_number(_strip("0"), "x") == 0
 
 
+def test_read_text_delta_ladder_splits_antialiased_bridges():
+    # faint ink (60/255) bridging the glyph gaps: at delta 40 everything merges
+    # into one box; the ladder's stricter deltas recover the real segmentation
+    from hoi4_agent.perception.ncc import to_gray_f32
+
+    strip = np.asarray(_strip("1936"), dtype=np.float32).copy()
+    bridge_row = strip.shape[0] - 2
+    strip[bridge_row, strip[bridge_row] == 0] = 60.0
+    img = Image.fromarray(strip.astype(np.uint8), mode="L")
+    assert len(glyph_boxes(to_gray_f32(img))) == 1  # default delta: one blob
+    reader = GlyphReader(_store("01369"), threshold=0.9)
+    assert reader.read_number(img, "x") == 1936  # ladder recovers it
+
+
 def test_read_number_unknown_glyph_is_none():
     reader = GlyphReader(_store("0136"), threshold=0.9)  # no "9", no "X"
     assert reader.read_number(_strip("196"), "x") is None

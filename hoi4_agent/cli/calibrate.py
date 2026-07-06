@@ -291,11 +291,14 @@ def run(cfg, title: str = "Hearts of Iron", only: str | None = None) -> int:
         typed = input("    date exactly as shown, no spaces (e.g. 12:00,1Jan,1936); blank skips: ").strip()
         if not typed:
             return True, None
-        from ..perception.digits import glyph_boxes
+        from ..perception.digits import DELTA_LADDER, glyph_boxes
         from ..perception.ncc import to_gray_f32
-        boxes = glyph_boxes(to_gray_f32(crop))
-        if len(boxes) != len(typed):
-            print(f"    segmented {len(boxes)} glyphs but typed {len(typed)} chars — retry (or S to skip)")
+        gray = to_gray_f32(crop)
+        counts = {delta: len(glyph_boxes(gray, delta)) for delta in DELTA_LADDER}
+        boxes = next((glyph_boxes(gray, d) for d, n in counts.items() if n == len(typed)), None)
+        if boxes is None:
+            print(f"    no segmentation matches {len(typed)} typed chars (got {sorted(set(counts.values()))} "
+                  "across ink thresholds) — retry unpaused (the pause flash bleeds ink), or S to skip")
             return False, None
         staged = []
         for (x0, y0, x1, y1), ch in zip(boxes, typed):

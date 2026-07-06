@@ -53,9 +53,9 @@ def test_read_date_out_of_range_is_none():
 def test_last_exchange_recorded_for_trace():
     b = _brain('{"value": 3}')
     assert b.last_raw is None
-    b.read_number(CROP, "free_civ_slots")
+    b.read_number(CROP, "construction_queue")
     assert b.last_raw == '{"value": 3}'
-    assert b.last_prompt is not None and "free_civ_slots" in b.last_prompt
+    assert b.last_prompt is not None and "construction_queue" in b.last_prompt
 
 
 def test_which_state_valid_and_invalid():
@@ -103,12 +103,14 @@ def test_encode_image_is_base64_str():
     assert isinstance(s, str) and len(s) > 0
 
 
-def test_number_prompt_counts_idle_research_slots():
+def test_number_prompt_field_specific_variants():
     from hoi4_agent.brain.prompts import number_prompt
 
     _, user, _ = number_prompt("idle_research_slots")
     assert "Count" in user  # derived from the slot row, not transcribed
     _, user, _ = number_prompt("free_civ_slots")
+    assert "FIRST number" in user  # X of the X/Y availability pair
+    _, user, _ = number_prompt("construction_queue")
     assert "integer value you see" in user  # printed digit: generic transcription prompt
 
 

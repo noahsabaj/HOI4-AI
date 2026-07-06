@@ -29,6 +29,12 @@ _NUMBER_FIELD_PROMPTS = {
         '{"value": N} — 0 if every slot is researching something. If the crop does '
         'not show the research slot row, reply {"value": -1}.'
     ),
+    "free_civ_slots": (
+        "This crop shows the construction header with civilian factory counts "
+        "rendered like '38/38' (available/total), plus trade/owned breakdowns. "
+        'Reply with the FIRST number of the X/Y pair (available factories) as '
+        '{"value": N}. If no X/Y pair is visible, reply {"value": -1}.'
+    ),
 }
 
 

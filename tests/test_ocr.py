@@ -49,6 +49,15 @@ def test_read_date_parses_and_validates():
     assert OcrReader(engine=_engine("gibberish")).read_date(CROP) is None
 
 
+def test_read_number_free_civ_slots_parses_x_of_xy():
+    # the construction header renders "38/38  From trade: 2  Owned: 36" — the
+    # wanted value is X of the first X/Y; other fields keep the one-run rule
+    eng = _engine("38/38", "From trade: 2", "Owned: 36")
+    assert OcrReader(engine=eng).read_number(CROP, "free_civ_slots") == 38
+    assert OcrReader(engine=eng).read_number(CROP, "other_field") is None  # ambiguous
+    assert OcrReader(engine=_engine("no pair 12")).read_number(CROP, "free_civ_slots") is None
+
+
 def test_read_date_hoi4_topbar_format():
     # what the HOI4 top bar actually renders (incl. the clock, which is ignored)
     assert OcrReader(engine=_engine("12:00, 1 Jan, 1936")).read_date(CROP) == GameDate(1936, 1, 1)

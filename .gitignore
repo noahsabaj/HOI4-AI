@@ -26,3 +26,4 @@ Thumbs.db
 runs/                       # per-cycle JSONL traces + screenshots
 config/calibration.toml     # machine-specific (resolution + click-points)
 eval/corpus/                # large labeled screenshot corpus (kept out of git)
+templates/                  # perception template PNGs (machine/resolution-specific, from calibrate)

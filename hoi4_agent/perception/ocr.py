@@ -17,6 +17,12 @@ from ..schemas import GameDate
 
 _DIGITS_RE = re.compile(r"\d+")
 
+# Field-specific shapes. free_civ_slots renders as "38/38  From trade: 2  Owned: 36"
+# in the construction header — the wanted value is X of the first X/Y (factories
+# currently available / total pool); the generic one-digit-run rule would always
+# call this crop ambiguous.
+_FIELD_RES = {"free_civ_slots": re.compile(r"(\d+)\s*/\s*\d+")}
+
 
 def _load_engine():
     """rapidocr v2+/v3 preferred (py3.13+); legacy rapidocr-onnxruntime accepted.
@@ -71,7 +77,15 @@ class OcrReader:
         engine = self._get_engine()
         if engine is None:
             return None
-        texts = _texts_of(engine(np.asarray(crop.convert("RGB"))))
+        # PP-OCR's detector misses text flush against the crop edge (tight ROIs);
+        # pad with the crop's own border tone before detection.
+        arr = np.asarray(crop.convert("RGB"))
+        border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]])
+        fill = np.median(border, axis=0).astype(arr.dtype)
+        pad = 16
+        padded = np.full((arr.shape[0] + 2 * pad, arr.shape[1] + 2 * pad, 3), fill, dtype=arr.dtype)
+        padded[pad:-pad, pad:-pad] = arr
+        texts = _texts_of(engine(padded))
         if not texts:
             return None
         return " ".join(texts)
@@ -81,6 +95,10 @@ class OcrReader:
         text = self._read_text(crop)
         if text is None:
             return None
+        field_re = _FIELD_RES.get(field)
+        if field_re is not None:
+            m = field_re.search(text)
+            return int(m.group(1)) if m else None
         groups = _DIGITS_RE.findall(text)
         if len(groups) != 1:  # zero or several digit runs: ambiguous, stay uncertain
             return None
