@@ -1,4 +1,6 @@
+import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -6,9 +8,21 @@ from PIL import Image
 
 from hoi4_agent.perception import ncc
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_no_opencv_dependency():
-    assert "cv2" not in sys.modules
+    """The CORE package must not import cv2. Checked in a clean subprocess:
+    optional extras (rapidocr pulls opencv-headless) may put cv2 in THIS
+    process's sys.modules during collection, which proves nothing about core."""
+    code = (
+        "import sys; "
+        "import hoi4_agent.perception.ncc, hoi4_agent.perception.perceive, "
+        "hoi4_agent.perception.digits, hoi4_agent.perception.ocr, hoi4_agent.context; "
+        "raise SystemExit(1 if 'cv2' in sys.modules else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(REPO_ROOT))
+    assert proc.returncode == 0, "importing the hoi4_agent core pulled in cv2"
 
 
 def test_ncc_identity_and_inverse():
