@@ -19,7 +19,7 @@ def _build_live_ctx(cfg: Config, title: str):
     from ..io import windows as win
     from ..perception.templates import TemplateStore
 
-    locator, capture, inp = win.build_io(cfg.timing.action_dwell_ms)
+    locator, capture, inp = win.build_io(cfg.timing.action_dwell_ms, cfg.capture_backend)
     geo = locator.find(title, (cfg.display.width, cfg.display.height))
     if geo is None:
         return None

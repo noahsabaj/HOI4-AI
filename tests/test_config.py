@@ -123,6 +123,17 @@ def test_grounding_profile_resolution(tmp_path):
         load_config(f3)
 
 
+def test_capture_backend_selection(tmp_path):
+    f = tmp_path / "cfg.toml"
+    f.write_text(PROFILE_TOML, encoding="utf-8")
+    assert load_config(f).capture_backend == "mss"  # default
+    f.write_text(PROFILE_TOML + '\n[capture]\nbackend = "printwindow"\n', encoding="utf-8")
+    assert load_config(f).capture_backend == "printwindow"
+    f.write_text(PROFILE_TOML + '\n[capture]\nbackend = "webcam"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="capture backend"):
+        load_config(f)
+
+
 def test_purist_mode_is_rejected_not_silently_robust(tmp_path):
     bad = tmp_path / "purist.toml"
     bad.write_text('mode = "purist"\n', encoding="utf-8")

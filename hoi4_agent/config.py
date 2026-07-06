@@ -58,6 +58,9 @@ class Config:
     # [grounding] profile: locator model for click-points the calibration table
     # lacks (crop-then-ground fallback). None = disabled (the default).
     grounding: LLMConfig | None = None
+    # [capture] backend: "mss" (desktop region) | "printwindow" (window-rendered,
+    # overlay/occlusion-immune — validate via live smoke before switching).
+    capture_backend: str = "mss"
 
 
 def _require(table: dict, key: str, section: str):
@@ -105,6 +108,16 @@ def _resolve_llm(raw: dict, profile_override: str | None = None) -> LLMConfig:
     )
 
 
+_CAPTURE_BACKENDS = ("mss", "printwindow")
+
+
+def _valid_capture_backend(raw: dict) -> str:
+    backend = raw.get("capture", {}).get("backend", "mss")
+    if backend not in _CAPTURE_BACKENDS:
+        raise ConfigError(f"unknown capture backend {backend!r} (want one of {list(_CAPTURE_BACKENDS)})")
+    return backend
+
+
 def list_llm_profiles(path: str | Path = "config/agent.toml") -> list[str]:
     """Profile names defined in the config file (empty for legacy flat [llm])."""
     return sorted(_read_raw(path).get("llm", {}).get("profiles", {}))
@@ -143,6 +156,7 @@ def load_config(path: str | Path = "config/agent.toml", llm_profile: str | None 
             max_advance_days=int(_require(tim, "max_advance_days", "timing")),
         ),
         recovery_vlm_consult=bool(raw.get("recovery", {}).get("vlm_consult", True)),
+        capture_backend=_valid_capture_backend(raw),
         grounding=(
             _resolve_llm(raw, grounding_profile)
             if (grounding_profile := raw.get("grounding", {}).get("profile") or None)
