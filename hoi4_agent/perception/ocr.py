@@ -20,18 +20,39 @@ _DIGITS_RE = re.compile(r"\d+")
 
 
 def _load_engine():
+    """rapidocr v2+/v3 preferred (py3.13+); legacy rapidocr-onnxruntime accepted.
+
+    Construction downloads the PP-OCR models (~20 MB) on first use.
+    """
     try:
-        from rapidocr_onnxruntime import RapidOCR
+        from rapidocr import RapidOCR
     except ImportError:
-        return None
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            return None
     return RapidOCR()
+
+
+def _texts_of(raw) -> list[str]:
+    """Normalize both rapidocr output generations to a list of strings."""
+    txts = getattr(raw, "txts", None)  # v2+/v3: RapidOCROutput.txts
+    if txts is not None:
+        return [str(t) for t in txts]
+    if isinstance(raw, tuple):  # legacy: (results, elapse), results = [(box, text, score)]
+        results = raw[0]
+        if not results:
+            return []
+        return [str(text) for _box, text, _score in results]
+    return []
 
 
 class OcrReader:
     """Implements the perception ``Reader`` protocol via general OCR.
 
-    ``engine`` is a callable ``engine(np.ndarray) -> (results, elapse)`` where
-    ``results`` is a list of ``(box, text, score)`` or None — rapidocr's shape.
+    ``engine`` is a callable taking an ``np.ndarray`` image and returning either
+    a rapidocr v2+ output object (``.txts``) or the legacy ``(results, elapse)``
+    tuple — both are normalized.
     """
 
     def __init__(self, engine=None) -> None:
@@ -51,10 +72,10 @@ class OcrReader:
         engine = self._get_engine()
         if engine is None:
             return None
-        results, _elapse = engine(np.asarray(crop.convert("RGB")))
-        if not results:
+        texts = _texts_of(engine(np.asarray(crop.convert("RGB"))))
+        if not texts:
             return None
-        return " ".join(str(text) for _box, text, _score in results)
+        return " ".join(texts)
 
     # --- Reader protocol ---
     def read_number(self, crop: Image.Image, field: str) -> int | None:
