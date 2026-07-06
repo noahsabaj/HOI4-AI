@@ -103,6 +103,15 @@ def test_encode_image_is_base64_str():
     assert isinstance(s, str) and len(s) > 0
 
 
+def test_number_prompt_counts_idle_research_slots():
+    from hoi4_agent.brain.prompts import number_prompt
+
+    _, user, _ = number_prompt("idle_research_slots")
+    assert "Count" in user  # derived from the slot row, not transcribed
+    _, user, _ = number_prompt("free_civ_slots")
+    assert "integer value you see" in user  # printed digit: generic transcription prompt
+
+
 def test_backend_receives_one_image_and_schema():
     be = ScriptedBackend(['{"value": 1}'])
     Brain(be).read_number(CROP, "free")

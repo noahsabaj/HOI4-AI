@@ -20,8 +20,20 @@ _SYSTEM_DECIDE = (
 )
 
 
+# Fields not rendered as a printed digit anywhere in the UI — the VLM must derive
+# the value from what the crop shows instead of transcribing a number.
+_NUMBER_FIELD_PROMPTS = {
+    "idle_research_slots": (
+        "This crop shows the row of research slot cards. Count the slots that are "
+        "EMPTY (no technology being researched in them). Reply with that count as "
+        '{"value": N} — 0 if every slot is researching something. If the crop does '
+        'not show the research slot row, reply {"value": -1}.'
+    ),
+}
+
+
 def number_prompt(field: str) -> tuple[str, str, dict]:
-    user = (
+    user = _NUMBER_FIELD_PROMPTS.get(field) or (
         f"This crop shows the '{field}' indicator. Reply with the integer value you "
         'see as {"value": N}. If you cannot read a number, reply {"value": -1}.'
     )
