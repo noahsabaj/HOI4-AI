@@ -78,6 +78,7 @@ def cmd_run(cfg: Config, args) -> int:
 
 def cmd_eval(cfg: Config, args) -> int:
     from ..brain.decide import Brain, build_backend
+    from ..config import list_llm_profiles, load_config
     from ..eval.corpus import load_corpus
     from ..eval.m0_perception import score_model
 
@@ -85,8 +86,35 @@ def cmd_eval(cfg: Config, args) -> int:
     if not corpus:
         print(f"no corpus at {cfg.paths.corpus} (add labeled *.png + *.toml)")
         return 1
-    report = score_model(corpus, Brain(build_backend(cfg.llm)))
-    print(json.dumps(report, indent=2))
+
+    if not getattr(args, "all_profiles", False):
+        report = score_model(corpus, Brain(build_backend(cfg.llm)))
+        print(json.dumps(report, indent=2))
+        return 0
+
+    # The M0 shootout: score every configured profile on the same corpus.
+    profiles = list_llm_profiles(args.config)
+    if not profiles:
+        print("no [llm.profiles.*] defined in config — nothing to compare")
+        return 1
+    rows = []
+    for name in profiles:
+        pcfg = load_config(args.config, llm_profile=name)
+        print(f"scoring profile {name!r} ({pcfg.llm.model} via {pcfg.llm.backend})...")
+        start = time.time()
+        report = score_model(corpus, Brain(build_backend(pcfg.llm)))
+        s_per_item = (time.time() - start) / max(report["total"], 1)
+        per_task = "  ".join(
+            f"{t}={v['accuracy']:.0%}" for t, v in sorted(report["per_task"].items())
+        )
+        rows.append((name, pcfg.llm.model, report["accuracy"], s_per_item, per_task))
+
+    print(f"\n{'profile':<16} {'model':<26} {'accuracy':>8} {'s/item':>7}")
+    for name, model, acc, s, per_task in rows:
+        print(f"{name:<16} {model:<26} {acc:>8.1%} {s:>7.2f}")
+        print(f"{'':<16} {per_task}")
+    best = max(rows, key=lambda r: r[2])
+    print(f"\nbest: {best[0]} ({best[2]:.1%}) — see [llm] comment in agent.toml for the switch rule")
     return 0
 
 
@@ -132,6 +160,8 @@ def cmd_calibrate(cfg: Config, args) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="hoi4_agent")
     p.add_argument("--config", default="config/agent.toml")
+    p.add_argument("--llm-profile", default=None,
+                   help="override the [llm] profile from config (see [llm.profiles.*])")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("smoke-test", help="validate I/O (live) or run controller with fakes (--offline)")
@@ -144,6 +174,8 @@ def main(argv=None) -> int:
     s.set_defaults(func=cmd_calibrate)
 
     s = sub.add_parser("eval", help="M0: score the model's perception on the corpus")
+    s.add_argument("--all-profiles", action="store_true",
+                   help="score EVERY [llm.profiles.*] entry and print a comparison table")
     s.set_defaults(func=cmd_eval)
 
     s = sub.add_parser("replay", help="re-run saved trace frames through the model")
@@ -158,7 +190,7 @@ def main(argv=None) -> int:
 
     args = p.parse_args(argv)
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, llm_profile=args.llm_profile)
     except AgentError as e:
         print(f"config error: {e}")
         return 1
