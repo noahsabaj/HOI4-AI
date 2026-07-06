@@ -15,7 +15,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .enums import BuildingType, GermanState, MapMode, Tech
+from .enums import BuildingType, GermanState, MapMode, ResearchTab, Tech
 from .errors import ConfigError, TemplateMissingError
 
 # Standard ROI names the perception tiers expect.
@@ -52,6 +52,10 @@ GLYPH_TEMPLATE_PREFIX = "glyph_"
 #   minimap_anchor — a fixed minimap spot over Germany (camera re-anchoring)
 UI_POINT_NAMES = ("event_option", "minimap_anchor")
 
+# Research-panel tab click-points (one per ResearchTab). Tech points are
+# tab-relative, so the executor clicks the tab before the tech.
+RESEARCH_TAB_NAMES = tuple(t.value for t in ResearchTab)
+
 
 @dataclass(frozen=True, slots=True)
 class Calibration:
@@ -62,6 +66,7 @@ class Calibration:
     state_points: dict[str, tuple[int, int]] = field(default_factory=dict)
     tech_points: dict[str, tuple[int, int]] = field(default_factory=dict)
     ui_points: dict[str, tuple[int, int]] = field(default_factory=dict)
+    research_tabs: dict[str, tuple[int, int]] = field(default_factory=dict)
     home_map_mode: str = MapMode.DEFAULT.value
 
     def roi(self, name: str) -> tuple[float, float, float, float]:
@@ -81,6 +86,11 @@ class Calibration:
     def ui_point(self, name: str) -> tuple[int, int] | None:
         """Optional named UI point; None means the feature degrades gracefully."""
         return self.ui_points.get(name)
+
+    def research_tab_point(self, tab: ResearchTab) -> tuple[int, int] | None:
+        """Calibrated click-point for a research tab, or None if uncalibrated
+        (preflight blocks a live run whose techs need an uncalibrated tab)."""
+        return self.research_tabs.get(tab.value)
 
     @staticmethod
     def _pt(d: dict[str, tuple[int, int]], key: str, kind: str) -> tuple[int, int]:
@@ -125,6 +135,7 @@ def load_calibration(path: str | Path) -> Calibration:
         state_points={k: _as_point(v) for k, v in raw.get("state_points", {}).items()},
         tech_points={k: _as_point(v) for k, v in raw.get("tech_points", {}).items()},
         ui_points={k: _as_point(v) for k, v in raw.get("ui_points", {}).items()},
+        research_tabs={k: _as_point(v) for k, v in raw.get("research_tabs", {}).items()},
         home_map_mode=raw.get("home_view", {}).get("map_mode", MapMode.DEFAULT.value),
     )
 
@@ -140,6 +151,7 @@ def dump_toml(c: Calibration) -> str:
         ("state_points", c.state_points),
         ("tech_points", c.tech_points),
         ("ui_points", c.ui_points),
+        ("research_tabs", c.research_tabs),
     ):
         lines.append(f"[{section}]")
         for k, (x, y) in d.items():
@@ -186,5 +198,6 @@ def default_calibration(width: int = 2560, height: int = 1440) -> Calibration:
         state_points=grid([s.value for s in GermanState], 450),
         tech_points=grid([t.value for t in Tech], 350),
         ui_points={"event_option": (500, 620), "minimap_anchor": (930, 930)},
+        research_tabs={tab.value: (int(500 + i * 60), 120) for i, tab in enumerate(ResearchTab)},
         home_map_mode=MapMode.DEFAULT.value,
     )

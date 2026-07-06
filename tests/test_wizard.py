@@ -13,8 +13,8 @@ from hoi4_agent.cli.calibrate import (
 from hoi4_agent.cli.wizard import Step, Wizard
 from hoi4_agent.errors import ConfigError
 
-# 10 ROIs x 2 corners + 2 buildings + 8 techs + 8 states + 2 ui + 11 templates + glyphs
-FULL_STEPS = 20 + 2 + 8 + 8 + 2 + 11 + 1
+# 10 ROIs x 2 corners + 2 buildings + 3 tabs + 8 techs + 8 states + 2 ui + 11 templates + glyphs
+FULL_STEPS = 20 + 2 + 3 + 8 + 8 + 2 + 11 + 1
 
 
 def _wiz(*ids, skippable=()):
@@ -81,6 +81,17 @@ def test_build_steps_section_and_narrow_filters():
     assert combo == {"roi:date:tl", "roi:date:br", "template:pause_on", "glyphs"}
 
 
+def test_build_steps_tabs_section():
+    tabs = build_steps(parse_only("tabs"))
+    assert {s.id for s in tabs} == {"tab:industry", "tab:engineering", "tab:land_doctrine"}
+    one = build_steps(parse_only("tabs:engineering"))
+    assert [s.id for s in one] == ["tab:engineering"]
+    # tabs sit between buildings and techs in the full flow (both research-panel)
+    ids = [s.id for s in build_steps(None)]
+    assert ids.index("tab:industry") < ids.index("tech:construction_1")
+    assert ids.index("building:civilian_factory") < ids.index("tab:industry")
+
+
 def test_parse_only_validates_loudly():
     assert parse_only(None) is None
     with pytest.raises(ConfigError):
@@ -89,6 +100,8 @@ def test_parse_only_validates_loudly():
         parse_only("points:bogus_name")
     with pytest.raises(ConfigError):
         parse_only("glyphs:anything")  # glyphs has no narrow names
+    with pytest.raises(ConfigError):
+        parse_only("tabs:bogus_tab")
     with pytest.raises(ConfigError):
         parse_only(" , ")
 

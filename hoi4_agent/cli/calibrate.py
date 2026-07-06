@@ -11,9 +11,10 @@ goes back, K keeps a previously recorded answer when revisiting, S skips where
 allowed, Q aborts without writing. Nothing is written until the last step, and
 one mistake costs one recapture, not a restart.
 
-``--only rois|points|templates|glyphs`` redoes a subset on top of the existing
-calibration (narrow with ``points:techs``, ``points:industry_1``,
-``templates:pause_on``, ``rois:date`` — comma-separate to combine). Glyph
+``--only rois|points|tabs|templates|glyphs`` redoes a subset on top of the
+existing calibration (narrow with ``points:techs``, ``points:industry_1``,
+``tabs:engineering``, ``templates:pause_on``, ``rois:date`` — comma-separate to
+combine). Glyph
 coverage is DESIGNED to grow across sessions: re-run ``--only glyphs`` at later
 in-game dates until 0-9 are all captured.
 
@@ -26,12 +27,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..calibration import (
+    RESEARCH_TAB_NAMES,
     ROI_NAMES,
     Calibration,
     dump_toml,
     load_calibration,
 )
-from ..enums import BuildingType, GermanState, MapMode, Tech
+from ..enums import BuildingType, GermanState, MapMode, ResearchTab, Tech
 from ..errors import ConfigError
 from .wizard import Step, Wizard
 
@@ -89,6 +91,7 @@ def parse_only(spec: str | None) -> list[tuple[str, str | None]] | None:
     valid_narrow: dict[str, set[str]] = {
         "rois": set(ROI_NAMES),
         "points": set(POINT_GROUPS) | point_names,
+        "tabs": set(RESEARCH_TAB_NAMES),
         "templates": set(_TEMPLATE_ROI),
         "glyphs": set(),
     }
@@ -135,6 +138,10 @@ def build_steps(filters: list[tuple[str, str | None]] | None = None) -> list[Ste
         if want("points", b.value, "buildings"):
             steps.append(Step(f"building:{b.value}",
                               f"building {b.value!r}: construction panel open — hover the click point"))
+    for tab in ResearchTab:
+        if want("tabs", tab.value):
+            steps.append(Step(f"tab:{tab.value}",
+                              f"research tab {tab.value!r}: research panel open — hover the {tab.value} tab"))
     for t in Tech:
         if want("points", t.value, "techs"):
             steps.append(Step(f"tech:{t.value}",
@@ -273,7 +280,7 @@ def run(cfg, title: str = "Hearts of Iron", only: str | None = None) -> int:
         section = step.id.split(":", 1)[0]
         if section == "roi":
             return True, frac_of_cursor()
-        if section in ("building", "tech", "state", "ui"):
+        if section in ("building", "tech", "state", "ui", "tab"):
             return True, geo.screen_to_norm(geo.full_crop(), *cursor())
         if section == "template":
             tname = step.id.split(":", 1)[1]
@@ -363,6 +370,7 @@ def run(cfg, title: str = "Hearts of Iron", only: str | None = None) -> int:
         state_points=merged("state", base.state_points if base else {}),
         tech_points=merged("tech", base.tech_points if base else {}),
         ui_points=merged("ui", base.ui_points if base else {}),
+        research_tabs=merged("tab", base.research_tabs if base else {}),
         home_map_mode=base.home_map_mode if base else MapMode.DEFAULT.value,
     )
     path.parent.mkdir(parents=True, exist_ok=True)

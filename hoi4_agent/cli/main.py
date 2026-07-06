@@ -222,8 +222,8 @@ def main(argv=None) -> int:
     s.add_argument("--title", default="Hearts of Iron")
     s.add_argument("--only", default=None,
                    help="redo a subset over the existing calibration: comma-separated "
-                        "rois|points|templates|glyphs, narrowable like points:techs, "
-                        "points:industry_1, templates:pause_on, rois:date")
+                        "rois|points|tabs|templates|glyphs, narrowable like points:techs, "
+                        "points:industry_1, tabs:engineering, templates:pause_on, rois:date")
     s.set_defaults(func=cmd_calibrate)
 
     s = sub.add_parser("eval", help="M0: score the model's perception on the corpus")

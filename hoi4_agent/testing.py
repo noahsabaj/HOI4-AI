@@ -60,6 +60,7 @@ class FakeGame:
             ("state", self.calib.state_points),
             ("tech", self.calib.tech_points),
             ("ui", self.calib.ui_points),
+            ("tab", self.calib.research_tabs),
         ):
             for name, (nx, ny) in d.items():
                 self._points.append((cat, name, nx, ny))
@@ -117,6 +118,11 @@ class FakeGame:
             if name == "event_option" and self.event_popup:
                 self.event_popup = False
             # minimap_anchor: pans the camera; no observable state change here.
+            return
+        if cat == "tab":
+            # Selecting a research tab has no observable counter change here; the
+            # executor always clicks the tech's tab before the tech, so modeling
+            # it as a benign no-op keeps the tech click from being misread as one.
             return
         if self.event_popup or self.pause_menu:
             return  # overlays swallow clicks that aren't on their own buttons
