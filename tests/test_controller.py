@@ -8,8 +8,8 @@ from hoi4_agent.calibration import default_calibration
 from hoi4_agent.context import AgentContext
 from hoi4_agent.controller import cadence, recovery
 from hoi4_agent.controller.loop import run
-from hoi4_agent.enums import BuildingType, GermanState, PanelId, PreconditionKind, ToolName, Verdict
-from hoi4_agent.errors import BackendUnavailableError, HaltAndFlag
+from hoi4_agent.enums import BuildingType, GermanState, PanelId, PreconditionKind, Tech, ToolName, Verdict
+from hoi4_agent.errors import BackendUnavailableError, HaltAndFlag, ResetFailedError
 from hoi4_agent.geometry import WindowGeometry
 from hoi4_agent.io.backends import InputRecorder, RecordingInput
 from hoi4_agent.perception.templates import TemplateStore
@@ -292,6 +292,121 @@ def test_expired_date_window_is_skipped_not_waited_on(cfg, tmp_path):
     skipped = [r for r in records if r.kind == "skipped"]
     assert len(skipped) == 1 and skipped[0].plan_step == "old"
     assert "expired" in skipped[0].verification_question
+
+
+def test_advance_target_backoff_and_eta(cfg):
+    d = GameDate(1936, 1, 1)
+    t0, r0 = cadence.compute_advance_target(d, (), 7, 56, 0)
+    assert (t0, r0) == (d.plus_days(7), "backoff 7d")
+    _, r3 = cadence.compute_advance_target(d, (), 7, 56, 3)  # 7 * 2^3 = 56
+    assert r3 == "backoff 56d"
+    _, r9 = cadence.compute_advance_target(d, (), 7, 56, 9)
+    assert r9 == "backoff 56d"  # capped
+    t_blind, _ = cadence.compute_advance_target(None, (), 7, 56, 0)
+    assert t_blind is None
+    # An ETA may only SHORTEN the hop...
+    etas = (("construction_1", "1936.02.01"),)
+    t, r = cadence.compute_advance_target(d, etas, 7, 56, 9)  # backoff would be 56d
+    assert t == GameDate(1936, 2, 1) and r.startswith("eta")
+    # ...never extend past the backoff target, and never fire once passed.
+    t, r = cadence.compute_advance_target(d, etas, 7, 56, 0)  # backoff 7d < eta
+    assert t == d.plus_days(7) and r.startswith("backoff")
+    t, _ = cadence.compute_advance_target(GameDate(1936, 6, 1), etas, 7, 56, 0)
+    assert t == GameDate(1936, 6, 1).plus_days(7)
+
+
+def test_research_eta_recorded_on_assign(cfg):
+    ctx, fg = _fakegame_ctx(cfg)
+    goal = Goal(id="r", tool=ToolName.ASSIGN_RESEARCH, tech=Tech.INDUSTRY_1,
+                precondition=Precondition(PreconditionKind.IDLE_RESEARCH_SLOT))
+    final = run(ctx, [goal], PlaybookState(),
+                research_days={Tech.INDUSTRY_1: 100}, sleep=lambda _s: None)
+    expected_eta = GameDate(1936, 1, 1).plus_days(100).to_str()
+    assert dict(final.pending_etas) == {"industry_1": expected_eta}
+
+
+def test_backoff_reflected_in_advance_records(cfg, tmp_path):
+    # A build that can never proceed (no civ regen): advances back off 7->14->28.
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    fg = FakeGame(calibration=calib, free_civ=0, max_free_civ=0)
+    ctx, fg = _fakegame_ctx(cfg, fg)
+    goal = Goal(id="b", tool=ToolName.BUILD_IN_STATE, building=BuildingType.CIVILIAN_FACTORY,
+                state=GermanState.RUHR, precondition=Precondition(PreconditionKind.FREE_CIV_SLOT))
+    trace = tmp_path / "t.jsonl"
+    with JsonlTraceWriter(trace) as w:
+        with pytest.raises(HaltAndFlag):  # max_cycles cap fires; we only care about pacing
+            run(ctx, [goal], PlaybookState(), writer=w, max_cycles=4, sleep=lambda _s: None)
+    reasons = [r.verification_question for r in JsonlTraceWriter.read(trace) if r.kind == "advance"]
+    assert any("backoff 7d" in x for x in reasons)
+    assert any("backoff 14d" in x for x in reasons)
+
+
+def test_recovery_consult_unblocks_after_hint(cfg, monkeypatch):
+    from hoi4_agent.controller import recovery as rec
+
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    fg = FakeGame(calibration=calib)
+    ctx, fg = _fakegame_ctx(cfg, fg)
+    ctx.brain = Brain(ScriptedBackend(['{"action": "press_escape"}']))
+
+    calls = {"n": 0}
+    real_reset = rec.macros.reset_to_home
+
+    def flaky_reset(c):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ResetFailedError("transiently stuck")
+        return real_reset(c)
+
+    monkeypatch.setattr(rec.macros, "reset_to_home", flaky_reset)
+    recovered, info = rec.recover_with_consult(ctx)
+    assert recovered is True
+    assert info is not None and info["hint"] == "press_escape"
+    assert ("key", "escape") in fg.input_calls  # the hint was actually applied
+
+
+def test_recovery_consult_none_or_disabled_goes_to_halt(cfg, monkeypatch):
+    import dataclasses
+
+    from hoi4_agent.controller import recovery as rec
+
+    monkeypatch.setattr(rec.macros, "reset_to_home",
+                        lambda c: (_ for _ in ()).throw(ResetFailedError("stuck")))
+    ctx, _ = _fakegame_ctx(cfg)
+    ctx.brain = Brain(ScriptedBackend(['{"action": "none"}']))
+    recovered, info = rec.recover_with_consult(ctx)
+    assert recovered is False and info is not None and info["hint"] == "none"
+
+    ctx2, _ = _fakegame_ctx(cfg)
+    ctx2.brain = None
+    assert rec.recover_with_consult(ctx2) == (False, None)
+
+    ctx3, _ = _fakegame_ctx(cfg)
+    ctx3.config = dataclasses.replace(cfg, recovery_vlm_consult=False)
+    assert rec.recover_with_consult(ctx3) == (False, None)
+
+
+def test_consult_record_written_when_recovery_fails(cfg, tmp_path):
+    from hoi4_agent.io.backends import FakeCapture
+    from PIL import Image
+
+    # Recovery can never reach home (panel stuck open) -> consult fires, is
+    # traced, hint doesn't help -> halt.
+    world = WorldState(open_panel=PanelId.CONSTRUCTION, construction_queue_len=5,
+                       free_civ_slots=3, paused=True, confidence={"panel": 1.0, "pause": 1.0})
+    ctx = _const_ctx(cfg, world)
+    ctx.brain = Brain(ScriptedBackend(['{"action": "none"}']))
+    ctx.capture = FakeCapture(Image.new("RGB", (8, 8)))
+    goal = Goal(id="b", tool=ToolName.BUILD_IN_STATE, building=BuildingType.CIVILIAN_FACTORY,
+                state=GermanState.RUHR)
+    trace = tmp_path / "t.jsonl"
+    with JsonlTraceWriter(trace) as w:
+        with pytest.raises(HaltAndFlag):
+            run(ctx, [goal], PlaybookState(), writer=w, max_failures=2, sleep=lambda _s: None)
+    consults = [r for r in JsonlTraceWriter.read(trace) if r.kind == "consult"]
+    assert consults and consults[0].vlm_used
+    assert "none" in consults[0].verification_question
+    assert consults[0].raw_model_output == '{"action": "none"}'
 
 
 def test_judgment_prompt_and_raw_output_are_traced(cfg, tmp_path):

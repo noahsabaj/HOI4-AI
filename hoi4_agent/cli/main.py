@@ -35,7 +35,7 @@ def _build_live_ctx(cfg: Config, title: str):
 def cmd_run(cfg: Config, args) -> int:
     from ..controller.loop import run
     from ..io.backends import InputRecorder
-    from ..playbook.loader import load_playbook
+    from ..playbook.loader import load_playbook, load_research_days
     from ..playbook.state import load_state
     from ..preflight import preflight
     from ..trace.writer import JsonlTraceWriter
@@ -67,7 +67,9 @@ def cmd_run(cfg: Config, args) -> int:
     state = load_state(state_path)
     with JsonlTraceWriter(run_dir / "trace.jsonl", screenshot_dir=run_dir / "frames") as w:
         try:
-            final = run(ctx, goals, state, writer=w, state_path=str(state_path), max_cycles=args.max_cycles)
+            final = run(ctx, goals, state, writer=w, state_path=str(state_path),
+                        max_cycles=args.max_cycles,
+                        research_days=load_research_days(cfg.paths.playbook))
         except HaltAndFlag as e:
             print(f"HALTED: {e}\ntrace: {e.trace_ref}")
             return 2

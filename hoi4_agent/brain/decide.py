@@ -86,6 +86,15 @@ class Brain:
             raise EnumError("answer", ans, ["yes", "no"])
         return ans == "yes"
 
+    def consult_recovery(self, crop: Image.Image, options: list[str]) -> str:
+        """Stuck-consultant: pick one recovery action from ``options``."""
+        system, user, schema = prompts.recovery_prompt(options)
+        d = self._ask(crop, system, user, schema, fmt="JPEG")
+        action = d.get("action")
+        if action not in options:
+            raise EnumError("action", action, options)
+        return action
+
 
 def build_backend(cfg: LLMConfig) -> LLMBackend:
     if cfg.backend == "ollama":

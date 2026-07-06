@@ -43,6 +43,7 @@ max_retries = 2
 ncc_threshold = 0.75
 run_speed = 4
 cycle_days = 7
+max_advance_days = 56
 [paths]
 calibration = "c"
 templates = "t"

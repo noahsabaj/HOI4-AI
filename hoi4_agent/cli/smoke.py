@@ -10,7 +10,7 @@ from ..config import Config
 from ..context import AgentContext
 from ..controller.loop import run
 from ..perception.templates import TemplateStore
-from ..playbook.loader import load_playbook
+from ..playbook.loader import load_playbook, load_research_days
 from ..playbook.select import all_done
 from ..schemas import PlaybookState
 from ..testing import FakeGame
@@ -43,6 +43,7 @@ def run_offline(cfg: Config) -> int:
     trace = tmp / "trace.jsonl"
     with JsonlTraceWriter(trace) as w:
         final = run(ctx, goals, PlaybookState(), writer=w, state_path=str(tmp / "state.json"),
+                    research_days=load_research_days(cfg.paths.playbook),
                     sleep=lambda _s: None)
     done = all_done(goals, final)
     records = JsonlTraceWriter.read(trace)

@@ -84,9 +84,33 @@ def parse_goals(raw: dict) -> list[Goal]:
 
 
 def load_playbook(path: str | Path) -> list[Goal]:
+    return parse_goals(_read_raw(path))
+
+
+def parse_research_days(raw: dict) -> dict[Tech, int]:
+    """Optional [research_days] table: tech -> approximate days to completion.
+
+    Wake-up HINTS for time advance only — correctness always comes from
+    perception. Unknown techs or non-positive days fail loudly.
+    """
+    table = raw.get("research_days", {})
+    out: dict[Tech, int] = {}
+    for key, value in table.items():
+        tech = _coerce("research_days", key, Tech)
+        days = int(value)
+        if days <= 0:
+            raise ConfigError(f"research_days {key} = {value!r} must be positive")
+        out[tech] = days
+    return out
+
+
+def load_research_days(path: str | Path) -> dict[Tech, int]:
+    return parse_research_days(_read_raw(path))
+
+
+def _read_raw(path: str | Path) -> dict:
     p = Path(path)
     if not p.is_file():
         raise ConfigError(f"playbook not found: {p}")
     with open(p, "rb") as f:
-        raw = tomllib.load(f)
-    return parse_goals(raw)
+        return tomllib.load(f)

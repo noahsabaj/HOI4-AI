@@ -90,3 +90,20 @@ def yes_no_prompt(question: str) -> tuple[str, str, dict]:
         "required": ["answer"],
     }
     return _SYSTEM_DECIDE, user, schema
+
+
+def recovery_prompt(options: list[str]) -> tuple[str, str, dict]:
+    """One bounded hint when deterministic recovery failed (stuck-consultant)."""
+    user = (
+        "The automated player is stuck: pressing escape and the map-mode key did "
+        "not return the game to the normal map view. Look at the screenshot and "
+        "pick the ONE action most likely to unblock it — 'click_event_option' "
+        "clicks an event window's option button; choose 'none' if nothing would "
+        f"help. Choose exactly one of: {options}. Reply {{\"action\": \"<option>\"}}."
+    )
+    schema = {
+        "type": "object",
+        "properties": {"action": {"type": "string", "enum": list(options)}},
+        "required": ["action"],
+    }
+    return _SYSTEM_DECIDE, user, schema

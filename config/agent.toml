@@ -50,7 +50,11 @@ verify_read_retries = 2            # extra re-READS (never re-clicks) when a ver
 max_retries = 2                    # bounded retries per tool before recover/halt
 ncc_threshold = 0.75               # template-match confidence floor; below => UNCERTAIN
 run_speed = 4                      # HOI4 speed to advance time at
-cycle_days = 7                     # in-game days to advance between decision checks
+cycle_days = 7                     # base in-game days to advance between decision checks
+max_advance_days = 56              # cap for the quiet-world advance backoff (7 -> 14 -> 28 -> 56)
+
+[recovery]
+vlm_consult = true                 # one bounded VLM hint when deterministic recovery fails, before halting
 
 [paths]
 calibration = "config/calibration.toml"
