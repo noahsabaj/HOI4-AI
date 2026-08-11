@@ -161,7 +161,7 @@ def cmd_calibrate(cfg: Config, args) -> int:
 
 
 def cmd_save_audit(cfg: Config, args) -> int:
-    from ..eval.savefile import read_save_facts
+    from ..eval.savefile import dates_agree, read_save_facts
     from ..trace.writer import JsonlTraceWriter
 
     facts = read_save_facts(args.save, country=args.country)
@@ -176,10 +176,13 @@ def cmd_save_audit(cfg: Config, args) -> int:
     if args.trace:
         records = JsonlTraceWriter.read(args.trace)
         traced_date = next((r.date for r in reversed(records) if r.date), None)
-        if traced_date is None or facts.date is None:
-            print("trace cross-check: skipped (no date on one side)")
-        elif traced_date == facts.date:
-            print(f"trace cross-check: MATCH (both {traced_date})")
+        # The two sides are formatted differently (padded Y.M.D vs the save's
+        # Y.M.D.HOUR), so compare normalized dates, not raw strings.
+        agree = dates_agree(traced_date, facts.date)
+        if agree is None:
+            print("trace cross-check: skipped (no readable date on one side)")
+        elif agree:
+            print(f"trace cross-check: MATCH (trace {traced_date}, save {facts.date})")
         else:
             print(f"trace cross-check: MISMATCH (trace {traced_date} vs save {facts.date})")
     return 0
@@ -189,9 +192,14 @@ def cmd_gui_import(cfg: Config, args) -> int:
     from ..calibration import dump_toml
     from ..gui_import import draft_calibration, load_elements
 
+    # Default to the configured display: a draft calibration computed against a
+    # resolution the agent isn't running at is worse than useless.
+    width = args.width or cfg.display.width
+    height = args.height or cfg.display.height
     elements = load_elements(args.path)
     print(f"parsed {len(elements)} positioned element(s)")
-    calib, report = draft_calibration(elements, args.width, args.height)
+    print(f"drafting against {width}x{height}")
+    calib, report = draft_calibration(elements, width, height)
     for roi, source in report["mapped"].items():
         print(f"  mapped {roi!r} <- {source}")
     for line in report["skipped"]:
@@ -244,8 +252,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("gui-import", help="EXPERIMENTAL: draft calibration from .gui interface files")
     s.add_argument("path", help=".gui file or directory containing them")
     s.add_argument("--out", default=None, help="write the draft calibration TOML here")
-    s.add_argument("--width", type=int, default=2560)
-    s.add_argument("--height", type=int, default=1440)
+    s.add_argument("--width", type=int, default=None, help="default: [display] width from config")
+    s.add_argument("--height", type=int, default=None, help="default: [display] height from config")
     s.set_defaults(func=cmd_gui_import)
 
     s = sub.add_parser("run", help="play Germany-1936 construction + research")

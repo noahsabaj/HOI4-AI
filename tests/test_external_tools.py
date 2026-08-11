@@ -80,6 +80,22 @@ def test_read_save_facts_reports_missing_not_guesses(tmp_path):
     assert any("GER" in m for m in facts.missing)
 
 
+def test_dates_agree_normalizes_both_formats():
+    from hoi4_agent.eval.savefile import dates_agree
+
+    # A trace carries GameDate.to_str()'s zero-padded form; a save carries
+    # year.month.day.HOUR. Comparing the raw strings reported MISMATCH for the
+    # same day, which made the save cross-check useless.
+    assert dates_agree("1936.01.01", "1936.1.1.12") is True
+    assert dates_agree("1936.01.01", "1936.1.1") is True
+    assert dates_agree("1943.12.28", "1943.12.28.06") is True
+    assert dates_agree("1936.01.01", "1936.1.2.12") is False
+    # undecidable is None, never a silent False
+    assert dates_agree(None, "1936.1.1.12") is None
+    assert dates_agree("1936.01.01", None) is None
+    assert dates_agree("1936.01.01", "not a date") is None
+
+
 # --- gui-import ----------------------------------------------------------------
 
 GUI = """
@@ -116,3 +132,23 @@ def test_gui_import_drafts_recognized_rois(tmp_path):
     assert fx0 == round(1178 / 2560, 4) and fy1 == round((17 + 32) / 1440, 4)
     assert "date" in report["mapped"]
     assert "pause" in report["unmapped_rois"]  # nothing matched it
+
+
+def test_gui_import_cli_defaults_to_the_configured_display(tmp_path, cfg, capsys):
+    # A draft calibration computed against a resolution the agent isn't running
+    # at is worse than useless, so the dimensions default to [display].
+    from hoi4_agent.calibration import load_calibration
+    from hoi4_agent.cli.main import main
+
+    src = tmp_path / "topbar.gui"
+    src.write_text(GUI, encoding="utf-8")
+    out = tmp_path / "draft.toml"
+    assert main(["gui-import", str(src), "--out", str(out)]) == 0
+
+    drafted = load_calibration(out)
+    assert (drafted.width, drafted.height) == (cfg.display.width, cfg.display.height)
+    assert f"{cfg.display.width}x{cfg.display.height}" in capsys.readouterr().out
+    # and an explicit override still wins
+    assert main(["gui-import", str(src), "--out", str(out), "--width", "1920",
+                 "--height", "1080"]) == 0
+    assert (load_calibration(out).width, load_calibration(out).height) == (1920, 1080)
