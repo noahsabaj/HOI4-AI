@@ -21,9 +21,15 @@ model that does not exist. v4 inverts the fragile parts. See
 
 - Windows 11, Python **3.11+** (tested on 3.14).
 - Deps: `pip install -e .` (mss, Pillow, numpy, requests). `pip install -e ".[dev]"` for tests.
-- A local VLM runtime: **Ollama** (default, native vision) with `gemma4:e4b`,
-  or an OpenAI-compatible server (LM Studio / llama.cpp) for grounding models.
-- Hearts of Iron IV running at **2560×1440 borderless** (configurable).
+- A VLM runtime: **Ollama** (native vision) or an OpenAI-compatible server
+  (LM Studio / llama.cpp) for grounding models. The shipped default profile is
+  `gemma4-cloud` (`gemma4:31b-cloud`, Ollama's free cloud tier) — an interim
+  choice to be retired for the best **local** profile that clears the M0 gate.
+  Local candidates ship alongside it; see `[llm.profiles.*]` in
+  [config/agent.toml](config/agent.toml) and run `eval --all-profiles` to compare.
+- Hearts of Iron IV running borderless at the resolution `[display]` names —
+  **3840×2160** as shipped. Calibration is resolution-specific, so the two must
+  agree; preflight refuses to start if they don't.
 
 ## Layout
 
@@ -45,9 +51,21 @@ python -m hoi4_agent.cli.main smoke-test --offline   # end-to-end with fakes
 # Live (after installing HOI4 + Ollama):
 python -m hoi4_agent.cli.main smoke-test   # validate the Windows I/O layer
 python -m hoi4_agent.cli.main calibrate    # wizard: record ROIs + click-points (B=back, K=keep, S=skip)
-python -m hoi4_agent.cli.main calibrate --only glyphs   # redo a subset (rois|points|templates|glyphs)
+python -m hoi4_agent.cli.main calibrate --only glyphs   # redo a subset (rois|points|tabs|templates|glyphs)
 python -m hoi4_agent.cli.main eval         # M0: measure model perception on crops
 python -m hoi4_agent.cli.main run          # play Germany-1936 construction + research
+```
+
+Glyph capture is meant to grow across sessions: the date strip renders as
+`12:00, 1 Jan, 1936`, and the reader is all-or-nothing, so re-run
+`calibrate --only glyphs` at later in-game dates until every digit and every
+month name it can show has been captured. Until then the date falls back to
+OCR, then the VLM.
+
+Before committing, all three checks must pass:
+
+```bash
+python -m pytest tests/ && python -m ruff check . && python -m mypy hoi4_agent
 ```
 
 ## License
