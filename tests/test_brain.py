@@ -202,7 +202,7 @@ def test_number_prompt_field_specific_variants():
     # like idle_research_slots. It used to get the generic transcription prompt,
     # which no reader tier could satisfy against a list.
     _, user, _ = number_prompt("construction_queue")
-    assert "Count the rows" in user
+    assert "Count the ROWS" in user
     assert "Do NOT" in user and "transcribe" in user
     # a field with no bespoke entry still falls back to the generic prompt
     _, user, _ = number_prompt("some_future_counter")
