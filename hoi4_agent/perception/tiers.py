@@ -9,13 +9,22 @@ T1/T2 reads are delegated to the injected ``reader`` (see ``perceive``).
 
 from __future__ import annotations
 
+import numpy as np
 from PIL import Image
 
 from ..calibration import Calibration
 from ..enums import PanelId
 from ..geometry import WindowGeometry
-from .ncc import match_resized
+from .ncc import match_resized, ncc, to_gray_f32
 from .templates import TemplateStore
+
+
+def _resized(gray: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Grayscale array onto a common grid, so residuals can be compared."""
+    if gray.shape == (height, width):
+        return gray
+    img = Image.fromarray(gray.astype(np.float32), mode="F")
+    return np.asarray(img.resize((width, height), Image.Resampling.BILINEAR), dtype=np.float32)
 
 
 def crop_roi(full_img: Image.Image, geo: WindowGeometry, frac) -> Image.Image:
@@ -110,10 +119,14 @@ def detect_pause_menu(
 # — the two templates share most of their pixels, so a near-tie is a guess.
 PAUSE_MARGIN = 0.05
 
-# Same rule for the speed indicator, and it needs it more: speed_1..speed_5 are
-# the SAME widget with a different number of chevrons lit, so they share even
-# more pixels than pause_on/pause_off. Without a margin an argmax turns a
-# coin-flip between adjacent speeds into a confident fact.
+# Same rule for the speed indicator, but applied to a DIFFERENT score — see
+# read_speed. speed_1..speed_5 are the same widget with a different number of
+# chevrons lit, so whole-ROI NCC between them is dominated by the shared widget:
+# measured on real captures, speed_4 vs speed_5 scores 0.9592. A margin over
+# whole-ROI scores therefore rejects every reading at the high speeds instead of
+# only the ambiguous ones, so the discrimination happens on mean-centered
+# residuals where the shared structure has been removed (same captures: worst
+# margin 0.0408 -> 0.3324).
 SPEED_MARGIN = 0.05
 
 
@@ -145,22 +158,44 @@ def read_speed(
     templates: TemplateStore,
     threshold: float,
 ) -> tuple[int | None, float]:
-    """Game speed 1..5 via whole-ROI template argmax (``speed_1``..``speed_5``).
+    """Game speed 1..5 by template classification (``speed_1``..``speed_5``).
 
     Deterministic T0: the indicator renders as chevrons, not digits, so it is a
     5-way template classification, not a numeric read.
 
-    Uncertain (None) when the best score is below ``threshold`` OR within
-    SPEED_MARGIN of the runner-up — see SPEED_MARGIN. Templates that are absent
-    score 0.0 and so can't be the runner-up that blocks a clean single match.
+    Two scores, answering two different questions:
+
+    - *Is this the speed widget at all?* Whole-ROI NCC against the best template,
+      gated on ``threshold``. This is the confidence returned to callers.
+    - *Which speed?* NCC on MEAN-CENTERED residuals, gated on SPEED_MARGIN.
+      Subtracting the per-pixel mean of the template set removes the widget
+      structure every speed shares and leaves only what distinguishes them, which
+      is the one chevron that differs. Without this the shared structure swamps
+      the signal and adjacent speeds are indistinguishable (see SPEED_MARGIN).
+
+    Uncertain (None) if the ROI doesn't look like the widget, or if the residuals
+    cannot separate the top two candidates. With fewer than two templates loaded
+    there is nothing to center against and nothing to confuse, so the whole-ROI
+    argmax stands on its own.
     """
-    scored = [
-        (roi_score(full_img, geo, calib, templates, "speed", f"speed_{s}"), s)
-        for s in range(1, 6)
-    ]
-    ranked = sorted(scored, reverse=True)
-    best_score, best_speed = ranked[0]
-    runner_up = ranked[1][0]
-    if best_score < threshold or (best_score - runner_up) < SPEED_MARGIN:
+    available = [(s, templates.get(f"speed_{s}")) for s in range(1, 6) if templates.has(f"speed_{s}")]
+    if not available or "speed" not in calib.rois:
+        return None, 0.0
+
+    whole = [(roi_score(full_img, geo, calib, templates, "speed", f"speed_{s}"), s) for s, _ in available]
+    best_score, best_speed = max(whole)
+    if best_score < threshold:
         return None, best_score
-    return best_speed, best_score
+    if len(available) == 1:
+        return best_speed, best_score
+
+    # Put every template and the ROI on one grid, then compare residuals.
+    ref_h, ref_w = available[0][1].shape
+    grid = {s: _resized(t, ref_w, ref_h) for s, t in available}
+    mean = np.mean(list(grid.values()), axis=0)
+    roi = _resized(to_gray_f32(crop_roi(full_img, geo, calib.roi("speed"))), ref_w, ref_h)
+
+    residual = sorted(((ncc(roi - mean, t - mean), s) for s, t in grid.items()), reverse=True)
+    if (residual[0][0] - residual[1][0]) < SPEED_MARGIN:
+        return None, best_score
+    return residual[0][1], best_score
