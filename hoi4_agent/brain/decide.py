@@ -16,7 +16,7 @@ from ..enums import BuildingType, GermanState, Tech
 from ..errors import ConfigError, EnumError, ParseError, SchemaError
 from ..schemas import GameDate
 from . import prompts
-from .llm import LLMBackend, encode_image
+from .llm import LLMBackend, encode_image, mime_for
 from .ollama import OllamaBackend
 from .openai_compat import OpenAICompatBackend
 from .parse import coerce_enum, coerce_int, extract_json
@@ -33,7 +33,8 @@ class Brain:
 
     def _ask(self, crop: Image.Image, system: str, user: str, schema: dict, fmt: str = "PNG") -> dict:
         raw = self.backend.chat(
-            images=[self._encode(crop, fmt)], system=system, user=user, schema=schema
+            images=[self._encode(crop, fmt)], image_mime=mime_for(fmt),
+            system=system, user=user, schema=schema,
         )
         self.last_system, self.last_user, self.last_raw = system, user, raw
         return extract_json(raw)
@@ -49,9 +50,15 @@ class Brain:
         system, user, schema = prompts.number_prompt(field)
         try:
             d = self._ask(crop, system, user, schema)
-            return coerce_int(d.get("value"))
+            value = coerce_int(d.get("value"))
         except (ParseError, SchemaError, EnumError):
             return None
+        # The prompt asks for -1 when the crop is unreadable; honor that sentinel
+        # here, symmetrically with read_date's year<1900 check. Leaking it made
+        # ChainReader treat "I can't read this" as a successful read and stop
+        # trying later tiers — harmless only because the VLM happens to be last.
+        # Every counter the agent reads is a count, so any negative is uncertain.
+        return None if value < 0 else value
 
     def read_date(self, crop: Image.Image) -> GameDate | None:
         system, user, schema = prompts.date_prompt()

@@ -13,7 +13,9 @@ class OllamaBackend:
         self.model = model
         self.timeout_s = timeout_s
 
-    def chat(self, *, images, system, user, schema, timeout=None) -> str:
+    def chat(self, *, images, system, user, schema, image_mime="image/png", timeout=None) -> str:
+        # image_mime is unused here by design: Ollama takes bare base64 and
+        # sniffs the format itself, so there is no media type to declare.
         payload = {
             "model": self.model,
             "messages": [
