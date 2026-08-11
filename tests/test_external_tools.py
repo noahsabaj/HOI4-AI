@@ -53,7 +53,11 @@ countries={
     GER={
         technology={ slots={ construction_1={ points=100 } industry_1={} } }
         civilian_factories=42
-        construction={ line={ id=1 } line={ id=2 } line={ id=3 } }
+        construction={
+            line={ id=1 state="ruhr" }
+            line={ id=2 state="saxony" }
+            line={ id=3 state="ruhr" }
+        }
     }
     FRA={ civilian_factories=30 }
 }
@@ -68,7 +72,48 @@ def test_read_save_facts(tmp_path):
     assert facts.researching == ("construction_1", "industry_1")
     assert facts.civilian_factories == 42
     assert facts.construction_lines == 3
+    assert facts.construction_states == ("ruhr", "saxony", "ruhr")
     assert facts.missing == ()
+
+
+def test_construction_states_reported_missing_when_the_schema_lacks_them(tmp_path):
+    # Paradox schemas drift; an unrecognized line shape must report missing, not
+    # invent a state — the identity check is only worth having if it can't lie.
+    p = tmp_path / "auto.hoi4"
+    p.write_text('HOI4txt\ndate="1936.1.1"\ncountries={ GER={ '
+                 'construction={ line={ id=1 } line={ id=2 } } } }\n', encoding="utf-8")
+    facts = read_save_facts(p, country="GER")
+    assert facts.construction_lines == 2
+    assert facts.construction_states is None
+    assert "construction_states" in facts.missing
+
+
+def test_build_identity_check_compares_intent_against_the_save(tmp_path):
+    # The live postcondition (queue +1) is cardinality: it cannot tell Ruhr from
+    # Bavaria. This offline pairing is the project's only identity check.
+    from hoi4_agent.eval.savefile import SaveFacts, build_identity_check
+    from hoi4_agent.schemas import TraceRecord
+
+    def rec(state, verdict="ok"):
+        return TraceRecord(cycle=0, ts=0.0, verdict=verdict,
+                           parsed_intent={"tool": "build_in_state", "state": state})
+
+    facts = SaveFacts(country="GER", construction_states=("ruhr", "saxony"))
+    status, _ = build_identity_check([rec("ruhr"), rec("saxony")], facts)
+    assert status == "match"
+
+    # intended Bavaria, save says the factory went to Saxony
+    status, notes = build_identity_check([rec("bavaria")], facts)
+    assert status == "mismatch"
+    assert any("bavaria" in n for n in notes)
+
+    # a failed build is not an intent the save should have honored
+    status, _ = build_identity_check([rec("ruhr", verdict="failed")], facts)
+    assert status == "undecidable"
+
+    # save exposes no states -> undecidable, never a silent pass
+    status, _ = build_identity_check([rec("ruhr")], SaveFacts(country="GER"))
+    assert status == "undecidable"
 
 
 def test_read_save_facts_reports_missing_not_guesses(tmp_path):

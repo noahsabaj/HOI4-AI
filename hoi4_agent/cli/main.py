@@ -35,6 +35,7 @@ def _build_live_ctx(cfg: Config, title: str):
 
 def cmd_run(cfg: Config, args) -> int:
     from ..controller.loop import run
+    from ..eval.corpus import load_corpus
     from ..io.backends import InputRecorder
     from ..playbook.loader import load_playbook, load_research_days
     from ..playbook.state import load_state
@@ -48,7 +49,19 @@ def cmd_run(cfg: Config, args) -> int:
     ctx.input = InputRecorder(ctx.input)  # journal every key/click into the trace
     goals = load_playbook(cfg.paths.playbook)
 
-    errors, warnings = preflight(cfg, ctx.calibration, ctx.templates, goals)
+    # Which numeric fields M0 has actually measured the model on — a missing or
+    # unreadable corpus simply means "none measured", never a crash before a run.
+    try:
+        measured = frozenset(
+            item.labels["field"]
+            for item in load_corpus(cfg.paths.corpus)
+            if item.labels.get("task") == "read_number" and item.labels.get("field")
+        )
+    except AgentError as e:
+        print(f"preflight WARN: corpus unreadable ({e}) — treating M0 as unmeasured")
+        measured = frozenset()
+
+    errors, warnings = preflight(cfg, ctx.calibration, ctx.templates, goals, measured)
     for warning in warnings:
         print(f"preflight WARN: {warning}")
     if errors:
@@ -161,7 +174,7 @@ def cmd_calibrate(cfg: Config, args) -> int:
 
 
 def cmd_save_audit(cfg: Config, args) -> int:
-    from ..eval.savefile import dates_agree, read_save_facts
+    from ..eval.savefile import build_identity_check, dates_agree, read_save_facts
     from ..trace.writer import JsonlTraceWriter
 
     facts = read_save_facts(args.save, country=args.country)
@@ -170,6 +183,7 @@ def cmd_save_audit(cfg: Config, args) -> int:
     print(f"  researching:         {', '.join(facts.researching) if facts.researching else '(not found)'}")
     print(f"  civilian factories:  {facts.civilian_factories if facts.civilian_factories is not None else '(not found)'}")
     print(f"  construction lines:  {facts.construction_lines if facts.construction_lines is not None else '(not found)'}")
+    print(f"  building in states:  {', '.join(facts.construction_states) if facts.construction_states else '(not found)'}")
     if facts.missing:
         print(f"  could not extract:   {', '.join(facts.missing)} (schema drift? inspect the save)")
 
@@ -185,6 +199,13 @@ def cmd_save_audit(cfg: Config, args) -> int:
             print(f"trace cross-check: MATCH (trace {traced_date}, save {facts.date})")
         else:
             print(f"trace cross-check: MISMATCH (trace {traced_date} vs save {facts.date})")
+
+        # The live loop verifies CARDINALITY (queue grew by 1) and cannot tell
+        # Ruhr from Bavaria. This is the only check of IDENTITY the project has.
+        status, notes = build_identity_check(records, facts)
+        print(f"build identity:    {status.upper()}")
+        for note in notes:
+            print(f"  {note}")
     return 0
 
 

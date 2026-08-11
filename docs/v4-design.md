@@ -20,6 +20,25 @@ pixels; deterministic code does *how*, *verify*, and all plumbing.
    macro → halt-and-flag. Never silent-loop. Nothing returns `None`.
 4. **Verifier independent of the actor** — robust mode verifies with deterministic
    perception, not by re-asking the VLM that acted.
+
+### Where (3) and (4) are weaker than they sound
+
+Both are load-bearing claims, and both are currently qualified. Stated here so
+nobody has to rediscover it from the source:
+
+- **The assertion is cardinality, not identity.** `queue+1` holds whether the
+  click landed on Ruhr or on Bavaria, and which state gets the factory is the
+  whole content of the playbook. No perceived quantity distinguishes a correct
+  state click from a wrong one, and `Calibration` carries no camera or zoom
+  state. The only identity check that exists is offline:
+  `save-audit --trace` pairs the trace's intended states against the save's
+  construction lines. Until that runs, no claim about *where* the agent built
+  is evidence-backed.
+- **The verifying reads are the model's.** `construction_queue` and
+  `idle_research_slots` are COUNTS of what a crop shows, not numbers the UI
+  prints, so no glyph or OCR tier can produce them. "Deterministic verification"
+  means deterministic *arithmetic* over a model read. Preflight names any such
+  field M0 has not yet measured.
 5. **Observed-not-assumed pause; date-driven cadence.**
 6. **Externalized playbook memory** — an ordered, idempotent Germany-1936 goal
    queue with persisted plan-state, instead of re-deriving strategy each frame.
