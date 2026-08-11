@@ -58,6 +58,15 @@ def test_gamedate_from_ui_text_ymd_and_hoi4_topbar():
     assert GameDate.from_ui_text("gibberish") is None
 
 
+def test_gamedate_month_name_wins_over_a_numeric_false_match():
+    # If a reader drops the clock's colon, the top bar arrives as
+    # "1200,1Jan,1936" — and the numeric Y.M.D pattern matches it as year 1200,
+    # month 1, day 19 ("Jan" eaten as a separator): an orderable WRONG date.
+    # The month NAME is unambiguous, so it is tried first.
+    assert GameDate.from_ui_text("1200,1Jan,1936") == GameDate(1936, 1, 1)
+    assert GameDate.from_ui_text("0000,28Dec,1943") == GameDate(1943, 12, 28)
+
+
 def test_gamedate_plus_days_rolls_over():
     assert GameDate(1936, 1, 25).plus_days(10) == GameDate(1936, 2, 5)
     assert GameDate(1936, 12, 25).plus_days(10) == GameDate(1937, 1, 5)
