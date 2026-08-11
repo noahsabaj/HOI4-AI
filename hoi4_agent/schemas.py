@@ -355,7 +355,12 @@ class TraceRecord:
     retries: int = 0
     latency_s: float = 0.0
     mode: str = "robust"
-    vlm_used: bool = False
+    vlm_used: bool = False       # the model made a JUDGMENT (prompt/raw describe it)
+    # Model round trips during this record's work, judgment and perception reads
+    # alike. vlm_used alone under-reports: the brain is the last tier of the
+    # perception chain, so a time advance polling the date can be many calls on a
+    # record whose vlm_used is False.
+    vlm_calls: int = 0
     error: str | None = None
 
     def to_dict(self) -> dict:

@@ -500,3 +500,106 @@ def test_judgment_prompt_and_raw_output_are_traced(cfg, tmp_path):
     assert rec.prompt and "state" in rec.prompt
     assert rec.raw_model_output == '{"state": "ruhr"}'
     assert rec.parsed_intent["state"] == "ruhr"  # the RESOLVED intent, not the template
+
+
+def test_unverifiable_mutation_halts_instead_of_silently_repeating(cfg, monkeypatch):
+    # retry_safe=False means "we clicked and could not read the effect".
+    # act_with_retry honors it within the cycle, but the goal is not marked
+    # complete, so the old code fell through to the failure path and re-offered
+    # the goal next cycle -- repeating a mutation that may already have landed.
+    from hoi4_agent.controller import recovery as recovery_mod
+    from hoi4_agent.schemas import ToolResult
+
+    ctx, fg = _fakegame_ctx(cfg)
+    goal = Goal(id="b", tool=ToolName.BUILD_IN_STATE, building=BuildingType.CIVILIAN_FACTORY,
+                state=GermanState.RUHR)
+
+    attempts = []
+
+    def _unverifiable(ctx_, intent, max_retries):
+        attempts.append(intent)
+        return ToolResult(intent.tool, Verdict.UNCERTAIN,
+                          assertion="queue unreadable after click - may have landed",
+                          retry_safe=False)
+
+    monkeypatch.setattr(recovery_mod, "act_with_retry", _unverifiable)
+
+    with pytest.raises(HaltAndFlag) as e:
+        run(ctx, [goal], PlaybookState(), max_failures=5, sleep=lambda _s: None)
+    assert "unverifiable" in str(e.value)
+    assert "'b'" in str(e.value)
+    assert len(attempts) == 1, f"the mutation was re-attempted {len(attempts)} times"
+
+
+def test_judgment_prompt_survives_the_tools_own_model_reads(cfg, tmp_path):
+    # The real wiring FakeGame hides: one Brain is both the judge AND the last
+    # tier of the perception ChainReader, and it keeps only its last exchange.
+    # Reading last_prompt after the action recorded a slot-counting read against
+    # a tech decision.
+    from hoi4_agent.brain.llm import ScriptedBackend
+
+    brain = Brain(ScriptedBackend(['{"tech": "industry_2"}', '{"value": 1}']))
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    fg = FakeGame(calibration=calib, idle_research=2)
+
+    def perceive_through_the_model(read_numbers=True, fields=None):
+        world = fg.perceive(read_numbers=read_numbers, fields=fields)
+        if read_numbers and world.idle_research_slots is not None:
+            brain.read_number(fg.grab(fg.geometry), "idle_research_slots")  # clobbers
+        return world
+
+    ctx = AgentContext(
+        config=cfg, geometry=fg.geometry, input=fg, capture=fg, calibration=calib,
+        templates=TemplateStore(), brain=brain, mode=cfg.mode,
+        perceive=perceive_through_the_model, sleep=lambda _s: None,
+    )
+    goal = Goal(id="refill", tool=ToolName.ASSIGN_RESEARCH, needs_judgment=True)
+    trace = tmp_path / "t.jsonl"
+    with JsonlTraceWriter(trace) as w:
+        run(ctx, [goal], PlaybookState(), writer=w, sleep=lambda _s: None)
+
+    rec = next(r for r in JsonlTraceWriter.read(trace) if r.plan_step == "refill")
+    assert rec.vlm_used is True
+    assert rec.raw_model_output == '{"tech": "industry_2"}', (
+        f"trace recorded a later read: {rec.raw_model_output!r}"
+    )
+    assert "best available technology" in (rec.prompt or "")
+    assert rec.parsed_intent["tech"] == "industry_2"
+    # and the model's real workload is reported, not just "judgment happened"
+    assert rec.vlm_calls >= 2, f"only counted {rec.vlm_calls} model calls"
+
+
+def test_time_advance_reports_its_model_calls(cfg, tmp_path):
+    # With no glyph/OCR tier every date poll is a model call, on a record whose
+    # vlm_used is False. The trace must still be able to say how much ran.
+    from hoi4_agent.brain.llm import ScriptedBackend
+
+    brain = Brain(ScriptedBackend(['{"value": 1}']))
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    fg = FakeGame(calibration=calib, free_civ=0, max_free_civ=0)
+
+    def perceive_through_the_model(read_numbers=True, fields=None):
+        world = fg.perceive(read_numbers=read_numbers, fields=fields)
+        if fields == {"date"}:
+            brain.read_number(fg.grab(fg.geometry), "date")
+        return world
+
+    ctx = AgentContext(
+        config=cfg, geometry=fg.geometry, input=fg, capture=fg, calibration=calib,
+        templates=TemplateStore(), brain=brain, mode=cfg.mode,
+        perceive=perceive_through_the_model, sleep=lambda _s: None,
+    )
+    goal = Goal(id="b", tool=ToolName.BUILD_IN_STATE, building=BuildingType.CIVILIAN_FACTORY,
+                state=GermanState.RUHR,
+                precondition=Precondition(PreconditionKind.FREE_CIV_SLOT))
+    trace = tmp_path / "t.jsonl"
+    with JsonlTraceWriter(trace) as w:
+        try:
+            run(ctx, [goal], PlaybookState(), writer=w, max_cycles=3, sleep=lambda _s: None)
+        except HaltAndFlag:
+            pass
+
+    advances = [r for r in JsonlTraceWriter.read(trace) if r.kind == "advance"]
+    assert advances, "no advance records"
+    assert any(r.vlm_calls > 0 for r in advances), "advance hid its model calls"
+    assert all(r.vlm_used is False for r in advances)  # no JUDGMENT happened

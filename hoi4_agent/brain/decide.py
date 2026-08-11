@@ -27,15 +27,22 @@ class Brain:
         self.backend = backend
         self._encode = encode
         # Last exchange, for the trace (prompt + raw output of the most recent call).
+        # Callers that need to attribute an exchange must read these IMMEDIATELY
+        # after their own call: one Brain serves both judgment and the perception
+        # ChainReader's last tier, so any later read overwrites them.
         self.last_system: str | None = None
         self.last_user: str | None = None
         self.last_raw: str | None = None
+        # Monotonic count of model round trips, so a trace can say how much work
+        # the model actually did rather than only whether judgment was consulted.
+        self.call_count = 0
 
     def _ask(self, crop: Image.Image, system: str, user: str, schema: dict, fmt: str = "PNG") -> dict:
         raw = self.backend.chat(
             images=[self._encode(crop, fmt)], image_mime=mime_for(fmt),
             system=system, user=user, schema=schema,
         )
+        self.call_count += 1
         self.last_system, self.last_user, self.last_raw = system, user, raw
         return extract_json(raw)
 
