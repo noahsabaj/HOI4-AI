@@ -78,7 +78,7 @@ def _parse_value(tp: _Peekable):
     return _coerce(tok)
 
 
-def _parse_block(tp: _Peekable, top: bool = False):
+def _parse_block(tp: _Peekable):
     """A block is a dict of pairs, a list of bare items, or (mixed) a dict with
     stray items under ``__items__``. Duplicate keys collect into a list."""
     pairs: dict[str, list] = {}
@@ -117,7 +117,7 @@ def parse(text: str):
         if text.startswith(magic):
             text = text[len(magic):]
             break
-    return _parse_block(_Peekable(_tokens(text)), top=True)
+    return _parse_block(_Peekable(_tokens(text)))
 
 
 def parse_file(path: str | Path):

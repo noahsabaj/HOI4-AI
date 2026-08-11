@@ -113,11 +113,10 @@ _ALIASES = {"esc": "escape", "return": "enter", "spacebar": "space"}
 
 
 def _normalize_key(name: str) -> str:
+    """Canonical SCANCODES key. Lowercasing also keeps an uppercase letter from
+    being read as Shift+letter — scancodes carry no case of their own."""
     n = name.strip().lower()
-    n = _ALIASES.get(n, n)
-    if len(n) == 1 and n.isalpha():  # avoid Shift+letter from an uppercase char
-        return n
-    return n
+    return _ALIASES.get(n, n)
 
 
 def _require() -> None:
