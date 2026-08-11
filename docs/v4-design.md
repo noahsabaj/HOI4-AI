@@ -28,12 +28,19 @@ pixels; deterministic code does *how*, *verify*, and all plumbing.
 
 ## Model (researched June 2026)
 
-- **Default: `gemma4:e4b`** (Google) — newest fitting multimodal, *native* Ollama
-  vision + tool calling, ~8 GB-friendly. Carries our dominant load: read crops +
-  pick from enums.
-- **Deferred grounding specialist: `Hcompany/Holo1.5-7B`** (Apache-2.0) — best
-  open GUI grounder in the class, but a Qwen2.5-VL fine-tune; Ollama mishandles
-  imported Qwen-VL vision GGUFs, so run it via the OpenAI-compatible backend.
+Candidates are configured as named `[llm.profiles.*]` entries and switched by
+name; `config/agent.toml` is the authority on which is active.
+
+- **Shipped default: the `gemma4-cloud` profile** (`gemma4:31b-cloud`, Ollama's
+  free cloud tier) — interim only. It is there so bring-up isn't blocked on VRAM,
+  and it is to be retired once the M0 shootout (`eval --all-profiles`) names a
+  **local** profile clearing ≥90% on the read tasks.
+- **Local candidates**: `gemma4-local` (`gemma4:e4b-it-qat`, ~6 GB, native Ollama
+  vision) and `qwen3vl-4b`. These carry the dominant load: read crops + pick from
+  enums.
+- **Grounding specialist: Holo 3.1** (`holo31-9b` / `holo31-4b`) — best open GUI
+  grounders in the class, but Qwen-VL fine-tunes; Ollama mishandles imported
+  Qwen-VL vision GGUFs, so they run via the OpenAI-compatible backend.
 - M0 measures candidates on real HOI4 crops before committing.
 
 ## Build order
