@@ -22,6 +22,7 @@ from .config import Config
 from .enums import TECH_TABS, GermanState, Tech, ToolName
 from .errors import IntentValidationError
 from .perception.digits import DATE_STRIP_CHARS, GlyphReader, missing_date_glyphs
+from .perception.perceive import VLM_ONLY_FIELDS
 from .perception.templates import TemplateStore
 from .schemas import Goal, validate_intent
 from .tools.macros import MAP_MODE_KEYS
@@ -32,8 +33,14 @@ def preflight(
     calibration: Calibration,
     templates: TemplateStore,
     goals: list[Goal],
+    measured_fields: frozenset[str] = frozenset(),
 ) -> tuple[list[str], list[str]]:
-    """Return (errors, warnings). Empty errors == safe to start the live loop."""
+    """Return (errors, warnings). Empty errors == safe to start the live loop.
+
+    ``measured_fields`` names the numeric fields the M0 corpus actually covers.
+    Passed in rather than read here so preflight stays free of I/O; the CLI
+    derives it from the corpus.
+    """
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -68,6 +75,22 @@ def preflight(
             f"{len(DATE_STRIP_CHARS)} date characters have no template: {shown}{more}. "
             "The reader is all-or-nothing, so every date poll falls back to OCR/the VLM; "
             "run `calibrate --only glyphs` at more in-game dates to close the gap"
+        )
+
+    # The two postconditions the load-bearing tools assert on are COUNTS of what
+    # a crop shows, not printed numbers, so no glyph or OCR tier can produce them
+    # and both reads are the model's. That is a real qualification on the
+    # "verified deterministically, not by re-asking the model" claim. It stops
+    # being a risk once M0 has measured the model on those fields, so the warning
+    # names exactly the ones the corpus does not yet cover.
+    unmeasured = sorted(set(VLM_ONLY_FIELDS) - set(measured_fields))
+    if unmeasured:
+        warnings.append(
+            "no deterministic tier for " + ", ".join(unmeasured)
+            + " — these are counted from the crop, not printed by the UI, so the "
+            "postconditions build_in_state/assign_research assert on are model "
+            "reads, and M0 has not measured the model on them; add labeled "
+            "read_number crops to the corpus and run `eval`"
         )
 
     if config.grounding is not None:

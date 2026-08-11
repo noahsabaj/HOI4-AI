@@ -84,7 +84,20 @@ def test_last_exchange_recorded_for_trace():
     assert b.last_raw is None
     b.read_number(CROP, "construction_queue")
     assert b.last_raw == '{"value": 3}'
-    assert b.last_prompt is not None and "construction_queue" in b.last_prompt
+    assert b.last_prompt is not None and "construction QUEUE" in b.last_prompt
+
+
+def test_last_exchange_is_clobbered_by_the_next_call():
+    # Why callers must read last_prompt/last_raw IMMEDIATELY: one Brain serves
+    # both judgment and the perception ChainReader's last tier, and it keeps only
+    # the most recent exchange. The controller captures at the call site because
+    # of this; the property is asserted so that stays true.
+    b = _brain('{"tech": "industry_1"}', '{"value": 2}')
+    b.which_tech(CROP, list(Tech))
+    assert b.last_raw == '{"tech": "industry_1"}'
+    b.read_number(CROP, "idle_research_slots")
+    assert b.last_raw == '{"value": 2}'
+    assert b.call_count == 2
 
 
 def test_which_state_valid_and_invalid():
@@ -184,8 +197,16 @@ def test_number_prompt_field_specific_variants():
     assert "Count" in user  # derived from the slot row, not transcribed
     _, user, _ = number_prompt("free_civ_slots")
     assert "FIRST number" in user  # X of the X/Y availability pair
+    # construction_queue is the primary verification metric and its ROI is the
+    # queue LIST, not a printed number — so it must ask for a ROW COUNT, exactly
+    # like idle_research_slots. It used to get the generic transcription prompt,
+    # which no reader tier could satisfy against a list.
     _, user, _ = number_prompt("construction_queue")
-    assert "integer value you see" in user  # printed digit: generic transcription prompt
+    assert "Count the rows" in user
+    assert "Do NOT" in user and "transcribe" in user
+    # a field with no bespoke entry still falls back to the generic prompt
+    _, user, _ = number_prompt("some_future_counter")
+    assert "integer value you see" in user
 
 
 def test_backend_receives_one_image_and_schema():

@@ -35,6 +35,14 @@ _NUMBER_FIELD_PROMPTS = {
         'Reply with the FIRST number of the X/Y pair (available factories) as '
         '{"value": N}. If no X/Y pair is visible, reply {"value": -1}.'
     ),
+    "construction_queue": (
+        "This crop shows the construction QUEUE: a vertical list of building "
+        "projects currently queued, one row per project. Count the rows. Reply "
+        'with that count as {"value": N} — 0 if the list is empty. Do NOT '
+        "transcribe any number printed inside a row (progress, cost, days): the "
+        'wanted value is how many entries the list has. If the crop does not '
+        'show the construction queue list, reply {"value": -1}.'
+    ),
 }
 
 
