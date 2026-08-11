@@ -106,6 +106,16 @@ def test_parse_only_validates_loudly():
         parse_only(" , ")
 
 
+def test_unknown_section_error_lists_every_real_section():
+    # The message was a hand-written literal and had already gone stale (it
+    # omitted "tabs"), telling an operator a valid section did not exist.
+    with pytest.raises(ConfigError) as e:
+        parse_only("bogus_section")
+    for section in ("rois", "points", "tabs", "templates", "glyphs"):
+        assert section in str(e.value)
+        parse_only(section)  # and each one really is accepted
+
+
 def test_stale_templates_track_roi_dependencies():
     # redoing the speed ROI invalidates all five speed templates...
     assert stale_templates_for(["speed"], set()) == [f"speed_{i}" for i in range(1, 6)]

@@ -31,6 +31,10 @@ _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
+# As the top bar renders them ("1 Jan, 1936"). The deterministic glyph tier has
+# to classify these letters, so perception derives its required alphabet here
+# rather than hardcoding a second copy of the month list.
+MONTH_ABBREVS = tuple(name.title() for name in _MONTHS)
 
 
 # --- in-game date -----------------------------------------------------------
@@ -68,20 +72,26 @@ class GameDate:
         Accepts numeric Y.M.D ("1936. 1. 14") and the HOI4 top-bar rendering
         ("12:00, 1 Jan, 1936" — the clock is ignored). Out-of-range values
         read as None so a misread can't become an orderable-but-wrong date.
+
+        The month-NAME form is tried FIRST because it is unambiguous. Y.M.D is
+        not: if a reader drops the clock's colon, "12:00, 1 Jan, 1936" arrives
+        as "1200,1Jan,1936", where the numeric pattern happily matches
+        1200-01-19 (year "1200", "Jan" eaten as a separator) — an orderable
+        wrong date. Anchoring on the month name reads that same string as
+        1936-01-01, correctly.
         """
+        m = _DMY_UI_RE.search(text)
+        if m:
+            month = _MONTHS.get(m.group(2)[:3].lower())
+            if month is not None:
+                try:
+                    return cls(int(m.group(3)), month, int(m.group(1)))
+                except ValueError:
+                    return None
         m = _YMD_UI_RE.search(text)
         if m:
             try:
                 return cls(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            except ValueError:
-                return None
-        m = _DMY_UI_RE.search(text)
-        if m:
-            month = _MONTHS.get(m.group(2)[:3].lower())
-            if month is None:
-                return None
-            try:
-                return cls(int(m.group(3)), month, int(m.group(1)))
             except ValueError:
                 return None
         return None
@@ -321,12 +331,18 @@ class PlaybookState:
 
 
 # --- trace record (plain DTO of primitives, round-trippable) -----------------
+# Every record kind the controller emits. Kept as a constant (and asserted in
+# tests against the loop) so the set can't drift out of sync with the code the
+# way a hand-maintained comment did.
+TRACE_KINDS = ("action", "advance", "error", "consult", "skipped")
+
+
 @dataclass(frozen=True, slots=True)
 class TraceRecord:
     cycle: int
     ts: float
     verdict: str
-    kind: str = "action"  # "action" | "advance" | "error"
+    kind: str = "action"  # one of TRACE_KINDS
     date: str | None = None
     plan_step: str | None = None
     pre_screenshot: str | None = None

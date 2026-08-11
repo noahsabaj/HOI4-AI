@@ -14,9 +14,11 @@ one mistake costs one recapture, not a restart.
 ``--only rois|points|tabs|templates|glyphs`` redoes a subset on top of the
 existing calibration (narrow with ``points:techs``, ``points:industry_1``,
 ``tabs:engineering``, ``templates:pause_on``, ``rois:date`` — comma-separate to
-combine). Glyph
-coverage is DESIGNED to grow across sessions: re-run ``--only glyphs`` at later
-in-game dates until 0-9 are all captured.
+combine). Glyph coverage is DESIGNED to grow across sessions: re-run ``--only
+glyphs`` at later in-game dates until every character the date strip can show —
+0-9, the colon/commas, and all twelve month names — has been captured. The
+reader is all-or-nothing, so one uncalibrated glyph makes the whole read
+uncertain.
 
 The step composition / filtering / staleness helpers are pure and unit-tested;
 the run loop itself requires the live game + a human.
@@ -102,8 +104,10 @@ def parse_only(spec: str | None) -> list[tuple[str, str | None]] | None:
             continue
         section, _, narrow = token.partition(":")
         if section not in valid_narrow:
+            # Listing the sections from valid_narrow, not a literal, so adding a
+            # section can't leave the error message naming an outdated set.
             raise ConfigError(
-                f"unknown --only section {section!r} (want rois|points|templates|glyphs)")
+                f"unknown --only section {section!r} (want {'|'.join(valid_narrow)})")
         name = narrow or None
         if name is not None and name not in valid_narrow[section]:
             raise ConfigError(
@@ -298,7 +302,7 @@ def run(cfg, title: str = "Hearts of Iron", only: str | None = None) -> int:
         typed = input("    date exactly as shown, no spaces (e.g. 12:00,1Jan,1936); blank skips: ").strip()
         if not typed:
             return True, None
-        from ..perception.digits import DELTA_LADDER, glyph_boxes
+        from ..perception.digits import DELTA_LADDER, glyph_boxes, template_name_for
         from ..perception.ncc import to_gray_f32
         gray = to_gray_f32(crop)
         counts = {delta: len(glyph_boxes(gray, delta)) for delta in DELTA_LADDER}
@@ -307,16 +311,20 @@ def run(cfg, title: str = "Hearts of Iron", only: str | None = None) -> int:
             print(f"    no segmentation matches {len(typed)} typed chars (got {sorted(set(counts.values()))} "
                   "across ink thresholds) — retry unpaused (the pause flash bleeds ink), or S to skip")
             return False, None
+        # Stage EVERY character, not just digits: the reader classifies all-or-
+        # nothing, and the top-bar date is "12:00, 1 Jan, 1936" — without the
+        # colon, commas and month letters the deterministic date read can never
+        # complete and every poll falls through to OCR/the VLM.
         staged = []
+        unstorable = []
         for (x0, y0, x1, y1), ch in zip(boxes, typed):
-            if ch.isdigit():
-                gname = f"glyph_{ch}"
-            elif ch == ".":
-                gname = "glyph_dot"
-            else:
-                continue  # letters/colon/comma are not template-able; expected
+            gname = template_name_for(ch)
+            if gname is None:
+                unstorable.append(ch)
+                continue
             staged.append((gname, crop.crop((x0, y0, x1, y1))))
-        print(f"    staged {len(staged)} glyph template(s)")
+        note = f" ({''.join(unstorable)!r} not storable)" if unstorable else ""
+        print(f"    staged {len(staged)} glyph template(s){note}")
         return True, staged
 
     print("Calibration wizard — [Enter] capture  [B/←] back  [K] keep recorded  "
@@ -391,7 +399,8 @@ def run(cfg, title: str = "Hearts of Iron", only: str | None = None) -> int:
             img.save(tdir / f"{gname}.png")
         recaptured.add("glyph_*")
         print(f"saved {len(staged_glyphs)} glyph template(s) — re-run `calibrate --only glyphs` "
-              "at a later date for full 0-9 coverage")
+              "at later in-game dates until every digit AND every month name the date can "
+              "show is covered (one unknown glyph makes the whole read uncertain)")
     if recaptured - {"glyph_*"}:
         print(f"saved {len(recaptured - {'glyph_*'})} template(s) to {tdir}")
 
