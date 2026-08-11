@@ -18,6 +18,7 @@ def build_record(
     intent: Intent | None = None,
     mode: str = "robust",
     vlm_used: bool = False,
+    vlm_calls: int = 0,
     kind: str = "action",
     pre_path: str | None = None,
     post_path: str | None = None,
@@ -50,5 +51,6 @@ def build_record(
         latency_s=result.latency_s,
         mode=mode,
         vlm_used=vlm_used,
+        vlm_calls=vlm_calls,
         error=type(result.error).__name__ if result.error else None,
     )

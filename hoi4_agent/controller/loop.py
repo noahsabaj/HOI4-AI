@@ -33,21 +33,37 @@ if TYPE_CHECKING:
     from ..trace.writer import JsonlTraceWriter
 
 
-def _resolve_intent(ctx: "AgentContext", goal: Goal, world: WorldState) -> tuple[Intent, bool]:
-    """Fill a model-chosen arg if the goal needs judgment. Returns (intent, vlm_used)."""
+def _resolve_intent(
+    ctx: "AgentContext", goal: Goal, world: WorldState
+) -> tuple[Intent, dict | None]:
+    """Fill a model-chosen arg if the goal needs judgment.
+
+    Returns (intent, judgment) where judgment is None when no model was consulted,
+    else {"prompt", "raw"} CAPTURED AT THE CALL. Reading ``brain.last_prompt``
+    later does not work: the Brain keeps only its most recent exchange and is
+    also the terminal tier of the perception ChainReader, so the tool's own
+    reads overwrite the judgment before the record is built — the trace then
+    attributes a slot-counting prompt to a tech decision.
+    """
     intent = goal.to_intent()
     if not goal.needs_judgment:
-        return intent, False
+        return intent, None
     if ctx.brain is None:
         raise ControllerError(f"goal {goal.id!r} needs judgment but no brain is wired")
     crop = ctx.capture.grab(ctx.geometry)
+    resolved = intent
     if goal.tool is ToolName.BUILD_IN_STATE and intent.state is None:
         state_opts = [s for s in GermanState if s.value in ctx.calibration.state_points]
-        return replace(intent, state=ctx.brain.which_state(crop, state_opts, goal.building)), True
-    if goal.tool is ToolName.ASSIGN_RESEARCH and intent.tech is None:
+        resolved = replace(intent, state=ctx.brain.which_state(crop, state_opts, goal.building))
+    elif goal.tool is ToolName.ASSIGN_RESEARCH and intent.tech is None:
         tech_opts = [t for t in Tech if t.value in ctx.calibration.tech_points]
-        return replace(intent, tech=ctx.brain.which_tech(crop, tech_opts)), True
-    return intent, False
+        resolved = replace(intent, tech=ctx.brain.which_tech(crop, tech_opts))
+    else:
+        return intent, None
+    return resolved, {
+        "prompt": getattr(ctx.brain, "last_prompt", None),
+        "raw": getattr(ctx.brain, "last_raw", None),
+    }
 
 
 def run(
@@ -85,6 +101,10 @@ def run(
     def _trace_ref() -> str | None:
         return str(writer.path) if writer else None
 
+    def _model_calls() -> int:
+        """Model round trips so far — judgment AND perception-chain reads."""
+        return int(getattr(ctx.brain, "call_count", 0) or 0)
+
     def _advance_time(world: WorldState) -> GameDate | None:
         nonlocal streak
         target, reason = cadence.compute_advance_target(
@@ -92,6 +112,7 @@ def run(
             ctx.config.timing.max_advance_days, streak,
         )
         streak += 1
+        before = _model_calls()
         last = cadence.run_to_date(ctx, target, sleep=sleep)
         res = ToolResult(
             ToolName.OBSERVE, Verdict.OK, pre=world,
@@ -103,11 +124,15 @@ def run(
         _append(build_record(
             cycle=state.cycle_count, ts=clock(), result=res, mode=ctx.mode.value,
             kind="advance", actions=_drain_actions(),
+            # An advance polls the date repeatedly; with no glyph/OCR tier every
+            # one of those polls is a model call, which a bare vlm_used=False hides.
+            vlm_calls=_model_calls() - before,
         ))
         return last
 
     def _recover_and_trace(world: WorldState | None) -> bool:
         """Deterministic recovery, escalating once to a traced VLM consult."""
+        before = _model_calls()
         recovered, consult = recovery.recover_with_consult(ctx)
         if consult is not None:
             res = ToolResult(
@@ -118,6 +143,7 @@ def run(
                 cycle=state.cycle_count, ts=clock(), result=res, mode=ctx.mode.value,
                 kind="consult", vlm_used=True, prompt=consult["prompt"],
                 raw=consult["raw"], actions=_drain_actions(),
+                vlm_calls=_model_calls() - before,
             ))
         return recovered
 
@@ -172,19 +198,19 @@ def run(
                 stem = f"c{state.cycle_count:05d}_s{cycle_step}"
                 cycle_step += 1
                 pre_path = _save_frame(f"{stem}_pre.jpg")
-                intent, vlm_used = _resolve_intent(ctx, goal, world)
+                before = _model_calls()
+                intent, judgment = _resolve_intent(ctx, goal, world)
                 result = recovery.act_with_retry(ctx, intent, ctx.config.timing.max_retries)
                 post_path = _save_frame(f"{stem}_post.jpg")
 
-                prompt = raw = None
-                if vlm_used and ctx.brain is not None:
-                    prompt = getattr(ctx.brain, "last_prompt", None)
-                    raw = getattr(ctx.brain, "last_raw", None)
-
                 _append(build_record(
                     cycle=state.cycle_count, ts=clock(), result=result, goal=goal,
-                    intent=intent, mode=ctx.mode.value, vlm_used=vlm_used,
-                    pre_path=pre_path, post_path=post_path, prompt=prompt, raw=raw,
+                    intent=intent, mode=ctx.mode.value,
+                    vlm_used=judgment is not None,
+                    vlm_calls=_model_calls() - before,
+                    pre_path=pre_path, post_path=post_path,
+                    prompt=judgment["prompt"] if judgment else None,
+                    raw=judgment["raw"] if judgment else None,
                     actions=_drain_actions(),
                 ))
 
@@ -210,6 +236,22 @@ def run(
                     # A one-shot gates strictly: wait for the game.
                     _advance_time(world)
                     break
+                if result.verdict is Verdict.UNCERTAIN and not result.retry_safe:
+                    # The handler clicked and then could not read the effect, so
+                    # it is unknown whether the mutation landed. act_with_retry
+                    # honors retry_safe within the cycle, but the goal is not
+                    # marked complete, so falling through to the failure path
+                    # would re-offer it next cycle and repeat a mutation that may
+                    # already have happened — the one silent-wrong path in a
+                    # system built on loud-stop. Both alternatives (re-run, skip)
+                    # are guesses about game state, so stop and hand it over.
+                    raise HaltAndFlag(
+                        f"unverifiable mutation at goal {goal.id!r}: {result.assertion} "
+                        "— cannot tell whether the action landed, so neither retrying "
+                        "nor skipping is safe; inspect the post frame and resume with "
+                        "an amended plan state",
+                        trace_ref=_trace_ref(),
+                    )
                 failures += 1
                 recovered = _recover_and_trace(world)
                 if not recovered or failures >= max_failures:
