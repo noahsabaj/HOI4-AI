@@ -84,6 +84,24 @@ building = "civilian_factory"
 state = "westphalia"
 precondition = "free_civ_slot"
 
+# --- hold the run open long enough for the repeatable goal to matter ---
+# The loop finishes when every ONE-SHOT is done (repeatables never gate
+# completion, by design). Without this goal that happened ~50 in-game days in,
+# as soon as the four builds landed — while the fastest tech in [research_days]
+# above takes 140 days. So no research slot could ever free before the run
+# ended, and "research_refill" — the ONLY goal in this playbook that asks the
+# model to decide anything — could never fire against a real freed slot. The
+# agent would finish having made zero judgments.
+#
+# This goal blocks on a date instead of a game fact, so the loop keeps advancing
+# time, techs complete, and refill re-fires as slots open. Move the date to
+# change how long a run lasts.
+[[goal]]
+id = "hold_until_1937"
+tool = "observe"
+precondition = "date_after"
+precondition_date = "1937.1.1"
+
 # --- leave the UI at a clean home state ---
 [[goal]]
 id = "close_panels"

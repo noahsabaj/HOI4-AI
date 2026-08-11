@@ -20,7 +20,6 @@ PLAYBOOK = REPO_ROOT / "config" / "playbooks" / "germany_1936.toml"
 
 def test_load_real_playbook():
     goals = load_playbook(PLAYBOOK)
-    assert len(goals) == 9
     assert goals[0].tool is ToolName.ASSIGN_RESEARCH
     build = next(g for g in goals if g.id == "build_ruhr")
     assert build.tool is ToolName.BUILD_IN_STATE
@@ -28,6 +27,42 @@ def test_load_real_playbook():
     assert build.precondition.kind is PreconditionKind.FREE_CIV_SLOT
     refill = next(g for g in goals if g.id == "research_refill")
     assert refill.repeatable and refill.needs_judgment and refill.tech is None
+    assert goals[-1].id == "close_panels"  # the UI is left clean last
+
+
+def test_the_judgment_goal_can_actually_be_reached():
+    """The run must outlast the one-shots, or the model never decides anything.
+
+    all_done ignores repeatables, so the loop ends when the last one-shot
+    completes. The builds finish in tens of in-game days while the fastest tech
+    in [research_days] takes 140, so without a date-gated goal holding the run
+    open, `research_refill` -- the only needs_judgment goal here -- could never
+    fire against a genuinely freed slot.
+    """
+    from hoi4_agent.enums import PreconditionKind as PK
+    from hoi4_agent.playbook.loader import load_research_days
+    from hoi4_agent.schemas import GameDate
+
+    goals = load_playbook(PLAYBOOK)
+    judged = [g for g in goals if g.needs_judgment]
+    assert judged, "no goal asks the model to decide anything"
+
+    horizon = [
+        g.precondition.date for g in goals
+        if not g.repeatable and g.precondition.kind is PK.DATE_AFTER and g.precondition.date
+    ]
+    assert horizon, "no date-gated goal holds the run open past the one-shots"
+
+    fastest = min(load_research_days(PLAYBOOK).values())
+    start = GameDate(1936, 1, 1)
+    assert max(horizon) > start.plus_days(fastest), (
+        f"the run ends before the fastest tech ({fastest}d) could complete, so "
+        f"{[g.id for g in judged]} can never fire against a freed slot"
+    )
+
+    # and the judgment goal is offered before the goal that ends the run
+    ids = [g.id for g in goals]
+    assert ids.index(judged[0].id) < ids.index("hold_until_1937")
 
 
 def test_parse_goals_errors():
