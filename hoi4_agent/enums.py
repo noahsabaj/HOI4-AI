@@ -77,15 +77,34 @@ class MapMode(StrEnum):
 
 
 class ResearchTab(StrEnum):
-    """Research-panel tabs. A tech's calibrated click-point is a screen position
-    that only lands correctly when the tech's tab is the one showing, and HOI4
-    remembers the last-opened tab across panel opens — so the executor selects
-    the tab before clicking the tech. Members carry the tabs M1 techs live on;
-    extending research to a new tab is an enum member + a calibrated tab-point."""
+    """Where a tech lives, and what has to be showing before its point is clickable.
 
-    INDUSTRY = "industry"           # construction, industry, synthetic oil
-    ENGINEERING = "engineering"     # electronic engineering (radio/radar), forts, atomic
-    LAND_DOCTRINE = "land_doctrine"
+    A tech's calibrated click-point is a screen position that only lands correctly
+    when its tab is the one showing, and HOI4 remembers the last selection across
+    panel opens — so the executor selects the tab before clicking the tech.
+
+    Verified against the installed game's interface data, which shows these are
+    NOT all the same kind of thing:
+
+    - INDUSTRY and ENGINEERING are folder tabs of ONE view. In
+      ``countrytechtreeview.gui`` a ``folder_tabs`` row holds nine buttons
+      evenly spaced 89 units apart from x=22: infantry, support, armour,
+      artillery, naval, mtg-naval-support, air, ``electronics_folder_tab``
+      (x=645 — the one HOI4 also labels ``highlight_engineering_folder``, hence
+      our name), ``industry_folder_tab`` (x=734).
+    - LAND_DOCTRINE is a SEPARATE VIEW, not a folder of that row.
+      ``countrydoctrinetreeview.gui`` defines its own ``land_doctrine_folder_tab``
+      alongside naval/air/special-forces. Its calibrated "tab point" is therefore
+      a view switch, not a sibling of the two above.
+
+    That distinction matters when extending: adding a tech in a new tech-tree
+    folder is an enum member plus a point on the known tab row, while adding one
+    in another separate view means calibrating a different navigation control.
+    """
+
+    INDUSTRY = "industry"           # tech-tree folder tab: construction, industry
+    ENGINEERING = "engineering"     # tech-tree folder tab: electronics (radio/radar)
+    LAND_DOCTRINE = "land_doctrine"  # separate doctrine VIEW, not a folder tab
 
 
 class PreconditionKind(StrEnum):

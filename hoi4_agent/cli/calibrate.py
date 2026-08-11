@@ -58,6 +58,20 @@ ROI_HINTS = {
                           "little else as possible (no header, no other numbers)",
 }
 
+# Where each research tab actually is, read out of the installed game's own
+# interface data rather than described vaguely. countrytechtreeview.gui lays the
+# tech-tree folders out as one evenly-spaced row; the doctrine tree is a
+# different view entirely, which is the step operators get wrong.
+TAB_HINTS = {
+    "industry": "open the RESEARCH tech tree — the folder tabs run along the top "
+                "in one row; industry is the LAST (rightmost) of them. Hover it.",
+    "engineering": "same tech-tree folder row — 'engineering' is the ELECTRONICS "
+                   "folder tab, immediately LEFT of industry. Hover it.",
+    "land_doctrine": "NOT on the tech-tree folder row: land doctrine is a separate "
+                     "DOCTRINE view. Navigate so the land doctrine tree is showing, "
+                     "then hover whatever control you used to get there.",
+}
+
 UI_POINT_SPECS = (
     ("event_option", "hover an event popup's FIRST OPTION button (open one if available)"),
     ("minimap_anchor", "hover the MINIMAP over central Germany (camera re-anchor)"),
@@ -147,7 +161,7 @@ def build_steps(filters: list[tuple[str, str | None]] | None = None) -> list[Ste
     for tab in ResearchTab:
         if want("tabs", tab.value):
             steps.append(Step(f"tab:{tab.value}",
-                              f"research tab {tab.value!r}: research panel open — hover the {tab.value} tab"))
+                              f"research tab {tab.value!r}: {TAB_HINTS[tab.value]}"))
     for t in Tech:
         if want("points", t.value, "techs"):
             steps.append(Step(f"tech:{t.value}",
