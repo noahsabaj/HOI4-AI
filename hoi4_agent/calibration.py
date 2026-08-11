@@ -45,7 +45,8 @@ REQUIRED_TEMPLATES = (
     "pause_off",
 )
 SPEED_TEMPLATES = tuple(f"speed_{s}" for s in range(1, 6))
-GLYPH_TEMPLATE_PREFIX = "glyph_"
+# Glyph template names are owned by perception.digits (GLYPH_PREFIX + the
+# char-name encoding); a second copy of the prefix here only invited drift.
 
 # Named UI click-points (calibrated, optional — features degrade without them):
 #   event_option   — an event popup's first/default option button (dismissal)
