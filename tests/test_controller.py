@@ -220,6 +220,75 @@ def test_trace_records_frames_actions_and_replays(cfg, tmp_path):
     assert out and all("replayed" in o for o in out)
 
 
+def test_frames_are_unique_when_several_goals_act_in_one_cycle(cfg, tmp_path):
+    # A repeatable goal that reports NotReady is stepped past and the NEXT goal
+    # acts in the SAME cycle. Frame names used to key on cycle_count alone, so
+    # the second goal's frames overwrote the first's and the first record ended
+    # up pointing at pixels from a different action.
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    fg = FakeGame(calibration=calib, idle_research=0, free_civ=2, max_free_civ=2)
+    ctx, fg = _fakegame_ctx(cfg, fg)
+    refill = Goal(id="refill", tool=ToolName.ASSIGN_RESEARCH, repeatable=True,
+                  needs_judgment=True,
+                  precondition=Precondition(PreconditionKind.IDLE_RESEARCH_SLOT))
+    build = Goal(id="b", tool=ToolName.BUILD_IN_STATE, building=BuildingType.CIVILIAN_FACTORY,
+                 state=GermanState.RUHR, precondition=Precondition(PreconditionKind.FREE_CIV_SLOT))
+    trace = tmp_path / "t.jsonl"
+    with JsonlTraceWriter(trace, screenshot_dir=tmp_path / "frames") as w:
+        run(ctx, [refill, build], PlaybookState(), writer=w, sleep=lambda _s: None)
+
+    actions = [r for r in JsonlTraceWriter.read(trace) if r.kind == "action"]
+    in_cycle_0 = [r for r in actions if r.cycle == 0]
+    assert {r.plan_step for r in in_cycle_0} == {"refill", "b"}, "need two goals in one cycle"
+    for kind in ("pre_screenshot", "post_screenshot"):
+        paths = [getattr(r, kind) for r in actions]
+        assert all(paths) and all(Path(p).is_file() for p in paths)
+        assert len(set(paths)) == len(paths), f"{kind} collided across records"
+
+
+def test_trace_kinds_declared_matches_the_loop():
+    # schemas.TRACE_KINDS is the documented set of record kinds. Checking it
+    # against the loop's actual build_record(kind=...) literals catches drift in
+    # BOTH directions — an emitted-but-undeclared kind (what the stale comment
+    # had) and a declared-but-never-emitted one.
+    import ast
+    import inspect
+
+    from hoi4_agent.controller import loop as loop_mod
+    from hoi4_agent.schemas import TRACE_KINDS, TraceRecord
+
+    tree = ast.parse(inspect.getsource(loop_mod))
+    emitted = {
+        kw.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "build_record"
+        for kw in node.keywords
+        if kw.arg == "kind" and isinstance(kw.value, ast.Constant)
+    }
+    assert emitted, "found no build_record(kind=...) literals to check"
+    # The action record passes no kind at all and takes the dataclass default.
+    default_kind = TraceRecord.__dataclass_fields__["kind"].default
+    assert emitted | {default_kind} == set(TRACE_KINDS)
+
+
+def test_run_to_date_makes_exactly_blind_polls_reads(cfg):
+    # With no target the contract is "advance exactly BLIND_POLLS polls"; the
+    # counter used to be incremented after the check, giving BLIND_POLLS + 1.
+    ctx, fg = _fakegame_ctx(cfg)
+    reads = []
+    inner = ctx.perceive
+
+    def counting(read_numbers=True, fields=None):
+        if fields == {"date"}:
+            reads.append(1)
+        return inner(read_numbers=read_numbers, fields=fields)
+
+    ctx.perceive = counting
+    cadence.run_to_date(ctx, None, sleep=lambda _s: None)
+    assert len(reads) == cadence.BLIND_POLLS
+    assert fg.paused is True  # and it re-pauses afterwards
+
+
 def test_click_required_popup_is_dismissed_and_run_completes(cfg, tmp_path):
     # A popup escape can't close (most HOI4 events) blocks a build; recovery
     # clicks the calibrated event_option and the playbook still completes.

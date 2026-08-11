@@ -138,6 +138,11 @@ def run(
             # stepped past (cycle_skip) and the NEXT goal tried in the same
             # cycle — "refill research when possible" must never starve builds.
             cycle_skip: set[str] = set()
+            # Frame names must key on (cycle, step), not cycle alone: several
+            # goals can act in ONE cycle, and a cycle-only name made the second
+            # goal's frames overwrite the first's — leaving the first record
+            # pointing at pixels from a different action.
+            cycle_step = 0
             while True:
                 goal = next_pending_goal(goals, state, world, skip=cycle_skip)
 
@@ -164,10 +169,12 @@ def run(
                         world = replace(world, date=last)
                     break
 
-                pre_path = _save_frame(f"c{state.cycle_count:05d}_pre.jpg")
+                stem = f"c{state.cycle_count:05d}_s{cycle_step}"
+                cycle_step += 1
+                pre_path = _save_frame(f"{stem}_pre.jpg")
                 intent, vlm_used = _resolve_intent(ctx, goal, world)
                 result = recovery.act_with_retry(ctx, intent, ctx.config.timing.max_retries)
-                post_path = _save_frame(f"c{state.cycle_count:05d}_post.jpg")
+                post_path = _save_frame(f"{stem}_post.jpg")
 
                 prompt = raw = None
                 if vlm_used and ctx.brain is not None:
