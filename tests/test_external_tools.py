@@ -197,3 +197,18 @@ def test_gui_import_cli_defaults_to_the_configured_display(tmp_path, cfg, capsys
     assert main(["gui-import", str(src), "--out", str(out), "--width", "1920",
                  "--height", "1080"]) == 0
     assert (load_calibration(out).width, load_calibration(out).height) == (1920, 1080)
+
+
+def test_gui_import_maps_the_verified_element_names():
+    # These names were read out of an installed HOI4 (interface/topbar.gui and
+    # interface/countryconstructionsview.gui), not guessed. They are the ROIs
+    # most tedious to hover by hand, so a regression here quietly restores
+    # manual calibration work.
+    from hoi4_agent.gui_import import ELEMENT_MAP
+
+    assert ELEMENT_MAP["DateText"] == "date"
+    assert ELEMENT_MAP["pause_button_date"] == "pause"
+    assert ELEMENT_MAP["production_lines"] == "construction_queue"
+    assert ELEMENT_MAP["count_container"] == "free_civ_slots"
+    # speed is five separate buttons in topbar.gui, so no single element maps
+    assert "button_speedstep1" not in ELEMENT_MAP

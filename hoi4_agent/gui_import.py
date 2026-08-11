@@ -18,10 +18,23 @@ from . import clausewitz
 from .calibration import ROI_NAMES, Calibration
 from .enums import MapMode
 
-# Curated: HOI4 .gui element name -> our ROI name. Best-guess seed — VERIFY and
-# extend against the actual interface files of the installed game version.
+# HOI4 .gui element name -> our ROI name.
+#
+# The entries marked VERIFIED were read out of an installed copy of the game
+# (interface/topbar.gui and interface/countryconstructionsview.gui) rather than
+# guessed, so gui-import can now seed the ROIs that are most tedious to hover by
+# hand. The rest are legacy guesses kept because element names differ between
+# versions; an unknown name simply doesn't match and is reported unmapped.
+#
+# Not mappable from a single element, and still hand-calibrated:
+#   speed  — topbar.gui defines five separate buttons (button_speedstep1..5),
+#            so the ROI has to span them rather than track one element.
 ELEMENT_MAP: dict[str, str] = {
-    "DateText": "date",
+    "DateText": "date",                          # VERIFIED topbar.gui
+    "pause_button_date": "pause",                # VERIFIED topbar.gui
+    "production_lines": "construction_queue",    # VERIFIED countryconstructionsview.gui
+    "count_container": "free_civ_slots",         # VERIFIED countryconstructionsview.gui
+    # legacy / other-version guesses
     "topbar_date": "date",
     "date_text": "date",
     "speed_indicator": "speed",

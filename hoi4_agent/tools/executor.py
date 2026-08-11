@@ -195,6 +195,16 @@ def _build_in_state(intent: Intent, ctx: "AgentContext") -> ToolResult:
     otherwise the handler declines to act. Slot pacing (free civ factory) is
     enforced here, where the panel showing it is open.
 
+    KNOWN LIMIT — the queue length is COUNTED, and counting saturates. The game
+    prints no queue length anywhere (verified in interface/
+    countryconstructionsview.gui: ``production_lines`` is a scrollable
+    single-column grid of ``production_building_line_entry`` rows, and the only
+    printed number in a row is that row's own quantity). So the value is however
+    many rows are VISIBLE, and once the queue is longer than the ROI can show,
+    adding one more changes nothing and this assertion fails on a click that
+    actually worked. M1 queues four buildings into a tall panel, so it does not
+    bite yet; a longer playbook needs a different metric.
+
     KNOWN LIMIT — the postcondition is CARDINALITY, not IDENTITY. ``queue+1`` is
     satisfied identically whether the click landed on Ruhr or on Bavaria, and
     which state gets the factory is the entire content of the playbook. Nothing
