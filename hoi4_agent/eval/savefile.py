@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import clausewitz
+from ..schemas import GameDate
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,25 @@ def _construction_lines(country_block: dict) -> int | None:
     if isinstance(lines, dict):
         return 1
     return None
+
+
+def dates_agree(traced: str | None, save: str | None) -> bool | None:
+    """Do a trace date and a save-file date name the same in-game day?
+
+    The two sides are formatted differently and must be normalized before they
+    can be compared: a ``TraceRecord`` carries ``GameDate.to_str()``'s
+    zero-padded ``"1936.01.01"``, while a Clausewitz save carries
+    ``"1936.1.1.12"`` — year.month.day.HOUR. Comparing the raw strings reported
+    MISMATCH for identical days, which made the independent-verifier check
+    useless. ``None`` means undecidable (a side is absent or unparseable) —
+    never a silent False.
+    """
+    if not traced or not save:
+        return None
+    a, b = GameDate.from_ui_text(traced), GameDate.from_ui_text(save)
+    if a is None or b is None:
+        return None
+    return a == b
 
 
 def read_save_facts(path: str | Path, country: str = "GER") -> SaveFacts:
