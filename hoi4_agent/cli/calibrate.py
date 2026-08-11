@@ -53,7 +53,9 @@ ROI_HINTS = {
     "pause_menu": "press ESCAPE so the game menu shows, box its title area",
     "free_civ_slots": "construction panel open, box JUST the free-civ-factory digits (one number only)",
     "idle_research_slots": "research view open, box the WHOLE row of research slot cards",
-    "construction_queue": "construction panel open, box the queue list area",
+    "construction_queue": "construction panel open, box JUST the queue rows — the "
+                          "value is the ROW COUNT, so include every row and as "
+                          "little else as possible (no header, no other numbers)",
 }
 
 UI_POINT_SPECS = (

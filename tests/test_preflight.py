@@ -41,12 +41,43 @@ def test_empty_templates_block_a_live_run(cfg):
     assert any("speed" in w for w in warnings)
 
 
+def _measured() -> frozenset[str]:
+    """Numeric fields M0 has scored the model on. Fully provisioned now includes
+    'perception measured', not only 'assets present'."""
+    from hoi4_agent.perception.perceive import VLM_ONLY_FIELDS
+
+    return frozenset(VLM_ONLY_FIELDS)
+
+
 def test_fully_provisioned_is_clean(cfg):
     goals = load_playbook(PLAYBOOK)
     calib = default_calibration(cfg.display.width, cfg.display.height)
-    errors, warnings = preflight(cfg, calib, _full_templates(), goals)
+    errors, warnings = preflight(cfg, calib, _full_templates(), goals, _measured())
     assert errors == []
     assert warnings == []
+
+
+def test_unmeasured_vlm_only_metrics_are_named(cfg):
+    # The postconditions build_in_state/assign_research assert on are COUNTS of
+    # what a crop shows, so no deterministic tier can produce them. That is only
+    # safe once M0 has measured the model on them, so preflight names the ones
+    # the corpus does not cover — and goes quiet when it does.
+    from hoi4_agent.perception.perceive import VLM_ONLY_FIELDS
+
+    goals = load_playbook(PLAYBOOK)
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+
+    _, warnings = preflight(cfg, calib, _full_templates(), goals)  # nothing measured
+    named = [w for w in warnings if "no deterministic tier" in w]
+    assert named, "silent about model-only verification metrics"
+    for field in VLM_ONLY_FIELDS:
+        assert field in named[0]
+
+    partial = frozenset({"construction_queue"})
+    _, warnings = preflight(cfg, calib, _full_templates(), goals, partial)
+    named = [w for w in warnings if "no deterministic tier" in w]
+    assert named and "construction_queue" not in named[0]
+    assert "idle_research_slots" in named[0]
 
 
 def test_resolution_mismatch_is_error(cfg):
