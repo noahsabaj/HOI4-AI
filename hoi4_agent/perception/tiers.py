@@ -110,6 +110,12 @@ def detect_pause_menu(
 # — the two templates share most of their pixels, so a near-tie is a guess.
 PAUSE_MARGIN = 0.05
 
+# Same rule for the speed indicator, and it needs it more: speed_1..speed_5 are
+# the SAME widget with a different number of chevrons lit, so they share even
+# more pixels than pause_on/pause_off. Without a margin an argmax turns a
+# coin-flip between adjacent speeds into a confident fact.
+SPEED_MARGIN = 0.05
+
 
 def read_pause(
     full_img: Image.Image,
@@ -143,12 +149,18 @@ def read_speed(
 
     Deterministic T0: the indicator renders as chevrons, not digits, so it is a
     5-way template classification, not a numeric read.
+
+    Uncertain (None) when the best score is below ``threshold`` OR within
+    SPEED_MARGIN of the runner-up — see SPEED_MARGIN. Templates that are absent
+    score 0.0 and so can't be the runner-up that blocks a clean single match.
     """
-    best_speed, best_score = None, 0.0
-    for s in range(1, 6):
-        score = roi_score(full_img, geo, calib, templates, "speed", f"speed_{s}")
-        if score > best_score:
-            best_speed, best_score = s, score
-    if best_score >= threshold:
-        return best_speed, best_score
-    return None, best_score
+    scored = [
+        (roi_score(full_img, geo, calib, templates, "speed", f"speed_{s}"), s)
+        for s in range(1, 6)
+    ]
+    ranked = sorted(scored, reverse=True)
+    best_score, best_speed = ranked[0]
+    runner_up = ranked[1][0]
+    if best_score < threshold or (best_score - runner_up) < SPEED_MARGIN:
+        return None, best_score
+    return best_speed, best_score

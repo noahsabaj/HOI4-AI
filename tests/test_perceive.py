@@ -147,3 +147,34 @@ def test_speed_is_template_classified_not_number_read():
     assert value == 3 and score >= 0.99
     none_value, _ = read_speed(img, GEO, CALIB, TemplateStore(), threshold=0.75)
     assert none_value is None
+
+
+def test_speed_near_tie_is_uncertain_not_a_guess():
+    # speed_1..speed_5 are the SAME widget with a different number of chevrons
+    # lit, so they share even more pixels than pause_on/pause_off. A bare argmax
+    # turned a coin-flip between adjacent speeds into a confident fact.
+    from hoi4_agent.perception.ncc import to_gray_f32
+    from hoi4_agent.perception.tiers import SPEED_MARGIN
+
+    img = _noise_img()
+    roi = crop_roi(img, GEO, ROIS["speed"])
+    gray = to_gray_f32(roi)
+
+    templates = TemplateStore()
+    templates.add("speed_3", roi)  # exact match: scores ~1.0
+    # A near-identical rival: the same pixels plus a whisper of noise, so it
+    # lands just under speed_3 rather than distinctly below it.
+    rng = np.random.default_rng(7)
+    templates.add("speed_4", gray + rng.normal(0, 12.0, gray.shape).astype(np.float32))
+
+    value, score = read_speed(img, GEO, CALIB, templates, threshold=0.75)
+    assert score >= 0.75, "the rival must be a near-tie, not a low-confidence match"
+    assert value is None, "a near-tie must read as uncertain"
+
+    # Widen the gap past SPEED_MARGIN and the argmax is trustworthy again.
+    clear = TemplateStore()
+    clear.add("speed_3", roi)
+    clear.add("speed_4", 255.0 - gray)  # inverted: scores about -1
+    value2, score2 = read_speed(img, GEO, CALIB, clear, threshold=0.75)
+    assert value2 == 3 and score2 >= 0.99
+    assert SPEED_MARGIN > 0  # the guard is a real threshold, not a no-op
