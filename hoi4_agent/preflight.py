@@ -12,7 +12,6 @@ glyph templates yet -> numeric reads fall back to the VLM).
 from __future__ import annotations
 
 from .calibration import (
-    GLYPH_TEMPLATE_PREFIX,
     REQUIRED_TEMPLATES,
     ROI_NAMES,
     SPEED_TEMPLATES,
@@ -22,6 +21,8 @@ from .calibration import (
 from .config import Config
 from .enums import TECH_TABS, GermanState, Tech, ToolName
 from .errors import IntentValidationError
+from .perception.digits import DATE_STRIP_CHARS, GlyphReader, missing_date_glyphs
+from .perception.perceive import VLM_ONLY_FIELDS
 from .perception.templates import TemplateStore
 from .schemas import Goal, validate_intent
 from .tools.macros import MAP_MODE_KEYS
@@ -32,8 +33,14 @@ def preflight(
     calibration: Calibration,
     templates: TemplateStore,
     goals: list[Goal],
+    measured_fields: frozenset[str] = frozenset(),
 ) -> tuple[list[str], list[str]]:
-    """Return (errors, warnings). Empty errors == safe to start the live loop."""
+    """Return (errors, warnings). Empty errors == safe to start the live loop.
+
+    ``measured_fields`` names the numeric fields the M0 corpus actually covers.
+    Passed in rather than read here so preflight stays free of I/O; the CLI
+    derives it from the corpus.
+    """
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -43,7 +50,10 @@ def preflight(
             errors.append(f"missing required template {name!r} (run `calibrate` to capture it)")
     if not any(templates.has(n) for n in SPEED_TEMPLATES):
         warnings.append("no speed_1..speed_5 templates: game speed will read as unreadable")
-    if not any(n.startswith(GLYPH_TEMPLATE_PREFIX) for n in templates.names()):
+    # Ask the reader itself rather than pattern-matching file names: a
+    # "glyph_*.png" whose name doesn't decode to a character is not a usable
+    # glyph tier, and preflight must not report one where the reader sees none.
+    if not GlyphReader(templates).available():
         from .perception.ocr import OcrReader
 
         if OcrReader().available():
@@ -53,6 +63,35 @@ def preflight(
                 "no glyph_* templates: numeric reads fall back to the VLM (slow, less "
                 'reliable) — `pip install -e ".[ocr]"` adds a faster OCR middle tier'
             )
+    elif missing_chars := missing_date_glyphs(templates):
+        # A PARTIAL glyph set reads numbers fine but silently cannot read the
+        # date: the strip carries a colon, commas and a month NAME, and the
+        # reader is all-or-nothing. Time advance polls the date every couple of
+        # seconds, so a quiet fallback here is a VLM call per poll.
+        shown = ", ".join(repr(c) for c in missing_chars[:8])
+        more = f" (+{len(missing_chars) - 8} more)" if len(missing_chars) > 8 else ""
+        warnings.append(
+            f"glyph set cannot read the in-game date — {len(missing_chars)} of "
+            f"{len(DATE_STRIP_CHARS)} date characters have no template: {shown}{more}. "
+            "The reader is all-or-nothing, so every date poll falls back to OCR/the VLM; "
+            "run `calibrate --only glyphs` at more in-game dates to close the gap"
+        )
+
+    # The two postconditions the load-bearing tools assert on are COUNTS of what
+    # a crop shows, not printed numbers, so no glyph or OCR tier can produce them
+    # and both reads are the model's. That is a real qualification on the
+    # "verified deterministically, not by re-asking the model" claim. It stops
+    # being a risk once M0 has measured the model on those fields, so the warning
+    # names exactly the ones the corpus does not yet cover.
+    unmeasured = sorted(set(VLM_ONLY_FIELDS) - set(measured_fields))
+    if unmeasured:
+        warnings.append(
+            "no deterministic tier for " + ", ".join(unmeasured)
+            + " — these are counted from the crop, not printed by the UI, so the "
+            "postconditions build_in_state/assign_research assert on are model "
+            "reads, and M0 has not measured the model on them; add labeled "
+            "read_number crops to the corpus and run `eval`"
+        )
 
     if config.grounding is not None:
         warnings.append(

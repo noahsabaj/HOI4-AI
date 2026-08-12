@@ -35,6 +35,20 @@ _NUMBER_FIELD_PROMPTS = {
         'Reply with the FIRST number of the X/Y pair (available factories) as '
         '{"value": N}. If no X/Y pair is visible, reply {"value": -1}.'
     ),
+    # Verified against the game's own interface data (interface/
+    # countryconstructionsview.gui): "production_lines" holds a single-column
+    # item_grid of "production_building_line_entry" rows. NOTHING in the panel
+    # prints the queue length, so it can only be counted. The per-row "queued"
+    # textbox is the count of that one line's building, never the total.
+    "construction_queue": (
+        "This crop shows the construction QUEUE: a vertical list of building "
+        "projects, one row per project, each row showing an icon, a name and a "
+        "progress bar. Count the ROWS you can see. Reply with that count as "
+        '{"value": N} — 0 if the list is empty. Do NOT transcribe any number '
+        "printed inside a row (a quantity, progress, cost or days remaining): "
+        "the wanted value is how many entries the list has. If the crop does not "
+        'show the construction queue list, reply {"value": -1}.'
+    ),
 }
 
 

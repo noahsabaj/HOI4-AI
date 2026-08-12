@@ -147,3 +147,93 @@ def test_speed_is_template_classified_not_number_read():
     assert value == 3 and score >= 0.99
     none_value, _ = read_speed(img, GEO, CALIB, TemplateStore(), threshold=0.75)
     assert none_value is None
+
+
+# --- the speed indicator, at a size where chevrons survive ---------------------
+# The tiny shared GEO above crops speed to 10x10px, which destroys the very
+# detail these tests are about, so they use their own frame.
+SPEED_GEO = WindowGeometry(1, 0, 0, 1000, 400)
+SPEED_ROI = (0.1, 0.1, 0.3, 0.22)  # exactly 200x48 client px
+SPEED_CALIB = Calibration(width=1000, height=400, rois={"speed": SPEED_ROI})
+
+
+def _chevron_widget(lit: int) -> np.ndarray:
+    """The speed indicator as HOI4 draws it: one widget, `lit` of 5 chevrons on.
+
+    Faithful in the way that matters. Most of the widget is chrome every speed
+    shares, and adjacent speeds differ by one chevron, which is why whole-ROI
+    NCC between them lands ~0.96 — matching the 0.9592 measured on the real
+    speed_4/speed_5 captures.
+    """
+    h, w = 48, 200
+    a = np.full((h, w), 40.0, dtype=np.float32)
+    a[0:6, :] = a[h - 6 :, :] = 110.0
+    a[:, 0:6] = a[:, w - 6 :] = 110.0
+    a[h // 2 - 1 : h // 2 + 1, 6 : w - 6] = 95.0
+    for i in range(5):
+        x0 = 20 + i * 32
+        a[10:18, x0 : x0 + 6] = 215.0 if i < lit else 70.0
+    return a
+
+
+def _speed_frame(lit: int) -> Image.Image:
+    rng = np.random.default_rng(3)
+    img = Image.fromarray(rng.integers(0, 255, (400, 1000, 3), dtype=np.uint8), "RGB")
+    crop = SPEED_GEO.panel_crop(SPEED_ROI)
+    patch = Image.fromarray(_chevron_widget(lit).astype(np.uint8), mode="L").convert("RGB")
+    img.paste(patch, (crop.client_x0, crop.client_y0))
+    return img
+
+
+def _speed_templates(lits=range(1, 6)) -> TemplateStore:
+    store = TemplateStore()
+    for s in lits:
+        store.add(f"speed_{s}", _chevron_widget(s))
+    return store
+
+
+def test_whole_roi_ncc_cannot_separate_adjacent_speeds():
+    # The premise of the residual fix, asserted so it cannot silently lapse.
+    from hoi4_agent.perception.ncc import ncc
+    from hoi4_agent.perception.tiers import SPEED_MARGIN
+
+    for s in range(1, 5):
+        gap = 1.0 - ncc(_chevron_widget(s), _chevron_widget(s + 1))
+        assert gap < SPEED_MARGIN, (
+            f"speed_{s} vs speed_{s+1} leaves a whole-ROI margin of {gap:.4f}; "
+            "gating SPEED_MARGIN on that score rejects real readings"
+        )
+
+
+def test_speed_is_read_from_residuals_so_every_speed_is_reachable():
+    # The regression this replaces: gating SPEED_MARGIN on whole-ROI scores made
+    # read_speed return None for speeds 4 and 5 against the real templates
+    # (speed_4 vs speed_5 = 0.9592), so set_speed could never confirm reaching
+    # the configured run_speed of 4. Residual matching separates them.
+    templates = _speed_templates()
+    for speed in range(1, 6):
+        value, score = read_speed(_speed_frame(speed), SPEED_GEO, SPEED_CALIB,
+                                  templates, threshold=0.75)
+        assert value == speed, f"speed {speed} read as {value} (conf {score:.3f})"
+
+
+def test_speed_stays_uncertain_when_residuals_cannot_separate():
+    # Two templates that are genuinely identical carry no distinguishing signal,
+    # so the guard must still refuse to pick one.
+    templates = TemplateStore()
+    templates.add("speed_3", _chevron_widget(3))
+    templates.add("speed_4", _chevron_widget(3))  # same widget under two names
+    value, _ = read_speed(_speed_frame(3), SPEED_GEO, SPEED_CALIB, templates, threshold=0.75)
+    assert value is None
+
+
+def test_speed_uncertain_when_the_roi_is_not_the_widget():
+    value, _ = read_speed(_noise_img(), GEO, CALIB, _speed_templates(), threshold=0.75)
+    assert value is None  # noise does not clear the whole-ROI gate
+
+
+def test_speed_single_template_still_readable():
+    # Nothing to center against and nothing to confuse: the argmax stands alone.
+    value, _ = read_speed(_speed_frame(3), SPEED_GEO, SPEED_CALIB,
+                          _speed_templates([3]), threshold=0.75)
+    assert value == 3

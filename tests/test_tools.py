@@ -4,6 +4,7 @@ from hoi4_agent.enums import GermanState, PanelId, ResearchTab, Tech, ToolName, 
 from hoi4_agent.errors import BuildInStateError, IntentValidationError, NotReadyError, PreconditionError
 from hoi4_agent.schemas import Intent, WorldState
 from hoi4_agent.tools.executor import execute
+from hoi4_agent.tools.grounding import map_crop
 
 CON = PanelId.CONSTRUCTION
 RES = PanelId.RESEARCH
@@ -280,3 +281,29 @@ def test_build_blocked_by_event_popup(scripted_ctx):
     assert isinstance(r.error, PreconditionError)
     assert "popup" in r.assertion
     assert inp.clicks == []
+
+
+def test_map_crop_clears_the_whole_construction_panel(scripted_ctx):
+    # The panel's right edge is not calibrated directly. Deriving the crop from
+    # the "construction_panel" ROI alone was wrong once the wizard started
+    # asking for "a small static region (its header)" — that box ends well
+    # inside the panel, so the "map only" crop still contained most of it.
+    ctx, _ = scripted_ctx([_ws()])
+    rois = {
+        "construction_panel": (0.0, 0.05, 0.09, 0.08),   # header only
+        "construction_queue": (0.0, 0.12, 0.16, 0.99),   # the panel's real reach
+        "free_civ_slots": (0.0, 0.08, 0.10, 0.12),
+    }
+    ctx.calibration = dataclasses.replace(ctx.calibration, rois=rois)
+    crop = map_crop(ctx)
+    widest = max(r[2] for r in rois.values())
+    assert crop.client_x0 == round(widest * ctx.geometry.client_w)
+    assert crop.client_x0 > round(rois["construction_panel"][2] * ctx.geometry.client_w)
+    assert crop.crop_w == ctx.geometry.client_w - crop.client_x0
+    assert crop.crop_h == ctx.geometry.client_h
+
+
+def test_map_crop_falls_back_to_the_full_frame_when_uncalibrated(scripted_ctx):
+    ctx, _ = scripted_ctx([_ws()])
+    ctx.calibration = dataclasses.replace(ctx.calibration, rois={})
+    assert map_crop(ctx) == ctx.geometry.full_crop()

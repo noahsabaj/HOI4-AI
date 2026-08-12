@@ -83,13 +83,13 @@ def run_to_date(
     polls = 0
     while polls < max_polls:
         world = ctx.perceive(fields={"date"})
+        polls += 1  # counted on the read, so BLIND_POLLS means exactly that many
         if world.date is not None:
             last = world.date
             if target is not None and world.date >= target:
                 break
         if target is None and polls >= BLIND_POLLS:
             break
-        polls += 1
         sleep(wait_s)
     repaused = execute(Intent(ToolName.ENSURE_PAUSED, paused=True), ctx)
     if not repaused.ok:

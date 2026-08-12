@@ -190,10 +190,29 @@ def _ensure_panel(ctx, target_panel, hotkey):
 def _build_in_state(intent: Intent, ctx: "AgentContext") -> ToolResult:
     """Self-contained: ensure construction panel open + building selected, then queue.
 
-    Verified by the construction queue growing by exactly 1 (deterministic), not by
-    re-asking the model. The queue baseline must be readable BEFORE the state click
-    — otherwise the handler declines to act. Slot pacing (free civ factory) is
+    Verified by the construction queue growing by exactly 1, not by re-asking the
+    model to confirm. The queue baseline must be readable BEFORE the state click —
+    otherwise the handler declines to act. Slot pacing (free civ factory) is
     enforced here, where the panel showing it is open.
+
+    KNOWN LIMIT — the queue length is COUNTED, and counting saturates. The game
+    prints no queue length anywhere (verified in interface/
+    countryconstructionsview.gui: ``production_lines`` is a scrollable
+    single-column grid of ``production_building_line_entry`` rows, and the only
+    printed number in a row is that row's own quantity). So the value is however
+    many rows are VISIBLE, and once the queue is longer than the ROI can show,
+    adding one more changes nothing and this assertion fails on a click that
+    actually worked. M1 queues four buildings into a tall panel, so it does not
+    bite yet; a longer playbook needs a different metric.
+
+    KNOWN LIMIT — the postcondition is CARDINALITY, not IDENTITY. ``queue+1`` is
+    satisfied identically whether the click landed on Ruhr or on Bavaria, and
+    which state gets the factory is the entire content of the playbook. Nothing
+    perceived here distinguishes a correct state click from a wrong one; the
+    calibrated point is simply trusted, and ``Calibration`` carries no camera or
+    zoom state that could invalidate that trust. Closing this needs either a
+    per-state read or the offline save cross-check (``save-audit --trace``), and
+    until it is closed no claim about WHERE the agent built is evidence-backed.
     """
     if (unfocused := _unfocused(ToolName.BUILD_IN_STATE, ctx)) is not None:
         return unfocused

@@ -106,6 +106,16 @@ def test_parse_only_validates_loudly():
         parse_only(" , ")
 
 
+def test_unknown_section_error_lists_every_real_section():
+    # The message was a hand-written literal and had already gone stale (it
+    # omitted "tabs"), telling an operator a valid section did not exist.
+    with pytest.raises(ConfigError) as e:
+        parse_only("bogus_section")
+    for section in ("rois", "points", "tabs", "templates", "glyphs"):
+        assert section in str(e.value)
+        parse_only(section)  # and each one really is accepted
+
+
 def test_stale_templates_track_roi_dependencies():
     # redoing the speed ROI invalidates all five speed templates...
     assert stale_templates_for(["speed"], set()) == [f"speed_{i}" for i in range(1, 6)]
@@ -124,3 +134,22 @@ def test_template_specs_cover_all_required_and_speed():
 
     assert set(REQUIRED_TEMPLATES) <= names
     assert set(SPEED_TEMPLATES) <= names
+
+
+def test_every_research_tab_has_a_real_hint():
+    # The tab steps used to say "hover the <name> tab" for all three, which is
+    # wrong for land_doctrine: the installed game puts it in a separate doctrine
+    # VIEW (countrydoctrinetreeview.gui), not on the tech tree's folder row
+    # (countrytechtreeview.gui). An operator following the old prompt would hunt
+    # for a tab that does not exist.
+    from hoi4_agent.cli.calibrate import TAB_HINTS
+    from hoi4_agent.enums import ResearchTab
+
+    assert set(TAB_HINTS) == {t.value for t in ResearchTab}
+    steps = {s.id: s.prompt for s in build_steps(parse_only("tabs"))}
+    for tab in ResearchTab:
+        assert steps[f"tab:{tab.value}"].endswith(TAB_HINTS[tab.value])
+    # and the distinction the game actually makes is carried into the prompt
+    assert "separate" in TAB_HINTS["land_doctrine"].lower()
+    assert "folder" in TAB_HINTS["industry"].lower()
+    assert "folder" in TAB_HINTS["engineering"].lower()

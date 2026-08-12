@@ -1,9 +1,16 @@
-"""Deterministic glyph reader: the digit-template tier the design promised.
+"""Deterministic glyph reader: the character-template tier the design promised.
 
-HOI4 renders UI numerals in a fixed font at the locked resolution, so reading a
-number is: segment the crop into glyphs by column projection, NCC each glyph
-against stored ``glyph_*`` templates (captured by ``calibrate``), and assemble.
-Any unknown glyph makes the whole read ``None`` (uncertain, never a guess).
+HOI4 renders UI text in a fixed font at the locked resolution, so reading a
+strip is: segment it into glyphs by column projection, NCC each glyph against
+stored ``glyph_*`` templates (captured by ``calibrate``), and assemble. Any
+unknown glyph makes the whole read ``None`` (uncertain, never a guess).
+
+Templates cover EVERY character the read strips contain, not just digits: the
+top-bar date renders as "12:00, 1 Jan, 1936", so a digits-only set could never
+classify the colon, commas, or the month NAME — and under the all-or-nothing
+rule that made the whole deterministic date read impossible. ``calibrate``
+already knows the exact string the operator typed, so it labels letters and
+punctuation the same way it labels digits.
 
 ``FallbackReader`` composes this with the VLM reader per call, so live bring-up
 works before glyph templates exist — preflight warns while the fallback is active.
@@ -14,13 +21,19 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from ..schemas import GameDate
+from ..schemas import MONTH_ABBREVS, GameDate
 from .ncc import match_resized, to_gray_f32
 from .templates import TemplateStore
 
 GLYPH_PREFIX = "glyph_"
-# template file names use words for characters that can't appear in filenames
-_GLYPH_CHAR_NAMES = {"dot": "."}
+# Template file names use words for characters that can't appear in filenames.
+# Digits keep their bare name so glyph sets captured before letters were
+# supported still load unchanged.
+_CHAR_SUFFIXES = {".": "dot", ":": "colon", ",": "comma", "/": "slash", "-": "dash"}
+_SUFFIX_CHARS = {v: k for k, v in _CHAR_SUFFIXES.items()}
+# Letters carry an explicit case prefix: template files must stay unambiguous on
+# a case-INSENSITIVE filesystem, where glyph_J.png and glyph_j.png are one file.
+_UPPER, _LOWER = "upper_", "lower_"
 _FG_DELTA = 40.0  # gray-level deviation from background median that counts as ink
 # Anti-aliased text (4K UI) leaves faint ink bridging glyph gaps: at a low delta
 # neighbours merge into one box. Readers walk this ladder until every segmented
@@ -62,9 +75,61 @@ def glyph_boxes(gray: np.ndarray, delta: float = _FG_DELTA) -> list[tuple[int, i
     return out
 
 
-def _char_for(template_name: str) -> str:
+def template_name_for(ch: str) -> str | None:
+    """Template file name a character is stored under, or None if unstorable.
+
+    ``calibrate`` uses this to auto-label the glyphs it segments out of a typed
+    string; the reader uses ``_char_for`` to invert it.
+    """
+    if len(ch) != 1 or not ch.isascii():
+        return None
+    if ch.isdigit():
+        return f"{GLYPH_PREFIX}{ch}"
+    if ch in _CHAR_SUFFIXES:
+        return f"{GLYPH_PREFIX}{_CHAR_SUFFIXES[ch]}"
+    if ch.isalpha():
+        return f"{GLYPH_PREFIX}{_UPPER if ch.isupper() else _LOWER}{ch.lower()}"
+    return None
+
+
+def _char_for(template_name: str) -> str | None:
+    """Character a glyph template stands for, or None if the name is unrecognized.
+
+    An unknown name must NOT fall through to its raw suffix: a stray
+    ``glyph_foo.png`` would otherwise inject the three characters "foo" into an
+    otherwise-clean read.
+    """
     suffix = template_name[len(GLYPH_PREFIX):]
-    return _GLYPH_CHAR_NAMES.get(suffix, suffix)
+    if len(suffix) == 1 and suffix.isascii() and suffix.isdigit():
+        return suffix
+    if suffix in _SUFFIX_CHARS:
+        return _SUFFIX_CHARS[suffix]
+    for prefix, cased in ((_UPPER, str.upper), (_LOWER, str.lower)):
+        if suffix.startswith(prefix):
+            letter = suffix[len(prefix):]
+            if len(letter) == 1 and letter.isascii() and letter.isalpha():
+                return cased(letter)
+    return None
+
+
+# Every character the standard top-bar date strip can contain — "12:00, 1 Jan,
+# 1936" across all twelve months. Spaces leave no ink, so they never segment out
+# and need no template.
+DATE_STRIP_CHARS = tuple(sorted(
+    set("0123456789:,") | {ch for name in MONTH_ABBREVS for ch in name}
+))
+
+
+def missing_date_glyphs(templates: TemplateStore) -> list[str]:
+    """Characters a date read needs that this glyph set cannot classify.
+
+    Advisory, and it assumes the standard top-bar rendering. The reader is
+    all-or-nothing, so ANY missing character means the deterministic date read
+    can never complete and every poll falls through to OCR or the VLM — which
+    is worth saying out loud at startup rather than discovering per poll.
+    """
+    have = {_char_for(n) for n in templates.names() if n.startswith(GLYPH_PREFIX)}
+    return [ch for ch in DATE_STRIP_CHARS if ch not in have]
 
 
 class GlyphReader:
@@ -75,7 +140,11 @@ class GlyphReader:
         self.threshold = threshold
 
     def _glyph_names(self) -> list[str]:
-        return [n for n in self.templates.names() if n.startswith(GLYPH_PREFIX)]
+        """Loaded glyph templates whose file name decodes to a character."""
+        return [
+            n for n in self.templates.names()
+            if n.startswith(GLYPH_PREFIX) and _char_for(n) is not None
+        ]
 
     def available(self) -> bool:
         return bool(self._glyph_names())

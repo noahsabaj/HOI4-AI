@@ -35,6 +35,7 @@ def _build_live_ctx(cfg: Config, title: str):
 
 def cmd_run(cfg: Config, args) -> int:
     from ..controller.loop import run
+    from ..eval.corpus import load_corpus
     from ..io.backends import InputRecorder
     from ..playbook.loader import load_playbook, load_research_days
     from ..playbook.state import load_state
@@ -48,7 +49,19 @@ def cmd_run(cfg: Config, args) -> int:
     ctx.input = InputRecorder(ctx.input)  # journal every key/click into the trace
     goals = load_playbook(cfg.paths.playbook)
 
-    errors, warnings = preflight(cfg, ctx.calibration, ctx.templates, goals)
+    # Which numeric fields M0 has actually measured the model on — a missing or
+    # unreadable corpus simply means "none measured", never a crash before a run.
+    try:
+        measured = frozenset(
+            item.labels["field"]
+            for item in load_corpus(cfg.paths.corpus)
+            if item.labels.get("task") == "read_number" and item.labels.get("field")
+        )
+    except AgentError as e:
+        print(f"preflight WARN: corpus unreadable ({e}) — treating M0 as unmeasured")
+        measured = frozenset()
+
+    errors, warnings = preflight(cfg, ctx.calibration, ctx.templates, goals, measured)
     for warning in warnings:
         print(f"preflight WARN: {warning}")
     if errors:
@@ -161,7 +174,7 @@ def cmd_calibrate(cfg: Config, args) -> int:
 
 
 def cmd_save_audit(cfg: Config, args) -> int:
-    from ..eval.savefile import read_save_facts
+    from ..eval.savefile import build_identity_check, dates_agree, read_save_facts
     from ..trace.writer import JsonlTraceWriter
 
     facts = read_save_facts(args.save, country=args.country)
@@ -170,18 +183,29 @@ def cmd_save_audit(cfg: Config, args) -> int:
     print(f"  researching:         {', '.join(facts.researching) if facts.researching else '(not found)'}")
     print(f"  civilian factories:  {facts.civilian_factories if facts.civilian_factories is not None else '(not found)'}")
     print(f"  construction lines:  {facts.construction_lines if facts.construction_lines is not None else '(not found)'}")
+    print(f"  building in states:  {', '.join(facts.construction_states) if facts.construction_states else '(not found)'}")
     if facts.missing:
         print(f"  could not extract:   {', '.join(facts.missing)} (schema drift? inspect the save)")
 
     if args.trace:
         records = JsonlTraceWriter.read(args.trace)
         traced_date = next((r.date for r in reversed(records) if r.date), None)
-        if traced_date is None or facts.date is None:
-            print("trace cross-check: skipped (no date on one side)")
-        elif traced_date == facts.date:
-            print(f"trace cross-check: MATCH (both {traced_date})")
+        # The two sides are formatted differently (padded Y.M.D vs the save's
+        # Y.M.D.HOUR), so compare normalized dates, not raw strings.
+        agree = dates_agree(traced_date, facts.date)
+        if agree is None:
+            print("trace cross-check: skipped (no readable date on one side)")
+        elif agree:
+            print(f"trace cross-check: MATCH (trace {traced_date}, save {facts.date})")
         else:
             print(f"trace cross-check: MISMATCH (trace {traced_date} vs save {facts.date})")
+
+        # The live loop verifies CARDINALITY (queue grew by 1) and cannot tell
+        # Ruhr from Bavaria. This is the only check of IDENTITY the project has.
+        status, notes = build_identity_check(records, facts)
+        print(f"build identity:    {status.upper()}")
+        for note in notes:
+            print(f"  {note}")
     return 0
 
 
@@ -189,9 +213,14 @@ def cmd_gui_import(cfg: Config, args) -> int:
     from ..calibration import dump_toml
     from ..gui_import import draft_calibration, load_elements
 
+    # Default to the configured display: a draft calibration computed against a
+    # resolution the agent isn't running at is worse than useless.
+    width = args.width or cfg.display.width
+    height = args.height or cfg.display.height
     elements = load_elements(args.path)
     print(f"parsed {len(elements)} positioned element(s)")
-    calib, report = draft_calibration(elements, args.width, args.height)
+    print(f"drafting against {width}x{height}")
+    calib, report = draft_calibration(elements, width, height)
     for roi, source in report["mapped"].items():
         print(f"  mapped {roi!r} <- {source}")
     for line in report["skipped"]:
@@ -244,8 +273,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("gui-import", help="EXPERIMENTAL: draft calibration from .gui interface files")
     s.add_argument("path", help=".gui file or directory containing them")
     s.add_argument("--out", default=None, help="write the draft calibration TOML here")
-    s.add_argument("--width", type=int, default=2560)
-    s.add_argument("--height", type=int, default=1440)
+    s.add_argument("--width", type=int, default=None, help="default: [display] width from config")
+    s.add_argument("--height", type=int, default=None, help="default: [display] height from config")
     s.set_defaults(func=cmd_gui_import)
 
     s = sub.add_parser("run", help="play Germany-1936 construction + research")
