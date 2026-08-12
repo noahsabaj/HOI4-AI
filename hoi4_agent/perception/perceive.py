@@ -39,6 +39,24 @@ class CaptureLike(Protocol):
 
 NUMERIC_FIELDS = ("date", "free_civ_slots", "idle_research_slots", "construction_queue", "speed")
 
+# How each numeric fact can actually be READ, which is not the same question as
+# whether its ROI is calibrated:
+#   "digits"  — the UI prints the value, so a glyph or OCR tier can transcribe it
+#               and the VLM is only a fallback.
+#   "counted" — the UI prints no such number. The value is derived by COUNTING
+#               what the crop shows (slot cards, queue rows), which no
+#               deterministic tier can do, so the read is VLM-only.
+# construction_queue and idle_research_slots are "counted" AND are the
+# postconditions build_in_state / assign_research assert on, so the deterministic
+# verification claim rests on a model read for both. Preflight says so out loud.
+FIELD_READ_KIND: dict[str, str] = {
+    "date": "digits",
+    "free_civ_slots": "digits",
+    "idle_research_slots": "counted",
+    "construction_queue": "counted",
+}
+VLM_ONLY_FIELDS = tuple(f for f, kind in FIELD_READ_KIND.items() if kind == "counted")
+
 # A field listed here is only readable while its panel is open; reading it in any
 # other UI state returns None (uncertain) without touching the reader.
 FIELD_PANEL_CONTEXT: dict[str, PanelId] = {

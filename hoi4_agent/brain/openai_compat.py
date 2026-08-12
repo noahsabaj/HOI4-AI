@@ -18,11 +18,15 @@ class OpenAICompatBackend:
         self.model = model
         self.timeout_s = timeout_s
 
-    def chat(self, *, images, system, user, schema, timeout=None) -> str:
+    def chat(self, *, images, system, user, schema, image_mime="image/png", timeout=None) -> str:
+        # The data URL must declare the format the bytes were actually encoded
+        # in: numeric reads are PNG on purpose (JPEG artifacts on 20-px digits
+        # corrupt exactly those reads), so labelling everything "image/jpeg"
+        # hands a strict server a PNG under a JPEG media type.
         content = [{"type": "text", "text": user}]
         for b in images:
             content.append(
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}}
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{b}"}}
             )
         payload = {
             "model": self.model,

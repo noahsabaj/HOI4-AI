@@ -30,14 +30,32 @@ def locate_point(ctx: "AgentContext", instruction: str, crop: CropRect) -> tuple
         return None
 
 
+# Every calibrated ROI that lies INSIDE the construction panel. Their right
+# edges bound where the panel ends; "construction_panel" alone does not, because
+# the wizard has the operator box "a small static region (its header)" — its x1
+# sits well inside the panel (0.09 of the client on a real 4K calibration, while
+# the queue list reaches 0.16), so a crop starting there still contains most of
+# the panel it is supposed to exclude.
+_CONSTRUCTION_AREA_ROIS = ("construction_panel", "construction_queue", "free_civ_slots")
+
+
 def map_crop(ctx: "AgentContext") -> CropRect:
     """The map area: everything right of the construction panel (the panel
-    occludes the west of Germany, and grounding must see only map pixels)."""
+    occludes the west of Germany, and grounding must see only map pixels).
+
+    The panel's right edge is not calibrated directly, so this uses the
+    rightmost edge of every ROI known to sit inside it — the best available
+    bound. Uncalibrated entries simply don't contribute.
+    """
     geo = ctx.geometry
-    frac = ctx.calibration.rois.get("construction_panel")
-    if frac is None:
+    edges = [
+        ctx.calibration.rois[name][2]
+        for name in _CONSTRUCTION_AREA_ROIS
+        if name in ctx.calibration.rois
+    ]
+    if not edges:
         return geo.full_crop()
-    x0 = int(round(frac[2] * geo.client_w))
+    x0 = min(int(round(max(edges) * geo.client_w)), geo.client_w - 1)
     return CropRect(x0, 0, max(1, geo.client_w - x0), geo.client_h)
 
 

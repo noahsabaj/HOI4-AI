@@ -15,13 +15,19 @@ PLAYBOOK = REPO_ROOT / "config" / "playbooks" / "germany_1936.toml"
 
 
 def _full_templates() -> TemplateStore:
+    """Everything a live run wants: T0 templates, all five speeds, and a glyph
+    set covering the WHOLE date strip — a digits-only set reads numbers but not
+    the date, which preflight now says out loud."""
+    from hoi4_agent.perception.digits import DATE_STRIP_CHARS, template_name_for
+
     store = TemplateStore()
     pat = np.arange(12, dtype=np.float32).reshape(3, 4)
     for name in REQUIRED_TEMPLATES:
         store.add(name, pat)
     for s in range(1, 6):
         store.add(f"speed_{s}", pat)
-    store.add("glyph_0", pat)
+    for ch in DATE_STRIP_CHARS:
+        store.add(template_name_for(ch), pat)
     return store
 
 
@@ -35,12 +41,43 @@ def test_empty_templates_block_a_live_run(cfg):
     assert any("speed" in w for w in warnings)
 
 
+def _measured() -> frozenset[str]:
+    """Numeric fields M0 has scored the model on. Fully provisioned now includes
+    'perception measured', not only 'assets present'."""
+    from hoi4_agent.perception.perceive import VLM_ONLY_FIELDS
+
+    return frozenset(VLM_ONLY_FIELDS)
+
+
 def test_fully_provisioned_is_clean(cfg):
     goals = load_playbook(PLAYBOOK)
     calib = default_calibration(cfg.display.width, cfg.display.height)
-    errors, warnings = preflight(cfg, calib, _full_templates(), goals)
+    errors, warnings = preflight(cfg, calib, _full_templates(), goals, _measured())
     assert errors == []
     assert warnings == []
+
+
+def test_unmeasured_vlm_only_metrics_are_named(cfg):
+    # The postconditions build_in_state/assign_research assert on are COUNTS of
+    # what a crop shows, so no deterministic tier can produce them. That is only
+    # safe once M0 has measured the model on them, so preflight names the ones
+    # the corpus does not cover — and goes quiet when it does.
+    from hoi4_agent.perception.perceive import VLM_ONLY_FIELDS
+
+    goals = load_playbook(PLAYBOOK)
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+
+    _, warnings = preflight(cfg, calib, _full_templates(), goals)  # nothing measured
+    named = [w for w in warnings if "no deterministic tier" in w]
+    assert named, "silent about model-only verification metrics"
+    for field in VLM_ONLY_FIELDS:
+        assert field in named[0]
+
+    partial = frozenset({"construction_queue"})
+    _, warnings = preflight(cfg, calib, _full_templates(), goals, partial)
+    named = [w for w in warnings if "no deterministic tier" in w]
+    assert named and "construction_queue" not in named[0]
+    assert "idle_research_slots" in named[0]
 
 
 def test_resolution_mismatch_is_error(cfg):
@@ -105,3 +142,77 @@ def test_invalid_goal_and_empty_judgment_options(cfg):
     no_states = dataclasses.replace(calib, state_points={})
     errors, _ = preflight(cfg, no_states, _full_templates(), [judged])
     assert any("'j'" in e and "judgment" in e for e in errors)
+
+
+def test_undecodable_glyph_file_is_not_reported_as_a_glyph_tier(cfg):
+    # preflight used to pattern-match the "glyph_" file-name prefix while the
+    # reader decodes the name to a character. A glyph_*.png the reader can't
+    # decode must not be reported as a working deterministic tier.
+    from hoi4_agent.perception.digits import GlyphReader
+
+    goals = load_playbook(PLAYBOOK)
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    templates = _full_templates()
+
+    junk = TemplateStore()
+    pat = np.arange(12, dtype=np.float32).reshape(3, 4)
+    for name in REQUIRED_TEMPLATES:
+        junk.add(name, pat)
+    junk.add("glyph_not_a_character", pat)
+
+    assert GlyphReader(junk).available() is False
+    _, warnings = preflight(cfg, calib, junk, goals)
+    assert any("glyph_" in w for w in warnings), "silent about an unusable glyph tier"
+
+    # ...and a real one is not warned about
+    _, warnings = preflight(cfg, calib, templates, goals)
+    assert not any("glyph_" in w for w in warnings)
+
+
+def test_partial_glyph_set_warns_that_dates_cannot_be_read(cfg):
+    # A digits-only set reads numbers fine but silently cannot read the date
+    # (colon, commas, month NAME). Time advance polls the date every couple of
+    # seconds, so a quiet fallback here is a VLM call per poll.
+    from hoi4_agent.perception.digits import (
+        DATE_STRIP_CHARS,
+        missing_date_glyphs,
+        template_name_for,
+    )
+
+    goals = load_playbook(PLAYBOOK)
+    calib = default_calibration(cfg.display.width, cfg.display.height)
+    pat = np.arange(12, dtype=np.float32).reshape(3, 4)
+
+    def _store(chars):
+        store = TemplateStore()
+        for name in REQUIRED_TEMPLATES:
+            store.add(name, pat)
+        for ch in chars:
+            store.add(template_name_for(ch), pat)
+        return store
+
+    # Exactly the set the repo shipped with: digits from one 1936 capture.
+    digits_only = _store("012369")
+    missing = missing_date_glyphs(digits_only)
+    assert ":" in missing and "," in missing and "J" in missing
+    _, warnings = preflight(cfg, calib, digits_only, goals)
+    assert any("cannot read the in-game date" in w for w in warnings)
+    assert any("--only glyphs" in w for w in warnings)
+
+    # A complete set is silent.
+    complete = _store(DATE_STRIP_CHARS)
+    assert missing_date_glyphs(complete) == []
+    _, warnings = preflight(cfg, calib, complete, goals)
+    assert not any("date" in w for w in warnings)
+
+
+def test_date_strip_alphabet_covers_every_month_name():
+    from hoi4_agent.perception.digits import DATE_STRIP_CHARS
+    from hoi4_agent.schemas import MONTH_ABBREVS
+
+    assert len(MONTH_ABBREVS) == 12
+    for name in MONTH_ABBREVS:
+        assert all(ch in DATE_STRIP_CHARS for ch in name), name
+    assert all(d in DATE_STRIP_CHARS for d in "0123456789")
+    assert ":" in DATE_STRIP_CHARS and "," in DATE_STRIP_CHARS
+    assert " " not in DATE_STRIP_CHARS  # spaces leave no ink to segment
