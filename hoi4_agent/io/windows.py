@@ -46,6 +46,8 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 
@@ -107,6 +109,8 @@ SCANCODES: dict[str, tuple[int, bool]] = {
     # Numpad +/- for game speed (no Shift needed, unlike main-row '+').
     "+": (0x4E, False), "add": (0x4E, False),
     "-": (0x4A, False), "subtract": (0x4A, False),
+    # Left-hand modifiers, held around a click by ``right_click(modifiers=...)``.
+    "ctrl": (0x1D, False), "shift": (0x2A, False), "alt": (0x38, False),
 }
 
 _ALIASES = {"esc": "escape", "return": "enter", "spacebar": "space"}
@@ -378,6 +382,43 @@ class Win32Input:
         if self.dwell_s:
             time.sleep(self.dwell_s)
         self._send([_mouse(ax, ay, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)])
+
+    def right_click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int,
+                    modifiers: tuple[str, ...] = ()) -> None:
+        """Right-click with optional held modifiers (e.g. ``("ctrl",)`` for support attack).
+
+        Modifiers go down before the cursor moves and come up after the button does, each
+        as its own injection with a dwell, for the same per-frame polling reason as key().
+        """
+        _require()
+        held: list[tuple[int, int]] = []
+        for name in modifiers:
+            sc = SCANCODES.get(_normalize_key(name))
+            if sc is None:
+                raise AgentError(f"no scancode for modifier {name!r}")
+            held.append((sc[0], KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if sc[1] else 0)))
+        sx, sy = geo.norm_to_screen(crop, nx, ny)
+        ax, ay = _to_virtual_abs(sx, sy)
+        where = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        pressed: list[tuple[int, int]] = []
+        try:
+            for scan, base in held:
+                self._send([_kbd(scan, base)])
+                pressed.append((scan, base))
+                self._dwell()
+            self._send([_mouse(ax, ay, MOUSEEVENTF_MOVE | where)])
+            self._dwell()
+            self._send([_mouse(ax, ay, MOUSEEVENTF_RIGHTDOWN | where)])
+            self._dwell()
+            self._send([_mouse(ax, ay, MOUSEEVENTF_RIGHTUP | where)])
+            self._dwell()
+        finally:  # a modifier left down would corrupt every later input
+            for scan, base in reversed(pressed):
+                self._send([_kbd(scan, base | KEYEVENTF_KEYUP)])
+
+    def _dwell(self) -> None:
+        if self.dwell_s:
+            time.sleep(self.dwell_s)
 
     @staticmethod
     def get_cursor_pos() -> tuple[int, int]:
