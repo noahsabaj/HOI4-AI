@@ -1,0 +1,90 @@
+{
+ "image": "live_selected_badge_2_1920x1080.png",
+ "source": "artifacts/live_matches/fix_advance_4_noown6.png",
+ "provenance": "Provenance: real 1920x1080 HOI4 frames captured during live arena matches on 2026-09-19, copied unmodified from artifacts/ (which is gitignored) because they are the only evidence of these overlays. Hand-labelled from 5x nearest-neighbour crops and numpy pixel dumps; the frame top-left of each counter was confirmed against its org bar, which sits at +13,+13. Labels are one reader's judgement of the pixels, not game state: there is no save file for these frames, so organisation/strength are NOT labelled.",
+ "note": "A second capture of the same moment as live_selected_badge_1920x1080 (the two PNGs differ over 1.8M pixels: map shading, clock, tooltip). The four counters sit at the same pixels, so this frame is an independent capture of the same four labels.",
+ "conventions": {
+  "center": "centre of the counter's 62x22 frame in image pixels (frame top-left + [31, 11])",
+  "match": "a detection matches when its bbox centre is within 16 px horizontally and 8 px vertically and the relation agrees",
+  "visibility": "full = whole counter visible; partial = a human can tell a counter is there (recall counts these); sliver = a few pixels, excluded from recall, a detection there is not a false positive",
+  "count": "null = not legible with confidence",
+  "selected": "the cream/gold ring is drawn round the frame. Read as the game's SELECTION highlight: each frame's province tooltip says 'Currently selected: Divisions: 1' and each frame has exactly one ringed counter. It is not an order marker -- in the two fix_advance frames both own divisions carry a movement chevron and only one is ringed.",
+  "overlay": "extra art drawn over the counter that used to defeat detection: ring = the cream selection ring, skull = a red combat skull on the top-left corner, arrow = a red battle arrow reaching across the top-left corner, chevron = a '>>' movement badge at the right end",
+  "province": "the province name the game printed above the counter, for traceability only; it is not used by any test"
+ },
+ "naval_boxes": [],
+ "counters": [
+  {
+   "center": [
+    1132,
+    462
+   ],
+   "frame_top_left": [
+    1101,
+    451
+   ],
+   "relation": "own",
+   "count": 1,
+   "visibility": "full",
+   "selected": false,
+   "overlays": [
+    "skull",
+    "chevron"
+   ],
+   "province": "Arena 9690"
+  },
+  {
+   "center": [
+    1264,
+    472
+   ],
+   "frame_top_left": [
+    1233,
+    461
+   ],
+   "relation": "enemy",
+   "count": 1,
+   "visibility": "full",
+   "selected": false,
+   "overlays": [],
+   "province": "Arena 3731"
+  },
+  {
+   "center": [
+    1051,
+    618
+   ],
+   "frame_top_left": [
+    1020,
+    607
+   ],
+   "relation": "enemy",
+   "count": 1,
+   "visibility": "full",
+   "selected": false,
+   "overlays": [
+    "arrow"
+   ],
+   "province": "Budapest"
+  },
+  {
+   "center": [
+    937,
+    695
+   ],
+   "frame_top_left": [
+    906,
+    684
+   ],
+   "relation": "own",
+   "count": 1,
+   "visibility": "full",
+   "selected": true,
+   "overlays": [
+    "ring",
+    "chevron"
+   ],
+   "province": "Arena 6703"
+  }
+ ]
+}
