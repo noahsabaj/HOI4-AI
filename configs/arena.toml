@@ -1,0 +1,32 @@
+[runtime]
+decision_hz = 5
+record_hz = 10
+deadline_ms = 200
+match_seconds = 1800
+game_speed = 2
+worker = "target/release/hoi4-desktop-worker.exe"
+
+[model]
+encoder = "levjepa"
+repository = "galilai-group/LeVJEPA-VideoMix-Large"
+clip_frames = 16
+clip_hz = 7.5
+image_size = 224
+memory_dim = 512
+projection_dim = 384
+auxiliary = "sparse"
+
+[training]
+seed = 42
+sequence_length = 8
+burn_in = 2
+learning_rate = 0.0001
+auxiliary_weight = 0.1
+regularizer_weight = 0.5
+xm_candidates = 5
+ppo_clip = 0.2
+gae_lambda = 0.95
+gamma = 0.9999
+entropy_weight = 0.001
+demonstration_weight = 0.1
+opponent_latest_probability = 0.5

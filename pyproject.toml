@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hoi4-arena"
+version = "0.1.0"
+description = "Screen-only HOI4 imitation learning and self-play research"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE.md", "third_party/licenses/*.txt"]
+requires-python = ">=3.12,<3.14"
+dependencies = ["numpy>=2", "pillow>=11", "gymnasium>=1", "torch>=2.7", "transformers>=5,<6", "huggingface-hub>=1", "einops>=0.8", "safetensors>=0.5", "psutil>=7", "scipy>=1.15", "lz4>=4", "cryptography>=46"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[project.scripts]
+hoi4-arena = "hoi4_arena.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hoi4_arena"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }

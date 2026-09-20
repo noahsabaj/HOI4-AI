@@ -1,0 +1,6 @@
+[
+  {"name":"bc-none","objective":"bc","auxiliary":"none","seed":42},
+  {"name":"bc-dense","objective":"bc","auxiliary":"dense","seed":42},
+  {"name":"bc-sparse","objective":"bc","auxiliary":"sparse","seed":42},
+  {"name":"xm-none","objective":"xm","auxiliary":"none","seed":42}
+]
