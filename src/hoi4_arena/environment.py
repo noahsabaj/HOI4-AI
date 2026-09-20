@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,6 +22,12 @@ FAULTS = (DesktopError, TimeoutError, OSError, ValueError, KeyError)
 
 def disarm(env):
     env.active = False
+    # Stop the interval in flight first: releasing while a dispatch thread is still
+    # applying events would be undone by its next apply.
+    try:
+        env.abort_dispatch()
+    except Exception as error:  # noqa: BLE001 - cleanup must not raise.
+        log.debug("abort during disarm: %s", error)
     try:
         env.desktop.release()
     except (DesktopError, OSError, ValueError):
@@ -51,6 +58,11 @@ class ArenaEnv(gym.Env):
         self.active = False
         self.last = None
         self.record_full = False
+        self.deadline = 0.0
+        self.dispatch = None
+        self.stop_dispatch = threading.Event()
+        # One thread: an interval is only ever dispatched after the previous one joined.
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dispatch")
 
     def observe(self):
         """Capture exactly what this tick will look at."""
@@ -68,26 +80,78 @@ class ArenaEnv(gym.Env):
         self.active = True
         self.desktop.arm()
         self.start = self.last_time = time.monotonic()
+        self.deadline = self.start + PERIOD
         self.clock_pixels = None
         self.clock_changed = self.start
         self.unhealthy = self.unknown = 0
         return self.last.rgb, {"capture": self.last.meta, "valid": True}
 
+    def _dispatch(self, action, start, stop):
+        """Apply the eight slots across one interval, on their own thread."""
+        receipts = []
+        for index, token in enumerate(action):
+            if stop.is_set():
+                break
+            time.sleep(max(0, start + index * PERIOD / SLOTS - time.monotonic()))
+            if stop.is_set():
+                break
+            receipts.append(self.desktop.apply(decode(token)))
+        return receipts
+
+    def _join_dispatch(self):
+        """Wait for the interval in flight and surface anything it raised."""
+        if self.dispatch is None:
+            return []
+        try:
+            return self.dispatch.result(timeout=PERIOD * 8)
+        finally:
+            self.dispatch = None
+
+    def abort_dispatch(self):
+        """Stop the interval in flight; the match is over or has faulted."""
+        if self.dispatch is None:
+            return
+        self.stop_dispatch.set()
+        try:
+            self.dispatch.result(timeout=PERIOD * 8)
+        except Exception as error:  # noqa: BLE001 - already unwinding.
+            log.debug("dispatch aborted with %s", error)
+        finally:
+            self.dispatch = None
+
     def step(self, action):
+        """One 200 ms tick, with input dispatch overlapping capture and inference.
+
+        The eight event slots occupy the whole interval but leave the thread idle, so
+        they run on their own thread while the caller captures, evaluates the screen and
+        decides the next action. The next tick blocks on that dispatch finishing, which
+        is the cadence barrier. Dispatching serially and only then capturing, as this
+        loop used to, made a tick cost interval + capture + inference and put 5 Hz out
+        of reach by construction rather than by measurement.
+
+        The action given here is executed over the interval that *starts* now, while the
+        frame returned is the screen at that same instant. That one interval of lag
+        between seeing and acting was always present; it is now the only one.
+
+        `applied` therefore holds the receipts for the interval that just ended, which is
+        the input that produced the frame being returned.
+        """
         if not self.active:
             raise RuntimeError("reset must succeed before step")
         if not self.action_space.contains(np.asarray(action)):
             self.desktop.release()
             self.active = False
             raise ValueError("Invalid physical action")
-        begin = time.monotonic()
-        applied = []
         try:
-            for index, token in enumerate(action):
-                due = begin + index * PERIOD / SLOTS
-                time.sleep(max(0, due - time.monotonic()))
-                applied.append(self.desktop.apply(decode(token)))
-            time.sleep(max(0, begin + PERIOD - time.monotonic()))
+            applied = self._join_dispatch()
+            time.sleep(max(0, self.deadline - time.monotonic()))
+            begin = time.monotonic()
+            late = begin - self.deadline
+            # Phase from the tick that actually happened, so a slow policy falls behind
+            # visibly instead of compressing the next interval to catch up.
+            self.deadline = begin + PERIOD
+            self.stop_dispatch = threading.Event()
+            self.dispatch = self.pool.submit(self._dispatch, action, begin, self.stop_dispatch)
             frame = self.observe()
             screen = self.rules.observe(frame)
             outcome = screen.outcome()
@@ -131,6 +195,7 @@ class ArenaEnv(gym.Env):
                 "outcome": outcome or ("draw" if timeout else None),
                 "elapsed_seconds": now - self.last_time,
                 "action_seconds": now - begin,
+                "late_seconds": late,
                 "deadline_miss": now - self.last_time > PERIOD * 1.25,
                 "capture": frame.meta,
                 "applied": applied,
@@ -147,6 +212,7 @@ class ArenaEnv(gym.Env):
                 log.info(
                     "episode finished: outcome=%s elapsed=%.1f s", info["outcome"], now - self.start
                 )
+                self.abort_dispatch()
                 self.desktop.release()
                 self.active = False
             return frame.rgb, reward, done, timeout, info
@@ -166,7 +232,11 @@ class ArenaEnv(gym.Env):
 
     def close(self):
         self.active = False
-        self.desktop.close()
+        try:
+            self.abort_dispatch()
+        finally:
+            self.pool.shutdown(wait=True)
+            self.desktop.close()
 
 
 class ArenaPair:
