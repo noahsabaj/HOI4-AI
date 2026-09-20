@@ -36,10 +36,21 @@ def window():
     return geo
 
 
-def focused(geo) -> None:
-    if not w.Win32Input().focus(geo):
-        raise SystemExit("HOI4 is not the foreground window; refusing to send input")
-    time.sleep(0.15)
+def focused(geo, attempts: int = 20) -> None:
+    """A freshly launched window can refuse the foreground for a while, so retry before giving up.
+
+    Windows only grants a foreground change to a process that has input; a synthetic ALT tap is
+    enough to qualify, and without it SetForegroundWindow fails silently from a background script.
+    """
+    for attempt in range(attempts):
+        w.Win32Input._send([w._kbd(0x38, w.KEYEVENTF_SCANCODE),
+                            w._kbd(0x38, w.KEYEVENTF_SCANCODE | w.KEYEVENTF_KEYUP)])
+        time.sleep(0.1)
+        if w.Win32Input().focus(geo):
+            time.sleep(0.15)
+            return
+        time.sleep(0.5 + 0.1 * attempt)
+    raise SystemExit("HOI4 is not the foreground window; refusing to send input")
 
 
 def move(geo, x: float, y: float) -> tuple[int, int]:
