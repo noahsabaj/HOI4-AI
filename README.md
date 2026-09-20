@@ -4,6 +4,8 @@ Project code is dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-A
 
 One direct policy: screenshots → video encoder and detail crops → GRU memory → raw mouse/keyboard events. The deployed actor has no world-state API or planner. Python supplies recording, training and match coordination; a Rust Windows worker captures pixels and applies input.
 
+Pointer positions are quantized onto a square 1024×1024 lattice of the client rectangle. On a 3840×2160 screen that is 3.75 px horizontally and 2.11 px vertically, so controls narrower than about four pixels cannot be addressed exactly and recorded human motion is re-quantized before it becomes a training label.
+
 **Research prototype; no trained combat agent yet.** See [STATUS.md](STATUS.md) for measured results and outstanding acceptance gates. The generated arena currently reaches country selection but crashes when starting a match on HOI4 1.19.3.
 
 ## Setup
@@ -57,14 +59,21 @@ Dense and sparse predictive objectives use separate projection modules. Sparse t
 
 Generation requires a new output directory. The disposable launch script temporarily selects the mod and restores the prior mod-selection file. Its current 20-second startup assumption requires local verification. Normal later launches use the restored selection. The map is an original rotationally mirrored island with equal infantry forces and ordinary supply; playable match startup remains unresolved.
 
-`template` creates screenshot ROI templates. `configs/pair.example.json` shows the two-player configuration. Real ready/healthy/speed-two/win/loss/disconnect/desync templates, a changing-clock ROI and observed lobby/reset recipes must be calibrated before collection. Missing evidence fails closed. There are no fabricated default victory templates.
+`template` creates screenshot ROI templates and `clock` calibrates the changing-clock ROI; collection refuses to start without both. `configs/pair.example.json` shows the two-player configuration, including its `seed` and `deterministic` keys. Real ready/healthy/speed-two/win/loss/disconnect/desync templates, a changing-clock ROI and observed lobby/reset recipes must be calibrated before collection. Missing evidence fails closed. There are no fabricated default victory templates.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe template screen.png artifacts/calibration-left/rules.json healthy --rect 100 40 220 60
+.venv\Scripts\hoi4-arena.exe clock screen.png artifacts/calibration-left/rules.json --rect 3420 60 180 34
+```
+
+A screen that stops matching `healthy` gets two bounded budgets: a short one while it matches no template at all, and a longer one once some terminal template is in flight, since the outcome debounce cannot start until the panel renders. A terminal template that never converges exhausts the longer budget and invalidates the episode, so it cannot suppress the speed-two and clock-liveness gates. Any fault inside a step — including a template or resolution mismatch — ends the episode as invalid rather than aborting the coordinator.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe collect-pair configs/pair.json artifacts/rollouts/match-001 artifacts/bc-none/epoch-0000.pt artifacts/bc-none/epoch-0000.pt
 .venv\Scripts\hoi4-arena.exe train-ppo artifacts/rollouts artifacts/bc-none/epoch-0000.pt artifacts/ppo
 ```
 
-Checkpoints are hashed and frozen during collection. Recurrent PPO excludes invalid episodes and historical-opponent data, and accounts for elapsed wall time. The league class samples current/historical checkpoints, but an unattended league scheduler is not yet wired to the CLI. Collection currently runs both policy actors on the coordinator GPU. It records deadline misses; five decisions per second has not been achieved end to end.
+Checkpoints are hashed and frozen during collection. Both commands seed torch, CUDA and NumPy and record the seed in the run manifest or checkpoint provenance; collection salts the seed with `pair_id` so matches stay reproducible without replaying one RNG stream across a league. Set `"deterministic": true` in the pair config for evaluation matches: the actor then takes the argmax *and* pins its latent, which an xm checkpoint needs to be greedy at all. Greedy rollouts are recorded in the manifest and excluded from PPO, since their likelihoods are not samples from the behavior policy. Leave it false for self-play. Progress and worker diagnostics go to stderr (`--log-level`), JSON results to stdout, and each run writes the worker's captured stderr beside its manifest. Both long-running commands write their evidence and then exit non-zero on failure. Recurrent PPO excludes invalid episodes and historical-opponent data, and accounts for elapsed wall time. The league class samples current/historical checkpoints, but an unattended league scheduler is not yet wired to the CLI. Collection currently runs both policy actors on the coordinator GPU. It records deadline misses; five decisions per second has not been achieved end to end.
 
 `evaluate results.jsonl` analyzes complete side-swapped pairs. Each row contains `pair_id`, candidate `side` (`left` or `right`), `scenario`, `valid`, and candidate `outcome` (`win`, `draw`, `loss`). Use a frozen imitation baseline and 50 predeclared pairs. The report includes pair-aware uncertainty, invalid exclusions and a sample-completion flag. Training metrics do not select the winner.
 

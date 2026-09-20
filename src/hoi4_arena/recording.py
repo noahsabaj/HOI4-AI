@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -9,6 +10,8 @@ import uuid
 from pathlib import Path
 
 from .desktop import Desktop
+
+log = logging.getLogger(__name__)
 
 
 def split_for_session(session_id: str):
@@ -103,12 +106,18 @@ class Recorder:
 
 
 def record(root, seconds, hz=15, command=None, split=None):
+    """Write the manifest whatever happens, then fail loudly if the session is unusable.
+
+    An incomplete recording is rejected by prepare_session, so exiting zero on a failed
+    or interrupted run would hand the operator a session that can never be trained on.
+    """
     with Desktop(command) as desktop:
         first = desktop.capture()
         recorder = Recorder(root, first, hz=hz, split=split)
         start = time.monotonic()
         deadline = start
         reason = None
+        failure = None
         try:
             recorder.append(first)
             while time.monotonic() - start < seconds:
@@ -119,7 +128,8 @@ def record(root, seconds, hz=15, command=None, split=None):
                 if time.monotonic() - deadline > 1:
                     raise RuntimeError("Recording cannot maintain capture cadence")
         except (Exception, KeyboardInterrupt) as error:
-            reason = str(error) or "interrupted"
+            failure = error
+            reason = str(error) or type(error).__name__
         finally:
             tail = None
             try:
@@ -127,5 +137,18 @@ def record(root, seconds, hz=15, command=None, split=None):
                 tail.pop("payload", None)
             except Exception as error:
                 reason = reason or f"Final input drain failed: {error}"
+            try:
+                lines = desktop.worker_log()
+                if lines:
+                    (recorder.root / "worker.log").write_text("\n".join(lines) + "\n")
+            except Exception as error:  # noqa: BLE001 - diagnostics must never mask cleanup.
+                log.warning("could not write worker.log: %s", error)
             recorder.close(complete=reason is None, reason=reason, trailing_events=tail)
-        print(json.dumps(recorder.manifest, indent=2))
+            print(json.dumps(recorder.manifest, indent=2))
+        # Recorder.close independently clears `complete` on a nonzero encoder exit without
+        # setting a reason, so key the failure on the manifest rather than on `reason`.
+        if not recorder.manifest["complete"]:
+            if failure is not None:
+                raise failure
+            detail = reason or f"encoder exit {recorder.manifest['encoder_exit']}"
+            raise RuntimeError(f"Recording incomplete: {detail}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,14 +9,21 @@ import numpy as np
 
 from .actions import GRID, PERIOD, SLOTS, VOCAB, decode
 from .desktop import DesktopError
-from .vision import run_setup
+from .vision import TERMINAL_GRACE_FRAMES, UNKNOWN_FRAMES, run_setup
+
+log = logging.getLogger(__name__)
+
+# Any fault inside a step invalidates the episode instead of escaping the loop.
+# ScreenRules raises ValueError on a resolution/template mismatch and KeyError on an
+# uncalibrated rule name; both must end the match, not abort the coordinator.
+FAULTS = (DesktopError, TimeoutError, OSError, ValueError, KeyError)
 
 
 def disarm(env):
     env.active = False
     try:
         env.desktop.release()
-    except (DesktopError, OSError):
+    except (DesktopError, OSError, ValueError):
         pass  # The independent worker watchdog also releases on connection loss.
 
 
@@ -48,6 +56,7 @@ class ArenaEnv(gym.Env):
         self.start = self.last_time = time.monotonic()
         self.clock_pixels = None
         self.clock_changed = self.start
+        self.unhealthy = self.unknown = 0
         return self.last.rgb, {"capture": self.last.meta, "valid": True}
 
     def step(self, action):
@@ -69,6 +78,22 @@ class ArenaEnv(gym.Env):
             outcome = self.rules.outcome(frame.rgb)
             # A calibrated healthy HUD is required for every nonterminal step and timeout.
             healthy = self.rules.matches("healthy", frame.rgb)
+            if outcome in {"disconnect", "desync", "invalid"}:
+                raise DesktopError(f"visual_fault:{outcome}")
+            if healthy:
+                self.unhealthy = self.unknown = 0
+            elif outcome is None:
+                # A terminal screen legitimately replaces the HUD while its template
+                # renders and then debounces, so grant the whole stretch a bounded budget
+                # rather than only the debounce depth. A screen matching nothing at all has
+                # nothing in flight and gets the shorter budget. Both are finite, so a
+                # candidate that never converges cannot suppress the gates below.
+                self.unhealthy += 1
+                self.unknown = self.unknown + 1 if self.rules.last is None else 0
+                if self.unknown > UNKNOWN_FRAMES:
+                    raise DesktopError("unrecognized_match_screen")
+                if self.unhealthy > TERMINAL_GRACE_FRAMES:
+                    raise DesktopError("terminal_screen_never_confirmed")
             if healthy and outcome is None:
                 if not self.rules.matches("running_speed_two", frame.rgb):
                     raise DesktopError("paused_or_wrong_game_speed")
@@ -81,10 +106,6 @@ class ArenaEnv(gym.Env):
                     self.clock_pixels = clock.copy()
                 elif time.monotonic() - self.clock_changed > 60:
                     raise DesktopError("game_clock_stalled")
-            if outcome in {"disconnect", "desync", "invalid"}:
-                raise DesktopError(f"visual_fault:{outcome}")
-            if outcome is None and not healthy and self.rules.last is None:
-                raise DesktopError("unrecognized_match_screen")
             now = time.monotonic()
             reward = {"win": 1.0, "loss": -1.0}.get(outcome, 0.0)
             done = outcome in {"win", "loss"}
@@ -104,11 +125,19 @@ class ArenaEnv(gym.Env):
             self.last = frame
             if self.recorder:
                 self.recorder.append(frame, action=np.asarray(action).tolist(), transition=info)
+            if info["deadline_miss"]:
+                log.warning(
+                    "deadline miss: %.3f s for a %.3f s interval", info["elapsed_seconds"], PERIOD
+                )
             if done or timeout:
+                log.info(
+                    "episode finished: outcome=%s elapsed=%.1f s", info["outcome"], now - self.start
+                )
                 self.desktop.release()
                 self.active = False
             return frame.rgb, reward, done, timeout, info
-        except (DesktopError, TimeoutError, OSError) as error:
+        except FAULTS as error:
+            log.warning("episode invalidated: %s: %s", type(error).__name__, error)
             disarm(self)
             return (
                 self.last.rgb,
@@ -135,16 +164,32 @@ class ArenaPair:
 
     def reset(self):
         futures = [self.pool.submit(e.reset) for e in self.envs]
-        try:
-            return [f.result() for f in futures]
-        except Exception:
+        results, errors = [], []
+        # Join every future before disarming: run_setup re-arms at each recipe boundary,
+        # so disarming a side that is still running its recipe is immediately undone.
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as error:
+                errors.append(error)
+        if errors:
             for e in self.envs:
                 disarm(e)
-            raise
+            raise errors[0]
+        return results
 
     def step(self, actions):
         futures = [self.pool.submit(e.step, a) for e, a in zip(self.envs, actions, strict=True)]
-        results = [f.result() for f in futures]
+        results, errors = [], []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            for e in self.envs:
+                disarm(e)
+            raise errors[0]
         if any(not r[4]["valid"] for r in results):
             for e in self.envs:
                 disarm(e)
@@ -182,7 +227,7 @@ class ArenaPair:
                             outcomes[i] == "draw",
                             info,
                         )
-                    except (DesktopError, OSError):
+                    except FAULTS:
                         outcomes[i] = "invalid"
             consistent = outcomes in [["win", "loss"], ["loss", "win"], ["draw", "draw"]]
             if not consistent:

@@ -15,6 +15,12 @@ from .desktop import Desktop, DesktopError, read_reply
 
 class RemoteDesktop(Desktop):
     def __init__(self, config):
+        from collections import deque
+
+        # The peer worker's stderr stays on the peer's console; keep the attribute so
+        # callers can record a worker log uniformly for local and remote desktops.
+        self.diagnostics = deque(maxlen=64)
+        self.close_error = None
         spec = json.loads(Path(config).read_text())
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
@@ -50,10 +56,12 @@ class RemoteDesktop(Desktop):
             return reply
 
     def close(self):
+        # Same contract as Desktop.close: record the failed release as evidence rather
+        # than raising out of __exit__ over an exception that is already propagating.
         try:
             self.release()
-        except (DesktopError, OSError, ValueError):
-            pass
+        except (DesktopError, OSError, ValueError) as error:
+            self.close_error = f"{type(error).__name__}: {error}"
         finally:
             self.stream.close()
             self.socket.close()
