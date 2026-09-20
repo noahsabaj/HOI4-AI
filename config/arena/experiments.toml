@@ -1,0 +1,66 @@
+# Shared experiment specification. Live execution is blocked until the native
+# adapter and integration gate exist. Human arms also require recorded matches.
+schema_version = 1
+
+[benchmark]
+hardware = "local"
+training_seeds = [0, 1, 2]
+max_training_hours_per_seed = 24
+evaluation_games_per_candidate_per_seed = 100
+side_balance = true
+minimum_score_improvement = 0.15
+paired_confidence_level = 0.95
+decision_limit_per_second = 2.0
+order_limit_per_second = 1.0
+match_horizon_game_hours = 2160
+curriculum_version = "land-arena-v1-pending-engine-validation"
+report_demonstration_collection_and_pretraining_wall_time = true
+
+[architecture]
+type = "province_graph_entity_gru"
+width = 128
+parameter_limit = 10000000
+actor_and_critic_share_observation = true
+
+[ppo]
+learning_rate = 0.0003
+gamma_per_hour = 0.9995
+lambda_per_hour = 0.998
+shaping = 0.0
+clip = 0.2
+entropy_coefficient = 0.01
+value_coefficient = 0.5
+epochs = 4
+sequence_length = 32
+
+[league]
+prioritized_history_probability = 0.5
+champion_probability = 0.25
+scripted_probability = 0.25
+opponent_frozen_per_episode = true
+permanent_evaluation_panel = true
+
+[experiments.scratch]
+initialization = "random"
+demonstration_sources = []
+retain_imitation_checkpoint = false
+
+[experiments.scripted]
+initialization = "behavior_cloning"
+demonstration_sources = ["scripted"]
+retain_imitation_checkpoint = true
+
+[experiments.human]
+initialization = "behavior_cloning"
+demonstration_sources = ["human"]
+retain_imitation_checkpoint = true
+
+[experiments.combined]
+initialization = "behavior_cloning"
+demonstration_sources = ["scripted", "human"]
+source_weights = [0.5, 0.5]
+retain_imitation_checkpoint = true
+
+[world_model]
+enabled = false
+requires_real_baseline_learning_gate = true

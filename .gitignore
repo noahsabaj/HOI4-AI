@@ -23,7 +23,23 @@ Thumbs.db
 .pytest_cache/
 
 # HOI4-AI v4 runtime artifacts
-runs/                       # per-cycle JSONL traces + screenshots
-config/calibration.toml     # machine-specific (resolution + click-points)
-eval/corpus/                # large labeled screenshot corpus (kept out of git)
-templates/                  # perception template PNGs (machine/resolution-specific, from calibrate)
+# per-cycle JSONL traces + screenshots
+runs/
+# machine-specific (resolution + click-points)
+config/calibration.toml
+# large labeled screenshot corpus (kept out of git)
+eval/corpus/
+# perception template PNGs (machine/resolution-specific, from calibrate)
+templates/
+
+# Local arena toolchains, generated mods, evidence, and model weights
+.tooling/
+.cache/
+artifacts/
+*.pt
+
+# Secrets
+.env
+
+# Stray local documents
+/*.pdf
