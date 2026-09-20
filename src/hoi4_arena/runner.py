@@ -94,26 +94,32 @@ class Actor:
         self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
         self.history = deque(maxlen=64)
 
-    def act(self, rgb, timestamp):
-        global_view, tiles = views(rgb)
+    def act(self, rgb, timestamp, precomputed=None):
+        device = self.device
+        # The worker downscales on the capture side when it can, which keeps a 33 MB
+        # frame off the wire and the resize out of this loop entirely. Fall back to
+        # resizing here, on the GPU, when it handed back a full frame instead.
+        global_view, tiles = precomputed if precomputed is not None else views(rgb, device=device)
+        # The worker hands back numpy; the local fallback hands back device tensors.
+        global_view = torch.as_tensor(global_view, device=device)
+        tiles = torch.as_tensor(tiles, device=device)
         self.history.append((timestamp, global_view))
         times = np.array([t for t, _ in self.history])
         desired = timestamp - np.arange(15, -1, -1) / 7.5
         ids = np.searchsorted(times, desired, side="right") - 1
-        clip = np.stack([self.history[max(0, int(i))][1] for i in ids])
+        clip = torch.stack([self.history[max(0, int(i))][1] for i in ids])
         before = (
             np.zeros(self.policy.memory_dim, np.float32)
             if self.hidden is None
             else self.hidden[0].float().cpu().numpy()
         )
-        device = self.device
         with (
             torch.inference_mode(),
             torch.autocast(torch.device(device).type, dtype=torch.bfloat16),
         ):
             self.hidden, value, _ = self.policy(
-                normalize(clip).permute(3, 0, 1, 2)[None].to(device),
-                normalize(tiles).permute(0, 3, 1, 2)[None].to(device),
+                normalize(clip).permute(3, 0, 1, 2)[None],
+                normalize(tiles).permute(0, 3, 1, 2)[None],
                 torch.from_numpy(self.previous)[None].to(device),
                 self.hidden,
             )
@@ -128,8 +134,8 @@ class Actor:
             )
         action = action[0].cpu().numpy()
         sample = {
-            "clip": clip,
-            "tiles": tiles,
+            "clip": clip.cpu().numpy(),
+            "tiles": tiles.cpu().numpy(),
             "hidden": before,
             "previous": self.previous.copy(),
             "action": action,
@@ -153,6 +159,10 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
     # Salt with the pair id so each match is independently seeded yet reproducible.
     seed = seed_everything(config.get("seed", 42), salt=config["pair_id"])
     deterministic = bool(config.get("deterministic", False))
+    # Native-resolution audit video costs a 33 MB frame per tick per side. Off by
+    # default: the worker then sends only the policy views and template crops, and the
+    # audit video records the global view the policy actually saw.
+    record_full = bool(config.get("record_full", False))
     actors = [
         Actor(left_checkpoint, config.get("model_path"), deterministic=deterministic),
         Actor(right_checkpoint, config.get("model_path"), deterministic=deterministic),
@@ -171,6 +181,7 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         "seed": seed,
         "config_seed": config.get("seed", 42),
         "deterministic": deterministic,
+        "record_full": record_full,
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     reason = None
@@ -186,10 +197,13 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
                     ScreenRules(spec["rules"]),
                     json.loads(Path(spec["recipe"]).read_text()),
                     seconds=config.get("seconds", 1800),
+                    downscale=config.get("downscale", True),
                 )
             )
+        for env in environments:
+            env.record_full = record_full
         pair = ArenaPair(*environments)
-        starts = pair.reset()
+        pair.reset()
         for index, env in enumerate(environments):
             recorder = Recorder(
                 root / f"player-{index}" / "recording", env.last, source="policy", hz=5
@@ -197,12 +211,15 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
             recorder.append(env.last)
             recorders.append(recorder)
             env.recorder = recorder
-        observations = [s[0] for s in starts]
         while True:
             actions = []
             samples = []
-            for actor, rgb, env in zip(actors, observations, environments, strict=True):
-                action, sample = actor.act(rgb, env.last.meta["t_ns"] / 1e9)
+            # Read the Frame rather than the returned observation: it carries the views
+            # the worker already downscaled, so no full frame is needed or resized here.
+            for actor, env in zip(actors, environments, strict=True):
+                action, sample = actor.act(
+                    env.last.rgb, env.last.meta["t_ns"] / 1e9, precomputed=env.last.views
+                )
                 actions.append(action)
                 samples.append(sample)
             results = pair.step(actions)
@@ -225,7 +242,6 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
                     max(r[4].get("elapsed_seconds", 0.0) for r in results),
                     misses,
                 )
-            observations = [r[0] for r in results]
             if any(r[2] or r[3] for r in results):
                 manifest.update(
                     valid=all(r[4]["valid"] for r in results),
