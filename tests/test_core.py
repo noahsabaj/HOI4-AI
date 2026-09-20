@@ -588,3 +588,328 @@ def test_screen_matching_nothing_is_rejected_fast_not_on_the_terminal_budget(tmp
     assert steps <= UNKNOWN_FRAMES + 1, (
         f"an unknown screen took {steps} steps; it must not consume the terminal budget"
     )
+
+
+# Identical constants to crates/desktop-worker/src/main.rs::downscale_matches_the_training_resize.
+# Both sides assert the same bytes, so a filter change in either language fails a test here.
+_DOWNSCALE_GOLDEN = [
+    (
+        12,
+        8,
+        3,
+        [
+            124,
+            133,
+            134,
+            126,
+            104,
+            79,
+            159,
+            144,
+            150,
+            144,
+            135,
+            132,
+            126,
+            131,
+            128,
+            167,
+            142,
+            133,
+            112,
+            146,
+            125,
+            119,
+            129,
+            154,
+            148,
+            117,
+            118,
+        ],
+    ),
+    (
+        7,
+        5,
+        3,
+        [
+            96,
+            103,
+            140,
+            172,
+            105,
+            110,
+            210,
+            58,
+            109,
+            94,
+            130,
+            129,
+            149,
+            110,
+            99,
+            162,
+            116,
+            141,
+            144,
+            159,
+            102,
+            149,
+            138,
+            164,
+            151,
+            186,
+            218,
+        ],
+    ),
+    (
+        16,
+        9,
+        4,
+        [
+            116,
+            167,
+            123,
+            160,
+            96,
+            116,
+            145,
+            123,
+            130,
+            154,
+            106,
+            105,
+            144,
+            137,
+            177,
+            162,
+            130,
+            107,
+            124,
+            149,
+            104,
+            132,
+            117,
+            128,
+            144,
+            122,
+            167,
+            135,
+            137,
+            98,
+            137,
+            149,
+            142,
+            125,
+            122,
+            109,
+            135,
+            121,
+            158,
+            121,
+            137,
+            112,
+            164,
+            142,
+            117,
+            131,
+            142,
+            133,
+        ],
+    ),
+]
+
+
+def _lcg(n):
+    out, s = np.empty(n, np.uint8), 12345
+    for i in range(n):
+        s = (1103515245 * s + 12345) & 0x7FFFFFFF
+        out[i] = (s >> 16) & 0xFF
+    return out
+
+
+def test_worker_downscale_matches_training_resize():
+    """The worker downscales before transport; it must produce the training pixels.
+
+    A plain box filter over fractional boundaries differs from this by a mean of 11/255,
+    and unfiltered bilinear by 72/255. Either would silently feed the policy different
+    pixels at deployment than it saw during training.
+    """
+    import torch.nn.functional as F
+
+    for w, h, size, expected in _DOWNSCALE_GOLDEN:
+        rgb = _lcg(w * h * 4).reshape(h, w, 4)[:, :, [2, 1, 0]].astype(np.float32)
+        t = torch.as_tensor(rgb).permute(2, 0, 1)[None]
+        out = F.interpolate(t, (size, size), mode="area").round().clamp(0, 255).to(torch.uint8)
+        got = out[0].permute(1, 2, 0).numpy().ravel().tolist()
+        assert got == expected, f"{w}x{h}->{size} drifted from the worker's golden vector"
+
+
+def test_views_uses_the_pinned_resampler_and_tiles_the_frame():
+    from hoi4_arena.dataset import quadrants, views
+
+    # Same source bytes as the golden case: BGRA from the LCG, swizzled to RGB.
+    rgb = _lcg(16 * 9 * 4).reshape(9, 16, 4)[:, :, [2, 1, 0]].copy()
+    g, tiles = views(rgb, size=4)
+    assert g.shape == (4, 4, 3) and tiles.shape == (4, 4, 4, 3)
+    assert g.dtype == torch.uint8
+    # The global view of this frame is the third golden case, computed the same way.
+    _, _, _, expected = _DOWNSCALE_GOLDEN[2]
+    assert g.numpy().ravel().tolist() == expected
+    assert sum(bh * bw for _, _, bh, bw in quadrants(9, 16)) == 9 * 16
+
+
+def test_observation_from_worker_crops_answers_exactly_like_a_full_frame(tmp_path):
+    """The two capture paths must be indistinguishable to the match loop."""
+    from hoi4_arena.desktop import Frame
+
+    names = ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
+    rules = _rules_with(tmp_path, names)
+    order, rects = rules.capture_regions()
+    assert order == sorted(names) and len(rects) == len(names) + 1  # + clock_rect
+
+    for active in ([], ["healthy"], ["win"], ["healthy", "running_speed_two"], ["win", "loss"]):
+        rgb = _screen(rules, active)
+        crops = [rgb[y : y + h, x : x + w].copy() for x, y, w, h in rects]
+        full = rules.observe(Frame(rgb, {}, 0))
+        cropped = rules.observe(Frame(None, {}, 0, crops=crops))
+        assert [full.matches(n) for n in names] == [cropped.matches(n) for n in names]
+        assert np.array_equal(full.clock_pixels(), cropped.clock_pixels())
+        rules.last, rules.count = None, 0
+        a = [rules.observe(Frame(rgb, {}, 0)).outcome() for _ in range(4)]
+        rules.last, rules.count = None, 0
+        b = [rules.observe(Frame(None, {}, 0, crops=crops)).outcome() for _ in range(4)]
+        assert a == b, f"debounced outcome differs between capture paths for {active}"
+
+
+def test_observation_rejects_a_capture_it_cannot_read(tmp_path):
+    from hoi4_arena.desktop import Frame
+
+    rules = _rules_with(
+        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
+    )
+    with pytest.raises(ValueError, match="neither a full frame nor calibrated crops"):
+        rules.observe(Frame(None, {}, 0))
+    _, rects = rules.capture_regions()
+    with pytest.raises(ValueError, match="different region set"):
+        rules.observe(Frame(None, {}, 0, crops=[np.zeros((2, 2, 3), np.uint8)] * (len(rects) - 1)))
+
+
+def test_capture_splits_a_downscaled_worker_payload():
+    """Protocol layout: full frame, then views, then region crops, in request order."""
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Desktop
+
+    size, regions = 4, [[1, 2, 3, 2], [0, 0, 2, 2]]
+    views_block = _lcg(5 * size * size * 3)
+    crop_blocks = [_lcg(3 * 2 * 4), _lcg(2 * 2 * 4)]
+    payload = bytes(views_block) + b"".join(bytes(c) for c in crop_blocks)
+
+    desktop = Desktop.__new__(Desktop)
+    desktop.request = Mock(
+        return_value={
+            "height": 8,
+            "width": 8,
+            "encoding": "raw",
+            "overflow": False,
+            "stopped": False,
+            "full_bytes": 0,
+            "view_size": size,
+            "views_bytes": len(views_block),
+            "region_bytes": [len(c) for c in crop_blocks],
+            "payload": payload,
+        }
+    )
+    frame = desktop.capture(views=size, regions=regions)
+    assert frame.rgb is None, "a views-only capture must not carry the full frame"
+    g, tiles = frame.views
+    assert g.shape == (size, size, 3) and tiles.shape == (4, size, size, 3)
+    assert np.array_equal(g.ravel(), views_block[: size * size * 3])
+    assert [c.shape for c in frame.crops] == [(2, 3, 3), (2, 2, 3)]
+    # Crops arrive BGRA and must be swizzled to RGB like the full frame is.
+    assert np.array_equal(frame.crops[0], crop_blocks[0].reshape(2, 3, 4)[:, :, [2, 1, 0]])
+    assert desktop.request.call_args.kwargs["regions"] == regions
+
+
+def test_capture_rejects_a_payload_that_contradicts_its_header():
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Desktop
+
+    desktop = Desktop.__new__(Desktop)
+    desktop.request = Mock(
+        return_value={
+            "height": 4,
+            "width": 4,
+            "encoding": "raw",
+            "overflow": False,
+            "stopped": False,
+            "full_bytes": 0,
+            "view_size": 2,
+            "views_bytes": 5 * 2 * 2 * 3,
+            "region_bytes": [],
+            "payload": b"\x00" * 7,
+        }
+    )
+    with pytest.raises(DesktopError, match="declared layout"):
+        desktop.capture(views=2)
+
+
+def test_recorder_records_the_pixels_the_policy_saw_when_the_worker_downscaled():
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.recording import audit_pixels
+
+    g = np.full((224, 224, 3), 7, np.uint8)
+    downscaled = Frame(
+        None, {"foreground": True}, 0, views=(g, np.zeros((4, 224, 224, 3), np.uint8))
+    )
+    assert np.array_equal(audit_pixels(downscaled), g)
+    native = np.full((8, 8, 3), 3, np.uint8)
+    assert np.array_equal(audit_pixels(Frame(native, {}, 0)), native)
+    with pytest.raises(ValueError, match="no pixels"):
+        audit_pixels(Frame(None, {}, 0))
+
+
+def test_views_rounds_ties_to_even_like_the_worker():
+    """Every channel here averages exactly x.5; half-away-from-zero would give 1,3,5."""
+    from hoi4_arena.dataset import views
+
+    bgra = np.array([[[4, 2, 0, 0], [5, 3, 1, 0]]], np.uint8)
+    g, _ = views(bgra[:, :, [2, 1, 0]].copy(), size=1)
+    assert g.numpy().ravel().tolist() == [0, 2, 4]
+
+
+def test_views_orders_quadrants_top_left_top_right_bottom_left_bottom_right():
+    """Each quadrant is a distinct constant, so any permutation changes the bytes."""
+    from hoi4_arena.dataset import views
+
+    src = np.zeros((4, 4, 3), np.uint8)
+    for idx, (top, left) in enumerate([(0, 0), (0, 2), (2, 0), (2, 2)]):
+        src[top : top + 2, left : left + 2] = [
+            10 * (idx + 1),
+            10 * (idx + 1) + 1,
+            10 * (idx + 1) + 2,
+        ]
+    g, tiles = views(src, size=1)
+    assert g.numpy().ravel().tolist() == [25, 26, 27]
+    assert tiles.reshape(4, 3).numpy().tolist() == [
+        [10, 11, 12],
+        [20, 21, 22],
+        [30, 31, 32],
+        [40, 41, 42],
+    ]
+
+
+def test_views_accumulates_in_float32_so_the_worker_can_match_it():
+    """A 32x reduction averages ~1024 values; float16 cannot hold that sum exactly.
+
+    The worker sums in u32 and divides in f32. If this side accumulated in half
+    precision the two would disagree on a real 4K frame, which no small golden vector
+    would reveal.
+    """
+    from hoi4_arena.dataset import views
+
+    rng = np.random.default_rng(7)
+    big = rng.integers(0, 256, (288, 512, 3), dtype=np.uint8)
+    g, _ = views(big, size=16)
+    assert int(g.sum()) == 97902, "resize no longer accumulates in float32"

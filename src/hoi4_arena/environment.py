@@ -36,21 +36,35 @@ class ArenaEnv(gym.Env):
 
     metadata = {"render_modes": ["rgb_array"]}
 
-    def __init__(self, desktop, rules, recipe, seconds=1800, recorder=None):
+    def __init__(
+        self, desktop, rules, recipe, seconds=1800, recorder=None, downscale=True, view_size=224
+    ):
         rules.require_match_rules()
         self.desktop, self.rules, self.recipe = desktop, rules, recipe
         self.seconds, self.recorder = seconds, recorder
+        # The worker downscales and crops on the capture side, so a tick moves the five
+        # policy views plus the calibrated template regions instead of a 33 MB frame.
+        # Recording asks for the full frame back, because video needs the pixels.
+        self.downscale, self.view_size = downscale, view_size
         self.action_space = gym.spaces.MultiDiscrete(np.tile([len(VOCAB), GRID, GRID], (SLOTS, 1)))
         self.observation_space = gym.spaces.Box(0, 255, (rules.height, rules.width, 3), np.uint8)
         self.active = False
         self.last = None
+        self.record_full = False
+
+    def observe(self):
+        """Capture exactly what this tick will look at."""
+        if not self.downscale:
+            return self.desktop.capture()
+        _, regions = self.rules.capture_regions()
+        return self.desktop.capture(views=self.view_size, regions=regions, full=self.record_full)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.desktop.release()
         run_setup(self.desktop, self.rules, self.recipe)
         self.rules.last, self.rules.count = None, 0
-        self.last = self.desktop.capture()
+        self.last = self.observe()
         self.active = True
         self.desktop.arm()
         self.start = self.last_time = time.monotonic()
@@ -74,10 +88,11 @@ class ArenaEnv(gym.Env):
                 time.sleep(max(0, due - time.monotonic()))
                 applied.append(self.desktop.apply(decode(token)))
             time.sleep(max(0, begin + PERIOD - time.monotonic()))
-            frame = self.desktop.capture()
-            outcome = self.rules.outcome(frame.rgb)
+            frame = self.observe()
+            screen = self.rules.observe(frame)
+            outcome = screen.outcome()
             # A calibrated healthy HUD is required for every nonterminal step and timeout.
-            healthy = self.rules.matches("healthy", frame.rgb)
+            healthy = screen.matches("healthy")
             if outcome in {"disconnect", "desync", "invalid"}:
                 raise DesktopError(f"visual_fault:{outcome}")
             if healthy:
@@ -95,10 +110,9 @@ class ArenaEnv(gym.Env):
                 if self.unhealthy > TERMINAL_GRACE_FRAMES:
                     raise DesktopError("terminal_screen_never_confirmed")
             if healthy and outcome is None:
-                if not self.rules.matches("running_speed_two", frame.rgb):
+                if not screen.matches("running_speed_two"):
                     raise DesktopError("paused_or_wrong_game_speed")
-                x, y, w, h = self.rules.clock_rect
-                clock = frame.rgb[y : y + h, x : x + w]
+                clock = screen.clock_pixels()
                 if clock.size == 0:
                     raise DesktopError("invalid_clock_calibration")
                 if self.clock_pixels is None or not np.array_equal(clock, self.clock_pixels):
@@ -209,12 +223,13 @@ class ArenaPair:
                     if outcomes[i] is not None:
                         continue
                     try:
-                        frame = env.desktop.capture()
-                        outcomes[i] = env.rules.outcome(frame.rgb)
+                        frame = env.observe()
+                        screen = env.rules.observe(frame)
+                        outcomes[i] = screen.outcome()
                         if (
                             outcomes[i] is None
                             and time.monotonic() - env.start >= env.seconds
-                            and env.rules.matches("healthy", frame.rgb)
+                            and screen.matches("healthy")
                         ):
                             outcomes[i] = "draw"
                         if env.recorder:

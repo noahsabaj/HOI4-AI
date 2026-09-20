@@ -18,7 +18,7 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
-Latest automated checks: **34 Python tests, 3 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
+Latest automated checks: **44 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
 
 Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a regression test:
 
@@ -42,11 +42,23 @@ These were latent defects in code paths that have never run against a live match
 
 Map diagnosis: revisions 2–5 hit the same access-violation stack at match start. Adding building placements, small/big weather placements, replacing base-map AI/focus definitions and correcting country-history filenames did not resolve it. `artifacts/arena-v5-start-test-focused` records a screen-guarded menu test that correctly stopped when an animating setup screen missed calibration; `artifacts/worker-menu-v5-start` records the subsequent manually reviewed Start input. The original mod selection was restored; no crash reports were submitted.
 
+Capture and preprocessing, measured locally on 2026-09-20:
+
+| Change | Before | After |
+|---|---|---|
+| Per-tick resize in the decision loop | 60.2 ms p50 (PIL, CPU) | 0 ms; the worker sends views |
+| Capture payload | 33.2 MB raw / 3.46 MB lz4 | 1.15 MB raw / 0.77 MB lz4 |
+| Worker CPU to produce five views | n/a | 18.0 ms p50 |
+| Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
+
+The 411 ms screenshot round trip should fall substantially, but it has **not** been re-measured on two PCs and the 5 Hz gate is still unmet: the synchronous step loop's structural extra interval is untouched by this. The resampler changed from PIL bilinear to an exact area average so the Rust worker can reproduce it bit for bit; this is a deliberate one-time break of any previously prepared dataset, of which there are none.
+
 Open acceptance work:
 
 - Diagnose arena match-start crash; verify armies, war, supply, fog, multiple routes and side symmetry in gameplay.
 - Pairing works; complete two-PC lobby/reset calibration and recovery checks. Menu input and watchdog release are verified remotely; match behavior remains untested.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and F12 under load. The worker now releases held input even when stdout fails; live regression remains needed.
+- Re-measure the two-PC screenshot round trip with worker-side downscaling enabled.
 - Fix and measure end-to-end scheduling: the current synchronous environment adds a full action interval after inference, so its nominal 5 Hz is not achieved by construction. Rendering/capture/encoding and two local actors add further cost.
 - Record 2–4 hours of expert demonstrations. Distill the compact encoder, train the BC baseline and compare held-out gameplay for the auxiliary/XM variants.
 - Run actual recurrent PPO self-play. Add an unattended league driver and model-selection schedule; current collector and trainer are separately invoked.

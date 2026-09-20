@@ -102,21 +102,44 @@ class ScreenRules:
                 "Calibrate all match outcomes, running speed two, and clock_rect before collection"
             )
 
+    def capture_regions(self):
+        """The rects the match loop reads, in a stable order: every rule, then the clock.
+
+        The worker crops exactly these and sends nothing else, so the order here is the
+        wire order. Sorted by name so it does not depend on JSON key ordering.
+        """
+        names = sorted(self.rules)
+        rects = [self.rules[name]["rect"] for name in names]
+        if self.clock_rect is not None:
+            rects.append(self.clock_rect)
+        return names, rects
+
+    def matches_crop(self, name, crop):
+        target = self.templates[name]
+        if target.shape != crop.shape:
+            raise ValueError("Template and screen region disagree")
+        return float(np.abs(crop.astype(np.float32) - target).mean()) <= self.rules[name].get(
+            "max_mae", 5
+        )
+
     def matches(self, name, rgb):
         if rgb.shape[:2] != (self.height, self.width):
             raise ValueError("Screen rules require their calibrated resolution")
         x, y, w, h = self.rules[name]["rect"]
-        roi = rgb[y : y + h, x : x + w].astype(np.float32)
-        target = self.templates[name]
-        if target.shape != roi.shape:
-            raise ValueError("Template and screen region disagree")
-        return float(np.abs(roi - target).mean()) <= self.rules[name].get("max_mae", 5)
+        return self.matches_crop(name, rgb[y : y + h, x : x + w])
+
+    def observe(self, frame):
+        """Bind a capture to these rules, whether it carries a full frame or just crops."""
+        return Observation(self, frame)
 
     def outcome(self, rgb):
+        return self.outcome_where(lambda name: self.matches(name, rgb))
+
+    def outcome_where(self, matches):
         matched = [
             name
             for name in ("win", "loss", "disconnect", "desync")
-            if name in self.rules and self.matches(name, rgb)
+            if name in self.rules and matches(name)
         ]
         if len(matched) > 1:
             return "invalid"
@@ -124,6 +147,45 @@ class ScreenRules:
         self.count = self.count + 1 if state == self.last else 1
         self.last = state
         return state if self.count >= OUTCOME_FRAMES else None
+
+
+class Observation:
+    """One capture, matched against its rules however the pixels arrived.
+
+    A worker that downscaled on the capture side sends only the calibrated crops, so
+    there is no full frame to slice. Everything the match loop asks of a screen goes
+    through here, and the two sources must answer identically.
+    """
+
+    def __init__(self, rules: ScreenRules, frame):
+        self.rules, self.frame = rules, frame
+        self.crops = None
+        if frame.crops is not None:
+            names, rects = rules.capture_regions()
+            if len(frame.crops) != len(rects):
+                raise ValueError("Worker returned a different region set than was calibrated")
+            self.crops = dict(zip(names, frame.crops, strict=False))
+            self.clock = frame.crops[len(names)] if rules.clock_rect is not None else None
+        elif frame.rgb is None:
+            raise ValueError("Capture carries neither a full frame nor calibrated crops")
+        else:
+            self.clock = None
+
+    def matches(self, name):
+        if self.crops is not None:
+            if name not in self.crops:
+                raise KeyError(name)
+            return self.rules.matches_crop(name, self.crops[name])
+        return self.rules.matches(name, self.frame.rgb)
+
+    def outcome(self):
+        return self.rules.outcome_where(self.matches)
+
+    def clock_pixels(self):
+        if self.clock is not None:
+            return self.clock
+        x, y, w, h = self.rules.clock_rect
+        return self.frame.rgb[y : y + h, x : x + w]
 
 
 def run_setup(desktop, rules: ScreenRules, recipe):

@@ -23,9 +23,14 @@ class DesktopError(RuntimeError):
 
 @dataclass
 class Frame:
-    rgb: np.ndarray
+    rgb: np.ndarray | None
     meta: dict
     received_ns: int
+    # Populated when the worker downscaled on the capture side. `views` is
+    # (global, tiles) already at policy resolution; `crops` holds the calibrated
+    # template regions at native resolution, keyed by the order they were requested.
+    views: tuple | None = None
+    crops: list | None = None
 
 
 class Desktop:
@@ -99,21 +104,60 @@ class Desktop:
                 raise DesktopError(reply["error"])
             return reply
 
-    def capture(self) -> Frame:
-        meta = self.request("capture", encoding="lz4")
+    def capture(self, *, views=None, regions=None, full=None) -> Frame:
+        """Capture a frame, optionally downscaled and cropped by the worker.
+
+        `views` asks the worker for the five policy views at that size, and `regions`
+        for a list of [x, y, w, h] crops at native resolution. Asking for either keeps
+        the 33 MB frame off the wire; the two together are under a megabyte. The full
+        frame is returned only when nothing narrower was requested, or `full=True`.
+        """
+        options = {}
+        if views:
+            options["views"] = int(views)
+        if regions:
+            options["regions"] = [[int(v) for v in r] for r in regions]
+        if full is not None:
+            options["full"] = bool(full)
+        meta = self.request("capture", encoding="lz4", **options)
         payload = meta.pop("payload")
+        full_bytes = meta.get("full_bytes", meta["height"] * meta["width"] * 4)
+        region_bytes = meta.get("region_bytes", [])
+        size = full_bytes + meta.get("views_bytes", 0) + sum(region_bytes)
         if meta.get("encoding") == "lz4":
             import lz4.block
 
-            size = meta["height"] * meta["width"] * 4
             if not 0 < size <= 8192 * 8192 * 4:
                 raise DesktopError("Invalid decompressed frame size")
             payload = lz4.block.decompress(payload, uncompressed_size=size)
-        pixels = np.frombuffer(payload, np.uint8)
-        rgb = pixels.reshape(meta["height"], meta["width"], 4)[:, :, [2, 1, 0]].copy()
+        if len(payload) != size:
+            raise DesktopError("Capture payload does not match its declared layout")
         if meta["overflow"] or meta["stopped"]:
             raise DesktopError("Input queue overflow or F12 emergency stop")
-        return Frame(rgb, meta, time.monotonic_ns())
+        buffer = np.frombuffer(payload, np.uint8)
+        offset = 0
+        rgb = None
+        if full_bytes:
+            rgb = (
+                buffer[:full_bytes]
+                .reshape(meta["height"], meta["width"], 4)[:, :, [2, 1, 0]]
+                .copy()
+            )
+            offset = full_bytes
+        view_pair = None
+        if meta.get("views_bytes"):
+            s = meta["view_size"]
+            # The worker already emits RGB at policy resolution; no swizzle needed.
+            stack = buffer[offset : offset + meta["views_bytes"]].reshape(5, s, s, 3)
+            view_pair = (stack[0].copy(), stack[1:].copy())
+            offset += meta["views_bytes"]
+        crops = None
+        if region_bytes:
+            crops = []
+            for (x, y, w, h), n in zip(options["regions"], region_bytes, strict=True):
+                crops.append(buffer[offset : offset + n].reshape(h, w, 4)[:, :, [2, 1, 0]].copy())
+                offset += n
+        return Frame(rgb, meta, time.monotonic_ns(), views=view_pair, crops=crops)
 
     def arm(self, *, setup=False):
         self.request("arm", mode="setup" if setup else "match")

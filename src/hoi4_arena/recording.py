@@ -14,6 +14,21 @@ from .desktop import Desktop
 log = logging.getLogger(__name__)
 
 
+def audit_pixels(frame):
+    """What to record for this frame.
+
+    A worker that downscaled on the capture side never sent the native frame, so the
+    audit video is the global view: the pixels the policy actually saw. The manifest
+    says which, because a 224x224 video is not a substitute for a native recording
+    when a human needs to review a match.
+    """
+    if frame.rgb is not None:
+        return frame.rgb
+    if frame.views is not None:
+        return frame.views[0]
+    raise ValueError("Capture carries no pixels to record")
+
+
 def split_for_session(session_id: str):
     bucket = int(hashlib.sha256(session_id.encode()).hexdigest()[:8], 16) % 100
     return "train" if bucket < 80 else "validation" if bucket < 90 else "test"
@@ -26,13 +41,15 @@ class Recorder:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=False)
         self.id = session_id or str(uuid.uuid4())
+        pixels = audit_pixels(first)
         self.manifest = {
             "schema": 1,
             "session_id": self.id,
             "split": split or split_for_session(self.id),
             "source": source,
-            "width": first.rgb.shape[1],
-            "height": first.rgb.shape[0],
+            "width": pixels.shape[1],
+            "height": pixels.shape[0],
+            "video_source": "full_frame" if first.rgb is not None else "global_view",
             "nominal_fps": hz,
             "complete": False,
             "frames": 0,
@@ -79,11 +96,12 @@ class Recorder:
         temp.replace(self.root / "manifest.json")
 
     def append(self, frame, **extra):
-        if frame.rgb.shape != (self.manifest["height"], self.manifest["width"], 3):
+        pixels = audit_pixels(frame)
+        if pixels.shape != (self.manifest["height"], self.manifest["width"], 3):
             raise ValueError("Resolution changed during recording")
         if frame.meta.get("overflow") or not frame.meta.get("foreground"):
             raise ValueError("Invalid capture")
-        self.encoder.stdin.write(frame.rgb.tobytes())
+        self.encoder.stdin.write(pixels.tobytes())
         row = {
             "index": self.manifest["frames"],
             **frame.meta,

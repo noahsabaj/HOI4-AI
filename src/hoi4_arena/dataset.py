@@ -7,31 +7,61 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from .actions import SLOTS, encode_interval
 
 
-def views(rgb, size=224):
-    h, w = rgb.shape[:2]
-    image = Image.fromarray(rgb)
-    global_view = np.asarray(image.resize((size, size), Image.Resampling.BILINEAR)).copy()
-    # Spatially ordered quadrants retain twice the global view's linear resolution.
-    tiles = [
-        np.asarray(image.crop(box).resize((size, size), Image.Resampling.BILINEAR)).copy()
-        for box in [
-            (0, 0, w // 2, h // 2),
-            (w // 2, 0, w, h // 2),
-            (0, h // 2, w // 2, h),
-            (w // 2, h // 2, w, h),
-        ]
+def quadrants(h, w):
+    """The four spatially ordered half-resolution boxes, as (top, left, height, width)."""
+    return [
+        (0, 0, h // 2, w // 2),
+        (0, w // 2, h // 2, w - w // 2),
+        (h // 2, 0, h - h // 2, w // 2),
+        (h // 2, w // 2, h - h // 2, w - w // 2),
     ]
-    return global_view, np.stack(tiles)
+
+
+def views(rgb, size=224, device="cpu"):
+    """Global view plus four quadrant crops, as uint8 tensors on `device`.
+
+    The resampler is `area`, an exact average over integer bins: output pixel k covers
+    source rows [floor(k*H/size), ceil((k+1)*H/size)). That rule is the whole point. A
+    3840x2160 frame is a 17x reduction, and the filter choice dominates the result --
+    plain bilinear without antialiasing differs from a properly filtered downscale by a
+    mean of 72/255. The two defensible filters here differ from each other by a mean of
+    11/255, which is far too much to let training and deployment disagree about.
+
+    `area` is chosen over antialiased bilinear because it is the one both sides can
+    reproduce exactly: the desktop worker implements the same integer binning in Rust so
+    it can downscale before transport, and test_worker_downscale_matches_training_resize
+    pins the two implementations against each other. Whatever this function does, the
+    worker must do bit-for-bit, or the policy sees different pixels than it trained on.
+
+    Accumulation stays in float32. Half precision would cost about 90 MiB of peak
+    allocation, but it rounds a handful of output pixels differently, and any divergence
+    here is exactly what the worker must not have. CPU and CUDA float32 agree exactly.
+    """
+    source = torch.as_tensor(np.ascontiguousarray(rgb), device=device).permute(2, 0, 1)[None]
+    h, w = source.shape[-2:]
+    # Spatially ordered quadrants retain twice the global view's linear resolution.
+    boxes = [source] + [
+        source[..., top : top + bh, left : left + bw] for top, left, bh, bw in quadrants(h, w)
+    ]
+    resized = []
+    for box in boxes:
+        # One box at a time: the intermediate for a full 4K frame dominates the peak.
+        scaled = F.interpolate(box.float(), (size, size), mode="area")
+        resized.append(scaled.round().clamp(0, 255).to(torch.uint8))
+        del scaled
+    stacked = torch.cat(resized).permute(0, 2, 3, 1)
+    return stacked[0], stacked[1:]
 
 
 def normalize(array):
-    x = torch.as_tensor(np.array(array, copy=True)).float() / 255
+    x = array.float() if torch.is_tensor(array) else torch.as_tensor(np.array(array, copy=True))
+    x = x.float() / 255
     mean = x.new_tensor([0.485, 0.456, 0.406])
     std = x.new_tensor([0.229, 0.224, 0.225])
     return (x - mean) / std
@@ -68,6 +98,8 @@ def prepare_session(source, destination):
     for decision, frame_id in enumerate(frame_ids):
         selected.setdefault(int(frame_id), []).append(decision)
     w, h = manifest["width"], manifest["height"]
+    # Offline work with the game closed, so the GPU is free; this is thousands of frames.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     decoder = subprocess.Popen(
         [
             shutil.which("ffmpeg"),
@@ -88,8 +120,12 @@ def prepare_session(source, destination):
             buf = decoder.stdout.read(w * h * 3)
             if len(buf) != w * h * 3:
                 raise ValueError("Video truncated relative to timestamps")
-            global_view, detail = views(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
-            global_frames[i] = global_view
+            global_view, detail = views(
+                np.frombuffer(buf, np.uint8).reshape(h, w, 3), device=device
+            )
+            global_frames[i] = global_view.cpu().numpy()
+            if selected.get(i):
+                detail = detail.cpu().numpy()
             for decision in selected.get(i, []):
                 details[decision] = detail
         if decoder.stdout.read(1):

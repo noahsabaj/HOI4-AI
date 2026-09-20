@@ -9,6 +9,57 @@ pub enum Event {
     Wheel { delta: i32 },
 }
 
+/// Area-average one BGRA box down to `size` x `size` RGB, matching torch's `area` mode.
+///
+/// Output pixel k covers source rows [floor(k*H/size), ceil((k+1)*H/size)) and the
+/// matching column span. This is not an approximation of the training resize, it is the
+/// same rule: `hoi4_arena.dataset.views` interpolates with mode="area", which is integer
+/// binned adaptive average pooling. A box filter over fractional boundaries, or a
+/// bilinear filter, would differ by a mean of roughly 11/255 and the policy would see
+/// different pixels at deployment than it trained on. Accumulation is f32 and rounding is
+/// ties-to-even, because that is what torch does.
+pub fn downscale_bgra(src: &[u8], width: usize, box_: [usize; 4], size: usize) -> Vec<u8> {
+    let [top, left, bh, bw] = box_;
+    let mut out = vec![0u8; size * size * 3];
+    for oy in 0..size {
+        let y0 = oy * bh / size;
+        let y1 = ((oy + 1) * bh).div_ceil(size);
+        for ox in 0..size {
+            let x0 = ox * bw / size;
+            let x1 = ((ox + 1) * bw).div_ceil(size);
+            let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
+            for y in y0..y1 {
+                let row = (top + y) * width * 4;
+                for x in x0..x1 {
+                    let i = row + (left + x) * 4;
+                    sb += src[i] as u32;
+                    sg += src[i + 1] as u32;
+                    sr += src[i + 2] as u32;
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as f32;
+            let o = (oy * size + ox) * 3;
+            out[o] = (sr as f32 / n).round_ties_even().clamp(0., 255.) as u8;
+            out[o + 1] = (sg as f32 / n).round_ties_even().clamp(0., 255.) as u8;
+            out[o + 2] = (sb as f32 / n).round_ties_even().clamp(0., 255.) as u8;
+        }
+    }
+    out
+}
+
+/// The global frame plus the four spatially ordered quadrants, in the order the policy
+/// expects. Mirrors `hoi4_arena.dataset.quadrants`.
+pub fn view_boxes(width: usize, height: usize) -> [[usize; 4]; 5] {
+    let (hh, hw) = (height / 2, width / 2);
+    [
+        [0, 0, height, width],
+        [0, 0, hh, hw],
+        [0, hw, hh, width - hw],
+        [hh, 0, height - hh, hw],
+        [hh, hw, height - hh, width - hw],
+    ]
+}
+
 fn valid_event(e: &Event, setup: bool) -> bool {
     match *e {
         Event::Move { x, y } => {
@@ -509,21 +560,79 @@ mod platform {
                         Ok((serde_json::json!({"armed":false}), vec![]))
                     }
                     "capture" => {
-                        let (bytes, w, h, start, end) = unsafe { capture(held.hwnd as HWND)? };
+                        let (raw, w, h, start, end) = unsafe { capture(held.hwnd as HWND)? };
+                        let (uw, uh) = (w as usize, h as usize);
+                        // Downscaling here keeps a 33 MB frame off the wire: the five
+                        // policy views plus the calibrated template crops are about
+                        // 800 KB. The caller asks for exactly what it will look at.
+                        let view_size = cmd["views"].as_u64().unwrap_or(0) as usize;
+                        if view_size > 1024 {
+                            return Err("view_size_too_large".into());
+                        }
+                        let mut regions: Vec<[usize; 4]> = Vec::new();
+                        if let Some(list) = cmd["regions"].as_array() {
+                            if list.len() > 64 {
+                                return Err("too_many_regions".into());
+                            }
+                            for item in list {
+                                let v: Vec<i64> = serde_json::from_value(item.clone())
+                                    .map_err(|e| e.to_string())?;
+                                if v.len() != 4 || v.iter().any(|&n| n < 0) {
+                                    return Err("invalid_region".into());
+                                }
+                                let (x, y, rw, rh) =
+                                    (v[0] as usize, v[1] as usize, v[2] as usize, v[3] as usize);
+                                if rw == 0 || rh == 0 || x + rw > uw || y + rh > uh {
+                                    return Err("region_outside_frame".into());
+                                }
+                                regions.push([y, x, rh, rw]);
+                            }
+                        }
+                        // The full frame is implied only when nothing narrower was asked
+                        // for; requesting it alongside views is explicit.
+                        let want_full = if view_size == 0 && regions.is_empty() {
+                            true
+                        } else {
+                            cmd["full"].as_bool().unwrap_or(false)
+                        };
+                        let mut payload = Vec::new();
+                        let full_bytes = if want_full { raw.len() } else { 0 };
+                        if want_full {
+                            payload.extend_from_slice(&raw);
+                        }
+                        let mut views_bytes = 0usize;
+                        if view_size > 0 {
+                            for b in view_boxes(uw, uh) {
+                                let v = downscale_bgra(&raw, uw, b, view_size);
+                                views_bytes += v.len();
+                                payload.extend_from_slice(&v);
+                            }
+                        }
+                        let mut region_bytes: Vec<usize> = Vec::new();
+                        for r in &regions {
+                            let [top, left, rh, rw] = *r;
+                            let mut crop = Vec::with_capacity(rw * rh * 4);
+                            for y in 0..rh {
+                                let i = ((top + y) * uw + left) * 4;
+                                crop.extend_from_slice(&raw[i..i + rw * 4]);
+                            }
+                            region_bytes.push(crop.len());
+                            payload.extend_from_slice(&crop);
+                        }
                         let encoding = if cmd["encoding"] == "lz4" {
                             "lz4"
                         } else {
                             "raw"
                         };
                         let bytes = if encoding == "lz4" {
-                            lz4_flex::block::compress(&bytes)
+                            lz4_flex::block::compress(&payload)
                         } else {
-                            bytes
+                            payload
                         };
                         seq += 1;
                         let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                         Ok((
-                            serde_json::json!({"seq":seq,"width":w,"height":h,"encoding":encoding,"capture_start_ns":start,"t_ns":end,"events":events,"overflow":OVERFLOW.swap(false,Ordering::Relaxed),"stopped":STOP.load(Ordering::SeqCst),"foreground":foreground()}),
+                            serde_json::json!({"seq":seq,"width":w,"height":h,"encoding":encoding,"capture_start_ns":start,"t_ns":end,"events":events,"overflow":OVERFLOW.swap(false,Ordering::Relaxed),"stopped":STOP.load(Ordering::SeqCst),"foreground":foreground(),"full_bytes":full_bytes,"view_size":view_size,"views_bytes":views_bytes,"region_bytes":region_bytes}),
                             bytes,
                         ))
                     }
@@ -603,6 +712,115 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Deterministic source bytes shared with the Python side of this check.
+    fn lcg(n: usize) -> Vec<u8> {
+        let mut s: u64 = 12345;
+        (0..n)
+            .map(|_| {
+                s = (1103515245u64.wrapping_mul(s).wrapping_add(12345)) & 0x7FFF_FFFF;
+                ((s >> 16) & 0xFF) as u8
+            })
+            .collect()
+    }
+
+    /// The worker's downscale must equal the training resize exactly, not approximately.
+    ///
+    /// These vectors were produced by `hoi4_arena.dataset.views`' resampler
+    /// (torch `F.interpolate(mode="area")`) and the identical constants are asserted from
+    /// the Python side in test_worker_downscale_matches_training_resize. If either
+    /// implementation drifts, one of the two tests fails. A filter mismatch here would not
+    /// crash anything; it would quietly feed the policy different pixels than it trained
+    /// on, which is why this is pinned rather than eyeballed.
+    #[test]
+    fn downscale_matches_the_training_resize() {
+        let cases: [(usize, usize, usize, &[u8]); 3] = [
+            (
+                12,
+                8,
+                3,
+                &[
+                    124, 133, 134, 126, 104, 79, 159, 144, 150, 144, 135, 132, 126, 131, 128, 167,
+                    142, 133, 112, 146, 125, 119, 129, 154, 148, 117, 118,
+                ],
+            ),
+            (
+                7,
+                5,
+                3,
+                &[
+                    96, 103, 140, 172, 105, 110, 210, 58, 109, 94, 130, 129, 149, 110, 99, 162,
+                    116, 141, 144, 159, 102, 149, 138, 164, 151, 186, 218,
+                ],
+            ),
+            (
+                16,
+                9,
+                4,
+                &[
+                    116, 167, 123, 160, 96, 116, 145, 123, 130, 154, 106, 105, 144, 137, 177, 162,
+                    130, 107, 124, 149, 104, 132, 117, 128, 144, 122, 167, 135, 137, 98, 137, 149,
+                    142, 125, 122, 109, 135, 121, 158, 121, 137, 112, 164, 142, 117, 131, 142, 133,
+                ],
+            ),
+        ];
+        for (w, h, size, expected) in cases {
+            let src = lcg(w * h * 4);
+            let got = downscale_bgra(&src, w, [0, 0, h, w], size);
+            assert_eq!(got, expected, "{w}x{h} -> {size}x{size}");
+        }
+    }
+
+    /// Rounding ties must go to even, as torch does. Every channel here averages
+    /// exactly x.5, so half-away-from-zero would give 1,3,5 instead of 0,2,4.
+    #[test]
+    fn downscale_rounds_ties_to_even() {
+        let src = [4u8, 2, 0, 0, 5, 3, 1, 0];
+        assert_eq!(downscale_bgra(&src, 2, [0, 0, 1, 2], 1), vec![0, 2, 4]);
+    }
+
+    /// The four quadrants must arrive in the order the policy's detail encoder expects:
+    /// top-left, top-right, bottom-left, bottom-right. Each quadrant here is a distinct
+    /// constant, so any permutation changes the bytes.
+    #[test]
+    fn view_boxes_are_ordered_top_left_top_right_bottom_left_bottom_right() {
+        let mut src = vec![0u8; 4 * 4 * 4];
+        for (idx, (top, left)) in [(0, 0), (0, 2), (2, 0), (2, 2)].iter().enumerate() {
+            let v = 10 * (idx as u8 + 1);
+            for y in *top..*top + 2 {
+                for x in *left..*left + 2 {
+                    let i = (y * 4 + x) * 4;
+                    src[i] = v + 2;
+                    src[i + 1] = v + 1;
+                    src[i + 2] = v;
+                }
+            }
+        }
+        let boxes = view_boxes(4, 4);
+        assert_eq!(downscale_bgra(&src, 4, boxes[0], 1), vec![25, 26, 27]);
+        for (n, expected) in [[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42]]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                downscale_bgra(&src, 4, boxes[n + 1], 1),
+                expected.to_vec(),
+                "quadrant {n} is out of order"
+            );
+        }
+    }
+
+    #[test]
+    fn view_boxes_cover_the_frame_without_overlap() {
+        let (w, h) = (3840usize, 2160usize);
+        let boxes = view_boxes(w, h);
+        assert_eq!(boxes[0], [0, 0, h, w]);
+        let area: usize = boxes[1..].iter().map(|b| b[2] * b[3]).sum();
+        assert_eq!(area, w * h, "quadrants must tile the frame exactly");
+        // Odd dimensions must still tile, with the far quadrants taking the extra pixel.
+        let odd = view_boxes(7, 5);
+        assert_eq!(odd[1..].iter().map(|b| b[2] * b[3]).sum::<usize>(), 35);
+    }
+
     #[test]
     fn blocks_os_and_speed_keys() {
         for vk in [0x5b, 0x5c, 0x12, 0xc0, 0x7b, 0x20, 0xbb, 0xbd] {
