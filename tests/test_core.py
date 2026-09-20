@@ -913,3 +913,157 @@ def test_views_accumulates_in_float32_so_the_worker_can_match_it():
     big = rng.integers(0, 256, (288, 512, 3), dtype=np.uint8)
     g, _ = views(big, size=16)
     assert int(g.sum()) == 97902, "resize no longer accumulates in float32"
+
+
+def _cadence_env(tmp_path, capture_ms=0.0):
+    """A match environment over a fake desktop whose capture costs `capture_ms`."""
+    import time as _time
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv
+
+    rules = _rules_with(
+        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
+    )
+    live = _screen(rules, ["ready", "healthy", "running_speed_two"])
+    ticking = [0]
+
+    def capture(**_):
+        _time.sleep(capture_ms / 1000)
+        # The clock ROI must change or the stall gate fires.
+        ticking[0] += 1
+        frame = live.copy()
+        x, y, w, h = rules.clock_rect
+        frame[y : y + h, x : x + w] = ticking[0] % 200
+        return Frame(frame, {"foreground": True}, 0)
+
+    desktop = Mock()
+    desktop.capture.side_effect = capture
+    desktop.apply.return_value = {"applied": 1}
+    env = ArenaEnv(desktop, rules, [], downscale=False)
+    env.reset()
+    return env, desktop
+
+
+def test_tick_holds_cadence_while_a_slow_policy_thinks(tmp_path):
+    """The whole point of the pipelined tick: inference overlaps input dispatch.
+
+    Serial dispatch-then-capture made a tick cost PERIOD + capture + inference, so 5 Hz
+    was unreachable by construction. With a 60 ms policy and a 15 ms capture the tick
+    must still be one PERIOD, not PERIOD + 75 ms.
+    """
+    import time as _time
+
+    from hoi4_arena.actions import PERIOD
+
+    env, _ = _cadence_env(tmp_path, capture_ms=15)
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    stamps = []
+    try:
+        for _ in range(6):
+            stamps.append(_time.monotonic())
+            _, _, _, _, info = env.step(action)
+            assert info["valid"], info.get("error")
+            _time.sleep(0.060)  # a policy deciding the next action
+    finally:
+        env.close()
+    periods = np.diff(stamps)[1:]  # drop the first, which has no interval in flight
+    assert periods.max() < PERIOD * 1.25, f"tick overran: {periods.tolist()}"
+    # Tight on the low side too: dropping the deadline would let ticks run at whatever
+    # rate the dispatch join allows (~175 ms), which is not the cadence that was asked for.
+    assert np.median(periods) > PERIOD * 0.9, f"tick undershot: {periods.tolist()}"
+    serial = PERIOD + 0.060 + 0.015
+    assert periods.mean() < serial * 0.9, (
+        f"mean tick {periods.mean():.3f}s is no better than serial {serial:.3f}s"
+    )
+
+
+def test_input_slots_still_span_the_whole_interval(tmp_path):
+    """Overlapping must not compress the eight slots into a burst."""
+    import time as _time
+
+    from hoi4_arena.actions import PERIOD
+
+    env, desktop = _cadence_env(tmp_path)
+    when = []
+    desktop.apply.side_effect = lambda events: when.append(_time.monotonic()) or {"applied": 1}
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    try:
+        env.step(action)
+        _time.sleep(0.030)
+        env.step(action)
+    finally:
+        env.close()
+    assert len(when) >= SLOTS, f"only {len(when)} slots dispatched"
+    gaps = np.diff(when[:SLOTS])
+    slot = PERIOD / SLOTS
+    assert when[SLOTS - 1] - when[0] > PERIOD * 0.5, "slots bursted instead of spanning"
+    assert np.median(gaps) > slot * 0.5, f"slots too tightly packed: {gaps.tolist()}"
+    assert gaps.max() < slot * 2.5, f"a slot was dropped or stalled: {gaps.tolist()}"
+
+
+def test_terminal_and_fault_stop_the_interval_in_flight(tmp_path):
+    """A dispatch thread must not keep injecting into a finished or faulted match."""
+    import time as _time
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv, disarm
+
+    rules = _rules_with(
+        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
+    )
+    for terminal in (["win"] * 4, ["disconnect"] * 4):
+        frames = [_screen(rules, ["ready", "healthy", "running_speed_two"])] + [
+            _screen(rules, active) for active in ([t] for t in terminal)
+        ]
+        desktop = Mock()
+        desktop.capture.side_effect = [
+            Frame(f, {"foreground": True}, i) for i, f in enumerate(frames)
+        ]
+        applied = []
+        desktop.apply.side_effect = lambda events: applied.append(_time.monotonic()) or {}
+        rules.last, rules.count = None, 0
+        env = ArenaEnv(desktop, rules, [], downscale=False)
+        env.reset()
+        action = np.zeros((SLOTS, 3), dtype=np.int64)
+        try:
+            for _ in range(len(terminal)):
+                _, _, done, truncated, _ = env.step(action)
+                if done or truncated:
+                    break
+            assert env.dispatch is None, "dispatch still in flight after the match ended"
+            count = len(applied)
+            _time.sleep(0.25)
+            assert len(applied) == count, "input was still applied after the match ended"
+        finally:
+            disarm(env)
+            env.close()
+
+
+def test_a_failure_inside_the_dispatch_thread_invalidates_the_episode(tmp_path):
+    """The join exists to surface this; without it the thread's error is swallowed.
+
+    The worker disarms itself immediately on focus loss, so the safety action does not
+    depend on this path. What depends on it is the episode being marked invalid instead
+    of silently continuing with input that never landed.
+    """
+    import time as _time
+
+    from hoi4_arena.desktop import DesktopError
+
+    env, desktop = _cadence_env(tmp_path)
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    try:
+        assert env.step(action)[4]["valid"]
+        desktop.apply.side_effect = DesktopError("focus_lost_during_batch")
+        _time.sleep(0.030)
+        info = env.step(action)[4]
+        if info["valid"]:  # the failure lands during this interval, so at the latest next
+            info = env.step(action)[4]
+        assert not info["valid"], "a failed dispatch must invalidate the episode"
+        assert "focus_lost_during_batch" in info["error"]
+        assert not env.active
+    finally:
+        env.close()

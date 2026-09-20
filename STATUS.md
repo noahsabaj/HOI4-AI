@@ -18,7 +18,7 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
-Latest automated checks: **44 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
+Latest automated checks: **48 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
 
 Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a regression test:
 
@@ -51,7 +51,17 @@ Capture and preprocessing, measured locally on 2026-09-20:
 | Worker CPU to produce five views | n/a | 18.0 ms p50 |
 | Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
 
-The 411 ms screenshot round trip should fall substantially, but it has **not** been re-measured on two PCs and the 5 Hz gate is still unmet: the synchronous step loop's structural extra interval is untouched by this. The resampler changed from PIL bilinear to an exact area average so the Rust worker can reproduce it bit for bit; this is a deliberate one-time break of any previously prepared dataset, of which there are none.
+The 411 ms screenshot round trip should fall substantially, but it has **not** been re-measured on two PCs.
+
+The step loop no longer serializes the interval against capture and inference. Each tick dispatches its eight slots on a separate thread and blocks the following tick on that dispatch completing, so a tick costs one interval rather than interval plus capture plus inference. Simulated locally against a fake desktop:
+
+| Policy + capture per tick | Serial loop | Pipelined loop |
+|---|---|---|
+| 51 ms + 15 ms | 266 ms | 203 ms (4.93 Hz) |
+| 102 ms + 15 ms | 317 ms | 203 ms (4.93 Hz) |
+| 150 ms + 20 ms | 370 ms | 203 ms (4.93 Hz) |
+
+Five Hz is therefore reachable rather than excluded by construction, but it is **not** demonstrated: these are simulated timings, not a live match, and the measured large-encoder p95 of 187.72 ms for a single actor still leaves no room for two on one GPU. The gate needs a real run. The resampler changed from PIL bilinear to an exact area average so the Rust worker can reproduce it bit for bit; this is a deliberate one-time break of any previously prepared dataset, of which there are none.
 
 Open acceptance work:
 
@@ -59,7 +69,7 @@ Open acceptance work:
 - Pairing works; complete two-PC lobby/reset calibration and recovery checks. Menu input and watchdog release are verified remotely; match behavior remains untested.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and F12 under load. The worker now releases held input even when stdout fails; live regression remains needed.
 - Re-measure the two-PC screenshot round trip with worker-side downscaling enabled.
-- Fix and measure end-to-end scheduling: the current synchronous environment adds a full action interval after inference, so its nominal 5 Hz is not achieved by construction. Rendering/capture/encoding and two local actors add further cost.
+- Measure end-to-end scheduling against a live game with two real actors. The loop now overlaps dispatch with capture and inference, but rendering, encoding and two actors sharing one GPU are untested at cadence.
 - Record 2–4 hours of expert demonstrations. Distill the compact encoder, train the BC baseline and compare held-out gameplay for the auxiliary/XM variants.
 - Run actual recurrent PPO self-play. Add an unattended league driver and model-selection schedule; current collector and trainer are separately invoked.
 - Complete 20 auditable unattended matches and 50 side-swapped evaluation pairs.
