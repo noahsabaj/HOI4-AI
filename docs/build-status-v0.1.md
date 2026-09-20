@@ -84,3 +84,21 @@ the log. Too few games for any strength claim.
 - Next: read pause state from the screen instead of toggling blindly; verify orders (arrow check); find out why
   `advance` never takes a VP; give Jev a less passive prompt or a time-pressure signal (a draw is not a win);
   calibrate the reset decision to drop the relaunch; then larger batches and the policy agent.
+
+## Live fixes, 2026-09-19 (later)
+
+Five faults, all found by playing matches rather than by reading code:
+
+| Fault | Fix | Measured |
+|---|---|---|
+| The space bar was toggled blind, so a stray pause stalled a match | `vision/topbar.py` reads paused/running from the glyph's green-minus-red and counts lit speed segments | one unfinished match before, none since |
+| Every tick re-issued the same order, restarting the battle it was fighting | standing orders remembered and fed back as the unit's order target | re-issues 100/match -> 0 |
+| Orders were never checked | confirmed by the movement arrow appearing on the unit->target line | 59/59 confirmed |
+| A counter whose unit is selected, or whose corner a combat badge covers, was dropped entirely | the cream ring replaces the border rather than surrounding it, so it anchors runs itself; a badged corner re-anchors on the run's right end | frames with no own units 33% -> 1.5% |
+| Camera setup relied on a fixed wheel sequence from an unknown start; one run played eight minutes over the British Isles, another ended over the Netherlands | zoom until the arena is the right size on screen, hunt the counters, and ask DeepSeek for a coarse fix when counters merge into a stack icon at wide zoom | camera verified on every run since |
+
+Also: `SetForegroundWindow` fails silently from a background script until the process has input (an ALT
+tap fixes it), and Jev held a level race to a draw until the state carried the clock.
+
+Still open: control is per stack; VP/day/outcome come from the log; the reset decision is not calibrated,
+so each match costs a relaunch; `in_combat` is still unread (measured, no reliable separation).

@@ -29,11 +29,37 @@ Honest limits, all UNVERIFIED against the live game:
 - Counters partly hidden by another counter or the screen edge are reported ``occluded`` when
   at least the icon box is visible; one hidden from the left or the top is not found at all.
 - Naval counters (two text rows, taller) fail the frame test and are deliberately not reported.
-- No in-combat mark was identifiable on a counter (HOI4 draws battles as bubbles on the
-  province border), so ``in_combat`` is always None here.
+- No in-combat mark was identifiable on a counter, so ``in_combat`` is always None here. The
+  red battle marks that DO overlap counters in live frames (a skull on the counter's top-left
+  corner, a battle arrow reaching across it) are the same red family as an enemy frame, and on
+  the three live frames in ``tests/data/arena`` they do not separate: the badge-carrying enemy
+  counter and a clean one score alike. Not guessed, so not reported. See ``corner_badge_h``.
 - The anchor is the border's exact colour (``edge_tolerance``). Land of the same HUE is handled;
   land within that RGB distance of the border colour itself would hide the counter.
-- A selected counter's highlight has not been seen; the executor deselects after each order.
+
+Two live-frame overlays were MEASURED on ``fix_advance_4_noown5/6.png`` and ``end_advance.png``
+(1920x1080, real game) and both used to defeat detection completely:
+
+1. A cream/gold ring, MEASURED #FFF8C7 fading to #CFB694 along its top edge. It does not sit
+   beside the frame: it REPLACES the frame's 1 px top border and left column and runs one pixel
+   past each side, so the strict top-border anchor found nothing at all and the counter was
+   never a candidate. From the second inner row down the counter is pixel-identical to an
+   unringed one. It is now its own anchor (``ring_mask``) and is reported as ``selected``.
+   That NAME is the best reading of the evidence, and it is not what the ring was first taken
+   for. Both frames' province tooltips say "Currently selected: Divisions: 1" and each frame
+   has exactly one ringed counter; in ``fix_advance_4_noown5.png`` BOTH own divisions carry a
+   movement chevron yet only one is ringed, and the two frames ring different provinces. So the
+   ring marks the selection, NOT "this unit has an order" — do not use it to skip order tracking.
+   Still unverified: which division the game considered selected is not in any of these frames.
+2. A red battle mark drawn over the counter's TOP-LEFT corner (a skull on an own counter, a
+   battle arrow on an enemy one). It hides the first ~11 rows of the left border and the first
+   ~6 columns of the top border, which shortened the anchor run and dropped the left-border
+   score to 0.68 against a 0.70 floor. The top border is now re-anchored on its RIGHT end and
+   the left-border score may come from the rows below the badge (``corner_badge_h``).
+
+A "»" chevron badge is drawn at the right end of a counter whose division is moving. It sits in
+the frame extension and overhangs only the outside; it did NOT break any read and is not
+detected. It, not the ring, is where a visual "has an order" flag would have to come from.
 """
 from __future__ import annotations
 
@@ -106,6 +132,17 @@ class CounterStyle:
     ink_value: float = 170.0
     plate_foreign_share: float = 0.15  # anti-aliased glyph edges stay well under this
     bar_lit_value: float = 90.0  # a bar column is filled when its brightest channel reaches this
+    # The cream/gold ring of an ordered counter, MEASURED along its top edge on
+    # end_advance.png and fix_advance_4_noown5.png: #FFF8C7 at the left corner fading to
+    # #CFB694 at the right. The test is a band, not a distance, because the fade is that wide.
+    ring_rgb: RGB = (0xFF, 0xF8, 0xC7)  # measured brightest ring pixel
+    ring_dim_rgb: RGB = (0xCF, 0xB6, 0x94)  # measured dimmest pixel still on the ring's top edge
+    ring_min_rgb: RGB = (190, 165, 135)  # per-channel floor for a ring pixel
+    ring_red_blue: tuple[float, float] = (40.0, 120.0)  # R-B of a ring pixel
+    ring_green_blue: tuple[float, float] = (12.0, 75.0)  # G-B of a ring pixel
+    ring_pad: float = 1.0  # the ring's inner row runs this far past each side of the frame
+    ring_share: float = 0.6  # share of a counter's top row that must be ring for selected
+    corner_badge_h: float = 11.0  # rows of the left border a battle badge was measured to cover
     min_scale: float = 0.75
     max_scale: float = 3.0
     scale: float = 1.0  # synthetic rendering only; detection measures scale per counter
@@ -126,13 +163,15 @@ class CounterReading:
     count_measured: bool  # False when a hand-drawn (guessed) digit template was used
     organization: float | None
     strength: float | None
-    in_combat: bool | None
+    in_combat: bool | None  # always None: no mark on a counter identifies combat (see module doc)
     has_army_plate: bool
     flag_rgb: RGB
     scale: float
     structure_score: float
     confidence: float
     occluded: bool = False  # only part of the top border was visible (overlap or screen edge)
+    selected: bool = False  # the cream/gold ring is drawn round the frame: the game's selection
+    #                         highlight, NOT an "this unit has an order" mark (see module doc)
 
     @property
     def center(self) -> tuple[float, float]:
@@ -251,6 +290,24 @@ def edge_mask(rgb: np.ndarray, reference: RGB, style: CounterStyle) -> np.ndarra
     return near
 
 
+def ring_mask(rgb: np.ndarray, style: CounterStyle) -> np.ndarray:
+    """Pixels of the cream/gold ring an ordered counter is drawn with.
+
+    A band rather than a distance to one colour: the ring fades from #FFF8C7 to #CFB694 across
+    a single counter, so what is constant is the ordering R > G > B and how far apart they are.
+    Measured on the two live frames in ``tests/data/arena``; on the 1680x1050 front sample it
+    lights 1 run of counter length or more, in the top-bar UI, and that run fails ``_structure``.
+    """
+    pixels = np.asarray(rgb, dtype=np.uint8).astype(np.int16)
+    red, green, blue = pixels[..., 0], pixels[..., 1], pixels[..., 2]
+    low, high = style.ring_red_blue
+    tint_low, tint_high = style.ring_green_blue
+    return ((red >= style.ring_min_rgb[0]) & (green >= style.ring_min_rgb[1])
+            & (blue >= style.ring_min_rgb[2]) & (red > green) & (green > blue)
+            & (red - blue >= low) & (red - blue <= high)
+            & (green - blue >= tint_low) & (green - blue <= tint_high))
+
+
 def _row_runs(mask: np.ndarray, min_len: int) -> list[tuple[int, int, int]]:
     """All horizontal True runs of at least ``min_len`` as (y, x0, x1), top to bottom."""
     padded = np.zeros((mask.shape[0], mask.shape[1] + 2), dtype=np.int8)
@@ -346,6 +403,10 @@ def _structure(mask: np.ndarray, x0: int, y: int, scale: float, visible: int,
     ``visible`` is how many columns of the top border were seen; a counter drawn over this one
     hides the rest, so only the visible part is tested. The separator test is what tells the two
     frame layouts apart: the column at 31 must be frame-coloured and the one before it must not.
+
+    The left-border score may also be taken from the rows BELOW ``corner_badge_h``: a red battle
+    badge covers the top of that border (11 rows measured on fix_advance_4_noown5.png) and would
+    otherwise push a real counter under the floor. Everything else still has to hold.
     """
     height, width = mask.shape
     if not style.min_scale <= scale <= style.max_scale:
@@ -357,7 +418,9 @@ def _structure(mask: np.ndarray, x0: int, y: int, scale: float, visible: int,
                    if float(mask[row, x0:span].mean()) >= 0.85), None)
     if bottom is None:
         return None
-    scores = [float(mask[y:bottom + 1, x0].mean())]
+    column = mask[y:bottom + 1, x0]
+    below = column[min(column.size - 1, int(round(style.corner_badge_h * scale))):]
+    scores = [max(float(column.mean()), float(below.mean()) if below.size else 0.0)]
     icon = _box(x0, y, scale, style.icon_box, min(width, x0 + visible), height)
     scores.append(1.0 - _mean(mask, icon))
     if scores[0] < 0.7 or scores[1] < 0.5:
@@ -380,7 +443,7 @@ def _structure(mask: np.ndarray, x0: int, y: int, scale: float, visible: int,
 
 def _read(pil: Image.Image, rgb: np.ndarray, relation: str, x0: int, y: int, x1: int, bottom: int,
           scale: float, structure: float, occluded: bool, style: CounterStyle,
-          digits: CounterDigits, bars: bool = True) -> CounterReading:
+          digits: CounterDigits, bars: bool = True, selected: bool = False) -> CounterReading:
     height, width = rgb.shape[:2]
     count, score, measured = None, 0.0, False
     text_box = _box(x0, y, scale, style.plate_text_box, width, height)
@@ -399,7 +462,7 @@ def _read(pil: Image.Image, rgb: np.ndarray, relation: str, x0: int, y: int, x1:
     return CounterReading(
         (x0, y, x1, bottom + 1), relation, count, round(score, 4), measured, organization, strength,
         None, has_plate, (int(flag[0]), int(flag[1]), int(flag[2])), round(scale, 3),
-        round(structure, 4), round(confidence, 4), occluded)
+        round(structure, 4), round(confidence, 4), occluded, selected)
 
 
 def find_counters(image: Image.Image | np.ndarray, style: CounterStyle | None = None,
@@ -407,9 +470,13 @@ def find_counters(image: Image.Image | np.ndarray, style: CounterStyle | None = 
     """Every land counter on the frame, top-to-bottom then left-to-right.
 
     Pass 1 accepts top-border runs that are exactly one counter long in either layout (53 wide
-    beside an army plate, 62 wide without one) and so measures the scale. Pass 2 revisits the
-    shorter runs at that scale: counters partly hidden by one drawn over them, or cut by the
-    screen edge. Those are reported ``occluded`` and read a count only if the plate is visible.
+    beside an army plate, 62 wide without one) and so measures the scale. Pass 1b anchors on the
+    cream/gold RING instead, for counters whose top border the ring has painted over; the ring
+    itself then stands in for the border it covers, and the reading carries ``selected``.
+    Pass 2 revisits the shorter runs at the measured scale: counters partly hidden by one drawn
+    over them, cut by the screen edge (reported ``occluded``, a count only if the plate is
+    visible), or with the top border's LEFT end under a red battle badge. The last are re-anchored
+    on the run's right end and are not occluded: only the border is covered, not the body.
     Naval counters are two text rows tall and fail the bottom-row test, so they are not reported.
     """
     style = style or CounterStyle()
@@ -418,6 +485,7 @@ def find_counters(image: Image.Image | np.ndarray, style: CounterStyle | None = 
     pil = pil.convert("RGB")
     rgb = np.asarray(pil)
     height, width = rgb.shape[:2]
+    ring = ring_mask(rgb, style)
     found: list[CounterReading] = []
     leftovers: list[tuple[str, np.ndarray, tuple[int, int, int]]] = []
 
@@ -425,8 +493,13 @@ def find_counters(image: Image.Image | np.ndarray, style: CounterStyle | None = 
         return any(x0 < c.bbox[2] and c.bbox[0] < x1 and y < c.bbox[3] and c.bbox[1] <= bottom
                    and abs(c.bbox[1] - y) < 3 for c in found)
 
-    def window(y: int, x0: int, x1: int, reach: float) -> tuple[int, int, int, int]:
-        return max(0, x0 - 6), max(0, y - 1), min(width, x1 + 6), min(height, y + int(reach) + 6)
+    def window(y: int, x0: int, x1: int, reach: float, pad: int = 6) -> tuple[int, int, int, int]:
+        return max(0, x0 - pad), max(0, y - 1), min(width, x1 + 6), min(height, y + int(reach) + 6)
+
+    def ringed(x0: int, y: int, x1: int) -> bool:
+        """The ring covers the counter's own top border, so that row is where it is read."""
+        row = ring[y, max(0, x0):min(width, x1)]
+        return bool(row.size) and float(row.mean()) >= style.ring_share
 
     for relation in RELATIONS:
         reference = style.frame_rgb(relation)
@@ -445,14 +518,39 @@ def find_counters(image: Image.Image | np.ndarray, style: CounterStyle | None = 
             (bottom, structure), scale = max(fits, key=lambda item: item[0][1])
             if not claimed(x0, y, x1, bottom + wy0):
                 found.append(_read(pil, rgb, relation, x0, y, x1, bottom + wy0, scale, structure, False,
-                                   style, digits))
+                                   style, digits, selected=ringed(x0, y, x1)))
+    # Pass 1b: a ringed counter has no frame-coloured top border left to anchor on. The ring's
+    # inner row runs ring_pad past each side of the frame and the outer row ring_pad inside, so
+    # each run yields two candidate top-left corners; the wrong one fails the structure test.
+    for row, rx0, rx1 in _row_runs(ring, int(style.separator_x * style.min_scale)):
+        pad = int(round(style.ring_pad))
+        for y, x0, span in ((row, rx0, rx1 - rx0 - 2 * pad), (row + 1, rx0 - pad, rx1 - rx0)):
+            if x0 < 0 or y >= height or span < style.separator_x * style.min_scale:
+                continue
+            x1 = x0 + span
+            wx0, wy0, wx1, wy1 = window(y, x0, x1, style.frame_h * span / style.frame_w)
+            here = ring[wy0:wy1, wx0:wx1]
+            best: tuple[tuple[int, float], float, str] | None = None
+            for relation in RELATIONS:
+                mask = hue_mask(rgb[wy0:wy1, wx0:wx1], style.frame_rgb(relation), style) | here
+                for layout in (style.full_w, style.frame_w):
+                    fit = _structure(mask, x0 - wx0, y - wy0, span / layout, span, style)
+                    if fit is not None and (best is None or fit[1] > best[0][1]):
+                        best = (fit, span / layout, relation)
+            if best is None:
+                continue
+            (bottom, scale, relation) = (best[0][0], best[1], best[2])
+            if not claimed(x0, y, x1, bottom + wy0):
+                found.append(_read(pil, rgb, relation, x0, y, x1, bottom + wy0, scale, best[0][1], False,
+                                   style, digits, selected=True))
     if found:
         scale = float(np.median([c.scale for c in found]))
         body = int(round(style.frame_h * scale))
         for relation, edge, (y, run_x0, x1) in leftovers:
             if x1 - run_x0 > style.full_w * scale + 2:
                 continue
-            wx0, wy0, wx1, wy1 = window(y, run_x0, x1, style.frame_h * scale)
+            reach = 6 + int(round(style.corner_badge_h * scale))  # room for a badge on the left
+            wx0, wy0, wx1, wy1 = window(y, run_x0, x1, style.frame_h * scale, pad=reach)
             mask = hue_mask(rgb[wy0:wy1, wx0:wx1], style.frame_rgb(relation), style)
             x0 = _refine_left(mask, edge[wy0:wy1, wx0:wx1], y - wy0, run_x0 - wx0, scale) + wx0
             if claimed(x0, y, x1, y + body - 1):
@@ -461,6 +559,27 @@ def find_counters(image: Image.Image | np.ndarray, style: CounterStyle | None = 
             if fit is not None:  # the right part is hidden; bars need the whole icon side
                 found.append(_read(pil, rgb, relation, x0, y, x1, fit[0] + wy0, scale, fit[1], True, style,
                                    digits, bars=x1 - x0 >= style.separator_x * scale))
+                continue
+            # A battle badge over the top-left corner eats the start of the run: the run's right
+            # end is still the frame's, so re-anchor a whole layout on it. Nothing is occluded but
+            # the border, so the body is read in full.
+            shifted: tuple[tuple[int, float], int, int] | None = None
+            for layout in (style.full_w, style.frame_w):
+                span = int(round(layout * scale))
+                # The run's own last column is often the darkened corner, which the strict edge
+                # mask drops, so the right end is x1 or x1 - 1: try both alignments.
+                for left in (x1 - span, x1 - span + 1):
+                    if not wx0 <= left < x0 or x0 - left > style.corner_badge_h * scale:
+                        continue
+                    got = _structure(mask, left - wx0, y - wy0, scale, span, style)
+                    if got is not None and (shifted is None or got[1] > shifted[0][1]):
+                        shifted = (got, left, span)
+            if shifted is not None:
+                (bottom, structure), left, span = shifted
+                if not claimed(left, y, left + span, bottom + wy0):
+                    found.append(_read(pil, rgb, relation, left, y, left + span, bottom + wy0, scale,
+                                       structure, False, style, digits,
+                                       selected=ringed(left, y, left + span)))
                 continue
             whole = any(abs((x1 - x0) - layout * scale) <= 2 for layout in (style.full_w, style.frame_w))
             rows = _covered(mask, x0 - wx0, y - wy0, scale, style) if whole else 0

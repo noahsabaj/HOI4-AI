@@ -1,6 +1,6 @@
 """Offline tests for the arena vision runtime.
 
-Only the two files under tests/data/arena are real HOI4 pixels. Every other frame here is
+Only the PNG files under tests/data/arena are real HOI4 pixels. Every other frame here is
 SYNTHETIC (``vision.synthetic``) and proves that the reader inverts the renderer, not that it
 reads the live game.
 """
@@ -25,7 +25,7 @@ from hoi4_agent.arena.vision.calibration import (ArenaVisionCalibration, PanelCa
                                                  assemble, build_steps, dump_vision_toml, fit_affine,
                                                  load_vision_calibration)
 from hoi4_agent.arena.vision.counters import (BUILTIN_DIGITS, MEASURED_DIGITS, CounterDigits, CounterStyle,
-                                              find_counters)
+                                              _row_runs, edge_mask, find_counters, hue_mask, ring_mask)
 from hoi4_agent.arena.vision.executor import OrderExecutor, line_change
 from hoi4_agent.arena.vision.observe import (ENEMY_BASE, OWN_STACK_BASE, ArenaObserver, EnemyTracker, LogTail,
                                              OwnDivisionTracker, absolute_hour, parse_outcome)
@@ -642,6 +642,88 @@ def test_hard_real_sample_bars_vary_and_the_empty_part_is_the_dark_box():
     assert (empty == (0x29, 0x25, 0x22)).all() and empty.max() < CounterStyle().bar_lit_value
 
 
+# --- third real sample set: live 1920x1080 frames with ring / battle-badge overlays -------
+# Provenance and hand labels: tests/data/arena/live_selected*.truth.json. Before the overlays were
+# handled the reader found 1 of 4 counters on each fix_advance frame (0 of 2 own) and 3 of 4 on
+# end_advance (1 of 2 own) -- the live "33% of frames report ZERO own counters" bug.
+LIVE_FRAMES = ("live_selected_1920x1080", "live_selected_badge_1920x1080",
+               "live_selected_badge_2_1920x1080")
+
+
+def live_sample(stem: str):
+    truth = json.loads((DATA / f"{stem}.truth.json").read_text(encoding="utf-8"))
+    return find_counters(Image.open(DATA / f"{stem}.png")), truth
+
+
+@pytest.mark.parametrize("stem", LIVE_FRAMES)
+def test_live_frame_finds_every_counter_including_ringed_and_badged_ones(stem):
+    readings, truth = live_sample(stem)
+    report = counter_truth_report(readings, truth)
+    assert len(truth["counters"]) == 4 and len(readings) == 4
+    for relation in ("own", "enemy"):
+        assert report[relation]["recall_full"] == 1.0 and report[relation]["found"] == 2
+        assert report[relation]["precision"] == 1.0 and report[relation]["false_positives"] == 0
+        assert report[relation]["count_accuracy"] == 1.0
+    assert all(r.in_combat is None for r in readings)  # the skull/arrow are not read: unknown, not False
+
+
+@pytest.mark.parametrize("stem", LIVE_FRAMES)
+def test_live_frame_own_counters_carry_their_labelled_count_and_selection_ring(stem):
+    readings, truth = live_sample(stem)
+    labels = {tuple(c["frame_top_left"]): c for c in truth["counters"] if c["relation"] == "own"}
+    own = [r for r in readings if r.relation == "own"]
+    assert len(own) == 2 and {r.bbox[:2] for r in own} == set(labels)
+    for reading in own:
+        label = labels[reading.bbox[:2]]
+        assert reading.count == label["count"] and reading.count_measured
+        assert reading.selected is label["selected"]  # exactly one ringed own counter per frame
+        assert not reading.occluded and reading.confidence > 0.9
+        # the body is whole behind both overlays, so both bars are read
+        assert reading.organization is not None and reading.strength is not None
+        assert reading.bbox[2] - reading.bbox[0] >= 61 and not reading.has_army_plate
+    assert sum(r.selected for r in readings) == 1
+
+
+def test_the_selection_ring_replaces_the_top_border_that_used_to_be_the_only_anchor():
+    """Why a ringed counter was invisible, measured rather than asserted from memory."""
+    style = CounterStyle()
+    pixels = np.asarray(Image.open(DATA / "live_selected_1920x1080.png").convert("RGB"))
+    x0, y0 = 864, 453  # the ringed own counter, from the truth file
+    border = pixels[y0, x0:x0 + 62]
+    assert edge_mask(pixels, style.own_frame_rgb, style)[y0, x0:x0 + 62].mean() == 0.0
+    assert tuple(border[0]) == style.ring_rgb and tuple(border[-1]) == style.ring_dim_rgb
+    ring = ring_mask(pixels, style)
+    assert ring[y0, x0:x0 + 62].all() and ring[y0:y0 + 22, x0].all()  # top border AND left column
+    # the ring's inner row runs one pixel past each side; from the second inner row down the
+    # counter is an ordinary one again
+    assert not ring[y0, x0 - 1] and ring[y0, x0 + 62] and not ring[y0 + 2, x0 + 2]
+    plain = pixels[725:747, 655:717]  # the unringed own counter on the same frame
+    assert (pixels[y0 + 2:y0 + 22, x0 + 2:x0 + 62] == plain[2:22, 2:62]).mean() > 0.99
+
+
+def test_a_battle_badge_over_the_corner_shortens_the_anchor_run_but_not_the_counter():
+    style = CounterStyle()
+    pixels = np.asarray(Image.open(DATA / "live_selected_badge_1920x1080.png").convert("RGB"))
+    x0, y0 = 1101, 451  # own counter under a red combat skull, from the truth file
+    edge = edge_mask(pixels, style.own_frame_rgb, style)
+    (run,) = [r for r in _row_runs(edge, int(style.separator_x * style.min_scale)) if r[0] == y0]
+    assert run[1] - x0 == 6 and run[2] - run[1] == 55  # the skull eats 6 columns of a 62 px border
+    column = hue_mask(pixels, style.own_frame_rgb, style)[y0:y0 + 22, x0]
+    assert round(float(column.mean()), 2) == 0.68  # under the 0.70 floor: the old rejection
+    assert float(column[int(style.corner_badge_h):].mean()) == 1.0  # clear below the badge
+    assert find_counters(Image.open(DATA / "live_selected_badge_1920x1080.png"))[0].bbox[:2] == (x0, y0)
+
+
+def test_the_ring_is_not_seen_on_frames_that_have_no_ringed_counter():
+    style = CounterStyle()
+    for name in ("sample_map_600x400.png", "sample_front_1680x1050.png"):
+        assert not any(r.selected for r in find_counters(Image.open(DATA / name)))
+    assert ring_mask(np.asarray(Image.open(DATA / "sample_map_600x400.png").convert("RGB")), style).sum() == 0
+    cal = calibration()
+    frame = render_arena_frame(LAYOUT, STACKS, cal)  # SYNTHETIC: the renderer draws no ring
+    assert not any(r.selected for r in find_counters(frame))
+
+
 def test_synthetic_other_relation_full_frame_and_touching_stack():
     from hoi4_agent.arena.vision.synthetic import draw_counter
     style = CounterStyle()
@@ -659,3 +741,18 @@ def test_synthetic_other_relation_full_frame_and_touching_stack():
     observation = observer(cal).observe(render_arena_frame(
         LAYOUT, [SyntheticStack(6, "other", 2, 1.0, 1.0, army_plate=False), SyntheticStack(7, "enemy", 4, 1.0, 1.0)], cal))
     assert [(u.country, u.province_id) for u in observation.units] == [(Country.RED, 7)]  # "other" is no combatant
+
+
+def test_top_bar_reads_pause_and_speed_from_real_frames() -> None:
+    """The two crops are 1920x1080-relative, so they are pasted back at their measured offset."""
+    from hoi4_agent.arena.vision.topbar import read_top_bar
+
+    for name, paused, speed in (("running_speed2", False, 2), ("paused_speed4", True, 4)):
+        crop = Image.open(DATA / f"topbar_{name}.png")
+        frame = Image.new("RGB", (1920, 1080), (0, 0, 0))
+        frame.paste(crop, (1600, 0))
+        bar = read_top_bar(frame)
+        assert (bar.paused, bar.speed) == (paused, speed), (name, bar)
+    # A blank frame has no glyph and no lit segment: both reads must abstain, never guess.
+    blank = read_top_bar(Image.new("RGB", (1920, 1080), (20, 20, 20)))
+    assert blank.paused is None and blank.speed is None

@@ -71,16 +71,61 @@ def fit(frame) -> tuple[float, float, float, float] | None:
     return best
 
 
+def counters(frame) -> list[tuple[float, float]]:
+    return [((r.bbox[0] + r.bbox[2]) / 2, (r.bbox[1] + r.bbox[3]) / 2)
+            for r in find_counters(frame) if r.relation in ("own", "enemy")]
+
+
+def coarse_arena(frame) -> tuple[float, float] | None:
+    """Roughly where the two arena countries are, asked of the cloud vision model.
+
+    Counters merge into a stack icon at wide zoom, so the classical reader sees nothing and
+    cannot lead the camera in. The model only has to get within a province or so; the counter
+    hunt takes over from there. Pointing is its weakest skill, so the answer is never trusted
+    as a click target.
+    """
+    try:
+        from hoi4_agent.brain.deepseek import DeepSeekClient
+
+        reply = DeepSeekClient().chat(
+            system="You read Hearts of Iron IV map screenshots. Output JSON only.",
+            user=('Most of this world map is one grey country. Exactly two small countries are coloured, one '
+                  'light blue and one red, side by side in central Europe. Give the centre of that coloured '
+                  'pair as json {"x": X, "y": Y}, integers 0-1000 normalised to this image. If you cannot see '
+                  'them, reply {"x": null, "y": null}.'),
+            images=[frame], thinking=False, max_tokens=60, timeout=40)
+        data = json.loads(reply.text)
+        if isinstance(data.get("x"), int) and isinstance(data.get("y"), int):
+            return data["x"] / 1000 * frame.width, data["y"] / 1000 * frame.height
+    except Exception as exc:  # the hunt still has its own fallbacks
+        print("coarse locate unavailable:", type(exc).__name__, exc)
+    return None
+
+
 w.Win32Input().key("space")  # pause: zooming while the clock runs races the AI
 time.sleep(0.5)
-live.scroll(geo, 5, 1150, 560)  # the arena is invisible at world zoom, so get into the region first
-time.sleep(1.5)
-for attempt in range(10):
+# Where the camera starts is not fixed, and zooming at a guessed point walks off across Europe
+# (one run ended over the Netherlands), so hunt for the units themselves: pull back until some
+# counter is on screen, then zoom in on the counters and let them lead the camera in.
+for pull in range(6):
+    seen = counters(capture.grab(geo))
+    if seen:
+        break
+    live.scroll(geo, -3, 960, 540)
+    time.sleep(1.5)
+for attempt in range(12):
     live.move(geo, 1900, 700)
     time.sleep(0.8)
-    result = fit(capture.grab(geo))
-    if result is None:  # the four counters are not all visible yet: step in and look again
-        live.scroll(geo, 1, 960, 540)
+    frame = capture.grab(geo)
+    result = fit(frame)
+    if result is None:  # the four counters are not all visible yet: zoom in on what is
+        seen = counters(frame)
+        if seen:
+            live.scroll(geo, 1, sum(x for x, _ in seen) / len(seen), sum(y for _, y in seen) / len(seen))
+        elif (where := coarse_arena(frame)) is not None:
+            live.scroll(geo, 2, *where)
+        else:
+            live.scroll(geo, -2, 960, 540)
         time.sleep(1.5)
         continue
     scale, dx, dy, _ = result
