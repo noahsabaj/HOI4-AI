@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import sys
 from pathlib import Path
 
 
 def main():
     parser = argparse.ArgumentParser(description="Screen-only HOI4 research prototype")
+    parser.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="Progress and diagnostics go to stderr; JSON results go to stdout.",
+    )
+    parser.add_argument("--traceback", action="store_true", help="Re-raise instead of exiting 1")
     sub = parser.add_subparsers(dest="command", required=True)
     bench = sub.add_parser("benchmark")
     bench.add_argument("--model", default="models/levjepa-large")
@@ -53,6 +62,10 @@ def main():
     template.add_argument("rules")
     template.add_argument("name")
     template.add_argument("--rect", nargs=4, type=int, required=True, metavar=("X", "Y", "W", "H"))
+    clock = sub.add_parser("clock", help="Calibrate the changing-clock ROI collection requires")
+    clock.add_argument("screenshot")
+    clock.add_argument("rules")
+    clock.add_argument("--rect", nargs=4, type=int, required=True, metavar=("X", "Y", "W", "H"))
     evaluation = sub.add_parser("evaluate")
     evaluation.add_argument("results")
     generation = sub.add_parser("generate-map")
@@ -69,8 +82,30 @@ def main():
     ppo.add_argument("output")
     ppo.add_argument("--epochs", type=int, default=3)
     ppo.add_argument("--model-path")
+    ppo.add_argument("--seed", type=int, default=42)
     args = vars(parser.parse_args())
     command = args.pop("command")
+    logging.basicConfig(
+        level=getattr(logging, args.pop("log_level").upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    traceback = args.pop("traceback")
+    try:
+        result = _dispatch(command, args)
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).error("interrupted")
+        raise SystemExit(130) from None
+    except Exception as error:
+        if traceback:
+            raise
+        logging.getLogger(__name__).error("%s: %s", type(error).__name__, error)
+        raise SystemExit(1) from None
+    if result is not None:
+        print(json.dumps(result, indent=2))
+
+
+def _dispatch(command, args):
     result = None
     if command == "benchmark":
         from .benchmark import benchmark
@@ -116,6 +151,10 @@ def main():
         from .vision import add_template
 
         result = add_template(**args)
+    elif command == "clock":
+        from .vision import set_clock_rect
+
+        result = set_clock_rect(**args)
     elif command == "evaluate":
         from .learning import paired_evaluation
 
@@ -136,8 +175,7 @@ def main():
         from .runner import train_ppo
 
         result = train_ppo(**args)
-    if result is not None:
-        print(json.dumps(result, indent=2))
+    return result
 
 
 if __name__ == "__main__":
