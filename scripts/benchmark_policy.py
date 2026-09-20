@@ -27,9 +27,9 @@ report = {
     "baseline_memory": gpu_memory(),
 }
 try:
-    view, tiles = views(np.asarray(Image.open(args.image).convert("RGB")))
-    clip = normalize(np.stack([view] * 16)).permute(3, 0, 1, 2)[None].cuda()
-    tiles = normalize(tiles).permute(0, 3, 1, 2)[None].cuda()
+    view, tiles = views(np.asarray(Image.open(args.image).convert("RGB")), device="cuda")
+    clip = normalize(torch.stack([view] * 16)).permute(3, 0, 1, 2)[None]
+    tiles = normalize(tiles).permute(0, 3, 1, 2)[None]
     encoder = VideoEncoder("models/levjepa-large", variant=args.variant)
     policy = Policy(encoder).cuda().eval()
     report["encoder_parameters"] = sum(p.numel() for p in encoder.parameters())
