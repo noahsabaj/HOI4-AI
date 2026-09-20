@@ -686,3 +686,16 @@ def test_cli_registers_commands_and_agent_info_prints_no_secrets(capsys: pytest.
     canned = canned_observation()
     assert summarize(canned)["sectors"]["north"]["force_balance"] == "heavily outnumbered"
     assert summarize(canned)["sectors"]["south"]["force_balance"] == "we heavily outnumber them"
+
+
+def test_summary_carries_the_clock_and_what_doing_nothing_earns() -> None:
+    """A level race that ends is a draw; the state must say so or holding looks free."""
+    from hoi4_agent.arena.tiers import summarize
+
+    early = summarize(sectored(hour=24))
+    assert (early["days_left"], early["time_left"]) == (89, "plenty")
+    late = summarize(sectored(hour=85 * 24))
+    assert (late["days_left"], late["time_left"]) == (5, "almost over")
+    assert late["result_if_nothing_changes"] in ("draw", "we win", "we lose")
+    assert summarize(sectored(hour=24), horizon_hours=30 * 24)["days_left"] == 29
+    assert summarize(sectored(hour=200 * 24))["time_left"] == "over"
