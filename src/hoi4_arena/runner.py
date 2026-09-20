@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from collections import deque
 from pathlib import Path
 
@@ -19,6 +21,40 @@ from .recording import Recorder
 from .remote import RemoteDesktop
 from .vision import ScreenRules
 
+log = logging.getLogger(__name__)
+
+
+def seed_everything(seed, *, salt=None):
+    """Seed every RNG the collection and PPO paths draw from.
+
+    A salt keeps runs reproducible without making them identical: seeding every match
+    from the same constant would replay one RNG stream across a whole league, so the
+    collected matches would no longer be independent samples of the policy.
+    """
+    if salt is not None:
+        seed = int.from_bytes(hashlib.sha256(f"{seed}:{salt}".encode()).digest()[:4], "big")
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    return int(seed)
+
+
+def ppo_exclusion(meta):
+    """Why this rollout may not train, or None if it may.
+
+    Greedy evaluation rollouts are not samples from the behavior policy: their stored
+    old_logp is the likelihood of an argmax, so the PPO ratio would be meaningless.
+    Evaluation data never trains.
+    """
+    if not meta.get("complete"):
+        return "incomplete"
+    if not meta.get("valid"):
+        return "invalid"
+    if meta.get("deterministic"):
+        return "deterministic evaluation rollout, not on-policy"
+    return None
+
 
 def load_policy(checkpoint, model_path=None, device="cuda"):
     path = Path(checkpoint)
@@ -33,10 +69,27 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
     return policy.to(device), config, metadata["sha256"]
 
 
+def act_noise(objective, width, deterministic, device):
+    """The latent an actor conditions on for one decision.
+
+    ActionHead conditions its entire start state on this vector, so an xm checkpoint that
+    keeps drawing a fresh latent stays stochastic no matter what the categorical heads do.
+    A deterministic actor must therefore pin the latent to the prior mean as well; taking
+    the argmax alone would leave exactly the sampling variance the flag exists to remove.
+    """
+    if deterministic or objective != "xm":
+        return torch.zeros(1, width, device=device)
+    return torch.randn(1, width, device=device)
+
+
 class Actor:
-    def __init__(self, checkpoint, model_path=None):
-        self.policy, self.config, self.digest = load_policy(checkpoint, model_path)
+    def __init__(self, checkpoint, model_path=None, deterministic=False, device="cuda"):
+        self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
         self.policy.eval().requires_grad_(False)
+        # Evaluation runs take the argmax so paired_evaluation's bound is not inflated by
+        # sampling noise the analysis does not model. Self-play collection must sample.
+        self.deterministic = deterministic
+        self.device = device
         self.hidden = None
         self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
         self.history = deque(maxlen=64)
@@ -49,23 +102,30 @@ class Actor:
         ids = np.searchsorted(times, desired, side="right") - 1
         clip = np.stack([self.history[max(0, int(i))][1] for i in ids])
         before = (
-            np.zeros(512, np.float32)
+            np.zeros(self.policy.memory_dim, np.float32)
             if self.hidden is None
             else self.hidden[0].float().cpu().numpy()
         )
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        device = self.device
+        with (
+            torch.inference_mode(),
+            torch.autocast(torch.device(device).type, dtype=torch.bfloat16),
+        ):
             self.hidden, value, _ = self.policy(
-                normalize(clip).permute(3, 0, 1, 2)[None].cuda(),
-                normalize(tiles).permute(0, 3, 1, 2)[None].cuda(),
-                torch.from_numpy(self.previous)[None].cuda(),
+                normalize(clip).permute(3, 0, 1, 2)[None].to(device),
+                normalize(tiles).permute(0, 3, 1, 2)[None].to(device),
+                torch.from_numpy(self.previous)[None].to(device),
                 self.hidden,
             )
-            noise = (
-                torch.randn(1, 16, device="cuda")
-                if self.config["objective"] == "xm"
-                else torch.zeros(1, 16, device="cuda")
+            noise = act_noise(
+                self.config["objective"],
+                self.policy.actor.noise_dim,
+                self.deterministic,
+                device,
             )
-            action, logp, _ = self.policy.actor(self.hidden, noise=noise)
+            action, logp, _ = self.policy.actor(
+                self.hidden, noise=noise, deterministic=self.deterministic
+            )
         action = action[0].cpu().numpy()
         sample = {
             "clip": clip,
@@ -90,9 +150,12 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
     config = json.loads(Path(config_path).read_text())
     root = Path(output)
     root.mkdir(parents=True, exist_ok=False)
+    # Salt with the pair id so each match is independently seeded yet reproducible.
+    seed = seed_everything(config.get("seed", 42), salt=config["pair_id"])
+    deterministic = bool(config.get("deterministic", False))
     actors = [
-        Actor(left_checkpoint, config.get("model_path")),
-        Actor(right_checkpoint, config.get("model_path")),
+        Actor(left_checkpoint, config.get("model_path"), deterministic=deterministic),
+        Actor(right_checkpoint, config.get("model_path"), deterministic=deterministic),
     ]
     environments = []
     recorders = []
@@ -105,6 +168,9 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         "scenario": config["scenario"],
         "pair_id": config["pair_id"],
         "screen_only": True,
+        "seed": seed,
+        "config_seed": config.get("seed", 42),
+        "deterministic": deterministic,
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     reason = None
@@ -151,6 +217,14 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
                 )
                 np.savez_compressed(root / f"player-{i}" / f"{count:06d}.npz", **sample)
             count += 1
+            if count % 25 == 0:
+                misses = sum(bool(r[4].get("deadline_miss")) for r in results)
+                log.info(
+                    "step %d: elapsed=%.1f s deadline_misses_this_step=%d",
+                    count,
+                    max(r[4].get("elapsed_seconds", 0.0) for r in results),
+                    misses,
+                )
             observations = [r[0] for r in results]
             if any(r[2] or r[3] for r in results):
                 manifest.update(
@@ -162,9 +236,19 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         reason = f"{type(error).__name__}: {error}"
         raise
     finally:
-        for desktop in desktops:
+        for index, desktop in enumerate(desktops):
+            try:
+                lines = desktop.worker_log()
+                if lines:
+                    (root / f"worker-{index}.log").write_text("\n".join(lines) + "\n")
+            except Exception as error:  # noqa: BLE001 - diagnostics must never mask cleanup.
+                log.warning("could not write worker-%d.log: %s", index, error)
             try:
                 desktop.close()
+                # close() records a failed release instead of raising out of __exit__;
+                # an unreleased worker still invalidates the run.
+                if desktop.close_error:
+                    reason = reason or f"Worker release failed: {desktop.close_error}"
             except Exception as error:
                 reason = reason or f"Worker cleanup failed: {error}"
         if pair is not None:
@@ -185,6 +269,17 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         except OSError as error:
             manifest.update(valid=False, error=f"Checkpoint unavailable after match: {error}")
         (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        # collect_pair re-raises, so the caller never sees the return value. Say where the
+        # evidence landed rather than leaving only a traceback.
+        log.info("manifest written: %s (valid=%s)", root / "manifest.json", manifest["valid"])
+    # Same contract as record: the evidence is written first, then the run fails loudly.
+    # A permanently miscalibrated rules file otherwise invalidates every episode in an
+    # unattended batch while every invocation still exits zero.
+    if not manifest["valid"]:
+        raise RuntimeError(
+            f"Match invalid ({manifest.get('error') or manifest.get('outcomes')}); "
+            f"see {root / 'manifest.json'}"
+        )
     return manifest
 
 
@@ -207,16 +302,21 @@ def replay_batch(files, device):
     return batch
 
 
-def train_ppo(rollouts, checkpoint, output, epochs=3, sequence=8, burn_in=2, model_path=None):
+def train_ppo(
+    rollouts, checkpoint, output, epochs=3, sequence=8, burn_in=2, model_path=None, seed=42
+):
     from .learning import gae, ppo_loss, save_checkpoint
 
+    seed = seed_everything(seed)
     policy, config, digest = load_policy(checkpoint, model_path)
     policy.train()
     optimizer = torch.optim.AdamW([p for p in policy.parameters() if p.requires_grad], lr=1e-5)
     episodes = []
     for manifest_path in sorted(Path(rollouts).glob("*/manifest.json")):
         meta = json.loads(manifest_path.read_text())
-        if not meta["complete"] or not meta["valid"]:
+        excluded = ppo_exclusion(meta)
+        if excluded:
+            log.info("excluding rollout %s: %s", manifest_path.parent, excluded)
             continue
         for player in range(2):
             if meta["checkpoint_sha256"][player] != digest:
@@ -305,6 +405,10 @@ def train_ppo(rollouts, checkpoint, output, epochs=3, sequence=8, burn_in=2, mod
             "parent": digest,
             "rollouts": str(Path(rollouts).resolve()),
             "episodes": len(episodes),
+            "seed": seed,
+            "epochs": epochs,
+            "sequence": sequence,
+            "burn_in": burn_in,
             "gameplay_verified": False,
         },
     )
@@ -312,5 +416,6 @@ def train_ppo(rollouts, checkpoint, output, epochs=3, sequence=8, burn_in=2, mod
         "episodes": len(episodes),
         "updates": len(losses),
         "mean_loss": float(np.mean(losses)),
+        "seed": seed,
         "selection_requires_held_out_games": True,
     }

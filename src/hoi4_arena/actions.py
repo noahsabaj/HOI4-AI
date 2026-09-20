@@ -1,4 +1,13 @@
-"""Physical event vocabulary; eight ordered 25 ms slots per policy decision."""
+"""Physical event vocabulary; eight ordered 25 ms slots per policy decision.
+
+Pointer positions are client-relative fractions quantized onto a square GRID x GRID
+lattice, so the pixel pitch is anisotropic on a non-square screen: at 3840x2160 one step
+is 3839/1023 = 3.75 px horizontally but 2159/1023 = 2.11 px vertically, giving up to
++/-1.9 px of horizontal round-trip error. Controls narrower than about four pixels cannot
+be addressed exactly, and recorded human motion is re-quantized onto this lattice before
+it becomes a behavioral-cloning label. Raising GRID widens the two position heads in
+models.ActionHead and invalidates existing prepared datasets and checkpoints.
+"""
 
 from __future__ import annotations
 

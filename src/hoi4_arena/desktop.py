@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class DesktopError(RuntimeError):
@@ -27,10 +31,17 @@ class Frame:
 class Desktop:
     def __init__(self, command: list[str] | None = None):
         command = command or [str(Path("target/release/hoi4-desktop-worker.exe").resolve())]
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        # The worker's only diagnostic channel is stderr. Capture it instead of letting it
+        # escape to an inherited console, so failures land beside the run's other evidence.
+        self.process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self.diagnostics = deque(maxlen=64)
+        self.close_error = None
         self.lock = threading.Lock()
         self.replies = queue.Queue()
         threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._drain, daemon=True).start()
         try:
             self.attached = self.request("attach")
         except Exception:
@@ -43,6 +54,23 @@ class Desktop:
                 self.replies.put(read_reply(self.process.stdout))
         except Exception as error:
             self.replies.put(error)
+
+    def _drain(self):
+        try:
+            for line in self.process.stderr:
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    self.diagnostics.append(text)
+                    log.warning("worker: %s", text)
+        except Exception:  # noqa: S110 - a closed pipe simply ends diagnostics.
+            pass
+
+    def worker_log(self) -> list[str]:
+        return list(self.diagnostics)
+
+    def _detail(self, message: str) -> str:
+        tail = self.worker_log()
+        return f"{message} ({'; '.join(tail[-3:])})" if tail else message
 
     def _shutdown(self):
         if self.process.stdin and not self.process.stdin.closed:
@@ -57,16 +85,16 @@ class Desktop:
     def request(self, op: str, **kwargs) -> dict:
         with self.lock:
             if self.process.poll() is not None:
-                raise DesktopError("Desktop worker exited")
+                raise DesktopError(self._detail("Desktop worker exited"))
             self.process.stdin.write((json.dumps({"op": op, **kwargs}) + "\n").encode())
             self.process.stdin.flush()
             try:
                 reply = self.replies.get(timeout=10)
             except queue.Empty:
                 self._shutdown()
-                raise DesktopError("Desktop response timed out") from None
+                raise DesktopError(self._detail("Desktop response timed out")) from None
             if isinstance(reply, Exception):
-                raise DesktopError(str(reply)) from reply
+                raise DesktopError(self._detail(str(reply))) from reply
             if "error" in reply:
                 raise DesktopError(reply["error"])
             return reply
@@ -99,9 +127,15 @@ class Desktop:
         self.request("release")
 
     def close(self):
+        # Record rather than raise: close() runs from __exit__, where raising would
+        # replace whatever exception is already propagating. Callers that treat a failed
+        # release as run-invalidating evidence read close_error instead.
         try:
             if self.process.poll() is None:
                 self.release()
+        except (DesktopError, OSError, ValueError) as error:
+            self.close_error = f"{type(error).__name__}: {error}"
+            log.warning("release during close failed: %s", error)
         finally:
             self._shutdown()
 

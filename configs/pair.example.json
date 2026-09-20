@@ -2,6 +2,8 @@
   "scenario": "infantry-arena-v2",
   "pair_id": "evaluation-000",
   "seconds": 1800,
+  "seed": 42,
+  "deterministic": false,
   "model_path": "models/levjepa-large",
   "left": {
     "rules": "artifacts/calibration-left/rules.json",
