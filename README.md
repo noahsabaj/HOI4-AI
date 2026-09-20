@@ -1,4 +1,25 @@
-# HOI4-AI v4
+# HOI4-AI
+
+The project is being redesigned around a local recurrent PPO combat agent and
+a two-country self-play arena. **The native HOI4 integration gate is not yet
+passed; there is no playable combat model or measured learning result yet.**
+
+The new `hoi4_agent.arena` package includes a compact graph/entity/GRU policy,
+PPO and imitation-learning primitives, resumable checkpoints, league sampling,
+trajectory validation, paired evaluation, and a Windows/C++ diagnostic bridge.
+See [the implementation status and measured capability report](docs/arena-status.md)
+for working commands, verification, and the remaining engine integration work.
+
+```powershell
+./scripts/bootstrap_arena.ps1
+./.venv/Scripts/python.exe -m hoi4_agent.arena.cli model-info
+./.venv/Scripts/python.exe -m hoi4_agent.arena.cli inspect
+```
+
+The existing vision controller and its calibration remain available below. Its
+construction/research automation is separate from the new combat-learning work.
+
+## Existing v4 vision agent
 
 A Windows-native, **closed-loop** AI agent that plays *Hearts of Iron IV* by sight.
 
