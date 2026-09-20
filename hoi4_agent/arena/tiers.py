@@ -61,10 +61,13 @@ def _average(units: list[UnitView], name: str) -> float | None:
     return None if not total else round(sum(value * count for value, count in known) / total, 2)
 
 
-def summarize(observation: PlayerObservation) -> dict[str, Any]:
+def summarize(observation: PlayerObservation, horizon_hours: int = 90 * 24) -> dict[str, Any]:
     """Compact JSON state for Jev, built only from the player view.
 
-    Comparisons are pre-computed (booleans and bucket words) next to the raw figures.
+    Comparisons are pre-computed (booleans and bucket words) next to the raw figures, and so is
+    the clock: the match ends at ``horizon_hours`` and is then decided on victory points, so a
+    level race is a draw. Without that, holding everywhere looks safe and scores nothing, which
+    is exactly what the first live matches did.
     "front_pressure" counts visible enemy divisions standing in, or adjacent to, a province
     of the sector that we control or occupy. Fog of war holds by construction: enemies that
     perception did not see are not here.
@@ -99,10 +102,18 @@ def summarize(observation: PlayerObservation) -> dict[str, Any]:
         }
     ours_vp = sum(p.victory_points for p in observation.provinces if p.controller == mine)
     theirs_vp = sum(p.victory_points for p in observation.provinces if p.controller == mine.opponent)
+    left = max(0, horizon_hours - observation.game_hour) // 24
+    total = max(1, horizon_hours // 24)
     return {
         "we_are": mine.value, "game_hour": observation.game_hour, "game_day": observation.game_hour // 24,
         "game_speed": observation.game_speed, "paused": observation.paused,
         "victory_point_race": "level" if ours_vp == theirs_vp else "we lead" if ours_vp > theirs_vp else "we trail",
+        "own_victory_points": ours_vp, "enemy_victory_points": theirs_vp,
+        "days_left": left,
+        "time_left": "over" if not left else "almost over" if left <= total // 10 else
+                     "running out" if left <= total // 3 else "plenty",
+        "result_if_nothing_changes": "draw" if ours_vp == theirs_vp else
+                                     "we win" if ours_vp > theirs_vp else "we lose",
         "own_divisions_total": sum(u.count for u in observation.units if u.country == mine),
         "enemy_divisions_visible": sum(u.count for u in observation.units if u.country != mine),
         "any_own_division_in_combat": any(bool(u.in_combat) for u in observation.units if u.country == mine),
@@ -273,12 +284,17 @@ def build_questions(observation: PlayerObservation, brief: Brief | None) -> tupl
         key = f"stance_{len(sector_keys)}_{_key(sector)}"
         sector_keys[key] = sector
         questions[key] = {"type": "choice", "instructions": (
-            f"You command the land forces of {side} in Hearts of Iron IV. Look only at sectors.{sector} in the "
-            f"state. Which stance should our divisions in the {sector} sector take now?"), "criteria": {
+            f"You command the land forces of {side} in Hearts of Iron IV. The match ends on the day in "
+            f"state.days_left and is decided on victory points, so state.result_if_nothing_changes is what we "
+            f"get by doing nothing. Look at sectors.{sector} and at the whole-match state. Which stance should "
+            f"our divisions in the {sector} sector take now?"), "criteria": {
             "attack": "Advance on enemy-held victory points. Right when we are not outnumbered and our divisions "
-                      "are fresh or fair, or the enemy here is absent, weaker or exhausted.",
-            "hold": "Stay and defend the current line. Right when forces are roughly even, our divisions are worn "
-                    "and need to recover, or we already hold the victory points here.",
+                      "are fresh or fair, or the enemy here is absent, weaker or exhausted. Also the only stance "
+                      "that can change a drawn or losing race before the match ends: holding a level race scores "
+                      "nothing, and attacking somewhere is better than a certain draw as the days run out.",
+            "hold": "Stay and defend the current line. Right when forces are roughly even AND we are already "
+                    "ahead on victory points, or our divisions are worn and need to recover. Wrong as a way to "
+                    "protect a level race, because the match is then decided as a draw.",
             "retreat": "Fall back toward our own victory points. Right when we are heavily outnumbered or our "
                        "divisions are exhausted under heavy front pressure."}}
     plans: dict[str, Plan] = {}
