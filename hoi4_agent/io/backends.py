@@ -32,6 +32,18 @@ class InputBackend(Protocol):
     def click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int) -> None: ...
 
 
+@runtime_checkable
+class OrderInputBackend(InputBackend, Protocol):
+    """InputBackend plus what unit orders need: a right-click with optional held modifiers.
+
+    A separate protocol so existing InputBackend implementations (``testing.FakeGame``)
+    that never issue unit orders stay valid.
+    """
+
+    def right_click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int,
+                    modifiers: tuple[str, ...] = ()) -> None: ...
+
+
 # --- fakes ------------------------------------------------------------------
 class StubLocator:
     """Always returns a fixed geometry (or None)."""
@@ -61,6 +73,10 @@ class RecordingInput:
 
     def click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int) -> None:
         self.calls.append(("click", nx, ny))
+
+    def right_click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int,
+                    modifiers: tuple[str, ...] = ()) -> None:
+        self.calls.append(("right_click", nx, ny, tuple(modifiers)))
 
     @property
     def keys(self) -> list[str]:
@@ -98,6 +114,13 @@ class InputRecorder:
     def click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int) -> None:
         self.inner.click(geo, crop, nx, ny)
         self._events.append({"kind": "click", "nx": nx, "ny": ny})
+
+    def right_click(self, geo: WindowGeometry, crop: CropRect, nx: int, ny: int,
+                    modifiers: tuple[str, ...] = ()) -> None:
+        if not isinstance(self.inner, OrderInputBackend):
+            raise TypeError("wrapped input backend cannot right-click")
+        self.inner.right_click(geo, crop, nx, ny, modifiers)
+        self._events.append({"kind": "right_click", "nx": nx, "ny": ny, "modifiers": list(modifiers)})
 
     def drain(self) -> list[dict]:
         out, self._events = self._events, []

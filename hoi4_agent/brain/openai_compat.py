@@ -7,6 +7,8 @@ uses ``response_format: json_schema``.
 
 from __future__ import annotations
 
+from typing import Any
+
 import requests
 
 from ..errors import BackendTimeoutError, BackendUnavailableError, BrainError
@@ -28,7 +30,7 @@ class OpenAICompatBackend:
             content.append(
                 {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{b}"}}
             )
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
