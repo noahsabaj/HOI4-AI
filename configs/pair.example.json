@@ -1,0 +1,15 @@
+{
+  "scenario": "infantry-arena-v2",
+  "pair_id": "evaluation-000",
+  "seconds": 1800,
+  "model_path": "models/levjepa-large",
+  "left": {
+    "rules": "artifacts/calibration-left/rules.json",
+    "recipe": "artifacts/calibration-left/reset.json"
+  },
+  "right": {
+    "peer": "artifacts/pairing-kat/peer.json",
+    "rules": "artifacts/calibration-right/rules.json",
+    "recipe": "artifacts/calibration-right/reset.json"
+  }
+}

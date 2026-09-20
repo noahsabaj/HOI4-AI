@@ -1,0 +1,16 @@
+HOI4-AI
+Copyright (c) 2026 HOI4-AI contributors
+
+Except where otherwise noted, this project's original source code,
+documentation, and configuration are dual-licensed under either:
+
+  * the MIT License (LICENSE-MIT), or
+  * the Apache License, Version 2.0 (LICENSE-APACHE),
+
+at your option.
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+Third-party dependencies, model weights, model code, and game assets retain
+their own licenses. See NOTICE.md and third_party/licenses for attribution
+and applicable third-party terms. This license does not relicense those works.
