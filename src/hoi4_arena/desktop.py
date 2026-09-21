@@ -121,6 +121,17 @@ class Desktop:
             options["full"] = bool(full)
         meta = self.request("capture", encoding="lz4", **options)
         payload = meta.pop("payload")
+        # A worker built before worker-side downscaling accepts these options, ignores
+        # them, and sends the whole 33 MB frame back. That is indistinguishable from a
+        # working one except by the reply, so say so rather than silently paying for it
+        # every tick. This is how a stale deployed binary stayed hidden once already.
+        if options.get("views") and not meta.get("views_bytes"):
+            raise DesktopError(
+                "Worker ignored the requested views; it predates worker-side "
+                "downscaling. Rebuild and redeploy hoi4-desktop-worker."
+            )
+        if len(meta.get("region_bytes", [])) != len(options.get("regions", [])):
+            raise DesktopError("Worker returned a different number of crops than requested")
         full_bytes = meta.get("full_bytes", meta["height"] * meta["width"] * 4)
         region_bytes = meta.get("region_bytes", [])
         size = full_bytes + meta.get("views_bytes", 0) + sum(region_bytes)
