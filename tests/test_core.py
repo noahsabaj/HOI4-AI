@@ -1105,13 +1105,6 @@ def test_generated_arena_resolves_every_reference_the_engine_looks_up(arena):
     assert audit(arena)["problems"] == []
 
 
-def test_audit_rejects_the_sentinel_adjacency_row_other_paradox_titles_use(arena):
-    """HOI4 reads -1;-1;;-1 as a real row, and GetProvince(-1) returns null."""
-    header = (arena / "map/adjacencies.csv").read_text().splitlines()[0]
-    problems = _audit_with(arena, "map/adjacencies.csv", f"{header}\n-1;-1;;-1;-1;-1;-1;-1;;\n")
-    assert any("adjacencies.csv" in p and "-1" in p for p in problems), problems
-
-
 def test_audit_rejects_a_coast_only_the_land_side_admits(arena):
     rows = []
     for row in (arena / "map/definition.csv").read_text().splitlines():
@@ -1173,9 +1166,75 @@ def test_province_adjacency_follows_shared_edges_in_the_bitmap():
     assert neighbours[3] == {1, 2}
 
 
-def test_generated_terrain_avoids_the_blend_only_palette_indices(arena):
-    """Stock terrain.bmp reserves palette 0 and 1 for terrain_0 and terrain_1, which are
-    blends. A land province drawn with one of those has no terrain the definition names.
+def test_generated_terrain_paints_only_the_indices_the_arena_defines(arena):
+    """Palette 19 is the perm_snow plains variant and 13 is urban with spawn_city, so a
+    stray index is a province rendered as something the definition never names.
     """
+    from hoi4_arena.mapgen import OCEAN_INDEX, TERRAIN_INDEX
+
     drawn = set(np.unique(np.array(Image.open(arena / "map/terrain.bmp"))).tolist())
-    assert not drawn & {0, 1}, f"land pixels use blend-only terrain: {sorted(drawn)}"
+    assert drawn == set(TERRAIN_INDEX.values()) | {OCEAN_INDEX}, sorted(drawn)
+
+
+def test_audit_rejects_a_tree_map_that_is_not_seventy_five_two_hundred_fifty_sixths(arena):
+    """The engine fixes trees.bmp at 75/256 of the province bitmap; stock is 1650x600."""
+    from hoi4_arena.mapgen import audit
+
+    path = arena / "map/trees.bmp"
+    original = path.read_bytes()
+    Image.open(io.BytesIO(original)).resize((512, 384)).save(path)
+    try:
+        assert any("75/256" in p for p in audit(arena)["problems"])
+    finally:
+        path.write_bytes(original)
+
+
+def test_audit_rejects_an_adjacency_file_with_no_end_marker(arena):
+    """Removing the -1 row hangs the loader; the stock file carries one too."""
+    header = (arena / "map/adjacencies.csv").read_text().splitlines()[0]
+    problems = _audit_with(arena, "map/adjacencies.csv", header + chr(10))
+    assert any("end marker" in p for p in problems), problems
+
+
+def test_audit_rejects_a_missing_colour_map(arena):
+    """Every map-shaped texture the arena does not ship is a picture of the stock Earth."""
+    from hoi4_arena.mapgen import audit
+
+    path = arena / "map/terrain/colormap_water_1.dds"
+    original = path.read_bytes()
+    path.unlink()
+    try:
+        assert any("colormap_water_1" in p and "stock Earth" in p for p in audit(arena)["problems"])
+    finally:
+        path.write_bytes(original)
+
+
+def test_audit_rejects_a_tag_with_no_character_name_list(arena):
+    """No name list means the random-character path has an empty pool and returns null."""
+    text = (arena / "common/names/01_arena_names.txt").read_text()
+    problems = _audit_with(arena, "common/names/01_arena_names.txt", text.replace("BLU =", "XXX ="))
+    assert any("BLU" in p and "nameless" in p for p in problems), problems
+
+
+def test_audit_rejects_a_tag_with_no_country_leader(arena):
+    text = (arena / "common/characters/arena.txt").read_text()
+    problems = _audit_with(
+        arena, "common/characters/arena.txt", text.replace("RED_commander", "RED_unused")
+    )
+    assert any("RED" in p and "random-character" in p for p in problems), problems
+
+
+def test_audit_rejects_a_victory_point_the_stock_game_would_name(arena):
+    """An unnamed victory point shows whatever the stock localisation calls that id."""
+    text = (arena / "localisation/english/arena_l_english.yml").read_text(encoding="utf-8-sig")
+    stripped = chr(10).join(r for r in text.splitlines() if "VICTORY_POINTS_" not in r)
+    problems = _audit_with(arena, "localisation/english/arena_l_english.yml", stripped)
+    assert any("has no name" in p for p in problems), problems
+
+
+def test_generated_coast_is_a_ramp_rather_than_a_cliff(arena):
+    """Land must sit above byte 95 and sea below it, without a step no stock coast has."""
+    heights = np.array(Image.open(arena / "map/heightmap.bmp")).astype(np.int16)
+    step = max(np.abs(np.diff(heights, axis=0)).max(), np.abs(np.diff(heights, axis=1)).max())
+    assert step <= 4, f"coast step of {step} bytes"
+    assert heights.min() < 95 < heights.max()

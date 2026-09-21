@@ -14,11 +14,11 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 | Live worker mouse input | `artifacts/worker-smoke/click-before.png`, `click-after.png` | Menu advanced using a 250 ms button hold |
 | TLS peer transport | `artifacts/pairing-kat/integration/report.json` | Actual KATHPINVICTUS authenticated; foreground 3840×2160 capture, menu click, Escape and held-Shift watchdog verified |
 | LAN screenshot timing | Same report, 20 menu captures | Status-request p95 1.51 ms; full screenshot round trip p95 **411.15 ms**, exceeds the 200 ms decision budget before inference |
-| Arena generation | `artifacts/mods/infantry-arena-v6`, minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | v5 crashed on Start; the map defects the dump traces to are fixed and `audit-map` passes, **but no match has been started on the fixed map** |
+| Arena match start | `artifacts/mods/infantry-arena-v10`, five minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | Match starts and runs: war declared, clock advanced 12:00 1 Jan to 20:00 2 Jan 1936, no crash. Combat, supply over time and victory detection **not** yet exercised |
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
-Latest automated checks: **55 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
+Latest automated checks: **61 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
 
 Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a regression test:
 
@@ -40,26 +40,61 @@ Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a
 
 These were latent defects in code paths that have never run against a live match; fixing them does not constitute live verification.
 
-Map diagnosis, 2026-09-20. Revisions 2-5 hit the same access-violation stack at match start, and earlier guesses (adding a few building placements, weather placements, replacing base-map AI/focus definitions, correcting country-history filenames) did not resolve it. The five saved minidumps do. Four of the five fault at one address, in the same second as `frontend.cpp:682: [[ Launching SINGLEPLAYER-game ]]`, with nothing logged after it. Reading the dump against the stock binary's unwind and RTTI tables:
+Arena match start, 2026-09-20. **The arena now starts and runs.** A match was started on
+`infantry-arena-v10` and left running: the war declaration fired, the clock advanced from
+12:00 1 January to 20:00 2 January 1936, province tooltips read `Plains`/`Owner: Blue`/
+`Victory Point(s): 20`, and no crash dump was written. The route there was four distinct
+faults, each read out of a minidump rather than guessed:
 
-- The faulting frame and its two callers live in `hoi4/source/areas.cpp`. The object being walked is a `CControllerArea`; the list it is walking holds `CProvince*`.
-- Per province it calls `CProvinceProvider::GetProvince`, whose prologue is `if (id < 1 || id >= count) return nullptr`, and then reads a member of the result without checking it.
-- The id argument survives in `rdx` on the null return path, and it is **0**. So a province association in the generated map was never set, and province 0 is the null province.
+| # | Fault | Evidence | Cause | Fix |
+|---|---|---|---|---|
+| 1 | `areas.cpp`, walking a `CControllerArea`'s province list | `GetProvince` returns null below id 1; `rdx` held **0** on the null path | a province association the map never set | write the placements and anchors the stock database supplies for every province |
+| 2 | `ingameidler.cpp`, `GenerateNonHistoricalAttributes` | log: `character_manager.cpp:261 Failed to generate a name ... for country Blue`, five times | BLU and RED had no `common/names` entry and no country leader, so every generated character was nameless | ship a name list and a `country_leader` for both tags |
+| 3 | same frame, null `this` | `rax` held **0x226 = 550**, `rbx` held the ASCII string `state` | the stock `tutorial/tutorial.txt` hard-codes state 550 and provinces 5010/5091/12766, and the hint loader resolves them at every match start | override the file; `replace_path = "tutorial"` does **not** unload that folder |
+| 4 | same function, later | `mov rcx,[rax+rcx*8-8]` with `rax = 0` and `rcx = 0` | the loader finishes by marking the **last** entry of the hint list, so an empty tutorial indexes element -1 | ship exactly one block that names no state and no province |
 
-Comparing every generated file against the stock database found the unset associations, each of which is now written:
+Two of the changes made before any of this was measured were wrong, and are reverted:
 
-| Generated by revision 5 | Stock database | Now |
-|---|---|---|
-| No sea province marked coastal, while 36 land provinces are | Coast is a property of both sides; 816 sea provinces are coastal | 42 coastal sea provinces; the flag is derived from the shared bitmap edge, so it cannot disagree |
-| One unit-counter anchor, land provinces only | 9 anchors for every land province, 13 for every sea province | All 192 provinces carry the stock anchor set |
-| 3 building placements per state | One `supply_node`, `bunker` and `special_project_facility_spawn` per land province; 6 factories, 3 AA and one of each unique building per state; one naval placement per coastal province carrying its adjacent sea province | 514 placements, including 36 ports each naming a real sea province |
-| One weather period spanning the year | Twelve, one per month | Twelve |
-| `-1;-1;;-1;...` terminator row in `adjacencies.csv` | Ends on a comment; the `-1` sentinel belongs to other Paradox titles | Comment |
-| Land painted with terrain palette 0 and 1 | 0 and 1 are the blend terrains `terrain_0`/`terrain_1`; plains is 19 and forest 13 | 19 and 13 |
+- The `-1;-1;;-1;-1;-1;-1;-1;-1` row in `adjacencies.csv` is the engine's end-of-file
+  marker, not a stray sentinel. The stock file carries one (line 253, before a trailing
+  comment, which is why a `tail` missed it) and the documentation requires it even when
+  the file holds no rows.
+- Terrain palette 19 is `plains_17`, which sets `perm_snow`, and 13 is `forest_13`, which
+  is `type = urban` with `spawn_city`. The original 0 and 1 were right: the stock
+  terrain.bmp paints index 0 over 9.8% of the world as plains and index 1 over 5.7% as
+  forest, and neither carries a side effect.
 
-Which of those supplied the zero is not distinguishable from the dump, so this is not "one fix"; all of them were wrong relative to the stock database and all are now written. `hoi4-arena audit-map` reports 41 problems for `infantry-arena-v5` and none for `infantry-arena-v6`, and every fix is mutation-tested: reverting any one of the seven fails at least one test. The audit runs without the game, which is the point of it: the engine does not log bad map data, it dereferences it.
+Two others were real but were never crash causes, and are kept only because they match the
+stock data: since 1.11 the bitmap decides coastal status and `definition.csv` only has to
+agree with it, and a single weather period spanning the year is what the documentation's
+own example shows.
 
-**This is a static fix against static evidence. The regenerated map has not been loaded, and no match has been started on it.** `artifacts/arena-v5-start-test-focused` records a screen-guarded menu test that correctly stopped when an animating setup screen missed calibration; `artifacts/worker-menu-v5-start` records the subsequent manually reviewed Start input. The original mod selection was restored; no crash reports were submitted.
+The rest of the map was audited against the stock database and the map-modding
+documentation, which found and fixed: `trees.bmp` at 75/256 of the province bitmap rather
+than a quarter; a sea strategic region with no `naval_terrain`, which is where sea
+provinces take their provincial terrain from; a heightmap whose every coast was a 50-byte
+cliff, steeper than any step on the stock map, now a ramp with a maximum neighbour step of
+1; `cities.bmp` filled with index 0, which the stock `cities.txt` maps to a sparse city
+group rather than to no cities; ship-in-port anchors missing from provinces that now have
+naval bases; all of a country's surrender weight on one province; weather objects anchored
+over the wrong region; an X-crossing breaker that never looked at the horizontal wrap seam;
+and missing adjective, ideology and victory-point localisation, which is why Red's capital
+was labelled "Kargopol" by the stock strings.
+
+**The vanilla Earth over the arena's ocean** was five map-shaped textures the mod never
+shipped. Each is a painting of the stock world at the stock map's aspect, so the engine
+stretched it over the new one: `colormap_rgb_cityemissivemask_a.dds` (world colour in RGB,
+city-light opacity in alpha), `colormap_water_0/1/2.dds` (ocean tint, at provinces/2, /4
+and /8), `fow_rgb_waterspec_a.dds` (fog-of-war and water specular), and both minimap
+widgets. All are now generated from the arena's own land mask as uncompressed 8.8.8.8 ARGB
+with no mip chain, using colours sampled from the stock files.
+
+`hoi4-arena audit-map` checks every one of these without the game, and `generate-map`
+audits what it wrote and exits non-zero. It exists because the engine does not report bad
+map data: it dereferences it.
+
+**Still unverified:** a full 1800-second match, combat, supply behaviour over time, victory
+detection, and anything on two machines. One match ran for a bit over one in-game day.
 
 Capture and preprocessing, measured locally on 2026-09-20:
 
@@ -84,7 +119,7 @@ Five Hz is therefore reachable rather than excluded by construction, but it is *
 
 Open acceptance work:
 
-- Load `infantry-arena-v6` and start a match; if it starts, verify armies, war, supply, fog, multiple routes and side symmetry in gameplay. If it still crashes, the new minidump narrows it the same way the last one did.
+- Run a full 1800-second match on `infantry-arena-v10` and verify armies, combat, supply, fog, multiple routes and side symmetry in gameplay. Match start itself is now verified.
 - Pairing works; complete two-PC lobby/reset calibration and recovery checks. Menu input and watchdog release are verified remotely; match behavior remains untested.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and F12 under load. The worker now releases held input even when stdout fails; live regression remains needed.
 - Re-measure the two-PC screenshot round trip with worker-side downscaling enabled.
