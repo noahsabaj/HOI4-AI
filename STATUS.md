@@ -204,6 +204,9 @@ level-1 line on every adjacent land pair, far denser than any stock network.
 | Worker CPU to produce five views | n/a | 18.0 ms p50 |
 | Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
 
+The last two rows predate the optimization pass below, which took the worker's five
+views to 8.3 ms and a 4K `views` call to 6.07 ms.
+
 Two-PC round trip, rebuilt worker on both machines, 25 captures per mode:
 
 | Request | p50 | p95 | On the wire |
@@ -213,12 +216,72 @@ Two-PC round trip, rebuilt worker on both machines, 25 captures per mode:
 | **Views plus template crops, what a tick asks for** | **83.9 ms** | **99.5 ms** | 0.868 MB |
 
 That meets the 200 ms decision budget with half to spare and leaves about 100 ms for
-inference: the compact policy at 51.46 ms p95 fits, the released 303M encoder at 187.72 ms
-does not. The first attempt returned 424.8 ms p50 for all three modes because both workers —
+inference: the compact policy at 51.46 ms p95 fits, and the released 303M encoder at
+187.72 ms did not until the pass below. The first attempt returned 424.8 ms p50 for all three modes because both workers —
 and the binary in `target/release` — predated worker-side downscaling and silently returned
 the whole frame. `Desktop.capture` now raises when a worker accepts `views` and answers
 without them; rebuild and redeploy after touching the Rust crate rather than trusting
 `target/release`.
+
+### The optimization pass, measured on an RTX 4060 Ti
+
+Every number here is from this machine with the game closed, so they are component
+timings rather than a live tick; the loaded-game figures above are what a match actually
+faced. What changed:
+
+| | before | after |
+|---|---|---|
+| One GPU tick, the shapes `Actor.act` builds | 145.1 ms p50 | **65.1 ms p50** |
+| Peak VRAM for that tick | 1311 MiB | **710 MiB** |
+| `ActionHead` forward, sampling | 21.6 ms | 7.72 ms eager, **0.741 ms** captured |
+| Encoder forward | 131.5 ms at 16 frames | 64.9 ms at 8 |
+| Worker CPU for the five views | 25.3 ms serial | **8.3 ms** on four threads |
+| Desktop capture, 3840x2160, idle screen | 53.8 ms blit | **12.8 ms** duplication |
+
+Where the time actually was, which is not where the list said:
+
+- **Not sampling — synchronizing.** `torch.distributions` validates its arguments
+  whenever `__debug__` is set, and each validation ends in `Tensor.__bool__` on a CUDA
+  tensor. That is 48 host-device stalls per action head forward, including on the
+  teacher-forcing path that never samples. The deterministic path measured 15.8 ms
+  against the same loop's 0.571 ms with no distribution objects in it.
+- **Not `torch.compile` — CUDA graphs.** Compiling the action head is worth 1.15x
+  (19.2 to 16.7 ms). Capturing it with `reduce-overhead` is worth 26x.
+- **Not the round trip — the blit.** The 99.5 ms in the table above is a two-PC LAN
+  round trip. The blit alone is 87.1 ms p50, bracketed by the worker's own
+  `capture_start_ns` and `t_ns` in `artifacts/pairing/integration`.
+- **Not quantization — float32 weights nothing read.** Parameters were 1170 MiB of a
+  1319 MiB peak; activations were 136 MiB. The live path shipped float32 weights and
+  then ran every matmul through autocast in bfloat16 anyway.
+
+Four things on the list were measured and **not** taken:
+
+- **`channels_last` on the conv stem is slower here:** 0.2069 ms contiguous against
+  0.2601 ms channels_last, at 4 tiles of 224px in bfloat16. The stem is 0.27 ms of a
+  200 ms tick either way.
+- **TF32 buys nothing on any current path.** Every matmul runs under autocast in
+  bfloat16, and autocast lowers `matmul`, `addmm`, `linear` and `GRUCell` whatever
+  reaches them; `ActionHead`'s `.float()` casts the head's *output*, after the Linear has
+  already run in bfloat16. A synthetic float32 matmul at these shapes measures 1.01x to
+  1.18x, while TF32's ten mantissa bits moved results by up to 2.1e-2. There is a
+  `--tf32` flag and it defaults off.
+- **Moving the resize to the GPU is the wrong direction.** It already exists as a
+  fallback at 6.07 ms, but reaching it means sending the whole 33 MB frame instead of
+  735 KiB of views: 2.9 ms to compress and 8.3 ms to decompress before any transport,
+  and over the LAN socket the second machine uses, 33 MB five times a second is not
+  slower but impossible. Parallelizing the Rust loop was 3.07x with byte-identical
+  output instead.
+- **Compiling the encoder is not free even though it is faster.** It is worth about
+  24 ms, and it moves a stored `old_logp` by 4.6e-4. No configuration removes that:
+  inductor's no-grad graph and its grad graph differ from each other by 3.4e-4, so
+  compiling PPO's side does not close it. Eager collection and eager update agree
+  *exactly* today. The action head is the opposite case -- compiled it is bit-for-bit
+  the eager head -- so only the head is captured.
+
+Casting the trainable weights to bfloat16 as well was measured and rejected for the same
+reason: another 55 MiB, and a 1.02e-2 shift in `old_logp`, which is a systematic 1.01x
+PPO ratio on every sample before a single gradient step. Only the frozen weights are
+halved, and `load_policy` serves both collection and PPO so both run the same function.
 
 The step loop no longer serializes the interval against capture and inference: each tick
 dispatches its eight slots on a separate thread and blocks the next tick on that dispatch.
@@ -243,6 +306,13 @@ average so the Rust worker can reproduce it bit for bit.
   the same on any map, so templates cut there transfer to the playable arena.
 - Calibrate `win`, `loss`, `ready`, `disconnect`, `desync`, and a `surrendered_country_popup`
   template anchored on its title box.
+- Flash-attention is closed, not pending: the encoder passes a dense block-causal mask
+  into SDPA at every layer, and torch's flash backend rejects any non-null `attn_mask`.
+  A prebuilt Windows wheel for this exact torch does exist, and installing it would
+  change nothing, because SDPA dispatches to a copy vendored inside `torch_cuda` rather
+  than to the pip package. Measured at this model's shape, the ceiling was 1.97 ms masked
+  against 1.21 ms unmasked -- about 12% end to end, and only by changing what the model
+  computes.
 - Decide what `running_speed_two` should be — the speed bars cannot detect a pause, and the
   name asserts a speed measurement has ruled out as too slow.
 - Work out why an AI that *does* advance stops. Province size and missing command are both
@@ -254,6 +324,16 @@ average so the Rust worker can reproduce it bit for bit.
   remotely even though menu input and watchdog release are verified.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and
   F12 under load.
+- **Re-measure the gates with the game loaded.** Every number in the optimization pass
+  was taken with HOI4 closed. The headroom gate is the one that matters: the last loaded
+  run left 710 MiB free against a required 1024, and halving the frozen weights returns
+  601 MiB of peak allocation, but whether that clears the gate is a live measurement and
+  is not claimed here. Duplication capture is likewise measured on an idle desktop.
+- **The live clip and the training clip are not the same clip.** Decisions happen at
+  5 Hz and the clip samples history at 7.5 Hz, so about two of the eight live frames are
+  repeats of their neighbours, where an offline session recorded at 10 Hz yields eight
+  distinct ones. Neither the clip length nor the resize controls this; it is the sampling
+  rate, and changing it is a modelling decision rather than a performance one.
 - Measure end-to-end scheduling against a live game with two real actors.
 - Record 2–4 hours of expert demonstrations, distil the compact encoder, train the BC
   baseline and compare held-out gameplay for the auxiliary/XM variants.
