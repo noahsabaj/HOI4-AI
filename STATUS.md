@@ -18,7 +18,7 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
-Latest automated checks: **61 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
+Latest automated checks: **63 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
 
 Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a regression test:
 
@@ -93,8 +93,15 @@ with no mip chain, using colours sampled from the stock files.
 audits what it wrote and exits non-zero. It exists because the engine does not report bad
 map data: it dereferences it.
 
-**Still unverified:** a full 1800-second match, combat, supply behaviour over time, victory
-detection, and anything on two machines. One match ran for a bit over one in-game day.
+**Soak, 2026-09-20.** A match on `infantry-arena-v10` ran unattended for 1800 seconds of
+wall clock at game speed two, from 12:00 on 1 January to 10:00 on 7 February 1936: about 37
+in-game days. No crash dump, no line in `error.log` matching `MAP_ERROR`, `naval base`,
+`has no continent` or `no pixels`, and a steady 2.7 GB working set. That is past the window
+in which a missing naval-base placement is documented to crash an AI evaluation loop.
+
+**Still unverified:** combat resolution, victory detection, and anything on two machines.
+The soak ran with RED under an AI that has no strategy plans, so the divisions dispersed but
+nothing tested a fight.
 
 Found by the same audit and deliberately left, none of them crash-level:
 `common/ai_focuses` is still replaced away, which leaves nine `supports_ai_strategy` tokens
@@ -114,7 +121,17 @@ Capture and preprocessing, measured locally on 2026-09-20:
 | Worker CPU to produce five views | n/a | 18.0 ms p50 |
 | Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
 
-The 411 ms screenshot round trip should fall substantially, but it has **not** been re-measured on two PCs.
+Two-PC round trip, re-measured 2026-09-20 and **still not the number that matters**. The
+peer answered 25 full-frame captures at p50 424.8 ms and p95 437.4 ms, consistent with the
+earlier 411 ms p95, because the peer was running a worker built before worker-side
+downscaling: it accepts `views` and `regions`, ignores both, and returns the whole frame.
+The binary deployed on *this* machine was stale in the same way, so the capture table above
+was measured against a build that no longer existed on disk. Rebuilt from the current crate
+source, one local capture goes from **33.178 MB to 0.805 MB** on the wire with the five
+policy views and two template crops and no full frame. `Desktop.capture` now raises when a
+worker accepts `views` and answers without them, so a stale binary fails loudly instead of
+quietly costing 33 MB a tick. The two-PC number stays open until the peer runs the rebuilt
+worker.
 
 The step loop no longer serializes the interval against capture and inference. Each tick dispatches its eight slots on a separate thread and blocks the following tick on that dispatch completing, so a tick costs one interval rather than interval plus capture plus inference. Simulated locally against a fake desktop:
 

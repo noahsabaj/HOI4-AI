@@ -1238,3 +1238,40 @@ def test_generated_coast_is_a_ramp_rather_than_a_cliff(arena):
     step = max(np.abs(np.diff(heights, axis=0)).max(), np.abs(np.diff(heights, axis=1)).max())
     assert step <= 4, f"coast step of {step} bytes"
     assert heights.min() < 95 < heights.max()
+
+
+def _stub_desktop(reply):
+    """A Desktop whose worker reply is fixed, so capture's contract can be checked."""
+    from hoi4_arena.desktop import Desktop
+
+    desktop = object.__new__(Desktop)
+    desktop.request = lambda op, **kwargs: dict(reply)
+    return desktop
+
+
+def test_capture_rejects_a_worker_that_ignores_the_requested_views():
+    """A worker predating worker-side downscaling accepts views and sends 33 MB anyway."""
+    stale = {
+        "payload": b"",
+        "width": 3840,
+        "height": 2160,
+        "overflow": False,
+        "stopped": False,
+    }
+    with pytest.raises(DesktopError, match="predates worker-side"):
+        _stub_desktop(stale).capture(views=224, full=False)
+
+
+def test_capture_rejects_a_reply_with_the_wrong_number_of_crops():
+    reply = {
+        "payload": b"",
+        "width": 3840,
+        "height": 2160,
+        "overflow": False,
+        "stopped": False,
+        "full_bytes": 0,
+        "views_bytes": 0,
+        "region_bytes": [10],
+    }
+    with pytest.raises(DesktopError, match="number of crops"):
+        _stub_desktop(reply).capture(regions=[[0, 0, 2, 2], [0, 0, 3, 3]], full=False)
