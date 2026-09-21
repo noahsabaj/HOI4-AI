@@ -9,11 +9,19 @@ import torch
 from PIL import Image
 from torch import nn
 
-from hoi4_arena.actions import GRID, SLOTS, decode, encode_interval
+from hoi4_arena.actions import GRID, SLOTS, VOCAB, decode, encode_interval
 from hoi4_arena.desktop import DesktopError, read_reply
 from hoi4_arena.environment import ArenaPair
 from hoi4_arena.learning import League, gae, paired_evaluation, ppo_loss, save_checkpoint
-from hoi4_arena.models import ActionHead, PredictiveAuxiliary, rdmreg, reprelu
+from hoi4_arena.models import (
+    ActionHead,
+    PredictiveAuxiliary,
+    categorical,
+    entropy,
+    gumbel_argmax,
+    rdmreg,
+    reprelu,
+)
 from hoi4_arena.recording import split_for_session
 from hoi4_arena.vision import ScreenRules, add_template
 
@@ -66,6 +74,143 @@ def test_actor_likelihood_replays_with_same_latent_and_ignores_inactive_xy():
     assert (action[:, :, 1:][action[:, :, 0] != 1] == 0).all()
     (-new.mean()).backward()
     assert actor.init.weight.grad.abs().sum() > 0
+
+
+def categorical_reference(actor, memory, noise, actions):
+    """Score `actions` through torch.distributions, the way ActionHead used to.
+
+    Kept as an independent replay rather than folded into a test body because three tests
+    below compare against it. It mirrors the loop exactly, including summing the per-slot
+    terms with the same stack-then-reduce the head uses: adding eight floats in a Python
+    loop instead would reduce in a different order and could differ in the last bits,
+    which is precisely the resolution these tests are trying to hold.
+    """
+    from torch.distributions import Categorical
+
+    state = torch.tanh(actor.init(torch.cat([memory, noise], -1)))
+    previous = torch.zeros(memory.shape[0], 64, dtype=memory.dtype)
+    logps, entropies = [], []
+    for slot in range(SLOTS):
+        state = actor.cell(previous, state)
+        heads = [Categorical(logits=z) for z in actor.heads(state).float().split(actor.widths, -1)]
+        values = actions[:, slot]
+        move = (values[:, 0] == 1).float()
+        lp = heads[0].log_prob(values[:, 0])
+        logps.append(lp + move * sum(heads[j].log_prob(values[:, j]) for j in (1, 2)))
+        entropies.append(
+            heads[0].entropy() + heads[0].probs[:, 1] * sum(heads[j].entropy() for j in (1, 2))
+        )
+        previous = actor.embedding(values[:, 0]) + actor.xy(
+            values[:, 1:].to(memory.dtype) / (GRID - 1)
+        )
+    return torch.stack(logps, 1).sum(1), torch.stack(entropies, 1).sum(1)
+
+
+def test_action_head_likelihood_is_bit_for_bit_the_categorical_it_replaced():
+    """The distribution objects went away; the numbers they produced must not have.
+
+    ActionHead stopped building Categorical because validating one ends in a host-device
+    synchronization and it paid 48 of them per forward, not because the arithmetic was
+    wrong. So the arithmetic has to come out identical rather than close: a PPO ratio is
+    a difference of two of these log-likelihoods, and a systematic shift in one of them
+    is indistinguishable from a policy update that never happened.
+    """
+    torch.manual_seed(5)
+    actor = ActionHead(memory_dim=16)
+    memory, noise = torch.randn(4, 16), torch.randn(4, actor.noise_dim)
+    # Once with ordinary logits, once with the head amplified until its normalized
+    # logits fall past -100. Categorical clamps them at the float32 minimum before
+    # weighting, and only a saturated head reaches the regime where the clamp does
+    # anything at all, so a milder test leaves that line of the entropy unexercised.
+    for scale in (1.0, 400.0):
+        with torch.no_grad():
+            actor.heads.weight.mul_(scale)
+        actions, _, _ = actor(memory, noise=noise)
+        _, logp, entropy = actor(memory, actions, noise)
+        expected_logp, expected_entropy = categorical_reference(actor, memory, noise, actions)
+        assert torch.equal(logp, expected_logp), (logp - expected_logp).abs().max().item()
+        assert torch.equal(entropy, expected_entropy), (
+            (entropy - expected_entropy).abs().max().item()
+        )
+
+
+def test_action_head_scores_in_float32_even_when_its_weights_are_bfloat16():
+    """Pins the `.float()` on the head output, which is easy to drop and quiet to lose.
+
+    Deleting it leaves the log-softmax and the entropy running in bfloat16, where this
+    same normalization lands roughly 0.05 away. The equivalence test above runs in
+    float32, where the cast is a no-op and the mutation survives; this one is the reason
+    a dropped cast fails something.
+    """
+    torch.manual_seed(6)
+    actor = ActionHead(memory_dim=16).to(torch.bfloat16)
+    memory = torch.randn(4, 16, dtype=torch.bfloat16)
+    noise = torch.randn(4, actor.noise_dim, dtype=torch.bfloat16)
+    actions, _, _ = actor(memory, noise=noise)
+    _, logp, entropy = actor(memory, actions, noise)
+    expected_logp, expected_entropy = categorical_reference(actor, memory, noise, actions)
+    assert logp.dtype == torch.float32 and entropy.dtype == torch.float32
+    assert torch.equal(logp, expected_logp)
+    assert torch.equal(entropy, expected_entropy)
+
+
+def test_fused_head_is_exactly_the_three_heads_it_replaced():
+    """One wide Linear split three ways is the same arithmetic as three narrow ones.
+
+    Concatenating the rows of three weight matrices changes which kernel runs, not what
+    any output row is, so this is an equality rather than a tolerance. If it ever becomes
+    a tolerance, the split offsets are wrong.
+    """
+    torch.manual_seed(7)
+    actor = ActionHead(memory_dim=16)
+    state = torch.randn(3, 256)
+    parts = actor.heads(state).split(actor.widths, -1)
+    assert actor.widths == (len(VOCAB), GRID, GRID)
+    offset = 0
+    for width, part in zip(actor.widths, parts, strict=True):
+        separate = nn.Linear(256, width)
+        with torch.no_grad():
+            separate.weight.copy_(actor.heads.weight[offset : offset + width])
+            separate.bias.copy_(actor.heads.bias[offset : offset + width])
+        assert torch.equal(part, separate(state))
+        offset += width
+
+
+def test_entropy_clamp_survives_an_impossible_category():
+    """The clamp inherited from Categorical only fires on a logit of negative infinity.
+
+    A Linear cannot emit one, so nothing in the head reaches this branch and the two
+    mutations that weaken the floor are invisible through ActionHead's output -- at any
+    floor past float32's exponential underflow the weights are already denormal and the
+    entropies differ by about 4e-45. What the clamp actually prevents is -inf * 0, so
+    that is what is pinned here, on the function rather than through the model.
+    """
+    logits = torch.tensor([[0.0, 1.0, float("-inf")]])
+    normalized = categorical(logits)
+    probabilities = normalized.softmax(-1)
+    assert probabilities[0, 2] == 0 and normalized[0, 2] == float("-inf")
+    assert torch.isfinite(entropy(normalized, probabilities)).all()
+    assert torch.isnan(-(normalized * probabilities).sum(-1)).all(), (
+        "without the clamp this is the nan the clamp exists to prevent"
+    )
+
+
+def test_gumbel_draw_has_the_categorical_law():
+    """The sampler is the one part that cannot be checked by equality.
+
+    Two correct samplers disagree on every single draw, so this compares distributions:
+    a chi-square against the exact multinomial probabilities, at a threshold loose enough
+    that a correct sampler effectively never trips it and tight enough that swapping in
+    a uniform draw or dropping the noise does.
+    """
+    torch.manual_seed(8)
+    logits = torch.tensor([2.0, 0.0, -1.0, 0.5, -3.0])
+    draws = 200_000
+    counts = torch.bincount(gumbel_argmax(logits.expand(draws, -1)), minlength=5).float()
+    expected = logits.softmax(-1) * draws
+    chi2 = ((counts - expected) ** 2 / expected).sum().item()
+    # chi-square with four degrees of freedom exceeds 23.5 once in ten thousand runs.
+    assert chi2 < 23.5, f"chi2 {chi2:.1f}: the draw is not categorical in these logits"
 
 
 def test_reprelu_is_relu_with_gelu_gradient():
@@ -495,11 +640,10 @@ def test_deterministic_action_equals_the_head_argmax():
     previous = torch.zeros(2, 64)
     for slot in range(SLOTS):
         state = actor.cell(previous, state)
-        expected_type = actor.type_head(state).float().argmax(-1)
+        type_logits, x_logits, y_logits = actor.heads(state).float().split(actor.widths, -1)
+        expected_type = type_logits.argmax(-1)
         assert torch.equal(action[:, slot, 0], expected_type)
-        expected = torch.stack(
-            [expected_type, actor.x_head(state).argmax(-1), actor.y_head(state).argmax(-1)], -1
-        )
+        expected = torch.stack([expected_type, x_logits.argmax(-1), y_logits.argmax(-1)], -1)
         move = (expected_type == 1).long()
         expected = expected.clone()
         expected[:, 1:] *= move[:, None]
