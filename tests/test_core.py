@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import threading
 from collections import deque
 
 import numpy as np
@@ -661,6 +662,7 @@ def test_actor_threads_deterministic_into_the_policy_and_is_reproducible():
         actor.hidden = None
         actor.previous = np.zeros((SLOTS, 3), dtype=np.int64)
         actor.history = deque(maxlen=64)
+        actor.compiled = False
         return actor
 
     rgb = np.full((32, 32, 3), 120, np.uint8)
@@ -676,6 +678,50 @@ def test_actor_threads_deterministic_into_the_policy_and_is_reproducible():
     assert any(not np.array_equal(sampled[0], other) for other in sampled[1:]), (
         "a non-deterministic actor must still sample"
     )
+
+
+def test_actor_drops_the_cuda_graph_rather_than_replaying_it_from_another_thread():
+    """A captured graph belongs to the thread that captured it, and only to that thread.
+
+    Inductor keeps its cudagraph tree manager in thread-local storage. Replaying from a
+    different thread raises an AssertionError from inside inductor -- measured, not
+    supposed -- which in a match would read as an unexplained crash rather than as a
+    scheduling mistake. `collect_pair` calls act on the main thread today and the pool
+    only carries capture and dispatch, so this is a guard on an invariant nothing else
+    states, of exactly the kind that gets broken by a plausible future refactor: moving
+    the two actors onto threads is the obvious next optimization to try.
+
+    Losing the graph costs about seven milliseconds a tick. Losing the match costs more.
+    """
+    from hoi4_arena.runner import Actor
+
+    class Marker(torch.nn.Module):
+        """Stands in for the compiled wrapper, which carries the eager module inside."""
+
+        def __init__(self, inner):
+            super().__init__()
+            self._orig_mod = inner
+
+    actor = Actor.__new__(Actor)
+    eager = ActionHead(memory_dim=8)
+    actor.policy = torch.nn.Module()
+    actor.policy.actor = Marker(eager)
+    actor.compiled = True
+    actor.graph_thread = threading.get_ident()
+
+    # Same thread: nothing changes, and the compiled wrapper stays in place.
+    assert actor.compiled and isinstance(actor.policy.actor, Marker)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(
+            lambda: (
+                actor._uncompile("test") if threading.get_ident() != actor.graph_thread else None
+            )
+        ).result()
+    assert not actor.compiled, "the actor kept a graph it can no longer replay"
+    assert actor.policy.actor is eager, "the eager head must be what replaces it"
 
 
 def test_deterministic_action_equals_the_head_argmax():

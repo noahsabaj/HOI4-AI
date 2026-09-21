@@ -297,6 +297,40 @@ reason: another 55 MiB, and a 1.02e-2 shift in `old_logp`, which is a systematic
 PPO ratio on every sample before a single gradient step. Only the frozen weights are
 halved, and `load_policy` serves both collection and PPO so both run the same function.
 
+### The live run, 2026-09-21, with a game actually loaded
+
+Everything above was measured with HOI4 closed. This was not: a vanilla 1936 German
+Reich game, 3840x2160, time running, capture through the worker's own path and the
+policy at the shapes `Actor.act` builds, including the host transfers a tick waits on.
+Fifty ticks, after five discarded to warm up.
+
+| | float32 weights, eager head | halved, compiled head |
+|---|---|---|
+| Resident weights | 1170.1 MiB | **640.0 MiB** |
+| Peak torch allocation | 1239.6 MiB | **705.7 MiB** |
+| Minimum free VRAM | 1324 MiB | **1822 MiB** |
+| Capture p50 / p95 | 27.8 / 32.9 ms | 28.2 / 33.8 ms |
+| Policy p50 / p95 | 126.4 / 138.4 ms | **107.0 / 120.9 ms** |
+| Whole tick p50 / p95 | 152.3 / 168.0 ms | **135.0 / 148.7 ms** |
+
+**One actor fits the 200 ms interval with about 51 ms to spare.** Capture is 28.2 ms
+p50 against the 87.1 ms the blit cost, and a direct comparison on the same loaded
+screen puts duplication at 16.2 ms against the blit's 67.1 ms, 4.1x. The backend
+reported itself as `dxgi_bgra` throughout.
+
+**A pair does not.** `collect_pair` runs both actors on the coordinator's GPU, one
+after the other, and that is 243.6 ms p50 and 279.9 ms p95 of GPU work per tick before
+any capture -- against a 200 ms interval. Two policies resident leave 1226 MiB free, so
+memory is not what stops it. This is now the gate, and nothing in the optimization pass
+moves it: the remaining options are a GPU per side, the compact encoder variant, or a
+smaller observation.
+
+**What is not shown here is a pass of the old 710 MiB figure.** That number came from a
+different run on a different day, and the unoptimized control above reports 1324 MiB
+under today's conditions, so the two are not a before and after. What today measures is
+the difference the change makes under one set of conditions: 498 MiB of headroom and
+17 ms of tick.
+
 The step loop no longer serializes the interval against capture and inference: each tick
 dispatches its eight slots on a separate thread and blocks the next tick on that dispatch.
 Simulated against a fake desktop, a tick costs one interval rather than interval plus
@@ -338,11 +372,11 @@ average so the Rust worker can reproduce it bit for bit.
   remotely even though menu input and watchdog release are verified.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and
   F12 under load.
-- **Re-measure the gates with the game loaded.** Every number in the optimization pass
-  was taken with HOI4 closed. The headroom gate is the one that matters: the last loaded
-  run left 710 MiB free against a required 1024, and halving the frozen weights returns
-  601 MiB of peak allocation, but whether that clears the gate is a live measurement and
-  is not claimed here. Duplication capture is likewise measured on an idle desktop.
+- **Fit a pair inside the interval.** Measured live on 2026-09-21, both actors together
+  need 279.9 ms p95 of GPU against a 200 ms tick, where one needs 120.9 ms. Free VRAM is
+  not the constraint (1226 MiB with both resident). Until this is resolved, unattended
+  self-play on one coordinator GPU is arithmetically excluded, whatever the screen path
+  does. The options are one GPU per side, the compact encoder, or fewer tokens.
 - **The live clip and the training clip are not the same clip.** Decisions happen at
   5 Hz and the clip samples history at 7.5 Hz, so about two of the eight live frames are
   repeats of their neighbours, where an offline session recorded at 10 Hz yields eight
