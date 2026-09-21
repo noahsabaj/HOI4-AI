@@ -71,6 +71,10 @@ def main():
     generation = sub.add_parser("generate-map")
     generation.add_argument("output")
     generation.add_argument("--game", required=True)
+    inspection = sub.add_parser(
+        "audit-map", help="Check a generated arena for references the engine cannot resolve"
+    )
+    inspection.add_argument("mod")
     collect = sub.add_parser("collect-pair")
     collect.add_argument("config")
     collect.add_argument("output")
@@ -103,6 +107,14 @@ def main():
         raise SystemExit(1) from None
     if result is not None:
         print(json.dumps(result, indent=2))
+
+
+def _report(problems):
+    """One line per unresolved reference, then a short failure the exit code follows."""
+    for problem in problems:
+        logging.getLogger(__name__).error("arena: %s", problem)
+    if problems:
+        raise ValueError(f"{len(problems)} references the game cannot resolve")
 
 
 def _dispatch(command, args):
@@ -162,9 +174,18 @@ def _dispatch(command, args):
             [json.loads(line) for line in Path(args["results"]).read_text().splitlines()]
         )
     elif command == "generate-map":
-        from .mapgen import generate
+        from .mapgen import audit, generate
 
         result = generate(args["game"], args["output"])
+        result["audit"] = audit(args["output"])
+        # The map is on disk either way; a bad one must not exit zero, because the next
+        # thing that reads it is the game, which crashes instead of reporting.
+        _report(result["audit"]["problems"])
+    elif command == "audit-map":
+        from .mapgen import audit
+
+        result = audit(args["mod"])
+        _report(result["problems"])
     elif command == "collect-pair":
         from .runner import collect_pair
 
