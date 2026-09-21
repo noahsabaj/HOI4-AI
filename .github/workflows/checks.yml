@@ -18,6 +18,12 @@ jobs:
     # import Windows-only paths at call time rather than at import time.
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      # GitHub's Windows runners are a mixed pool, and on some of them torch dispatched a
+      # kernel the CPU does not implement: pytest died with an illegal instruction
+      # (0xc000001d) inside GRUCell, twice in four runs, on an unchanged lockfile. Capping
+      # the dispatch below AVX-512 keeps the same results on every machine in the pool.
+      ATEN_CPU_CAPABILITY: avx2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
