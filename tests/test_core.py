@@ -1275,3 +1275,25 @@ def test_capture_rejects_a_reply_with_the_wrong_number_of_crops():
     }
     with pytest.raises(DesktopError, match="number of crops"):
         _stub_desktop(reply).capture(regions=[[0, 0, 2, 2], [0, 0, 3, 3]], full=False)
+
+
+def test_audit_rejects_a_map_colour_without_a_named_colour_space(arena):
+    """A bare `color = { }` is not the map colour, so Blue gets painted whatever the
+    engine picks. Only an rgb-tagged entry in colors.txt decides it.
+    """
+    text = (arena / "common/countries/colors.txt").read_text()
+    problems = _audit_with(
+        arena, "common/countries/colors.txt", text.replace("color = rgb {", "color = {")
+    )
+    assert any("no rgb map colour" in p for p in problems), problems
+
+
+def test_flag_pixels_and_map_colour_come_from_one_source(arena):
+    """The flags were right while the map was wrong because they read different values."""
+    from hoi4_arena.mapgen import COUNTRY_COLOUR
+
+    colours = (arena / "common/countries/colors.txt").read_text()
+    for tag, rgb in COUNTRY_COLOUR.items():
+        assert f"color = rgb {{ {' '.join(map(str, rgb))} }}" in colours
+        flag = np.array(Image.open(arena / f"gfx/flags/{tag}.tga").convert("RGB"))
+        assert tuple(flag[0, 0]) == rgb, f"{tag} flag {tuple(flag[0, 0])} != {rgb}"

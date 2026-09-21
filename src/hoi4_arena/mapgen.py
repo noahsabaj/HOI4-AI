@@ -77,6 +77,26 @@ PORT_BUILDINGS = ("naval_base_spawn", "floating_harbor")
 # Zero-based last day of each month, matching the twelve stock weather periods.
 MONTH_LAST_DAY = (30, 27, 30, 29, 30, 29, 30, 30, 29, 30, 29, 30)
 
+# One source of truth for each side's colour: the flag pixels, the country file and the
+# country colour database all read from here. The map colour comes from
+# common/countries/colors.txt, where the colour space is named explicitly. A bare
+# `color = { ... }` in a country file is not the map colour, which is why BLU rendered
+# green and RED rendered pale cyan while their flags were right: same numbers, and only
+# the flag path read them as RGB.
+COUNTRY_COLOUR = {"BLU": (40, 100, 220), "RED": (220, 60, 60)}
+COUNTRY_COLOUR_UI = {"BLU": (70, 130, 255), "RED": (255, 90, 90)}
+
+# The map is the size of the stock one, and for the same reason: the camera's zoom-out
+# limit is fixed in world units, not fitted to the map. A 2048x1536 arena left the camera
+# able to see past the top and bottom edges and more than one map width across, and since
+# HOI4 wraps horizontally that showed the same two countries two and a half times over,
+# only one copy carrying a name. Both dimensions must be multiples of 256 and the area
+# must stay under 13238272 pixels; 5632x2048 is the stock map exactly.
+MAP_SIZE = (5632, 2048)
+# 8 columns and 12 rows per half, mirrored, so 192 provinces. At this size a province box
+# is about 352x170, inside the eighth-of-the-map limit that triggers TOO LARGE BOX.
+COLUMNS_PER_HALF, ROWS, OCEAN_RINGS = 8, 12, 2
+
 # Colours sampled from the stock colour maps, so the arena's water and ground read the way
 # the game's own do. The alpha of the RGB colour map is the city-light mask and the alpha
 # of the fog-of-war map is the water specular.
@@ -156,18 +176,28 @@ def generate(game, output):
         )
 
     # Both dimensions must be a multiple of 256 and the area must stay under 13238272 px.
-    width, height = 2048, 1536
+    width, height = MAP_SIZE
+    step_x, step_y = width // (2 * COLUMNS_PER_HALF), height // ROWS
     left = np.array(
-        [(x * 128 + 64, y * 128 + 48 + (x % 2) * 32) for x in range(8) for y in range(12)]
+        [
+            (
+                x * step_x + step_x // 2,
+                y * step_y + step_y // 2 + (x % 2) * (step_y // 4),
+            )
+            for x in range(COLUMNS_PER_HALF)
+            for y in range(ROWS)
+        ]
     )
     points = np.concatenate([left, [width - 1, height - 1] - left])
     yy, xx = np.mgrid[:height, :width]
     ids = cKDTree(points).query(np.stack([xx.ravel(), yy.ravel()], 1))[1].reshape(height, width) + 1
+    # Two rings of provinces on every side are sea, so the land sits in open water rather
+    # than running off the edge of the world.
     land = (
-        (points[:, 0] >= 256)
-        & (points[:, 0] < width - 256)
-        & (points[:, 1] >= 256)
-        & (points[:, 1] < height - 256)
+        (points[:, 0] >= OCEAN_RINGS * step_x)
+        & (points[:, 0] < width - OCEAN_RINGS * step_x)
+        & (points[:, 1] >= OCEAN_RINGS * step_y)
+        & (points[:, 1] < height - OCEAN_RINGS * step_y)
     )
     # Break pixel-only four-way contacts, preserving rotational symmetry. The map wraps
     # horizontally, so the seam between the last and first column is a contact too.
@@ -347,7 +377,12 @@ def generate(game, output):
         capital = min(
             province_list,
             key=lambda i: np.linalg.norm(
-                points[i - 1] - ([448, 768] if state == 1 else [width - 449, height - 769])
+                points[i - 1]
+                - (
+                    [width // 4, height // 2]
+                    if state == 1
+                    else [width - 1 - width // 4, height - 1 - height // 2]
+                )
             ),
         )
         capitals.append(capital)
@@ -361,7 +396,8 @@ def generate(game, output):
         victory_points[state] = {capital: 20, **{p: 5 for p in outposts if p != capital}}
         write(
             f"common/countries/{tag}.txt",
-            f"graphical_culture = western_european_gfx\ngraphical_culture_2d = western_european_2d\ncolor = {{ {'40 100 220' if state == 1 else '220 60 60'} }}",
+            f"graphical_culture = western_european_gfx\ngraphical_culture_2d = western_european_2d\n"
+            f"color = rgb {{ {' '.join(map(str, COUNTRY_COLOUR[tag]))} }}",
         )
         points_block = " ".join(
             f"victory_points = {{ {province} {value} }}"
@@ -390,8 +426,7 @@ def generate(game, output):
         for sub, size in [("", (82, 52)), ("medium/", (41, 26)), ("small/", (10, 7))]:
             flag = root / f"gfx/flags/{sub}{tag}.tga"
             flag.parent.mkdir(parents=True, exist_ok=True)
-            fill = (40, 100, 220, 255) if state == 1 else (220, 60, 60, 255)
-            Image.new("RGBA", size, fill).save(flag)
+            Image.new("RGBA", size, (*COUNTRY_COLOUR[tag], 255)).save(flag)
     # Every country that exists at game start has a name list. Without one the engine
     # still takes the random-character path for leaders, advisors and unit commanders,
     # fails to name them, and dereferences the result. common/names is not replaced, so a
@@ -486,6 +521,21 @@ def generate(game, output):
     )
     write(
         "common/country_tags/00_arena.txt", 'BLU = "countries/BLU.txt"\nRED = "countries/RED.txt"\n'
+    )
+    # The map colour comes from this database, not from the country file, and every entry
+    # names its colour space. Replacing the stock file drops the colours of the 351 stock
+    # tags, which is harmless here: their history files are replaced away, so none of them
+    # owns a province to paint.
+    write(
+        "common/countries/colors.txt",
+        "#reload countrycolors\n"
+        + "".join(
+            f"{tag} = {{\n"
+            f"\tcolor = rgb {{ {' '.join(map(str, COUNTRY_COLOUR[tag]))} }}\n"
+            f"\tcolor_ui = rgb {{ {' '.join(map(str, COUNTRY_COLOUR_UI[tag]))} }}\n"
+            f"}}\n"
+            for tag in COUNTRY_COLOUR
+        ),
     )
     write(
         "common/bookmarks/arena.txt",
@@ -778,6 +828,13 @@ def audit(root):
     tags = sorted(
         re.findall(r"^(\w+)\s*=", (root / "common/country_tags/00_arena.txt").read_text(), re.M)
     )
+    colours = root / "common/countries/colors.txt"
+    colour_text = colours.read_text() if colours.exists() else ""
+    for tag in tags:
+        # Without an rgb-tagged entry here the engine picks its own colour, whatever the
+        # country file says, and the side that calls itself Blue is painted green.
+        if not re.search(rf"^{tag}\s*=\s*{{[^}}]*color\s*=\s*rgb", colour_text, re.M | re.S):
+            problems.append(f"{tag} has no rgb map colour in common/countries/colors.txt")
     names = root / "common/names/01_arena_names.txt"
     characters = root / "common/characters/arena.txt"
     localised = (root / "localisation/english/arena_l_english.yml").read_text(encoding="utf-8-sig")
