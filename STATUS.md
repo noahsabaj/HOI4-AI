@@ -94,8 +94,12 @@ audits what it wrote and exits non-zero. It exists because the engine does not r
 map data: it dereferences it.
 
 **Soak, 2026-09-20.** A match on `infantry-arena-v10` ran unattended for 1800 seconds of
-wall clock at game speed two, from 12:00 on 1 January to 10:00 on 7 February 1936: about 37
-in-game days. No crash dump, no line in `error.log` matching `MAP_ERROR`, `naval base`,
+wall clock **at game speed one**, from 12:00 on 1 January to 10:00 on 7 February 1936: about
+37 in-game days. Speed one was not the intention. Speed is changed with `+` and `-`
+(`VK_OEM_PLUS` and `VK_OEM_MINUS`, which the worker allows in setup mode and refuses during
+a match, exactly as intended); the number keys do nothing, so the attempt to select speed
+two silently left it at one. A soak at speed two covers more game time per wall second and
+has not been run. No crash dump, no line in `error.log` matching `MAP_ERROR`, `naval base`,
 `has no continent` or `no pixels`, and a steady 2.7 GB working set. That is past the window
 in which a missing naval-base placement is documented to crash an AI evaluation loop.
 
