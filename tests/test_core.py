@@ -1,5 +1,6 @@
 import io
 import json
+import re
 from collections import deque
 
 import numpy as np
@@ -1067,3 +1068,114 @@ def test_a_failure_inside_the_dispatch_thread_invalidates_the_episode(tmp_path):
         assert not env.active
     finally:
         env.close()
+
+
+@pytest.fixture(scope="module")
+def arena(tmp_path_factory):
+    """A freshly generated arena, built against a game directory holding only palettes."""
+    from hoi4_arena.mapgen import generate
+
+    game = tmp_path_factory.mktemp("game")
+    (game / "map").mkdir()
+    for name in ["provinces.bmp", "terrain.bmp", "rivers.bmp", "trees.bmp", "cities.bmp"]:
+        palette = Image.new("P", (1, 1))
+        palette.putpalette(bytes(range(256)) * 3)
+        palette.save(game / "map" / name)
+    root = tmp_path_factory.mktemp("mods") / "arena"
+    generate(game, root)
+    return root
+
+
+def _audit_with(root, name, text):
+    """Audit the arena with one file replaced, then put the original back."""
+    from hoi4_arena.mapgen import audit
+
+    path = root / name
+    original = path.read_text()
+    path.write_text(text)
+    try:
+        return audit(root)["problems"]
+    finally:
+        path.write_text(original)
+
+
+def test_generated_arena_resolves_every_reference_the_engine_looks_up(arena):
+    from hoi4_arena.mapgen import audit
+
+    assert audit(arena)["problems"] == []
+
+
+def test_audit_rejects_the_sentinel_adjacency_row_other_paradox_titles_use(arena):
+    """HOI4 reads -1;-1;;-1 as a real row, and GetProvince(-1) returns null."""
+    header = (arena / "map/adjacencies.csv").read_text().splitlines()[0]
+    problems = _audit_with(arena, "map/adjacencies.csv", f"{header}\n-1;-1;;-1;-1;-1;-1;-1;;\n")
+    assert any("adjacencies.csv" in p and "-1" in p for p in problems), problems
+
+
+def test_audit_rejects_a_coast_only_the_land_side_admits(arena):
+    rows = []
+    for row in (arena / "map/definition.csv").read_text().splitlines():
+        cells = row.split(";")
+        if len(cells) > 5 and cells[4] == "sea":
+            cells[5] = "false"
+        rows.append(";".join(cells))
+    problems = _audit_with(arena, "map/definition.csv", "\n".join(rows) + "\n")
+    assert any("no sea province is marked coastal" in p for p in problems), problems
+
+
+def test_audit_rejects_a_province_the_engine_can_build_on_but_cannot_place_a_model_for(arena):
+    kept = [
+        row
+        for row in (arena / "map/buildings.txt").read_text().splitlines()
+        if ";supply_node;" not in row
+    ]
+    problems = _audit_with(arena, "map/buildings.txt", "\n".join(kept) + "\n")
+    assert any("supply_node placements" in p for p in problems), problems
+
+
+def test_audit_rejects_a_port_pointing_at_no_sea_province(arena):
+    rows = []
+    for row in (arena / "map/buildings.txt").read_text().splitlines():
+        cells = row.split(";")
+        if len(cells) > 6 and cells[1] == "naval_base_spawn":
+            cells[6] = "0"
+        rows.append(";".join(cells))
+    problems = _audit_with(arena, "map/buildings.txt", "\n".join(rows) + "\n")
+    assert any("naval_base_spawn with no adjacent sea province" in p for p in problems), problems
+
+
+def test_audit_rejects_counter_anchors_the_engine_expects_for_every_province(arena):
+    only_first = [
+        row
+        for row in (arena / "map/unitstacks.txt").read_text().splitlines()
+        if row.split(";")[1:2] == ["0"]
+    ]
+    problems = _audit_with(arena, "map/unitstacks.txt", "\n".join(only_first) + "\n")
+    assert any("counter anchors" in p for p in problems), problems
+
+
+def test_audit_rejects_one_weather_period_stretched_over_the_year(arena):
+    name = "map/strategicregions/1-arena.txt"
+    text = (arena / name).read_text()
+    single = "period = { between = { 0.0 30.11 } temperature = { 15.0 20.0 } no_phenomenon = 1.0 }"
+    patched = re.sub(r"weather = \{.*\}\s*\}$", f"weather = {{ {single} }} }}", text)
+    problems = _audit_with(arena, name, patched)
+    assert any("weather periods, not 12" in p for p in problems), problems
+
+
+def test_province_adjacency_follows_shared_edges_in_the_bitmap():
+    from hoi4_arena.mapgen import adjacency
+
+    ids = np.array([[1, 1, 2], [1, 3, 2], [3, 3, 2]])
+    neighbours = adjacency(ids, 3)
+    assert neighbours[1] == {2, 3}
+    assert neighbours[2] == {1, 3}
+    assert neighbours[3] == {1, 2}
+
+
+def test_generated_terrain_avoids_the_blend_only_palette_indices(arena):
+    """Stock terrain.bmp reserves palette 0 and 1 for terrain_0 and terrain_1, which are
+    blends. A land province drawn with one of those has no terrain the definition names.
+    """
+    drawn = set(np.unique(np.array(Image.open(arena / "map/terrain.bmp"))).tolist())
+    assert not drawn & {0, 1}, f"land pixels use blend-only terrain: {sorted(drawn)}"

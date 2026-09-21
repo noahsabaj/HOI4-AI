@@ -8,7 +8,7 @@ The worker downscales before transport. A `capture` can ask for the five policy 
 
 Pointer positions are quantized onto a square 1024×1024 lattice of the client rectangle. On a 3840×2160 screen that is 3.75 px horizontally and 2.11 px vertically, so controls narrower than about four pixels cannot be addressed exactly and recorded human motion is re-quantized before it becomes a training label.
 
-**Research prototype; no trained combat agent yet.** See [STATUS.md](STATUS.md) for measured results and outstanding acceptance gates. The generated arena currently reaches country selection but crashes when starting a match on HOI4 1.19.3.
+**Research prototype; no trained combat agent yet.** See [STATUS.md](STATUS.md) for measured results and outstanding acceptance gates. The generated arena reached country selection and crashed on Start; the map data that crash traces to is fixed and checked by `audit-map`, but a match has not yet been played.
 
 ## Setup
 
@@ -58,10 +58,13 @@ Dense and sparse predictive objectives use separate projection modules. Sparse t
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe generate-map artifacts/mods/infantry-arena --game 'C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV'
+.venv\Scripts\hoi4-arena.exe audit-map artifacts/mods/infantry-arena
 .\scripts\Test-ArenaLoad.ps1 -Mod artifacts/mods/infantry-arena
 ```
 
-Generation requires a new output directory. The disposable launch script temporarily selects the mod and restores the prior mod-selection file. Its current 20-second startup assumption requires local verification. Normal later launches use the restored selection. The map is an original rotationally mirrored island with equal infantry forces and ordinary supply; playable match startup remains unresolved.
+Generation requires a new output directory. The disposable launch script temporarily selects the mod and restores the prior mod-selection file. Its current 20-second startup assumption requires local verification. Normal later launches use the restored selection. The map is an original rotationally mirrored island with equal infantry forces and ordinary supply; playable match startup remains unverified.
+
+`generate-map` audits what it wrote and exits non-zero if anything is wrong, and `audit-map` re-checks a mod on disk. The audit exists because the engine does not report bad map data: `CProvinceProvider::GetProvince` returns null for any id below 1, and the match-start callers dereference the result without checking, so an unset province id ends the process with an access violation and no log line. It checks every province id the generated files ask the engine to resolve, that both sides of a coast agree, that every province carries the unit-counter anchors and building placements the stock database supplies for it, and that each strategic region has all twelve weather periods.
 
 `template` creates screenshot ROI templates and `clock` calibrates the changing-clock ROI; collection refuses to start without both. `configs/pair.example.json` shows the two-player configuration, including its `seed` and `deterministic` keys. Real ready/healthy/speed-two/win/loss/disconnect/desync templates, a changing-clock ROI and observed lobby/reset recipes must be calibrated before collection. Missing evidence fails closed. There are no fabricated default victory templates.
 
