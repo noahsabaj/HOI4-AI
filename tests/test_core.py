@@ -1378,3 +1378,38 @@ def test_a_pair_shares_one_match_clock():
     second.reset.side_effect = finishing_at(second, 1030.0)
     ArenaPair(first, second).reset()
     assert first.start == second.start == 1030.0
+
+
+def test_both_countries_have_a_general_who_is_actually_recruited(arena):
+    """A country leader is not a general, and both tags had only the former, so neither
+    could form an army group. A character that is defined but never recruited does not
+    exist in the match at all, so both halves have to hold.
+    """
+    from hoi4_arena.mapgen import GENERALS_PER_COUNTRY
+
+    written = (arena / "common/characters/arena.txt").read_text()
+    for tag in ["BLU", "RED"]:
+        recruited = (arena / f"history/countries/{tag} - Arena.txt").read_text()
+        wanted = [(f"{tag}_marshal", "field_marshal")] + [
+            (f"{tag}_general_{n}", "corps_commander") for n in range(1, GENERALS_PER_COUNTRY + 1)
+        ]
+        for key, role in wanted:
+            block = written.split(f"\t{key} = {{", 1)
+            assert len(block) > 1, f"{key} is not defined"
+            assert role in block[1].split("\n\t}", 1)[0], f"{key} is not a {role}"
+            assert f"recruit_character = {key}" in recruited, f"{key} is never recruited"
+
+
+def test_each_country_is_told_to_execute_its_front(arena):
+    """The engine draws the front on its own, but nothing told either AI to execute an
+    order across it, and Red held position for three months against a stationary Blue.
+    execute_order is the key that forces the execute-or-not decision.
+    """
+    text = (arena / "common/ai_strategy/arena.txt").read_text()
+    for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]:
+        block = text.split(f"{tag}_arena_offensive = {{", 1)
+        assert len(block) > 1, f"{tag} has no offensive strategy"
+        body = block[1]
+        assert "type = front_control" in body
+        assert f"tag = {enemy}" in body
+        assert "execute_order = yes" in body
