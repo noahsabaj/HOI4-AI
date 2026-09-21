@@ -19,6 +19,11 @@ log = logging.getLogger(__name__)
 # uncalibrated rule name; both must end the match, not abort the coordinator.
 FAULTS = (DesktopError, TimeoutError, OSError, ValueError, KeyError)
 
+# How long one side waits for the other to agree on a result once it has one of its own.
+# It only has to cover the debounce depth and a tick, because both sides now share a match
+# clock; it does not have to absorb the difference between two independent setups.
+PAIR_CONFIRM_SECONDS = 3
+
 
 def disarm(env):
     env.active = False
@@ -260,6 +265,16 @@ class ArenaPair:
             for e in self.envs:
                 disarm(e)
             raise errors[0]
+        # One match, one clock. Each side started its own `seconds` the moment its own
+        # setup finished, and two setups never finish together: the lobby recipe waits on
+        # templates and one side is a LAN round trip away. Whichever finished first then
+        # reached its own timeout first and reported a draw, while the other was still
+        # short of its own and had only PAIR_CONFIRM_SECONDS to catch up, so any reset
+        # skew past that invalidated every timeout draw. Both sides take the later start,
+        # so they expire within a tick of each other.
+        start = max(e.start for e in self.envs)
+        for env in self.envs:
+            env.start = start
         return results
 
     def step(self, actions):
@@ -286,7 +301,7 @@ class ArenaPair:
             # Both players stop sending input while each screen confirms its result.
             for env in self.envs:
                 disarm(env)
-            expiry = time.monotonic() + 3
+            expiry = time.monotonic() + PAIR_CONFIRM_SECONDS
             while None in outcomes and time.monotonic() < expiry:
                 time.sleep(0.1)
                 for i, env in enumerate(self.envs):

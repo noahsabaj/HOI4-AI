@@ -1353,3 +1353,28 @@ def test_both_countries_march_at_the_arena_rate(arena):
             "add_ideas = arena_march_speed"
             in (arena / f"history/countries/{tag} - Arena.txt").read_text()
         )
+
+
+def test_a_pair_shares_one_match_clock():
+    """Two setups never finish together: the lobby recipe waits on templates and one side
+    is a LAN round trip away. While each side timed its own match from its own setup, the
+    side that finished first hit its timeout first and reported a draw, and the other had
+    only PAIR_CONFIRM_SECONDS to reach its own — so any skew past that came back
+    unconfirmed and invalidated the episode. Every timeout draw is affected, which is
+    most of them while a decisive result is rare.
+    """
+    from unittest.mock import Mock
+
+    first, second = Mock(), Mock()
+
+    def finishing_at(env, when):
+        def run(**_):
+            env.start = when
+            return "ok", {}
+
+        return run
+
+    first.reset.side_effect = finishing_at(first, 1000.0)
+    second.reset.side_effect = finishing_at(second, 1030.0)
+    ArenaPair(first, second).reset()
+    assert first.start == second.start == 1030.0

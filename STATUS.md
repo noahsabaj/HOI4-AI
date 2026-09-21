@@ -16,7 +16,8 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 | LAN screenshot timing | `artifacts/pairing-roundtrip-downscaled.json`, 25 captures per mode | Live path (five views plus template crops) p50 83.9 ms, **p95 99.5 ms**, 0.87 MB; the full frame it replaces is p95 433.8 ms, 33.2 MB |
 | Arena match start | `artifacts/mods/infantry-arena-v10`, five minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | Match starts and runs: war declared, clock advanced 12:00 1 Jan to 20:00 2 Jan 1936, no crash |
 | Combat resolution | `infantry-arena-v12`, live match, 5 March to mid-May 1936 at game speed four | Battle joined and resolved: 2 Blue divisions attacked 1 Red defender, tooltip gave a running estimate, attacker repulsed, no province changed hands |
-| Victory detection | Arithmetic below, from `00_defines.lua` and the live map | **Not reachable as generated.** Needs the enemy capital plus two outposts, about five province hops and 130 in-game days away, through a front symmetric infantry cannot break |
+| Victory detection | Arithmetic below, from `00_defines.lua` and the live map | **Not reachable at the old province size.** Needed the enemy capital plus two outposts, about five hops and 130 in-game days away, through a front symmetric infantry cannot break |
+| Rescaled map loads | `infantry-arena-v13`, `logs/game.log` and `logs/error.log` from a clean launch | `Loaded 1537 provinces`, history executed to 1936.1.1.12, no crash dump, 2.9 GB resident. Zero `MAP_ERROR`, `TOO LARGE BOX`, `has no continent`, `no pixels` or naval-base lines. **Match start on this map is still untested** — all four historical crashes were there, not at map load |
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
@@ -39,6 +40,16 @@ Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a
 - `ActionHead`'s `deterministic` path was unreachable, so evaluation would have sampled and inflated variance the paired bound does not model. Wired through `Actor` and the pair config.
 - The package had no logging and discarded the worker's stderr, its only diagnostic channel, during 1800-second unattended matches. Worker stderr is now captured, surfaced in error messages and written beside each run's manifest.
 - `record` swallowed every failure and exited zero, handing back a session that `prepare_session` will always reject. Both long-running commands now write their evidence and then exit non-zero.
+
+One more, found on 2026-09-21 and fixed with a regression test: **a pair had two match
+clocks.** Each side started its own `seconds` the moment its own `reset` finished, and two
+setups never finish together — the lobby recipe waits on templates and one side is a LAN
+round trip away. The side that finished first reached its timeout first and reported a
+draw, while the other was still short of its own and had only `PAIR_CONFIRM_SECONDS` to
+agree, so any reset skew past three seconds came back `unconfirmed_pair_result` and
+invalidated the episode. That is every timeout draw, which is nearly every match while a
+decisive result is out of reach. Both sides now take the later start and expire within a
+tick of each other.
 
 These were latent defects in code paths that have never run against a live match; fixing them does not constitute live verification.
 
@@ -185,9 +196,15 @@ conference cost discount, not an auto-annex.
 **The match-side vision rules have never been calibrated.** `ScreenRules` ends a match only
 on a `win`, `loss`, `disconnect` or `desync` template, and the only two `rules.json` files on
 disk hold the four lobby templates and no `clock_rect`, so `require_match_rules()` raises.
-Worse than raising: if a match ends on a screen matching nothing, the liveness budget
-invalidates the episode, but if the HUD simply stays up the runner records a **draw with
-reward 0.0 for both sides** — a silent zero-signal result rather than an error.
+An earlier version of this entry said a match ending on an unrecognised screen is silently
+recorded as a draw. That was wrong, and reading the code settles it: a screen matching
+nothing raises `unrecognized_match_screen`, a terminal candidate that never converges
+raises `terminal_screen_never_confirmed`, and a timeout without a healthy HUD raises
+`uncertain_timeout`. The gap is narrower and more specific. `surrendered_country_popup` is
+520x320 and centred, so it need not cover whichever rectangle `healthy` is calibrated on;
+if it does not, the HUD keeps matching, the loop keeps stepping, and the match ends as an
+ordinary timeout draw. The requirement that follows is a calibrated template for that
+popup, not a louder failure.
 
 Two smaller results from the same pass, both contrary to what was assumed: generals are a
 **degrade, not a blocker** (`PLANNING_CAP_NO_HQ_SCALING = 0.8`, and about 60 stock 1936
@@ -248,7 +265,7 @@ Open acceptance work:
 
 - Decide how the arena reaches a decision at all. Its provinces are 150x the area of a stock land province, so every crossing costs 26 in-game days and each capital is five hops behind its front. The options are to cut the province size (the generator is already parametric in `COLUMNS_PER_HALF` and `ROWS`, but states, buildings, supply and victory points all scale with it), to raise army speed to suit the scale, or to accept that matches are scored on territory rather than capitulation. Nothing else on this list resolves until this does.
 - Calibrate the match-side screen rules. `win`, `loss`, `healthy`, `disconnect` and `desync` have never been written for a match, and `require_match_rules()` raises without them. The win and loss templates must anchor on the peace conference's top-art banner, since both sides get the same full-screen window.
-- Make an unmatched terminal screen fail loudly. A match that simply runs out with the HUD up is recorded as a draw at reward 0.0 for both sides, which is indistinguishable from a real draw.
+- Calibrate a template for `surrendered_country_popup`. It is 520x320 and centred, so it need not cover the `healthy` rectangle; if it does not, a capitulation reads as an ordinary timeout draw.
 - Run a full 1800-second match at speed four and verify armies, supply over time, fog, multiple routes and side symmetry in gameplay. Match start and combat resolution are now verified.
 - Pairing works; complete two-PC lobby/reset calibration and recovery checks. Menu input and watchdog release are verified remotely; match behavior remains untested.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and F12 under load. The worker now releases held input even when stdout fails; live regression remains needed.
