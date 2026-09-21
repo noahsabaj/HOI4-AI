@@ -96,6 +96,15 @@ map data: it dereferences it.
 **Still unverified:** a full 1800-second match, combat, supply behaviour over time, victory
 detection, and anything on two machines. One match ran for a bit over one in-game day.
 
+Found by the same audit and deliberately left, none of them crash-level:
+`common/ai_focuses` is still replaced away, which leaves nine `supports_ai_strategy` tokens
+in a file that still loads; the 351 stock country tags still exist with their history files
+deleted, so they are present but empty; `map/ambient_object.txt` is emptied rather than
+inherited, because the stock world frame is positioned for a 5632x2048 map; and the railway
+generator lays a level-1 line on every adjacent land pair, which is far denser than any
+stock network. `common/ai_strategy` was removed from the replaced list, because wiping it
+also removed `default.txt`, the only country-agnostic AI behaviour file.
+
 Capture and preprocessing, measured locally on 2026-09-20:
 
 | Change | Before | After |
