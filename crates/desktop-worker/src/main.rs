@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+mod duplication;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -318,7 +321,51 @@ mod platform {
         }
         Ok(windows[0].0 as HWND)
     }
-    unsafe fn capture(hwnd: HWND) -> Result<(Vec<u8>, i32, i32, u64, u64), String> {
+    /// The game's client rectangle, from Desktop Duplication if it is available.
+    ///
+    /// The blit below costs 87.1 ms p50 at 3840x2160, measured by the worker's own
+    /// `capture_start_ns` and `t_ns`, and it is the largest single term in a 200 ms tick.
+    /// Duplication reads a texture the compositor already holds instead.
+    ///
+    /// GDI stays as the fallback and that is not politeness. A duplication is lost on a
+    /// resolution change, a full-screen transition, a driver reset or a session switch,
+    /// and a match must not end because the display mode did. A lost one is dropped here
+    /// and rebuilt on the next tick; if the rebuild fails the blit still works. The reply
+    /// reports which backend produced the pixels, because that field is already recorded
+    /// with every run and a silent downgrade to a 87 ms capture would otherwise look
+    /// like the game got slower.
+    /// The duplication, and whether it is still worth asking for one.
+    ///
+    /// Building one costs a D3D11 device and an output enumeration, so a machine that
+    /// simply cannot duplicate -- a remote session, an adapter that refuses -- must not
+    /// pay for the attempt five times a second forever. A creation failure is final for
+    /// the connection. A duplication *lost* at runtime is a different thing: a
+    /// resolution change or a driver reset is recoverable and gets a bounded number of
+    /// rebuilds before the worker settles for the blit and stops trying.
+    enum Screen {
+        Untried,
+        Active(Box<crate::duplication::Duplicator>),
+        Retired,
+    }
+
+    /// How many lost duplications to rebuild through before giving up on the fast path.
+    const DUPLICATION_REBUILDS: u32 = 3;
+
+    /// One captured client rectangle, and which backend produced it.
+    struct Capture {
+        bytes: Vec<u8>,
+        width: i32,
+        height: i32,
+        start_ns: u64,
+        end_ns: u64,
+        backend: &'static str,
+    }
+
+    unsafe fn capture(
+        screen: &mut Screen,
+        rebuilds: &mut u32,
+        hwnd: HWND,
+    ) -> Result<Capture, String> {
         let start = ns();
         if IsIconic(hwnd) != 0 || !foreground() {
             return Err("game_not_foreground".into());
@@ -332,6 +379,44 @@ mod platform {
         let mut origin = POINT { x: 0, y: 0 };
         if ClientToScreen(hwnd, &mut origin) == 0 {
             return Err("client_to_screen_failed".into());
+        }
+        if matches!(screen, Screen::Untried) {
+            *screen = match crate::duplication::Duplicator::new((origin.x, origin.y)) {
+                Ok(duplicator) => Screen::Active(Box::new(duplicator)),
+                Err(reason) => {
+                    eprintln!("desktop duplication unavailable, using gdi: {reason}");
+                    Screen::Retired
+                }
+            };
+        }
+        if let Screen::Active(duplicator) = screen {
+            match duplicator.client((origin.x, origin.y), w as usize, h as usize) {
+                Ok(bytes) => {
+                    // The same post-condition the blit is held to: a frame captured as
+                    // focus left the game is a frame of something else.
+                    if !foreground() {
+                        return Err("capture_failed_or_focus_changed".into());
+                    }
+                    return Ok(Capture {
+                        bytes,
+                        width: w,
+                        height: h,
+                        start_ns: start,
+                        end_ns: ns(),
+                        backend: "dxgi_bgra",
+                    });
+                }
+                Err(reason) => {
+                    *rebuilds += 1;
+                    *screen = if *rebuilds <= DUPLICATION_REBUILDS {
+                        eprintln!("desktop duplication lost, rebuilding: {reason}");
+                        Screen::Untried
+                    } else {
+                        eprintln!("desktop duplication lost {rebuilds} times, using gdi: {reason}");
+                        Screen::Retired
+                    };
+                }
+            }
         }
         // A legacy application's own DC can remain DPI-virtualized even when
         // GetClientRect returns physical pixels. Capture the foreground client
@@ -391,7 +476,14 @@ mod platform {
         if lines != h || !foreground() {
             return Err("capture_failed_or_focus_changed".into());
         }
-        Ok((bytes, w, h, start, ns()))
+        Ok(Capture {
+            bytes,
+            width: w,
+            height: h,
+            start_ns: start,
+            end_ns: ns(),
+            backend: "gdi_bgra",
+        })
     }
     unsafe fn inject(hwnd: HWND, e: &Event) -> Result<(), String> {
         let mut input: INPUT = zeroed();
@@ -570,6 +662,11 @@ mod platform {
             }
         });
         let mut seq = 0u64;
+        // One duplication per process, held across ticks: the device, the output
+        // enumeration and the staging texture all cost far more to create than the
+        // capture they serve.
+        let mut screen = Screen::Untried;
+        let mut rebuilds = 0u32;
         let mut out = io::BufWriter::new(io::stdout().lock());
         loop {
             let line = match rx.recv_timeout(Duration::from_millis(10)) {
@@ -594,8 +691,18 @@ mod platform {
                         let hwnd = unsafe { select()? };
                         held.hwnd = hwnd as usize;
                         TARGET.store(hwnd as usize, Ordering::Relaxed);
+                        // Try the fast path once here so the reply names the backend a
+                        // match will really use, instead of whichever one the first tick
+                        // happens to reach. A failure is reported, not raised: GDI works.
+                        screen = Screen::Untried;
+                        rebuilds = 0;
+                        let attached_backend =
+                            match unsafe { capture(&mut screen, &mut rebuilds, hwnd) } {
+                                Ok(frame) => frame.backend,
+                                Err(_) => "gdi_bgra",
+                            };
                         Ok((
-                            serde_json::json!({"hwnd":hwnd as usize,"foreground":foreground(),"clock_ns":ns(),"backend":"gdi_bgra","computer":std::env::var("COMPUTERNAME").unwrap_or_default()}),
+                            serde_json::json!({"hwnd":hwnd as usize,"foreground":foreground(),"clock_ns":ns(),"backend":attached_backend,"computer":std::env::var("COMPUTERNAME").unwrap_or_default()}),
                             vec![],
                         ))
                     }
@@ -615,7 +722,14 @@ mod platform {
                         Ok((serde_json::json!({"armed":false}), vec![]))
                     }
                     "capture" => {
-                        let (raw, w, h, start, end) = unsafe { capture(held.hwnd as HWND)? };
+                        let Capture {
+                            bytes: raw,
+                            width: w,
+                            height: h,
+                            start_ns: start,
+                            end_ns: end,
+                            backend,
+                        } = unsafe { capture(&mut screen, &mut rebuilds, held.hwnd as HWND)? };
                         let (uw, uh) = (w as usize, h as usize);
                         // Downscaling here keeps a 33 MB frame off the wire: the five
                         // policy views plus the calibrated template crops are about
@@ -687,7 +801,7 @@ mod platform {
                         seq += 1;
                         let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                         Ok((
-                            serde_json::json!({"seq":seq,"width":w,"height":h,"encoding":encoding,"capture_start_ns":start,"t_ns":end,"events":events,"overflow":OVERFLOW.swap(false,Ordering::Relaxed),"stopped":STOP.load(Ordering::SeqCst),"foreground":foreground(),"full_bytes":full_bytes,"view_size":view_size,"views_bytes":views_bytes,"region_bytes":region_bytes}),
+                            serde_json::json!({"seq":seq,"width":w,"height":h,"encoding":encoding,"capture_start_ns":start,"t_ns":end,"events":events,"overflow":OVERFLOW.swap(false,Ordering::Relaxed),"stopped":STOP.load(Ordering::SeqCst),"foreground":foreground(),"full_bytes":full_bytes,"view_size":view_size,"views_bytes":views_bytes,"region_bytes":region_bytes,"backend":backend}),
                             bytes,
                         ))
                     }
