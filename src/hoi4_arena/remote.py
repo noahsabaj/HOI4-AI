@@ -67,7 +67,7 @@ class RemoteDesktop(Desktop):
             self.socket.close()
 
 
-def bundle(output, host, coordinator, port=<worker-port>):
+def bundle(output, host, coordinator, port):
     """Creates a portable worker plus private pairing credentials; never auto-opens a port."""
     import datetime
     import ipaddress
@@ -134,7 +134,7 @@ def bundle(output, host, coordinator, port=<worker-port>):
         "Open HOI4, then run Start-Worker.ps1 in PowerShell. Leave this window open.\n"
         "F12 stops injected inputs. Close PowerShell to disconnect.\n"
         "Only the paired coordinator can connect. Keep this folder private.\n"
-        "If Windows Firewall blocks this connection, allow TCP <worker-port> only from the\n"
+        f"If Windows Firewall blocks this connection, allow TCP {port} only from the\n"
         "coordinator address in server.json on your private network.\n"
     )
     shutil.make_archive(str(root / "second-pc"), "zip", peer)

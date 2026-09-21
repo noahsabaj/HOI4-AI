@@ -52,6 +52,13 @@ def main():
     pairing.add_argument("output")
     pairing.add_argument("--host", required=True)
     pairing.add_argument("--coordinator", required=True)
+    pairing.add_argument(
+        "--port",
+        type=int,
+        required=True,
+        help="Worker port. Required rather than defaulted, because a published "
+        "default is a detail of somebody's actual network.",
+    )
     probe = sub.add_parser("probe-peer")
     probe.add_argument("config")
     capture = sub.add_parser("capture")

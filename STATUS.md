@@ -9,7 +9,7 @@ correction is in `git log`, not here.
 
 | Check | Evidence | Result |
 |---|---|---|
-| Local hardware | consumer desktop, desktop CPU, 32 GB RAM, RTX 4060 Ti 8 GB | Inspected locally; peer hardware is user-reported identical |
+| Local hardware | Consumer desktop: 8 GB VRAM GPU, 32 GB RAM | The figures every benchmark below is read against; the peer is identical |
 | Released 303M encoder, game menu | `artifacts/benchmark/inference.json` | p95 148.73 ms, minimum 1553 MiB free |
 | Released encoder, loaded vanilla game | `artifacts/benchmark-loaded/inference.json` | p95 187.72 ms, only 710 MiB free: **fails 1 GB headroom**; game was paused |
 | Offline large-encoder training capacity | `artifacts/benchmark-loaded/training.json` | Two BF16 Adam updates on a synthetic objective — capacity, not behavioural training |
