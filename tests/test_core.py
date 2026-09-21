@@ -1299,6 +1299,62 @@ def test_flag_pixels_and_map_colour_come_from_one_source(arena):
         assert tuple(flag[0, 0]) == rgb, f"{tag} flag {tuple(flag[0, 0])} != {rgb}"
 
 
+def test_every_province_gets_a_colour_of_its_own(arena):
+    """definition.csv is how provinces.bmp is read back, so a shared colour merges two
+    provinces into one and the loss is silent. The previous scheme took each channel
+    modulo 251, which repeats every 251 ids and only held while there were 192 of them.
+    """
+    rows = [r.split(";") for r in (arena / "map/definition.csv").read_text().splitlines() if r]
+    colours = [(r[1], r[2], r[3]) for r in rows]
+    assert len(set(colours)) == len(colours)
+    painted = np.array(Image.open(arena / "map/provinces.bmp").convert("RGB"))
+    assert len(np.unique(painted.reshape(-1, 3), axis=0)) == len(rows) - 1
+
+
+def test_states_are_a_grid_rather_than_one_state_a_side(arena):
+    """A state is the unit the engine builds, supplies and garrisons in, and theatre
+    generation has a documented three-state minimum that one state a side cannot meet.
+    """
+    from hoi4_arena.mapgen import STATE_COLUMNS, STATE_ROWS
+
+    files = sorted((arena / "history/states").glob("*-arena.txt"))
+    assert len(files) == 2 * STATE_COLUMNS * STATE_ROWS
+    owners = [re.search(r"owner\s*=\s*(\w+)", f.read_text()).group(1) for f in files]
+    assert owners.count("BLU") == owners.count("RED") == STATE_COLUMNS * STATE_ROWS
+
+
+def test_each_state_holds_a_supply_hub(arena):
+    """Supply flow falls off per province travelled and runs out after about two hops, so
+    one hub a country left the ends of the border column out of supply, which caps a
+    division's organisation below the level the AI needs before it will attack with it.
+    """
+    hubs = {
+        int(line.split()[1])
+        for line in (arena / "map/supply_nodes.txt").read_text().split("\n")
+        if line
+    }
+    for path in (arena / "history/states").glob("*-arena.txt"):
+        provinces = {
+            int(p) for p in re.search(r"provinces = \{([^}]*)\}", path.read_text()).group(1).split()
+        }
+        assert provinces & hubs, f"{path.name} has no supply hub"
+
+
+def test_both_countries_march_at_the_arena_rate(arena):
+    """Province size is what makes a crossing cost days; marching speed is what pays for
+    it. The spirit is useless if it is defined and never added.
+    """
+    from hoi4_arena.mapgen import ARMY_SPEED_FACTOR
+
+    idea = (arena / "common/ideas/arena.txt").read_text()
+    assert f"army_speed_factor = {ARMY_SPEED_FACTOR}" in idea
+    for tag in ["BLU", "RED"]:
+        assert (
+            "add_ideas = arena_march_speed"
+            in (arena / f"history/countries/{tag} - Arena.txt").read_text()
+        )
+
+
 def test_a_pair_shares_one_match_clock():
     """Two setups never finish together: the lobby recipe waits on templates and one side
     is a LAN round trip away. While each side timed its own match from its own setup, the
