@@ -16,6 +16,12 @@ def main():
         help="Progress and diagnostics go to stderr; JSON results go to stdout.",
     )
     parser.add_argument("--traceback", action="store_true", help="Re-raise instead of exiting 1")
+    parser.add_argument(
+        "--tf32",
+        action="store_true",
+        help="Allow TF32 float32 matmuls. Measured worth nothing here and not free; "
+        "see models.configure_precision.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     bench = sub.add_parser("benchmark")
     bench.add_argument("--model", default="models/levjepa-large")
@@ -121,7 +127,11 @@ def main():
         stream=sys.stderr,
     )
     traceback = args.pop("traceback")
+    tf32 = args.pop("tf32")
     try:
+        from .models import configure_precision
+
+        configure_precision(tf32)
         result = _dispatch(command, args)
     except KeyboardInterrupt:
         logging.getLogger(__name__).error("interrupted")

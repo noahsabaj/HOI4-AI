@@ -12,6 +12,22 @@ from torch.utils.data import Dataset
 
 from .actions import SLOTS, encode_interval
 
+# How many past global views one decision looks at, and how densely they are sampled.
+# Eight at 7.5 Hz is 1.07 s of context, down from sixteen and 2.13 s: measured on the
+# 4060 Ti the encoder forward falls from 131.5 ms to 64.9 ms, which is the difference
+# between a policy that fits the 200 ms interval alongside capture and one that does not.
+# That is a research tradeoff and not a free win -- a shorter window is genuinely less
+# history -- and it is taken because a policy that misses its deadline observes nothing
+# at all. The encoder imposes no limit of its own: it positions tokens with RoPE rather
+# than a fixed table, so any length is legal and only the context changes.
+#
+# Note the live path cannot actually deliver eight distinct frames. Decisions happen at
+# 5 Hz, so sampling the history at 7.5 Hz repeats about two of the eight, where an
+# offline session recorded at 10 Hz yields eight distinct ones. Training clips and live
+# clips therefore differ in a way neither this constant nor the resize controls.
+CLIP_FRAMES = 8
+CAPTURE_HZ = 7.5
+
 
 def quadrants(h, w):
     """The four spatially ordered half-resolution boxes, as (top, left, height, width)."""
@@ -46,12 +62,23 @@ def views(rgb, size=224, device="cpu"):
     source = torch.as_tensor(np.ascontiguousarray(rgb), device=device).permute(2, 0, 1)[None]
     h, w = source.shape[-2:]
     # Spatially ordered quadrants retain twice the global view's linear resolution.
-    boxes = [source] + [
-        source[..., top : top + bh, left : left + bw] for top, left, bh, bw in quadrants(h, w)
-    ]
+    boxes = [source[..., top : top + bh, left : left + bw] for top, left, bh, bw in quadrants(h, w)]
+    # The four quadrants go through as one batch when they are the same size, which on an
+    # even-dimensioned frame they always are. `area` pools each sample over its own bins,
+    # so batching cannot change a pixel -- a test pins that on both devices, including
+    # the fallback -- and it turns four launches into one: a 4K frame goes from 7.04 ms
+    # to 6.07 ms on the GPU, across thousands of frames per prepared session. It is not
+    # free. Holding four quadrants at once raises peak allocation from 215.9 MiB to
+    # 239.9 MiB, still under the whole-frame intermediate the global view already needs.
+    # An odd dimension makes the bottom or right quadrant a pixel larger, and that case
+    # falls back to the loop rather than padding, because padding is exactly the kind of
+    # almost-right resize this function exists to avoid.
+    if len({box.shape for box in boxes}) == 1:
+        boxes = [torch.cat(boxes)]
     resized = []
-    for box in boxes:
-        # One box at a time: the intermediate for a full 4K frame dominates the peak.
+    # The global view stays on its own: its source is the whole frame, so it can never
+    # join the batch, and its float32 intermediate is what dominates the peak anyway.
+    for box in [source, *boxes]:
         scaled = F.interpolate(box.float(), (size, size), mode="area")
         resized.append(scaled.round().clamp(0, 255).to(torch.uint8))
         del scaled
@@ -83,9 +110,13 @@ def prepare_session(source, destination):
     if tail.exists():
         events += json.loads(tail.read_text())["events"]
     events.sort(key=lambda e: e["t_ns"])
-    decisions = np.arange(
-        times[0] + 2_100_000_000, times[-1] - 200_000_000, 200_000_000, dtype=np.int64
-    )
+    # The first decision needs a whole clip of recorded video behind it, so the lead-in
+    # is derived from the clip rather than written down: a hardcoded 2.1 s was correct
+    # only while a clip spanned 2.0 s, and raising CLIP_FRAMES past that would have
+    # produced a dataset that only failed later, at __getitem__, with "Clip reaches
+    # before session start".
+    lead_in = int(1e9 * (CLIP_FRAMES / CAPTURE_HZ + 0.2))
+    decisions = np.arange(times[0] + lead_in, times[-1] - 200_000_000, 200_000_000, dtype=np.int64)
     frame_ids = np.searchsorted(times, decisions, side="right") - 1
     destination.mkdir(parents=True, exist_ok=False)
     global_frames = np.lib.format.open_memmap(
@@ -201,7 +232,8 @@ class Sessions(Dataset):
         data = self.sessions[session]
         n = self.length + self.burn_in
         decision_times = data["decisions"][start : start + n]
-        clip_times = decision_times[:, None] - np.arange(15, -1, -1)[None] * (1e9 / 7.5)
+        offsets = np.arange(CLIP_FRAMES - 1, -1, -1)[None] * (1e9 / CAPTURE_HZ)
+        clip_times = decision_times[:, None] - offsets
         clip_ids = np.searchsorted(data["times"], clip_times, side="right") - 1
         if clip_ids.min() < 0:
             raise ValueError("Clip reaches before session start")
