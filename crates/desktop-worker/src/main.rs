@@ -406,6 +406,11 @@ mod platform {
                         backend: "dxgi_bgra",
                     });
                 }
+                // Nothing presented yet is not a failure. The duplication is healthy
+                // and will serve the next tick; this one falls through to the blit
+                // rather than spending a rebuild -- a still screen is the screen
+                // duplication handles best and must not be the one that retires it.
+                Err(crate::duplication::Unavailable::NotReadyYet) => {}
                 Err(reason) => {
                     *rebuilds += 1;
                     *screen = if *rebuilds <= DUPLICATION_REBUILDS {
