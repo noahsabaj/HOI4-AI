@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from collections import deque
 from pathlib import Path
 
@@ -134,8 +135,7 @@ class Actor:
             self.policy.actor.compile(mode="reduce-overhead", dynamic=False)
             self._warm_head()
         except Exception as error:  # noqa: BLE001 - an uncompiled actor is still correct.
-            log.warning("action head left uncompiled: %s: %s", type(error).__name__, error)
-            self.policy.actor = getattr(self.policy.actor, "_orig_mod", self.policy.actor)
+            self._uncompile(f"{type(error).__name__}: {error}")
             return False
         return True
 
@@ -150,6 +150,13 @@ class Actor:
         exactly the reproducibility seed_everything exists to provide.
         """
         memory = torch.zeros(1, self.policy.memory_dim, device=self.device)
+        # Inductor keeps its cudagraph tree manager in thread-local storage, so a graph
+        # captured here can only be replayed from this thread. `collect_pair` calls act
+        # from the main thread and only hands capture and dispatch to a pool, so the
+        # invariant holds -- but it is invisible in the code that depends on it, and
+        # violating it raises an AssertionError from inside inductor rather than
+        # anything a match loop would recognize. Recorded so act can check it.
+        self.graph_thread = threading.get_ident()
         with torch.random.fork_rng(devices=[self.device]):
             for _ in range(3):
                 with (
@@ -163,8 +170,19 @@ class Actor:
                     )
         torch.cuda.synchronize()
 
+    def _uncompile(self, reason):
+        """Drop back to the eager head, keeping the match alive."""
+        log.warning("running the action head eagerly: %s", reason)
+        self.policy.actor = getattr(self.policy.actor, "_orig_mod", self.policy.actor)
+        self.compiled = False
+
     def act(self, rgb, timestamp, precomputed=None):
         device = self.device
+        # A replay from the wrong thread would take the match down with an assertion
+        # from inside inductor. Losing the graph costs about seven milliseconds a tick;
+        # losing the match costs the match.
+        if self.compiled and threading.get_ident() != self.graph_thread:
+            self._uncompile("the cuda graph was captured on another thread")
         # The worker downscales on the capture side when it can, which keeps a 33 MB
         # frame off the wire and the resize out of this loop entirely. Fall back to
         # resizing here, on the GPU, when it handed back a full frame instead.
