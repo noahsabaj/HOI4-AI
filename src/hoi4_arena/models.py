@@ -183,6 +183,32 @@ class Policy(nn.Module):
         return hidden, self.value(hidden).squeeze(-1), features
 
 
+def configure_precision(tf32: bool = False):
+    """Say out loud what float32 matmuls are allowed to do, instead of inheriting it.
+
+    Torch leaves float32 matmuls at full precision and warns that the tensor cores are
+    idle, which reads like a free speedup being declined. Measured, it is not one here:
+    every matmul in this project runs inside torch.autocast in bfloat16, and autocast
+    lowers matmul, addmm, linear and GRUCell regardless of what dtype reaches them. The
+    two candidates that look like exceptions are not -- ActionHead casts the head's
+    *output* to float32, after the Linear has already run in bfloat16, and rdmreg's
+    explicit .float() sits inside the same autocast block. There is no float32 GEMM left
+    for TF32 to accelerate, and a synthetic one at these shapes measures between 1.01x
+    and 1.18x, all of it launch overhead at batch one.
+
+    So the default is off, and the reason is not caution about the speedup. TF32 keeps
+    ten mantissa bits, and on the shapes this project does use it moved results by up to
+    2.1e-2 -- against a PPO log-likelihood, that is a phantom ratio larger than anything
+    the optimizer is being asked to find. Zero measured gain is not worth that.
+
+    Use set_float32_matmul_precision and not the newer
+    torch.backends.cuda.matmul.fp32_precision: on torch 2.11 assigning that attribute
+    leaves get_float32_matmul_precision() raising RuntimeError.
+    """
+    torch.set_float32_matmul_precision("high" if tf32 else "highest")
+    return torch.get_float32_matmul_precision()
+
+
 def halve_frozen(module):
     """Keep every parameter that carries no gradient in bfloat16.
 

@@ -18,6 +18,7 @@ from hoi4_arena.models import (
     ActionHead,
     PredictiveAuxiliary,
     categorical,
+    configure_precision,
     entropy,
     gumbel_argmax,
     halve_frozen,
@@ -176,6 +177,23 @@ def test_fused_head_is_exactly_the_three_heads_it_replaced():
             separate.bias.copy_(actor.heads.bias[offset : offset + width])
         assert torch.equal(part, separate(state))
         offset += width
+
+
+def test_configure_precision_defaults_to_full_float32():
+    """Off by default, and set explicitly rather than left to whatever torch inherits.
+
+    The flag exists so the choice is recorded, not because it is worth taking: every
+    matmul here runs under autocast in bfloat16, so TF32 has no float32 GEMM to
+    accelerate, while on the shapes this project does use it moved results by 2.1e-2.
+    """
+    try:
+        assert configure_precision(False) == "highest"
+        assert configure_precision(True) == "high"
+        # The newer torch.backends.cuda.matmul.fp32_precision attribute is deliberately
+        # not used: assigning it on torch 2.11 leaves this query raising RuntimeError.
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        configure_precision(False)
 
 
 def test_halve_frozen_spares_everything_an_optimizer_reads():
