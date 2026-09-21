@@ -19,6 +19,7 @@ from hoi4_arena.models import (
     categorical,
     entropy,
     gumbel_argmax,
+    halve_frozen,
     rdmreg,
     reprelu,
 )
@@ -174,6 +175,22 @@ def test_fused_head_is_exactly_the_three_heads_it_replaced():
             separate.bias.copy_(actor.heads.bias[offset : offset + width])
         assert torch.equal(part, separate(state))
         offset += width
+
+
+def test_halve_frozen_spares_everything_an_optimizer_reads():
+    """Halving the weights is only safe on the tensors no gradient and no update touch.
+
+    The trainable parameters are deliberately excluded. Casting them too saves a further
+    55 MiB and shifts a stored old_logp by 1.02e-2, because AdamW would be accumulating
+    into eight mantissa bits; the frozen ones cannot drift that way. If this test ever
+    has to be relaxed, the memory saving is not the thing that got bigger.
+    """
+    module = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    module[0].requires_grad_(False)
+    halve_frozen(module)
+    assert module[0].weight.dtype == torch.bfloat16 and module[0].bias.dtype == torch.bfloat16
+    assert module[1].weight.dtype == torch.float32 and module[1].bias.dtype == torch.float32
+    assert not module[0].weight.requires_grad and module[1].weight.requires_grad
 
 
 def test_entropy_clamp_survives_an_impossible_category():

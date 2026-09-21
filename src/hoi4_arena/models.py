@@ -183,6 +183,27 @@ class Policy(nn.Module):
         return hidden, self.value(hidden).squeeze(-1), features
 
 
+def halve_frozen(module):
+    """Keep every parameter that carries no gradient in bfloat16.
+
+    The live path shipped 1170 MiB of float32 weights to the card and then ran every
+    matmul through autocast in bfloat16 regardless, so most of that was precision
+    nothing ever read. Halving it recovers 530 MiB against a headroom gate the
+    loaded-game run fails: 710 MiB free where 1024 is required.
+
+    Only the frozen parameters, and the restriction is the whole point. Casting the
+    trainable ones as well saves a further 55 MiB and moves a stored old_logp by
+    1.02e-2, which is a systematic 1.01x PPO ratio on every sample before a single
+    gradient step, because collection would then compute the likelihood differently from
+    the update that scores it. Frozen weights cannot diverge that way -- load_policy
+    serves both sides, so both run the same function -- and no optimizer reads them.
+    """
+    for parameter in module.parameters():
+        if not parameter.requires_grad:
+            parameter.data = parameter.data.to(torch.bfloat16)
+    return module
+
+
 def reprelu(value):
     soft = F.gelu(value)
     return value.relu().detach() + soft - soft.detach()

@@ -16,7 +16,7 @@ from .dataset import normalize, views
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
 from .learning import file_hash
-from .models import Policy, VideoEncoder
+from .models import Policy, VideoEncoder, halve_frozen
 from .recording import Recorder
 from .remote import RemoteDesktop
 from .vision import ScreenRules
@@ -66,7 +66,12 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
     encoder = VideoEncoder(model_path or config["model_path"], variant=config["variant"])
     policy = Policy(encoder)
     policy.load_state_dict(saved["policy"])
-    return policy.to(device), config, metadata["sha256"]
+    # Both collection and PPO come through here, so the frozen weights are halved in
+    # both and the likelihood stays the same function on either side of a rollout.
+    # Halve before the transfer, not after: casting on the card first allocates the whole
+    # float32 model there and leaves the freed half as allocator cache, which counts
+    # against the free-VRAM gate exactly as if it were still in use.
+    return halve_frozen(policy).to(device), config, metadata["sha256"]
 
 
 def act_noise(objective, width, deterministic, device):
@@ -83,7 +88,9 @@ def act_noise(objective, width, deterministic, device):
 
 
 class Actor:
-    def __init__(self, checkpoint, model_path=None, deterministic=False, device="cuda"):
+    def __init__(
+        self, checkpoint, model_path=None, deterministic=False, device="cuda", compile_head=True
+    ):
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
         self.policy.eval().requires_grad_(False)
         # Evaluation runs take the argmax so paired_evaluation's bound is not inflated by
@@ -93,6 +100,56 @@ class Actor:
         self.hidden = None
         self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
         self.history = deque(maxlen=64)
+        self.compiled = compile_head and device == "cuda" and self._compile_head()
+
+    def _compile_head(self):
+        """Capture the action head into a CUDA graph, and prove it before trusting it.
+
+        The head is eight fixed-length slots of very small tensors, so nearly all of its
+        cost is launching them: 7.72 ms of work that measures 0.741 ms once replayed from
+        a graph. The encoder is deliberately left alone. Compiling it is worth about
+        24 ms, but it moves a stored old_logp by 4.6e-4 and there is no configuration
+        that removes the gap -- inductor's no-grad graph and its grad graph differ by
+        3.4e-4 from each other, so compiling PPO's side too does not fix it. Eager
+        collection and eager update agree exactly today, and that property is worth more
+        than the milliseconds. The head is a different case: compiled, it is bit-for-bit
+        the eager head, so this costs nothing at all.
+
+        Returns whether compilation took, because inductor needs Triton and a failure
+        here must cost latency rather than the match.
+        """
+        try:
+            self.policy.actor.compile(mode="reduce-overhead", dynamic=False)
+            self._warm_head()
+        except Exception as error:  # noqa: BLE001 - an uncompiled actor is still correct.
+            log.warning("action head left uncompiled: %s: %s", type(error).__name__, error)
+            self.policy.actor = getattr(self.policy.actor, "_orig_mod", self.policy.actor)
+            return False
+        return True
+
+    def _warm_head(self):
+        """Pay compilation now, in act's exact context, without touching the match RNG.
+
+        Both halves matter. Dynamo guards on the tensor dispatch key set, so warming
+        outside inference_mode compiles a graph the first live tick then discards, and
+        the tick that was supposed to be cheap pays for two. And the warm-up samples:
+        drawing from the match generator here would make a compiled actor produce a
+        different action sequence than an uncompiled one from the same seed, which is
+        exactly the reproducibility seed_everything exists to provide.
+        """
+        memory = torch.zeros(1, self.policy.memory_dim, device=self.device)
+        with torch.random.fork_rng(devices=[self.device]):
+            for _ in range(3):
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16),
+                ):
+                    self.policy.actor(
+                        memory,
+                        noise=torch.zeros(1, self.policy.actor.noise_dim, device=self.device),
+                        deterministic=self.deterministic,
+                    )
+        torch.cuda.synchronize()
 
     def act(self, rgb, timestamp, precomputed=None):
         device = self.device
