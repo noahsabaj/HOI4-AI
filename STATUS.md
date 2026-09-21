@@ -256,6 +256,13 @@ Where the time actually was, which is not where the list said:
 
 Four things on the list were measured and **not** taken:
 
+A second correction, found by CI rather than by reasoning: a freshly created
+duplication has no desktop image until something is presented, and on a still screen
+`AcquireNextFrame` simply times out. Treating that as a failure would have retired the
+fast path back to the 87 ms blit on exactly the screens it handles best. It is now a
+distinct outcome from a lost duplication -- the worker keeps the duplication and takes
+the blit for that one tick.
+
 - **`channels_last` on the conv stem is slower here:** 0.2069 ms contiguous against
   0.2601 ms channels_last, at 4 tiles of 224px in bfloat16. The stem is 0.27 ms of a
   200 ms tick either way.

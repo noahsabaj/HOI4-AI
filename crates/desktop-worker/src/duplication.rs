@@ -55,6 +55,35 @@ use windows::Win32::Graphics::Dxgi::{
 /// refresh rate this runs at.
 const FRAME_TIMEOUT_MS: u32 = 8;
 
+/// How long to keep asking before the very first frame, which has nothing cached behind
+/// it. A freshly created duplication has no desktop image until something is presented,
+/// and on a still screen that can be a while -- CI found this by duplicating an idle
+/// runner desktop and getting nothing at all. Spread across several waits rather than
+/// one long one so a screen that starts moving is picked up immediately.
+const FIRST_FRAME_ATTEMPTS: u32 = 8;
+const FIRST_FRAME_TIMEOUT_MS: u32 = 25;
+
+/// Why a frame could not be produced. The distinction is not cosmetic: a duplication
+/// that has simply not seen a present yet is healthy and should be kept, while a lost
+/// one has to be rebuilt. Collapsing the two retires the fast path on a still screen,
+/// which is the screen it handles best.
+#[derive(Debug)]
+pub enum Unavailable {
+    /// Nothing has been presented yet, so there is no desktop image to hand back.
+    NotReadyYet,
+    /// The duplication is gone, or failed in a way that needs a new one.
+    Lost(String),
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReadyYet => write!(f, "no frame presented yet"),
+            Self::Lost(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
 pub struct Duplicator {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -162,39 +191,62 @@ impl Duplicator {
     }
 
     /// Refresh the cached desktop image, if the compositor has presented a new one.
-    fn refresh(&mut self) -> Result<(), String> {
+    fn refresh(&mut self) -> Result<(), Unavailable> {
         unsafe {
             self.release();
             let mut info = Default::default();
             let mut resource: Option<IDXGIResource> = None;
-            match self
-                .duplication
-                .AcquireNextFrame(FRAME_TIMEOUT_MS, &mut info, &mut resource)
-            {
-                Ok(()) => {}
-                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                    // Nothing was presented, so the screen is still what was captured
-                    // last. Only the very first call can have nothing to return.
-                    return if self.ready {
-                        Ok(())
-                    } else {
-                        Err("duplication_timed_out_before_any_frame".into())
-                    };
+            // With an image already cached a timeout is the answer, not a wait: the
+            // screen did not change. Without one there is nothing to return, so the
+            // first frame is worth waiting for.
+            let (attempts, timeout) = if self.ready {
+                (1, FRAME_TIMEOUT_MS)
+            } else {
+                (FIRST_FRAME_ATTEMPTS, FIRST_FRAME_TIMEOUT_MS)
+            };
+            let mut acquired = false;
+            for _ in 0..attempts {
+                match self
+                    .duplication
+                    .AcquireNextFrame(timeout, &mut info, &mut resource)
+                {
+                    Ok(()) => {
+                        acquired = true;
+                        break;
+                    }
+                    Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
+                    Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
+                        return Err(Unavailable::Lost("duplication_access_lost".into()));
+                    }
+                    Err(error) => {
+                        return Err(Unavailable::Lost(format!(
+                            "acquire_frame_failed_{:x}",
+                            error.code().0
+                        )))
+                    }
                 }
-                Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
-                    return Err("duplication_access_lost".into());
-                }
-                Err(error) => return Err(format!("acquire_frame_failed_{:x}", error.code().0)),
+            }
+            if !acquired {
+                // Nothing presented. With an image cached that is still the screen;
+                // without one the caller has to get its pixels elsewhere this tick.
+                return if self.ready {
+                    Ok(())
+                } else {
+                    Err(Unavailable::NotReadyYet)
+                };
             }
             self.holding = true;
-            let resource = resource.ok_or("acquire_frame_returned_no_surface")?;
-            let texture: ID3D11Texture2D = resource.cast().map_err(|_| "frame_is_not_a_texture")?;
+            let resource = resource
+                .ok_or_else(|| Unavailable::Lost("acquire_frame_returned_no_surface".into()))?;
+            let texture: ID3D11Texture2D = resource
+                .cast()
+                .map_err(|_| Unavailable::Lost("frame_is_not_a_texture".into()))?;
             self.context.CopyResource(&self.staging, &texture);
 
             let mut mapped = Default::default();
             self.context
                 .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| format!("map_staging_failed_{:x}", e.code().0))?;
+                .map_err(|e| Unavailable::Lost(format!("map_staging_failed_{:x}", e.code().0)))?;
             // The staging row pitch is the driver's, not width * 4, so the rows are
             // copied one at a time into a packed buffer the rest of the worker can index.
             let pitch = mapped.RowPitch as usize;
@@ -226,12 +278,19 @@ impl Duplicator {
     /// `screen` is the client origin in virtual-desktop coordinates -- exactly what the
     /// GDI path hands to BitBlt -- so both backends return the identical rectangle and
     /// can be compared pixel for pixel.
-    pub fn client(&mut self, screen: (i32, i32), w: usize, h: usize) -> Result<Vec<u8>, String> {
+    pub fn client(
+        &mut self,
+        screen: (i32, i32),
+        w: usize,
+        h: usize,
+    ) -> Result<Vec<u8>, Unavailable> {
         self.refresh()?;
         let x = screen.0 - self.origin.0;
         let y = screen.1 - self.origin.1;
         if x < 0 || y < 0 || x as usize + w > self.width || y as usize + h > self.height {
-            return Err("client_rect_outside_duplicated_output".into());
+            return Err(Unavailable::Lost(
+                "client_rect_outside_duplicated_output".into(),
+            ));
         }
         let (x, y) = (x as usize, y as usize);
         let mut out = vec![0u8; w * h * 4];
@@ -328,15 +387,22 @@ mod tests {
                 assert!(!reason.is_empty(), "a failure must name itself");
                 eprintln!("no duplication on this machine: {reason}");
             }
-            Ok(mut duplicator) => {
-                let frame = duplicator
-                    .client((0, 0), 64, 64)
-                    .expect("a built duplication must produce its first frame");
-                assert_eq!(frame.len(), 64 * 64 * 4);
-                // A second call exercises the release-before-acquire path, which the API
-                // refuses if the previous frame is still held.
-                assert!(duplicator.client((0, 0), 64, 64).is_ok());
-            }
+            // A duplication that has not seen a present yet is healthy, not broken --
+            // CI duplicated an idle runner desktop and got exactly this. It is a
+            // distinct outcome from a lost duplication precisely so the worker can keep
+            // one and fall through to the blit for that tick.
+            Ok(mut duplicator) => match duplicator.client((0, 0), 64, 64) {
+                Ok(frame) => {
+                    assert_eq!(frame.len(), 64 * 64 * 4);
+                    // A second call exercises the release-before-acquire path, which
+                    // the API refuses if the previous frame is still held.
+                    assert!(duplicator.client((0, 0), 64, 64).is_ok());
+                }
+                Err(Unavailable::NotReadyYet) => {
+                    eprintln!("nothing presented on this desktop; the blit covers the tick")
+                }
+                Err(Unavailable::Lost(reason)) => panic!("duplication failed: {reason}"),
+            },
         }
     }
 
@@ -345,8 +411,14 @@ mod tests {
     fn a_rectangle_outside_the_output_is_refused() {
         let _exclusive = exclusive();
         if let Ok(mut duplicator) = Duplicator::new((0, 0)) {
-            assert!(duplicator.client((-1, 0), 8, 8).is_err());
-            assert!(duplicator.client((0, 0), 1 << 20, 8).is_err());
+            // Out of bounds is a Lost, not a NotReadyYet: it is a caller error and must
+            // not be mistaken for a screen that has not moved.
+            for outside in [
+                duplicator.client((-1, 0), 8, 8),
+                duplicator.client((0, 0), 1 << 20, 8),
+            ] {
+                assert!(matches!(outside, Err(Unavailable::Lost(_))));
+            }
         }
     }
 
