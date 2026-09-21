@@ -1413,3 +1413,68 @@ def test_each_country_is_told_to_execute_its_front(arena):
         assert "type = front_control" in body
         assert f"tag = {enemy}" in body
         assert "execute_order = yes" in body
+
+
+def test_a_template_carries_the_tolerance_it_was_calibrated_with(tmp_path):
+    """A live HUD does not hold still to within five, so the tolerance must be settable.
+
+    Two captures of a running match seconds apart differ by a mean of about 7 over the
+    HUD, because the day/night terminator sweeps the map under a translucent bar. A rule
+    cut at the old fixed 5 rejects the very screen it was cut from one frame later.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from hoi4_arena.vision import ScreenRules, add_template
+
+    shot = tmp_path / "screen.png"
+    base = np.zeros((40, 60, 3), dtype=np.uint8)
+    Image.fromarray(base).save(shot)
+    rules = tmp_path / "rules.json"
+    result = add_template(shot, rules, "healthy", [0, 0, 60, 40], max_mae=15)
+    assert result["max_mae"] == 15
+
+    screen = ScreenRules(rules)
+    drifted = base.astype(np.int16) + 7
+    assert screen.matches_crop("healthy", drifted.astype(np.uint8))
+    far = base.astype(np.int16) + 40
+    assert not screen.matches_crop("healthy", far.astype(np.uint8))
+
+
+def test_a_tolerance_that_would_match_anything_is_refused(tmp_path):
+    """Above about 96 a crop matches every other crop, which is worse than no rule."""
+    import numpy as np
+    import pytest
+    from PIL import Image
+
+    from hoi4_arena.vision import add_template
+
+    shot = tmp_path / "screen.png"
+    Image.fromarray(np.zeros((40, 60, 3), dtype=np.uint8)).save(shot)
+    for bad in (0, 255):
+        with pytest.raises(ValueError, match="max_mae"):
+            add_template(
+                shot, tmp_path / f"rules-{bad}.json", "healthy", [0, 0, 60, 40], max_mae=bad
+            )
+
+
+def test_a_paused_clock_reads_as_stalled_despite_capture_noise():
+    """Exact equality could never hold, so the stall gate could never fire.
+
+    Measured on a live 3840x2160 match on 2026-09-21: two captures of the clock crop of a
+    *paused* game differ by a mean of 6.4, and by 44.8 while the clock is advancing. The
+    loop compared them with `array_equal`, so every frame looked like a fresh tick and a
+    paused game would have been stepped for the whole match.
+    """
+    import numpy as np
+
+    from hoi4_arena.vision import clock_advanced
+
+    reading = np.full((18, 170, 3), 120, dtype=np.uint8)
+    noisy = np.clip(reading.astype(np.int16) + 6, 0, 255).astype(np.uint8)
+    assert not np.array_equal(reading, noisy), "the frames really are different pixels"
+    assert not clock_advanced(noisy, reading), "but they are the same reading"
+
+    ticked = np.clip(reading.astype(np.int16) + 45, 0, 255).astype(np.uint8)
+    assert clock_advanced(ticked, reading)
+    assert clock_advanced(reading, None), "the first frame always counts as a change"

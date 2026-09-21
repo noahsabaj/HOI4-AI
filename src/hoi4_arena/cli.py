@@ -62,6 +62,13 @@ def main():
     template.add_argument("rules")
     template.add_argument("name")
     template.add_argument("--rect", nargs=4, type=int, required=True, metavar=("X", "Y", "W", "H"))
+    template.add_argument(
+        "--max-mae",
+        type=int,
+        default=5,
+        help="How far this crop may drift and still match. The default of 5 is tighter "
+        "than a live HUD holds still: measure the drift before trusting it.",
+    )
     clock = sub.add_parser("clock", help="Calibrate the changing-clock ROI collection requires")
     clock.add_argument("screenshot")
     clock.add_argument("rules")
@@ -71,6 +78,18 @@ def main():
     generation = sub.add_parser("generate-map")
     generation.add_argument("output")
     generation.add_argument("--game", required=True)
+    generation.add_argument(
+        "--undefended",
+        choices=["BLU", "RED"],
+        help="Field no divisions for this country. A diagnostic, not a playable arena: "
+        "an empty front an AI never enters says it is not attacking at all.",
+    )
+    generation.add_argument(
+        "--victory-points-on-border",
+        action="store_true",
+        help="Put every victory point on the border column, so one crossing takes the "
+        "whole surrender weight. Used to put a real capitulation on screen to template.",
+    )
     inspection = sub.add_parser(
         "audit-map", help="Check a generated arena for references the engine cannot resolve"
     )
@@ -176,7 +195,12 @@ def _dispatch(command, args):
     elif command == "generate-map":
         from .mapgen import audit, generate
 
-        result = generate(args["game"], args["output"])
+        result = generate(
+            args["game"],
+            args["output"],
+            undefended=args["undefended"],
+            victory_points_on_border=args["victory_points_on_border"],
+        )
         result["audit"] = audit(args["output"])
         # The map is on disk either way; a bad one must not exit zero, because the next
         # thing that reads it is the game, which crashes instead of reporting.

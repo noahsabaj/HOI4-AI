@@ -1,4 +1,4 @@
-# Verification status — 2026-09-20
+# Verification status — 2026-09-21
 
 The code implements an initial visual learning pipeline. It does not yet deliver reliable self-play or a winning multiplayer agent.
 
@@ -16,13 +16,16 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 | LAN screenshot timing | `artifacts/pairing-roundtrip-downscaled.json`, 25 captures per mode | Live path (five views plus template crops) p50 83.9 ms, **p95 99.5 ms**, 0.87 MB; the full frame it replaces is p95 433.8 ms, 33.2 MB |
 | Arena match start | `artifacts/mods/infantry-arena-v10`, five minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | Match starts and runs: war declared, clock advanced 12:00 1 Jan to 20:00 2 Jan 1936, no crash |
 | Combat resolution | `infantry-arena-v12`, live match, 5 March to mid-May 1936 at game speed four | Battle joined and resolved: 2 Blue divisions attacked 1 Red defender, tooltip gave a running estimate, attacker repulsed, no province changed hands |
-| Victory detection | Arithmetic below, from `00_defines.lua` and the live map | **Not reachable at the old province size.** Needed the enemy capital plus two outposts, about five hops and 130 in-game days away, through a front symmetric infantry cannot break |
+| Victory detection | `capitulation-harness-v2`, live match 1936-01-01 to 1940-05-05 | **Still not reached, and for a different reason than was written here.** Blue held Red's entire victory-point weight from 1936-01-13 and Red had not capitulated 52 months later. Victory points are not what decides a surrender here; see below |
 | Rescaled map starts a match | `infantry-arena-v13`, `logs/game.log`, `logs/error.log`, live screen | `Loaded 1537 provinces`, `[[ Launching SINGLEPLAYER-game ]] Start-date: 1936.1.1.12`, war declared, no crash dump, and it ran to 11 April 1936 at game speed four. Zero `MAP_ERROR`, `TOO LARGE BOX`, `has no continent`, `no pixels` or naval-base lines. State names resolve (`A Plains province in West 13`) |
 | Red's AI taking ground | Two runs, `infantry-arena-v13` and `-v14`, debug tooltip at ~100 in-game days each | **None, either time.** `Surrender level: 0.00` with controlled and owned victory points equal. Blue sat still by design. v14 added a field marshal, three corps commanders and a `front_control` strategy with `execute_order = yes` to both sides; all of it loaded with no error and the outcome did not change |
+| An AI against an enemy with no army at all | `capitulation-harness-v2` (Red fielding zero divisions), one match run 1936-01-01 to 1940-05-05 | **The AI advances, then stops.** Playing Red, so Blue was AI-driven throughout: Blue's owned victory-point weight rose from 950 to 1400 between 1936-01-17 and 1936-10-13 against no opposition whatever, then read exactly 1400 again on 1938-05-03, 1938-07-08 and 1940-05-05. It took roughly 47% of an undefended country and then took nothing more for 43 in-game months |
+| Four-year unattended run | Same match, at game speed four to five | 1936-01-01 to 1940-05-05 with no crash dump and no new `error.log` line. Far past the 1800-second soak, and the longest the arena has run |
+| Live screen stability | Four worker captures at 3840x2160, two running and two paused | **Nothing on screen holds still to within the hardcoded 5 MAE.** The HUD icon row drifts a mean of 6.9 between two captures seconds apart while the game runs, and 1.6 paused. The running drift is the day/night terminator sweeping the map under a translucent HUD |
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
-Latest automated checks: **65 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
+Latest automated checks: **81 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
 
 Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a regression test:
 
@@ -51,6 +54,26 @@ agree, so any reset skew past three seconds came back `unconfirmed_pair_result` 
 invalidated the episode. That is every timeout draw, which is nearly every match while a
 decisive result is out of reach. Both sides now take the later start and expire within a
 tick of each other.
+
+Two more, found on 2026-09-21 by measuring a live screen rather than by reading code, and
+each fixed with a regression test:
+
+- **Every template tolerance was hardcoded at 5, which no live screen satisfies.** A
+  `healthy` rectangle cut from one capture rejected the next capture of the same screen at
+  7.3. `add_template` now takes `max_mae`, exposed as `template --max-mae`, bounded to
+  1..96 because above that a crop matches any other crop.
+- **`game_clock_stalled` was unreachable.** The loop tested successive clock crops with
+  `np.array_equal`, and two captures of a *paused* clock differ by a mean of 6.4, so the
+  60-second stall budget was reset on every frame. `clock_advanced` now compares with a
+  tolerance of 15, measured to sit between a paused clock at 6.4 and an advancing one at
+  44.8.
+
+The generator grew two diagnostic options in the same pass, both recorded in
+`generation.json` and neither producing a playable arena: `--undefended BLU|RED` fields no
+divisions for that side, which is what separated "the AI attacks and fails" from "the AI
+does not attack"; and `--victory-points-on-border`, which masses a side's whole 35-point
+weight on one border province. The second was built to force a capitulation and did not,
+which is how the victory-point assumption above came to be refuted.
 
 These were latent defects in code paths that have never run against a live match; fixing them does not constitute live verification.
 
@@ -164,15 +187,29 @@ are engine-generated, and the arena already has one: the debug tooltip reads
 The 1800-second soak at speed one covered about 37 days: barely more than a single province
 crossing. Nothing dispersed and nothing failed — the armies had not finished walking.
 
-**Victory detection is not reachable in the arena as generated**, for three compounding
-reasons, each measured rather than assumed:
+**Taking every victory point a country owns does not capitulate it.** This was written
+here as settled arithmetic — "surrender worth is victory points alone" — and it is wrong.
+The measurement, on 2026-09-21: `capitulation-harness-v2` gives Red a single province
+carrying its whole 35-point weight, on the border column, with no divisions anywhere in the
+country. Blue's divisions took that province on 1936-01-13, and the debug tooltip read
+`Province ID = 1524 ... Owner = Red / Controller = Blue / Local VP: 35`. Red had not
+capitulated by 1940-05-05, 52 months later and long past
+`DAYS_OF_WAR_BEFORE_SURRENDER = 7`.
 
-- `BASE_SURRENDER_LIMIT = 0.8` and surrender worth is victory points alone
-  (`VICTORY_POINT_WORTH_FACTOR = 10`, and the in-game tooltip in
-  `waroverview_l_english.yml:33` states the quantity as the fraction of victory points
-  controlled). The arena's 35 VP weight means an attacker needs 28: the 20-point capital
-  **plus at least two of the three 5-point outposts**. All three outposts without the
-  capital is 15 and capitulates nobody.
+What the tooltip actually reports is not the 35 points the generator places. It reads
+`Owned VPs: 950` for a fresh 30-state country whose placed victory points total 35, and
+`State value: 22.3` for a state holding none — 30 states at about 31.7 is roughly 950. The
+quantity surrender is measured against is therefore territorial, and the four victory-point
+provinces are a small part of it. Blue's own figure rose from 950 to 1400 as it occupied
+Red, which is the same number moving with ground rather than with victory points.
+
+Two defines that were quoted here as one number are two, in different tables of
+`00_defines.lua`: `BASE_SURRENDER_LIMIT = 0.8` sits in `NCountry` and is the occupation
+fraction, while `BASE_SURRENDER_LEVEL = 1.0` in `NDiplomacy` is commented "Surrender when
+level reached". `DAYS_OF_WAR_BEFORE_SURRENDER = 7` is a hard floor and was confirmed.
+
+Two constraints from the earlier entry do still hold and are unaffected:
+
 - Each capital sits 1,583 px behind its front by construction, about five province hops, so
   roughly 130 in-game days of marching before any fighting.
 - Symmetric unsupported infantry does not break through. Six `infantry_equipment_1`
@@ -184,17 +221,34 @@ been a worry: no stock modifier ties stability to `surrender_limit` at all, and 
 `surrender_limit` entry in `00_static_modifiers.txt` is `-0.3` inside
 `war_support_bad_modifier`. Max war support pins the limit at 0.8 rather than raising it.
 
-**There is no bare "game over" screen to template.** What the engine actually shows, and
-what a terminal rule would have to anchor on: `surrendered_country_popup` (520x320, centred,
-`gfx/interface/capitulation_bg.dds`); `peaceconference_full_window`, which is
-`width=100% height=100%` and covers the HUD completely — **the winner and the loser get the
-same window**, distinguished only by the top-art sprite
-(`GFX_top_art_winning_conference` vs `GFX_top_art_losing_conference`), so win and loss
-templates must anchor on that banner and not on the screen as a whole; and the end-game
-`playthrough_overview_window` with its CONTINUE/QUIT buttons. `annex_everything` is a peace
-conference cost discount, not an auto-annex.
+**There is no bare "game over" screen to template**, and the end-game window is not a
+fallback either. Read out of the shipped files on 2026-09-21 and adversarially re-checked:
 
-**The match-side vision rules have never been calibrated.** `ScreenRules` ends a match only
+- A one-versus-one capitulation **does** open a conference. The engine's own capitulation
+  path creates it (`"Creating peace conference between %s and %s"` sits beside the surrender
+  log in `country.cpp`), a single-winner conference is a first-class serialized state
+  (`solo_winner`), and the peace-conference AI explicitly refuses to run for a human
+  country. The only annex-on-war-end path in the shipped files is the civil-war one.
+- The sequence is `surrendered_country_popup` (520x320) -> `peaceconference_full_window`
+  (100% x 100%) -> "Calculating Effects..." -> `peace_summary_popup_window` (480x382) ->
+  back to the map.
+- **`playthrough_overview_window` never fires on conquest.** HOI4 has no victory-condition
+  concept anywhere in script or engine; the only end-of-game define is `END_DATE = 1949.1.1.1`.
+  An earlier version of this entry listed it as a terminal screen to template. It is not one.
+- `surrendered_country_popup` is `orientation = center`, `position = { x = -225 y = -160 }`,
+  `size = { 520 320 }`, `moveable = yes`, on `GFX_popup_capitulation_bg` — a 527x322 texture,
+  so the art is 7 px wider than the declared window. **`exile_country_popup` reuses the same
+  sprite and the same geometry byte for byte**, so a template cut from the frame art cannot
+  tell the two apart; it has to anchor on the title text box.
+- The winner and the loser get the same `peaceconference_full_window`, distinguished only by
+  the top-art sprite (`GFX_top_art_winning_conference` vs `GFX_top_art_losing_conference`),
+  so win and loss templates must anchor on that banner and not on the screen as a whole.
+- `annex_everything` is **not** an auto-annex, and it is **not** a peace-conference cost
+  discount either, which is what this document previously claimed. Its two discount lines are
+  commented out in `common/wargoals/00_invasion.txt:145-146`, so it contributes nothing to the
+  cost line, unlike `take_state`/`take_core_state` which have live values.
+
+**The match-side vision rules are two-sevenths calibrated.** `ScreenRules` ends a match only
 on a `win`, `loss`, `disconnect` or `desync` template, and the only two `rules.json` files on
 disk hold the four lobby templates and no `clock_rect`, so `require_match_rules()` raises.
 An earlier version of this entry said a match ending on an unrecognised screen is silently
@@ -206,6 +260,37 @@ raises `terminal_screen_never_confirmed`, and a timeout without a healthy HUD ra
 if it does not, the HUD keeps matching, the loop keeps stepping, and the match ends as an
 ordinary timeout draw. The requirement that follows is a calibrated template for that
 popup, not a louder failure.
+
+**Calibration, 2026-09-21: `healthy` and `clock_rect` are cut from a live match; the five
+terminal and setup rules are not.** `artifacts/calibration-live/rules.json` holds them at
+3840x2160, taken through the worker off a running match on `capitulation-harness-v2`.
+Getting them exposed three things worth more than the templates:
+
+| | |
+|---|---|
+| HUD icon row, two captures seconds apart, game running | mean drift **6.9** |
+| Same rectangle, game paused | mean drift **1.6** |
+| Clock crop, game running | mean drift **44.8** |
+| Clock crop, game **paused** | mean drift **6.4** |
+| Speed bars, running versus paused | mean drift **0.6** |
+| Play/pause glyph, running versus paused | **26.3**, against 15.6 running-versus-running |
+
+- **Nothing on a live screen holds still to within the hardcoded 5.** The first `healthy`
+  template was cut and then rejected the very next capture at 7.3. The drift is the day/night
+  terminator sweeping the map under a translucent HUD; it drops to 1.6 when the game is
+  paused. `template` now takes `--max-mae`, and `healthy` is calibrated at 15 on
+  `[168, 64, 600, 52]`, verified against four captures spanning four in-game years, running
+  and paused.
+- **The clock stall detector could never fire.** The loop compared successive clock crops
+  with `np.array_equal`, and two captures of a *paused* clock differ by 6.4, so every frame
+  looked like a fresh tick and `game_clock_stalled` was unreachable. Now compared with a
+  tolerance of 15, which sits between the paused 6.4 and the advancing 44.8.
+- **`running_speed_two` cannot be implemented on the speed bars.** They read 0.6 between a
+  running and a paused game: the bars show the *selected* speed, not whether time is moving.
+  The play/pause glyph does separate the two, but at 26.3 against a 15.6 running-versus-running
+  drift, which is a thin margin for a gate that invalidates an episode. With the clock fix
+  above the loop is no longer blind to a pause, but this rule still needs a decision — and
+  its name still asserts speed two, which measurement has already ruled out as too slow.
 
 Two smaller results from the same pass, both contrary to what was assumed: generals are a
 **degrade, not a blocker** (`PLANNING_CAP_NO_HQ_SCALING = 0.8`, and about 60 stock 1936
@@ -264,10 +349,12 @@ Five Hz is therefore reachable rather than excluded by construction, but it is *
 
 Open acceptance work:
 
-- Decide how the arena reaches a decision at all. Its provinces are 150x the area of a stock land province, so every crossing costs 26 in-game days and each capital is five hops behind its front. The options are to cut the province size (the generator is already parametric in `COLUMNS_PER_HALF` and `ROWS`, but states, buildings, supply and victory points all scale with it), to raise army speed to suit the scale, or to accept that matches are scored on territory rather than capitulation. Nothing else on this list resolves until this does.
-- Calibrate the match-side screen rules. `win`, `loss`, `healthy`, `disconnect` and `desync` have never been written for a match, and `require_match_rules()` raises without them. The win and loss templates must anchor on the peace conference's top-art banner, since both sides get the same full-screen window.
-- Calibrate a template for `surrendered_country_popup`. It is 520x320 and centred, so it need not cover the `healthy` rectangle; if it does not, a capitulation reads as an ordinary timeout draw.
-- Work out why Red's AI takes no ground. Two of the three suspects are now eliminated: province size is no longer the explanation, and giving both sides a field marshal, three corps commanders and a `front_control` strategy with `execute_order = yes` changed nothing over a hundred in-game days. What has **not** been established is whether Red is attacking and failing or not attacking at all — the camera could not be zoomed out to the front during either run, so no battle was ever seen. Settle that first, because a symmetric front that repels every attack is a balance problem and an idle AI is a scripting one. A single unsupported division attacking a dug-in one loses in about two days, so failing attacks would leave the map exactly as still as an idle army.
+- Decide how the arena reaches a decision at all. Capitulation is measured against something territorial, not against the four victory points the generator places, so a decision means occupying most of a 600-province country. The harness run took 47% of an undefended Red and stalled. The options are a much smaller province grid, a much larger army, or scoring matches on territory rather than capitulation. Nothing else on this list resolves until this does.
+- **Build a small-map harness so a capitulation can be produced on demand.** This is what blocks the five uncalibrated rules. `--victory-points-on-border` was built on the assumption that victory points decide a surrender; that assumption is now refuted, so massing them achieves nothing on a full-size map. The fix is to make `COLUMNS_PER_HALF`, `ROWS`, `STATE_COLUMNS` and `STATE_ROWS` per-call arguments rather than module constants, and generate a grid small enough that an undefended country is overrun in days. The peace conference and the surrender popup are engine UI and look the same on any map, so templates cut there transfer to the playable arena.
+- Calibrate the remaining five rules: `win`, `loss`, `ready`, `disconnect`, `desync`. `healthy` and `clock_rect` are done. `require_match_rules()` still raises. The win and loss templates must anchor on the peace conference's top-art banner, since both sides get the same full-screen window.
+- Calibrate a template for `surrendered_country_popup`, anchored on its title box rather than its frame, because `exile_country_popup` is byte-identical in background and geometry. It is 520x320 and centred, so it need not cover the `healthy` rectangle; if it does not, a capitulation reads as an ordinary timeout draw.
+- Decide what `running_speed_two` should be. The speed bars cannot distinguish a paused game from a running one (0.6 MAE), the play/pause glyph separates them only at 26.3 against a 15.6 self-drift, and the rule's name asserts a speed that measurement has ruled out.
+- Work out why an AI that *does* advance stops. The old question — attacking and failing, or never attacking — is settled: against a Red with no divisions anywhere, where a failed attack is not possible, Blue took roughly 47% of the country in nine months and then took nothing for the next 43. So the AI issues advance orders and then ceases to. Province size and missing command are both eliminated as explanations. What has not been established is what it is waiting for: a supply limit, a front it considers held, or an objective it thinks it has reached.
 - Run a full 1800-second match at speed four and verify armies, supply over time, fog, multiple routes and side symmetry in gameplay. Match start and combat resolution are now verified.
 - Pairing works; complete two-PC lobby/reset calibration and recovery checks. Menu input and watchdog release are verified remotely; match behavior remains untested.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and F12 under load. The worker now releases held input even when stdout fails; live regression remains needed.
