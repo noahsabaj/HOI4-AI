@@ -10,6 +10,7 @@ from PIL import Image
 from torch import nn
 
 from hoi4_arena.actions import GRID, SLOTS, VOCAB, decode, encode_interval
+from hoi4_arena.dataset import CLIP_FRAMES
 from hoi4_arena.desktop import DesktopError, read_reply
 from hoi4_arena.environment import ArenaPair
 from hoi4_arena.learning import League, gae, paired_evaluation, ppo_loss, save_checkpoint
@@ -671,13 +672,26 @@ def test_deterministic_action_equals_the_head_argmax():
 def test_ppo_excludes_deterministic_evaluation_rollouts():
     from hoi4_arena.runner import ppo_exclusion
 
-    on_policy = {"complete": True, "valid": True, "deterministic": False}
+    on_policy = {
+        "complete": True,
+        "valid": True,
+        "deterministic": False,
+        "clip_frames": CLIP_FRAMES,
+    }
     assert ppo_exclusion(on_policy) is None
     assert ppo_exclusion({**on_policy, "deterministic": True}) is not None
     assert ppo_exclusion({**on_policy, "valid": False}) is not None
     assert ppo_exclusion({**on_policy, "complete": False}) is not None
     # A manifest written before the deterministic key existed is still on-policy.
-    assert ppo_exclusion({"complete": True, "valid": True}) is None
+    assert ppo_exclusion({"complete": True, "valid": True, "clip_frames": CLIP_FRAMES}) is None
+    # A clip of a different length is not. The encoder places tokens with RoPE, so the
+    # wrong length replays silently rather than raising, and silence is the hazard.
+    assert ppo_exclusion({**on_policy, "clip_frames": CLIP_FRAMES * 2}) is not None
+    # Rollouts predating the field were collected at sixteen, so that is what absence
+    # means -- not "whatever the policy reads today".
+    assert ppo_exclusion({"complete": True, "valid": True}) == ppo_exclusion(
+        {**on_policy, "clip_frames": 16}
+    )
 
 
 def test_clock_rect_must_be_integral(tmp_path):

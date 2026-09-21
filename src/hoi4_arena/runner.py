@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .actions import SLOTS
-from .dataset import normalize, views
+from .dataset import CAPTURE_HZ, CLIP_FRAMES, normalize, views
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
 from .learning import file_hash
@@ -46,6 +46,13 @@ def ppo_exclusion(meta):
     Greedy evaluation rollouts are not samples from the behavior policy: their stored
     old_logp is the likelihood of an argmax, so the PPO ratio would be meaningless.
     Evaluation data never trains.
+
+    A rollout collected under a different clip length is excluded for the same reason,
+    and it is the quieter failure of the two. The encoder positions tokens with RoPE, so
+    a sixteen-frame clip replays through an eight-frame policy without complaint -- the
+    shapes fit, nothing raises, and the ratio is simply computed against a likelihood
+    from an observation the current policy never sees. Rollouts predating the field were
+    all sixteen.
     """
     if not meta.get("complete"):
         return "incomplete"
@@ -53,6 +60,9 @@ def ppo_exclusion(meta):
         return "invalid"
     if meta.get("deterministic"):
         return "deterministic evaluation rollout, not on-policy"
+    frames = meta.get("clip_frames", 16)
+    if frames != CLIP_FRAMES:
+        return f"collected against a {frames}-frame clip; the policy now reads {CLIP_FRAMES}"
     return None
 
 
@@ -162,7 +172,7 @@ class Actor:
         tiles = torch.as_tensor(tiles, device=device)
         self.history.append((timestamp, global_view))
         times = np.array([t for t, _ in self.history])
-        desired = timestamp - np.arange(15, -1, -1) / 7.5
+        desired = timestamp - np.arange(CLIP_FRAMES - 1, -1, -1) / CAPTURE_HZ
         ids = np.searchsorted(times, desired, side="right") - 1
         clip = torch.stack([self.history[max(0, int(i))][1] for i in ids])
         before = (
@@ -239,6 +249,7 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         "config_seed": config.get("seed", 42),
         "deterministic": deterministic,
         "record_full": record_full,
+        "clip_frames": CLIP_FRAMES,
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     reason = None

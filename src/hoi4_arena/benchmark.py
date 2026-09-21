@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .dataset import CAPTURE_HZ, CLIP_FRAMES
 from .desktop import Desktop
 
 MODEL_ID = "galilai-group/LeVJEPA-VideoMix-Large"
@@ -72,7 +73,7 @@ def benchmark(model_path, output, iterations=30, offline=False, command=None):
             if not frame_path.exists():
                 raise RuntimeError("First run live capture to supply a real screenshot")
             x = preprocess(np.asarray(Image.open(frame_path).convert("RGB")))
-            clip = x[None, :, None].expand(1, 3, 16, 224, 224).cuda().to(torch.bfloat16)
+            clip = x[None, :, None].expand(1, 3, CLIP_FRAMES, 224, 224).cuda().to(torch.bfloat16)
             model.train()
             optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
             # Two updates allocate optimizer moments and expose steady-state memory.
@@ -89,10 +90,10 @@ def benchmark(model_path, output, iterations=30, offline=False, command=None):
             times, capture_times, memory = [], [], []
             with Desktop(command) as desktop:
                 frames = []
-                for _ in range(16):
+                for _ in range(CLIP_FRAMES):
                     f = desktop.capture()
                     frames.append(preprocess(f.rgb))
-                    time.sleep(1 / 7.5)
+                    time.sleep(1 / CAPTURE_HZ)
                 Image.fromarray(f.rgb).save(output / "screen.png")
                 report["capture_shape"] = list(f.rgb.shape)
                 report["capture_backend"] = desktop.attached["backend"]
@@ -103,7 +104,7 @@ def benchmark(model_path, output, iterations=30, offline=False, command=None):
                         f = desktop.capture()
                         capture_end = time.perf_counter()
                         frames.append(preprocess(f.rgb))
-                        frames = frames[-16:]
+                        frames = frames[-CLIP_FRAMES:]
                         x = torch.stack(frames, 1)[None].cuda().to(torch.bfloat16)
                         torch.cuda.synchronize()
                         start = time.perf_counter()
