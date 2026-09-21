@@ -26,14 +26,14 @@ The worker only attaches to `hoi4.exe`. It requires foreground focus to apply in
 
 ## Second PC
 
-The prepared private bundle is `artifacts/pairing/second-pc.zip`. Extract it on the peer machine, open HOI4 and run `Start-Worker.ps1`. It prints `HOI4 worker ready`. No Python is needed there. Keep the ZIP private: it contains pairing credentials.
+The prepared private bundle is written to the path you pass to `bundle-peer`. Extract it on the peer machine, open HOI4 and run `Start-Worker.ps1`. It prints `HOI4 worker ready`. No Python is needed there. Keep the ZIP private: it contains pairing credentials.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe probe-peer artifacts/pairing/peer.json
 .venv\Scripts\hoi4-arena.exe capture artifacts/peer.png --peer artifacts/pairing/peer.json
 ```
 
-The connection uses a pinned TLS certificate, a random token and the coordinator's source IP. It exposes worker operations, not a remote shell. The prepared addresses are coordinator `<coordinator-address>`, peer `<peer-address>`, TCP port `<worker-port>`; DHCP changes require updating configuration. No firewall rules are changed automatically. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed. Full screenshot round-trip p95 was 411 ms over 20 menu captures; the transport still needs optimization before the 5 Hz runtime gate.
+The connection uses a pinned TLS certificate, a random token and the coordinator's source IP. It exposes worker operations, not a remote shell. Both addresses and the port are supplied to `bundle-peer` and stored in the generated config, which is ignored by Git; a DHCP change means regenerating it. No firewall rules are changed automatically. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed. Full screenshot round-trip p95 was 411 ms over 20 menu captures; the transport still needs optimization before the 5 Hz runtime gate.
 
 ## Demonstrations and learning
 
