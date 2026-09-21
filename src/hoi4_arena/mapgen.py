@@ -181,10 +181,19 @@ def shore_heights(ground):
     return np.round(middle + half * ramp).astype(np.uint8)
 
 
-def generate(game, output):
+def generate(game, output, *, undefended=None, victory_points_on_border=False):
+    """Write an arena. The two keyword arguments build diagnostics, not playable arenas.
+
+    `undefended` fields no divisions for one side. `victory_points_on_border` moves every
+    victory point onto the border column, so a single crossing takes the whole surrender
+    weight. Both exist to make something happen on screen that a balanced arena cannot be
+    asked to produce on demand, and `generation.json` records which were used.
+    """
     game, root = Path(game), Path(output).resolve()
     if not (game / "map/provinces.bmp").exists():
         raise ValueError("Point --game at the installed HOI4 directory")
+    if undefended is not None and undefended not in COUNTRY_COLOUR:
+        raise ValueError("undefended names a country tag: BLU or RED")
     root.mkdir(parents=True, exist_ok=False)
 
     def write(name, text):
@@ -430,7 +439,17 @@ def generate(game, output):
             if half == 0
             else [width - 1 - width // 4, height - 1 - height // 2]
         )
-        capital = min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - centre))
+        # The border column: one province per land row, nearest the vertical seam. The
+        # starting divisions stand here, and the harness puts every victory point here
+        # too, so it is computed once and shared.
+        border = sorted(province_list, key=lambda i: abs(points[i - 1, 0] - width / 2))[
+            :divisions_per_country
+        ]
+        capital = (
+            min(border, key=lambda i: abs(points[i - 1, 1] - height / 2))
+            if victory_points_on_border
+            else min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - centre))
+        )
         capitals.append(capital)
         for province in province_list:
             state = half * states_per_country + state_cell(province) + 1
@@ -441,11 +460,26 @@ def generate(game, output):
         # ends a match the moment one province changes hands. Four points spread across
         # the half make the result follow the front rather than a single tile. Surrender
         # needs 80% of the worth, so an attacker must take the capital and two outposts.
-        spread = sorted(
-            province_list, key=lambda i: -np.linalg.norm(points[i - 1] - points[capital - 1])
+        #
+        # The harness inverts that on purpose: it masses the entire 35-point weight onto
+        # one border province, directly across the seam from the enemy's own starting
+        # division. One order takes 100% of a side's victory points, which is the only
+        # way to ask for a capitulation on demand. It is a calibration fixture, and it
+        # is also the measurement of whether victory points alone decide a surrender:
+        # if taking all of them does not capitulate, something else carries the weight.
+        if victory_points_on_border:
+            outposts = []
+        else:
+            spread = sorted(
+                province_list,
+                key=lambda i: -np.linalg.norm(points[i - 1] - points[capital - 1]),
+            )
+            outposts = [spread[0], spread[len(spread) // 2], spread[-2]]
+        victory_points[tag] = (
+            {capital: 35}
+            if victory_points_on_border
+            else {capital: 20, **{p: 5 for p in outposts if p != capital}}
         )
-        outposts = [spread[0], spread[len(spread) // 2], spread[-2]]
-        victory_points[tag] = {capital: 20, **{p: 5 for p in outposts if p != capital}}
         write(
             f"common/countries/{tag}.txt",
             f"graphical_culture = western_european_gfx\ngraphical_culture_2d = western_european_2d\n"
@@ -461,15 +495,17 @@ def generate(game, output):
             )
             + f"set_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nadd_ideas = arena_march_speed\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n",
         )
-        front = sorted(province_list, key=lambda i: abs(points[i - 1, 0] - width / 2))[
-            :divisions_per_country
-        ]
         regiments = " ".join(
             f"infantry = {{ x = {x} y = {y} }}" for x in range(2) for y in range(3)
         )
+        # An undefended side keeps its template, its equipment and its generals and
+        # fields nothing. That separates the two readings a motionless map cannot tell
+        # apart: an AI that never attacks leaves an empty front untouched, and an AI
+        # whose every attack fails does not.
+        deployed = [] if tag == undefended else border
         divisions = "\n".join(
             f'division = {{ name = "Infantry {n}" location = {p} division_template = "Arena Infantry" start_experience_factor = 0.3 start_equipment_factor = 1 }}'
-            for n, p in enumerate(front, 1)
+            for n, p in enumerate(deployed, 1)
         )
         write(
             f"history/units/{tag}_1936.txt",
@@ -752,6 +788,8 @@ def generate(game, output):
         "land_provinces_per_country": len(left_land),
         "states_per_country": states_per_country,
         "divisions_per_country": divisions_per_country,
+        "undefended": undefended,
+        "victory_points_on_border": victory_points_on_border,
         "army_speed_factor": ARMY_SPEED_FACTOR,
         "coastal_land_provinces": sum(1 for i in neighbours if land[i - 1] and coastal[i]),
         "victory_points_per_country": len(victory_points["BLU"]),

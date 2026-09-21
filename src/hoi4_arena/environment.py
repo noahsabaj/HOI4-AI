@@ -10,7 +10,7 @@ import numpy as np
 
 from .actions import GRID, PERIOD, SLOTS, VOCAB, decode
 from .desktop import DesktopError
-from .vision import TERMINAL_GRACE_FRAMES, UNKNOWN_FRAMES, run_setup
+from .vision import TERMINAL_GRACE_FRAMES, UNKNOWN_FRAMES, clock_advanced, run_setup
 
 log = logging.getLogger(__name__)
 
@@ -184,7 +184,7 @@ class ArenaEnv(gym.Env):
                 clock = screen.clock_pixels()
                 if clock.size == 0:
                     raise DesktopError("invalid_clock_calibration")
-                if self.clock_pixels is None or not np.array_equal(clock, self.clock_pixels):
+                if clock_advanced(clock, self.clock_pixels):
                     self.clock_changed = time.monotonic()
                     self.clock_pixels = clock.copy()
                 elif time.monotonic() - self.clock_changed > 60:

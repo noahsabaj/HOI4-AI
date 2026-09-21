@@ -11,6 +11,32 @@ from PIL import Image
 # A screen state must repeat this many times before it is believed.
 OUTCOME_FRAMES = 3
 
+# How far a crop may drift from its template and still count as the same screen. Measured
+# on a live 3840x2160 match on 2026-09-21: two captures seconds apart differ by a mean of
+# 6.9 over the HUD icon row while the game runs, and 1.6 with it paused. The running drift
+# is the day/night terminator sweeping the map under a translucent HUD, so nothing on
+# screen holds still to within 5. A rule calibrated at the old fixed 5 rejects the very
+# screen it was cut from one frame later.
+DEFAULT_MAX_MAE = 5
+
+# How far two captures of the clock may differ and still be the same reading. The match
+# loop compared them for exact equality, which no two captures of this game ever satisfy:
+# measured on 2026-09-21, the clock crop of a *paused* game differs from itself by a mean
+# of 6.4 between captures, and by 44.8 while the clock is advancing. Exact equality made
+# every frame look like a fresh tick, so `game_clock_stalled` could never fire and a
+# paused game would have been stepped for the full match. Sits between the two.
+CLOCK_STILL_MAE = 15.0
+
+
+def clock_advanced(current, previous):
+    """Whether the clock reads differently than it did, against capture noise."""
+    if previous is None or current.shape != previous.shape:
+        return True
+    return float(np.abs(current.astype(np.float32) - previous.astype(np.float32)).mean()) > (
+        CLOCK_STILL_MAE
+    )
+
+
 # Two separate budgets guard a screen that has stopped matching "healthy".
 #
 # UNKNOWN_FRAMES bounds a screen matching no template at all: nothing is in flight, so
@@ -45,19 +71,25 @@ def _checked_rect(image, rect, label):
     return [int(v) for v in rect]
 
 
-def add_template(screenshot, rules, name, rect):
+def add_template(screenshot, rules, name, rect, max_mae=DEFAULT_MAX_MAE):
     import re
 
     if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
         raise ValueError("Use a simple rule name")
+    if not 1 <= max_mae <= 96:
+        raise ValueError("max_mae outside 1..96 either never matches or matches anything")
     path, image, spec = _open_spec(screenshot, rules)
     x, y, w, h = _checked_rect(image, rect, "Template")
     if name in spec["rules"]:
         raise ValueError("Use a new rule name or explicitly remove the old calibration")
     image.crop((x, y, x + w, y + h)).save(path.parent / f"{name}.png")
-    spec["rules"][name] = {"rect": [x, y, w, h], "template": f"{name}.png", "max_mae": 5}
+    spec["rules"][name] = {
+        "rect": [x, y, w, h],
+        "template": f"{name}.png",
+        "max_mae": int(max_mae),
+    }
     path.write_text(json.dumps(spec, indent=2))
-    return {"rule": name, "calibration": str(path)}
+    return {"rule": name, "calibration": str(path), "max_mae": int(max_mae)}
 
 
 def set_clock_rect(screenshot, rules, rect):
@@ -119,7 +151,7 @@ class ScreenRules:
         if target.shape != crop.shape:
             raise ValueError("Template and screen region disagree")
         return float(np.abs(crop.astype(np.float32) - target).mean()) <= self.rules[name].get(
-            "max_mae", 5
+            "max_mae", DEFAULT_MAX_MAE
         )
 
     def matches(self, name, rgb):
