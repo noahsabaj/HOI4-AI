@@ -13,12 +13,12 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 | Held input watchdog | `artifacts/worker-smoke/result.json` | Held Shift released after timeout |
 | Live worker mouse input | `artifacts/worker-smoke/click-before.png`, `click-after.png` | Menu advanced using a 250 ms button hold |
 | TLS peer transport | `artifacts/pairing-kat/integration/report.json` | Actual KATHPINVICTUS authenticated; foreground 3840×2160 capture, menu click, Escape and held-Shift watchdog verified |
-| LAN screenshot timing | Same report, 20 menu captures | Status-request p95 1.51 ms; full screenshot round trip p95 **411.15 ms**, exceeds the 200 ms decision budget before inference |
+| LAN screenshot timing | `artifacts/pairing-roundtrip-downscaled.json`, 25 captures per mode | Live path (five views plus template crops) p50 83.9 ms, **p95 99.5 ms**, 0.87 MB; the full frame it replaces is p95 433.8 ms, 33.2 MB |
 | Arena match start | `artifacts/mods/infantry-arena-v10`, five minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | Match starts and runs: war declared, clock advanced 12:00 1 Jan to 20:00 2 Jan 1936, no crash. Combat, supply over time and victory detection **not** yet exercised |
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
-Latest automated checks: **63 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
+Latest automated checks: **65 Python tests, 7 Rust tests, Ruff lint/format, Cargo format and Clippy pass**. Locked dependency installation and packaged CLI help also pass. Each fix below was mutation-tested: reverting it fails at least one test.
 
 Defects found by an audit of the match loop on 2026-09-20 and fixed, each with a regression test:
 
@@ -103,6 +103,24 @@ has not been run. No crash dump, no line in `error.log` matching `MAP_ERROR`, `n
 `has no continent` or `no pixels`, and a steady 2.7 GB working set. That is past the window
 in which a missing naval-base placement is documented to crash an AI evaluation loop.
 
+Two further map defects, found by looking at the running game rather than at a file:
+
+- **Blue rendered green and Red rendered pale cyan** while their flags were correct. The
+  map colour comes from `common/countries/colors.txt`, where the colour space is named:
+  `color = rgb { ... }`. A bare `color = { ... }` in a country file is not the map colour,
+  so the arena's tags fell back to engine-assigned defaults. The flags were right only
+  because they are literal pixels. Both now read one constant.
+- **The map was far too small for the camera.** At 2048x1536 the zoom-out limit, which is
+  fixed in world units rather than fitted to the map, showed sky above and below the map
+  and more than one map width across; since HOI4 wraps horizontally that drew the same two
+  countries two and a half times over, only one copy labelled. The arena is now 5632x2048,
+  the stock map's exact dimensions, with the same 192 provinces and the same 48 land
+  provinces a side. Largest province box 379x213, inside the 704x256 that triggers
+  TOO LARGE BOX. Confirmed on screen: at the zoom-out limit the view holds exactly one
+  world, Red wrapping to both sides of Blue, with no sky below the map and no unnamed
+  repeats. Red appearing twice is the wrap itself and is correct: a world with two
+  countries in it looks like that from either one.
+
 **Still unverified:** combat resolution, victory detection, and anything on two machines.
 The soak ran with RED under an AI that has no strategy plans, so the divisions dispersed but
 nothing tested a fight.
@@ -125,17 +143,24 @@ Capture and preprocessing, measured locally on 2026-09-20:
 | Worker CPU to produce five views | n/a | 18.0 ms p50 |
 | Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
 
-Two-PC round trip, re-measured 2026-09-20 and **still not the number that matters**. The
-peer answered 25 full-frame captures at p50 424.8 ms and p95 437.4 ms, consistent with the
-earlier 411 ms p95, because the peer was running a worker built before worker-side
-downscaling: it accepts `views` and `regions`, ignores both, and returns the whole frame.
-The binary deployed on *this* machine was stale in the same way, so the capture table above
-was measured against a build that no longer existed on disk. Rebuilt from the current crate
-source, one local capture goes from **33.178 MB to 0.805 MB** on the wire with the five
-policy views and two template crops and no full frame. `Desktop.capture` now raises when a
-worker accepts `views` and answers without them, so a stale binary fails loudly instead of
-quietly costing 33 MB a tick. The two-PC number stays open until the peer runs the rebuilt
-worker.
+Two-PC round trip, measured 2026-09-20 with the rebuilt worker on both machines, 25
+captures per mode:
+
+| Request | p50 | p95 | On the wire |
+|---|---|---|---|
+| Full frame, the old path | 419.2 ms | 433.8 ms | 33.178 MB |
+| Five policy views only | 92.1 ms | 108.8 ms | 0.753 MB |
+| **Views plus template crops, what a tick asks for** | **83.9 ms** | **99.5 ms** | 0.868 MB |
+
+That is the 200 ms decision budget met with half of it to spare, against 411 ms p95 before.
+It leaves about 100 ms for inference: the compact policy at 51.46 ms p95 fits, the released
+303M encoder at 187.72 ms p95 does not.
+
+The first attempt at this measurement returned 424.8 ms p50 for all three modes, because
+both workers predated worker-side downscaling: they accept `views` and `regions`, ignore
+them, and return the whole frame. The binary in `target/release` was stale the same way, so
+the capture table above had been measured against a build that no longer existed on disk.
+`Desktop.capture` now raises when a worker accepts `views` and answers without them.
 
 The step loop no longer serializes the interval against capture and inference. Each tick dispatches its eight slots on a separate thread and blocks the following tick on that dispatch completing, so a tick costs one interval rather than interval plus capture plus inference. Simulated locally against a fake desktop:
 
