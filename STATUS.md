@@ -325,6 +325,29 @@ memory is not what stops it. This is now the gate, and nothing in the optimizati
 moves it: the remaining options are a GPU per side, the compact encoder variant, or a
 smaller observation.
 
+Which of the three options actually closes it, measured the same day, both actors per
+row, synthetic input so this is GPU work alone:
+
+| Encoder and clip | pair p50 | pair p95 | |
+|---|---|---|---|
+| large, 8 frames | 186.2 ms | 283.1 ms | over |
+| large, 4 frames | 192.8 ms | 286.1 ms | over |
+| compact, 8 frames | 85.6 ms | **103.6 ms** | fits |
+| compact, 16 frames | 87.8 ms | **124.4 ms** | fits |
+
+Two things follow. **Cutting the clip below eight frames buys nothing** -- four frames
+measured slightly worse than eight -- so the 16-to-8 change took the available win and
+the encoder is now bound by per-call overhead across its twenty-four blocks rather than
+by how much video it is given. And **the compact encoder is the only lever here that
+closes the gate**, with enough margin left to put the clip back to sixteen frames and
+2.13 s of context.
+
+That is a latency result and not a capability one: the compact variant has not been
+distilled yet, so nothing is known about whether it can play. The `distill` command
+exists for exactly this and is the path the open work already names. Free-VRAM figures
+in that table are not comparable between rows, because the four configurations shared
+one process and one allocator.
+
 **What is not shown here is a pass of the old 710 MiB figure.** That number came from a
 different run on a different day, and the unoptimized control above reports 1324 MiB
 under today's conditions, so the two are not a before and after. What today measures is
@@ -376,7 +399,10 @@ average so the Rust worker can reproduce it bit for bit.
   need 279.9 ms p95 of GPU against a 200 ms tick, where one needs 120.9 ms. Free VRAM is
   not the constraint (1226 MiB with both resident). Until this is resolved, unattended
   self-play on one coordinator GPU is arithmetically excluded, whatever the screen path
-  does. The options are one GPU per side, the compact encoder, or fewer tokens.
+  does. Measured: a shorter clip does not help, and the compact encoder does -- 103.6 ms
+  p95 for the pair at eight frames, 124.4 at sixteen. So distilling the compact encoder
+  is now on the critical path rather than beside it, and the remaining alternative is a
+  GPU per side.
 - **The live clip and the training clip are not the same clip.** Decisions happen at
   5 Hz and the clip samples history at 7.5 Hz, so about two of the eight live frames are
   repeats of their neighbours, where an offline session recorded at 10 Hz yields eight
