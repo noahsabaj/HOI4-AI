@@ -86,6 +86,12 @@ MONTH_LAST_DAY = (30, 27, 30, 29, 30, 29, 30, 30, 29, 30, 29, 30)
 COUNTRY_COLOUR = {"BLU": (40, 100, 220), "RED": (220, 60, 60)}
 COUNTRY_COLOUR_UI = {"BLU": (70, 130, 255), "RED": (255, 90, 90)}
 
+# One field marshal to hold an army group and enough generals to hold armies under it.
+# The portrait is the only generic land-commander sprite the stock interface defines; a
+# character with none renders an empty frame.
+COMMANDER_PORTRAIT = "GFX_portrait_europe_generic_land_13"
+GENERALS_PER_COUNTRY = 3
+
 # The map is the size of the stock one, and for the same reason: the camera's zoom-out
 # limit is fixed in world units, not fitted to the map. A 2048x1536 arena left the camera
 # able to see past the top and bottom edges and more than one map width across, and since
@@ -447,7 +453,13 @@ def generate(game, output):
         )
         write(
             f"history/countries/{tag} - Arena.txt",
-            f'capital = {capital_states[half]}\noob = "{tag}_1936"\nrecruit_character = {tag}_commander\nset_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nadd_ideas = arena_march_speed\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n',
+            f'capital = {capital_states[half]}\noob = "{tag}_1936"\nrecruit_character = {tag}_commander\n'
+            + f"recruit_character = {tag}_marshal\n"
+            + "".join(
+                f"recruit_character = {tag}_general_{n}\n"
+                for n in range(1, GENERALS_PER_COUNTRY + 1)
+            )
+            + f"set_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nadd_ideas = arena_march_speed\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n",
         )
         front = sorted(province_list, key=lambda i: abs(points[i - 1, 0] - width / 2))[
             :divisions_per_country
@@ -529,15 +541,54 @@ def generate(game, output):
         )
         + "\n",
     )
+
+    # A country leader is not a general. Both tags had only the former, so neither could
+    # form an army group and the audit never looked. Stock 1936 countries do exist with no
+    # commander at all and still fight, so this is not on its own why Red never moved, but
+    # a front the AI is meant to populate needs someone to command it.
+    def commander(key, role):
+        return (
+            f'\t{key} = {{\n\t\tname = "{key}"\n'
+            f'\t\tportraits = {{ army = {{ small = "{COMMANDER_PORTRAIT}_small" }} '
+            f'army = {{ large = "{COMMANDER_PORTRAIT}" }} }}\n'
+            f"\t\t{role} = {{ traits = {{ }} skill = 3 attack_skill = 3 defense_skill = 3 "
+            f"planning_skill = 3 logistics_skill = 3 }}\n\t}}\n"
+        )
+
     write(
         "common/characters/arena.txt",
         "characters = {\n"
         + "".join(
             f'\t{tag}_commander = {{\n\t\tname = "{name}"\n'
             f'\t\tcountry_leader = {{ ideology = despotism expire = "1965.1.1.1" id = -1 }}\n\t}}\n'
+            + commander(f"{tag}_marshal", "field_marshal")
+            + "".join(
+                commander(f"{tag}_general_{n}", "corps_commander")
+                for n in range(1, GENERALS_PER_COUNTRY + 1)
+            )
             for tag, name in [("BLU", "Blue Command"), ("RED", "Red Command")]
         )
         + "}\n",
+    )
+    # The engine draws the front on its own, but nothing here ever told either AI to
+    # execute an order across it, and Red held position for three months of game time
+    # against a stationary Blue. front_control is the documented override: execute_order
+    # forces the execute-or-not decision and execution_type overrides the stance the AI
+    # would otherwise pick from a front-strength comparison that two identical armies can
+    # never move. common/ai_strategy is not replaced, so this merges with the stock files.
+    write(
+        "common/ai_strategy/arena.txt",
+        "".join(
+            f"{tag}_arena_offensive = {{\n"
+            f"\tallowed = {{ original_tag = {tag} }}\n"
+            f"\tenable = {{ has_war_with = {enemy} }}\n"
+            f"\tabort = {{ always = no }}\n\n"
+            f"\tai_strategy = {{\n\t\ttype = front_control\n\t\ttag = {enemy}\n"
+            f"\t\tratio = 0.1\n\t\tpriority = 100\n\t\tordertype = front\n"
+            f"\t\texecution_type = rush\n\t\texecute_order = yes\n\t\tmanual_attack = yes\n\t}}\n"
+            f"}}\n"
+            for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
+        ),
     )
     # Ordinary supply hubs and rail lines following actual bitmap adjacency.
     rails = [
@@ -650,6 +701,11 @@ def generate(game, output):
             f' {tag}_neutrality_DEF:0 "{name}"',
             f' {tag}_neutrality_ADJ:0 "{name}"',
             f' {tag}_commander:0 "{name} Command"',
+            f' {tag}_marshal:0 "{name} Marshal"',
+            *(
+                f' {tag}_general_{n}:0 "{name} General {n}"'
+                for n in range(1, GENERALS_PER_COUNTRY + 1)
+            ),
         ]
     for tag, listed in victory_points.items():
         side = "West" if tag == "BLU" else "East"
@@ -926,13 +982,29 @@ def audit(root):
     names = root / "common/names/01_arena_names.txt"
     characters = root / "common/characters/arena.txt"
     localised = (root / "localisation/english/arena_l_english.yml").read_text(encoding="utf-8-sig")
-    for tag in tags:
+    for index, tag in enumerate(tags):
         if not names.exists() or not re.search(rf"^{tag}\s*=\s*{{", names.read_text(), re.M):
             problems.append(
                 f"{tag} has no character name list, so generated characters are nameless"
             )
         if not characters.exists() or f"{tag}_commander" not in characters.read_text():
             problems.append(f"{tag} has no country leader, forcing the random-character path")
+        # A country leader is not a general, and without one no army group can form.
+        written = characters.read_text() if characters.exists() else ""
+        recruited = (root / f"history/countries/{tag} - Arena.txt").read_text()
+        for key, role in [(f"{tag}_marshal", "field_marshal")] + [
+            (f"{tag}_general_{n}", "corps_commander") for n in range(1, GENERALS_PER_COUNTRY + 1)
+        ]:
+            # Split on the block rather than matching inside it: a character carries
+            # nested braces for its portraits, so any [^}]* stops at the wrong one.
+            parts = written.split(f"\t{key} = {{", 1)
+            if len(parts) < 2 or role not in parts[1].split("\n\t}", 1)[0]:
+                problems.append(f"{tag} has no {role} named {key}")
+            if f"recruit_character = {key}" not in recruited:
+                problems.append(f"{key} is defined but never recruited, so it does not exist")
+        strategy = root / "common/ai_strategy/arena.txt"
+        if not strategy.exists() or f"tag = {tags[1 - index]}" not in strategy.read_text():
+            problems.append(f"{tag} has no front_control strategy, so the AI may never attack")
         for suffix in ["", "_DEF", "_ADJ"]:
             if f" {tag}{suffix}:" not in localised:
                 problems.append(f"localisation has no {tag}{suffix} key")
