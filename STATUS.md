@@ -116,7 +116,10 @@ Two further map defects, found by looking at the running game rather than at a f
   countries two and a half times over, only one copy labelled. The arena is now 5632x2048,
   the stock map's exact dimensions, with the same 192 provinces and the same 48 land
   provinces a side. Largest province box 379x213, inside the 704x256 that triggers
-  TOO LARGE BOX.
+  TOO LARGE BOX. Confirmed on screen: at the zoom-out limit the view holds exactly one
+  world, Red wrapping to both sides of Blue, with no sky below the map and no unnamed
+  repeats. Red appearing twice is the wrap itself and is correct: a world with two
+  countries in it looks like that from either one.
 
 **Still unverified:** combat resolution, victory detection, and anything on two machines.
 The soak ran with RED under an AI that has no strategy plans, so the divisions dispersed but
