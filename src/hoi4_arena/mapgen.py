@@ -93,9 +93,24 @@ COUNTRY_COLOUR_UI = {"BLU": (70, 130, 255), "RED": (255, 90, 90)}
 # only one copy carrying a name. Both dimensions must be multiples of 256 and the area
 # must stay under 13238272 pixels; 5632x2048 is the stock map exactly.
 MAP_SIZE = (5632, 2048)
-# 8 columns and 12 rows per half, mirrored, so 192 provinces. At this size a province box
-# is about 352x170, inside the eighth-of-the-map limit that triggers TOO LARGE BOX.
-COLUMNS_PER_HALF, ROWS, OCEAN_RINGS = 8, 12, 2
+# 32 columns and 24 rows per half, mirrored, so 1536 provinces of about 88x85 px. The
+# earlier 8x12 grid gave 352x170 cells: 150 times the area of a mean stock land province
+# and 14.6 times its linear size, which made a single border crossing cost 26 in-game days
+# and put each capital about five hops and 130 days behind its own front. No match could
+# reach a decision, and the 1800-second soak at speed one covered barely one crossing.
+COLUMNS_PER_HALF, ROWS, OCEAN_RINGS = 32, 24, 2
+# Each half's land is cut into a grid of states rather than held as one. A state is the
+# unit the engine builds, supplies and garrisons in, one state per country left both
+# countries below the documented three-state minimum for theatre generation, and a single
+# supply hub cannot reach the ends of a front column. Both counts must divide the land
+# grid exactly: land is COLUMNS_PER_HALF - OCEAN_RINGS columns by ROWS - 2 * OCEAN_RINGS
+# rows, so 30 by 20, cut into 6 by 5 states of 5 by 4 provinces each.
+STATE_COLUMNS, STATE_ROWS = 6, 5
+# Even at 88 px a crossing is 626 km, which the infantry archetype's 4 km/h walks in 6.5
+# days against the roughly one day a stock province takes. The rest of the gap is closed
+# with a country spirit rather than by shrinking the provinces further, because province
+# count is what costs generation time and engine load, and marching speed is free.
+ARMY_SPEED_FACTOR = 4.0
 
 # Colours sampled from the stock colour maps, so the arena's water and ground read the way
 # the game's own do. The alpha of the RGB colour map is the city-light mask and the alpha
@@ -178,6 +193,8 @@ def generate(game, output):
     # Both dimensions must be a multiple of 256 and the area must stay under 13238272 px.
     width, height = MAP_SIZE
     step_x, step_y = width // (2 * COLUMNS_PER_HALF), height // ROWS
+    half_count = COLUMNS_PER_HALF * ROWS
+    total_provinces = 2 * half_count
     left = np.array(
         [
             (
@@ -209,17 +226,26 @@ def generate(game, output):
         for y, x in np.argwhere(crossing):
             if x < width // 2:
                 ids[y, (x + 1) % width] = ids[y, x]
-                mirror = (ids[y, x] + 95) % 192 + 1
+                mirror = (ids[y, x] + half_count - 1) % total_provinces + 1
                 ids[height - 1 - y, (width - 2 - x) % width] = mirror
+    # definition.csv is read back by colour, so two provinces sharing one is a map that
+    # silently loses provinces. The old scheme took each channel modulo 251, which repeats
+    # every 251 ids and was only safe while there were 192 of them. Multiplying by an odd
+    # constant and keeping the low 24 bits is injective for every id the map can hold, and
+    # only id 0 lands on black.
     colors = np.array(
-        [[0, 0, 0]]
-        + [[(i * 67) % 251 + 1, (i * 101) % 251 + 1, (i * 149) % 251 + 1] for i in range(1, 193)],
+        [
+            [(i * 2654435761 >> shift) & 255 for shift in (16, 8, 0)]
+            for i in range(total_provinces + 1)
+        ],
         dtype=np.uint8,
     )
     (root / "map").mkdir()
     Image.fromarray(colors[ids]).save(root / "map/provinces.bmp")
     ground = land[ids - 1]
-    terrain_types = ["plains" if i % 12 not in (3, 7) else "forest" for i in range(96)] * 2
+    # Forest on every sixth row, so the same one-in-six share of the map as the 8x12 grid
+    # painted, which is close to the share the stock terrain.bmp gives palette index 1.
+    terrain_types = ["forest" if i % ROWS % 6 == 3 else "plains" for i in range(half_count)] * 2
     terrain_ids = np.array([TERRAIN_INDEX[t] for t in terrain_types], dtype=np.uint8)
     neighbours = adjacency(ids, len(points))
     # A coast is a shared edge between the two classes, so it belongs to both provinces.
@@ -370,48 +396,62 @@ def generate(game, output):
                 positions.append(f"{region};{x}.00;10.00;{height - y}.00;{kind}")
     write("map/weatherpositions.txt", "\n".join(positions) + "\n")
 
-    left_land = (np.flatnonzero(land[:96]) + 1).tolist()
-    right_land = [i + 96 for i in left_land]
-    capitals, victory_points = [], {}
-    for state, tag, province_list in [(1, "BLU", left_land), (2, "RED", right_land)]:
-        capital = min(
-            province_list,
-            key=lambda i: np.linalg.norm(
-                points[i - 1]
-                - (
-                    [width // 4, height // 2]
-                    if state == 1
-                    else [width - 1 - width // 4, height - 1 - height // 2]
-                )
-            ),
+    left_land = (np.flatnonzero(land[:half_count]) + 1).tolist()
+    right_land = [i + half_count for i in left_land]
+    land_columns, land_rows = COLUMNS_PER_HALF - OCEAN_RINGS, ROWS - 2 * OCEAN_RINGS
+    state_width, state_height = land_columns // STATE_COLUMNS, land_rows // STATE_ROWS
+    states_per_country = STATE_COLUMNS * STATE_ROWS
+    # One division per row of the border column, so a side actually holds its own front
+    # instead of leaving gaps an opponent can walk through unopposed.
+    divisions_per_country = land_rows
+
+    def state_cell(province):
+        """Which state of its own half a land province falls in, counted from zero.
+
+        Province ids run down each column, and the right half is the left half rotated,
+        so the same column-and-row arithmetic places both and the state grid comes out
+        rotationally symmetric for free.
+        """
+        index = (province - 1) % half_count
+        column = index // ROWS - OCEAN_RINGS
+        row = index % ROWS - OCEAN_RINGS
+        return (column // state_width) * STATE_ROWS + row // state_height
+
+    states, state_owner, capitals, capital_states, victory_points = {}, {}, [], [], {}
+    for half, (tag, province_list) in enumerate([("BLU", left_land), ("RED", right_land)]):
+        centre = (
+            [width // 4, height // 2]
+            if half == 0
+            else [width - 1 - width // 4, height - 1 - height // 2]
         )
+        capital = min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - centre))
         capitals.append(capital)
+        for province in province_list:
+            state = half * states_per_country + state_cell(province) + 1
+            states.setdefault(state, []).append(province)
+            state_owner[state] = tag
+        capital_states.append(half * states_per_country + state_cell(capital) + 1)
         # Surrender weight follows victory points, so putting all of it on the capital
         # ends a match the moment one province changes hands. Four points spread across
-        # the half make the result follow the front rather than a single tile.
+        # the half make the result follow the front rather than a single tile. Surrender
+        # needs 80% of the worth, so an attacker must take the capital and two outposts.
         spread = sorted(
             province_list, key=lambda i: -np.linalg.norm(points[i - 1] - points[capital - 1])
         )
         outposts = [spread[0], spread[len(spread) // 2], spread[-2]]
-        victory_points[state] = {capital: 20, **{p: 5 for p in outposts if p != capital}}
+        victory_points[tag] = {capital: 20, **{p: 5 for p in outposts if p != capital}}
         write(
             f"common/countries/{tag}.txt",
             f"graphical_culture = western_european_gfx\ngraphical_culture_2d = western_european_2d\n"
             f"color = rgb {{ {' '.join(map(str, COUNTRY_COLOUR[tag]))} }}",
         )
-        points_block = " ".join(
-            f"victory_points = {{ {province} {value} }}"
-            for province, value in victory_points[state].items()
-        )
-        write(
-            f"history/states/{state}-arena.txt",
-            f'state = {{ id = {state} name = "ARENA_STATE_{state}" manpower = 1000000 state_category = rural history = {{ owner = {tag} add_core_of = {tag} {points_block} buildings = {{ infrastructure = 4 }} }} provinces = {{ {" ".join(map(str, province_list))} }} }}',
-        )
         write(
             f"history/countries/{tag} - Arena.txt",
-            f'capital = {state}\noob = "{tag}_1936"\nrecruit_character = {tag}_commander\nset_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n',
+            f'capital = {capital_states[half]}\noob = "{tag}_1936"\nrecruit_character = {tag}_commander\nset_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nadd_ideas = arena_march_speed\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n',
         )
-        front = sorted(province_list, key=lambda i: abs(points[i - 1, 0] - width / 2))[:12]
+        front = sorted(province_list, key=lambda i: abs(points[i - 1, 0] - width / 2))[
+            :divisions_per_country
+        ]
         regiments = " ".join(
             f"infantry = {{ x = {x} y = {y} }}" for x in range(2) for y in range(3)
         )
@@ -427,6 +467,29 @@ def generate(game, output):
             flag = root / f"gfx/flags/{sub}{tag}.tga"
             flag.parent.mkdir(parents=True, exist_ok=True)
             Image.new("RGBA", size, (*COUNTRY_COLOUR[tag], 255)).save(flag)
+    # A country's manpower is split across its states rather than repeated in each, so the
+    # total stays the roughly one million that twenty divisions can actually draw on.
+    for state, province_list in sorted(states.items()):
+        tag = state_owner[state]
+        points_block = " ".join(
+            f"victory_points = {{ {province} {value} }}"
+            for province, value in victory_points[tag].items()
+            if province in set(province_list)
+        )
+        write(
+            f"history/states/{state}-arena.txt",
+            f'state = {{ id = {state} name = "ARENA_STATE_{state}" manpower = {1000000 // states_per_country} state_category = rural history = {{ owner = {tag} add_core_of = {tag} {points_block} buildings = {{ infrastructure = 4 }} }} provinces = {{ {" ".join(map(str, province_list))} }} }}',
+        )
+    # Marching speed, not province size, is what closes the gap between an 88 px cell and
+    # the roughly one day a stock province takes to cross. common/ideas is not replaced,
+    # so this file merges with the stock ones rather than shadowing them.
+    write(
+        "common/ideas/arena.txt",
+        "ideas = {\n\tcountry = {\n\t\tarena_march_speed = {\n"
+        "\t\t\tallowed = { always = no }\n\t\t\tremoval_cost = -1\n"
+        f"\t\t\tmodifier = {{ army_speed_factor = {ARMY_SPEED_FACTOR} }}\n"
+        "\t\t}\n\t}\n}\n",
+    )
     # Every country that exists at game start has a name list. Without one the engine
     # still takes the random-character path for leaders, advisors and unit commanders,
     # fails to name them, and dereferences the result. common/names is not replaced, so a
@@ -481,23 +544,28 @@ def generate(game, output):
         f"1 2 {a} {b}"
         for a, sides in sorted(neighbours.items())
         for b in sorted(sides)
-        if a < b and land[a - 1] and land[b - 1] and (a <= 96) == (b <= 96)
+        if a < b and land[a - 1] and land[b - 1] and (a <= half_count) == (b <= half_count)
     ]
     write("map/railways.txt", "\n".join(rails) + "\n")
-    hubs = []
-    for provinces, capital in zip([left_land, right_land], capitals, strict=True):
-        front = min(
-            provinces,
-            key=lambda i: abs(points[i - 1, 0] - width / 2) + abs(points[i - 1, 1] - height / 2),
-        )
-        hubs += [f"1 {capital}", f"1 {front}"]
-    write("map/supply_nodes.txt", "\n".join(hubs) + "\n")
+
+    def state_centre(province_list):
+        """The province nearest the middle of a state, used to anchor its hub and slots."""
+        middle = points[np.array(province_list) - 1].mean(axis=0)
+        return min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - middle))
+
+    centres = {state: state_centre(listed) for state, listed in states.items()}
+    # A hub in every state rather than one per country. Supply flow falls off per province
+    # travelled and runs out after about two hops, so a single mid-front hub left the ends
+    # of the border column out of supply, which caps a division's organisation below the
+    # level the AI requires before it will attack with it at all.
+    hubs = sorted(set(centres.values()) | set(capitals))
+    write("map/supply_nodes.txt", "\n".join(f"1 {hub}" for hub in hubs) + "\n")
     # One placement wherever the stock database supplies one: per state slot, per land
     # province and per coastal province. A building the engine can place but has no
     # position for leaves it holding province 0, which is the null province.
     buildings = []
-    for state, province_list in [(1, left_land), (2, right_land)]:
-        cx, cy = points[capitals[state - 1] - 1]
+    for state, province_list in sorted(states.items()):
+        cx, cy = points[centres[state] - 1]
         for kind, slots in STATE_BUILDINGS.items():
             for slot in range(slots):
                 buildings.append(
@@ -557,14 +625,22 @@ def generate(game, output):
         ' ARENA_DESC:0 "Equal infantry armies. Multiple routes. Normal supply and fog of war."',
         ' ARENA_BLU_HISTORY:0 "Blue holds the western half of the arena."',
         ' ARENA_RED_HISTORY:0 "Red holds the eastern half of the arena."',
-        ' ARENA_STATE_1:0 "West"',
-        ' ARENA_STATE_2:0 "East"',
         ' ARENA_REGION_1:0 "Arena"',
         ' ARENA_REGION_2:0 "Ocean"',
         ' arena_focus:0 "Arena"',
         ' arena_training:0 "Army Training"',
         ' arena_training_desc:0 ""',
+        ' arena_march_speed:0 "Arena March Rate"',
+        ' arena_march_speed_desc:0 "Provinces here are far larger than a stock one, so'
+        ' armies march proportionally faster."',
     ]
+    # Every state needs a name or the engine falls back to a stock string, which is how
+    # Red's capital came to be labelled Kargopol.
+    for state in sorted(states):
+        side = "West" if state_owner[state] == "BLU" else "East"
+        localisation.append(
+            f' ARENA_STATE_{state}:0 "{side} {(state - 1) % states_per_country + 1}"'
+        )
     for tag, name in [("BLU", "Blue"), ("RED", "Red")]:
         localisation += [
             f' {tag}:0 "{name}"',
@@ -575,8 +651,8 @@ def generate(game, output):
             f' {tag}_neutrality_ADJ:0 "{name}"',
             f' {tag}_commander:0 "{name} Command"',
         ]
-    for state, listed in victory_points.items():
-        side = "West" if state == 1 else "East"
+    for tag, listed in victory_points.items():
+        side = "West" if tag == "BLU" else "East"
         for order, province in enumerate(listed):
             label = f"{side} Capital" if order == 0 else f"{side} Outpost {order}"
             localisation.append(f' VICTORY_POINTS_{province}:0 "{label}"')
@@ -616,10 +692,13 @@ def generate(game, output):
         "width": width,
         "height": height,
         "countries": 2,
+        "provinces": total_provinces,
         "land_provinces_per_country": len(left_land),
-        "divisions_per_country": 12,
+        "states_per_country": states_per_country,
+        "divisions_per_country": divisions_per_country,
+        "army_speed_factor": ARMY_SPEED_FACTOR,
         "coastal_land_provinces": sum(1 for i in neighbours if land[i - 1] and coastal[i]),
-        "victory_points_per_country": len(victory_points[1]),
+        "victory_points_per_country": len(victory_points["BLU"]),
         "rotational_mirror": True,
         "gameplay_verified": False,
         "engine_load_verified": False,
@@ -735,12 +814,21 @@ def audit(root):
         if not {"small", "big"} <= sizes.get(region, set()):
             problems.append(f"strategic region {region} lacks a small or big weather object")
 
-    states = {}
+    states, owner_points = {}, {}
     for path in sorted((root / "history/states").glob("*.txt")):
         text = path.read_text()
         states[int(re.search(r"id\s*=\s*(\d+)", text).group(1))] = _block(text, "provinces")
-        if not re.search(r"victory_points\s*=\s*\{\s*\d+\s+\d+", text):
-            problems.append(f"{path.name} has no victory point province")
+        owner = re.search(r"owner\s*=\s*(\w+)", text)
+        if owner:
+            owner_points.setdefault(owner.group(1), 0)
+            owner_points[owner.group(1)] += len(
+                re.findall(r"victory_points\s*=\s*\{\s*\d+\s+\d+", text)
+            )
+    # Per country, not per state: most stock states hold no victory point at all, but a
+    # country with none can never be made to capitulate, so the match has no way to end.
+    for tag, owned in sorted(owner_points.items()):
+        if not owned:
+            problems.append(f"{tag} owns no victory point, so it can never capitulate")
     owned = [p for listed in states.values() for p in listed]
     check("history/states", owned)
     stateless = sorted(p for p in valid if kind[p] == "land" and p not in owned)
