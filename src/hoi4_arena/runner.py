@@ -122,8 +122,10 @@ class Actor:
         that removes the gap -- inductor's no-grad graph and its grad graph differ by
         3.4e-4 from each other, so compiling PPO's side too does not fix it. Eager
         collection and eager update agree exactly today, and that property is worth more
-        than the milliseconds. The head is a different case: compiled, it is bit-for-bit
-        the eager head, so this costs nothing at all.
+        than the milliseconds. The head is a different case: compiled, it measured
+        bit-for-bit identical to the eager head on this GPU in both modes, so it costs
+        nothing at all. Stated with the machine attached deliberately -- the sibling
+        claim about the fused head held here and failed on CI's CPU.
 
         Returns whether compilation took, because inductor needs Triton and a failure
         here must cost latency rather than the match.

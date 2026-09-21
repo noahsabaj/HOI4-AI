@@ -91,7 +91,7 @@ fn downscale_row(
         let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
         for y in y0..y1 {
             let start = ((top + y) * width + left + x0) * 4;
-            for pixel in src[start..start + (x1 - x0) * 4].chunks_exact(4) {
+            for pixel in src[start..start + (x1 - x0) * 4].as_chunks::<4>().0 {
                 sb += pixel[0] as u32;
                 sg += pixel[1] as u32;
                 sr += pixel[2] as u32;

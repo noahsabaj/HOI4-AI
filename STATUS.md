@@ -275,8 +275,15 @@ Four things on the list were measured and **not** taken:
   24 ms, and it moves a stored `old_logp` by 4.6e-4. No configuration removes that:
   inductor's no-grad graph and its grad graph differ from each other by 3.4e-4, so
   compiling PPO's side does not close it. Eager collection and eager update agree
-  *exactly* today. The action head is the opposite case -- compiled it is bit-for-bit
-  the eager head -- so only the head is captured.
+  *exactly* today. The action head is the opposite case -- compiled it measured
+  bit-for-bit identical to the eager head on this GPU -- so only the head is captured.
+
+One claim here was wrong and is worth keeping as a correction: the fused action head
+was written up as producing bit-identical output to the three Linears it replaced,
+because that is what it measured on this machine. CI failed it on another. Every output
+element is a dot product over the same 256 inputs either way, but a 256x2122 matmul and
+a 256x1024 one may accumulate in different orders, and whether they do is a property of
+the CPU. The arithmetic is identical; the bits are not guaranteed.
 
 Casting the trainable weights to bfloat16 as well was measured and rejected for the same
 reason: another 55 MiB, and a 1.02e-2 shift in `old_logp`, which is a systematic 1.01x

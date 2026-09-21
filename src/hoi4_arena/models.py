@@ -111,9 +111,11 @@ class ActionHead(nn.Module):
         self.xy = nn.Linear(2, 64)
         self.cell = nn.GRUCell(64, 256)
         # One projection, split three ways. At batch one these are launch-bound rather
-        # than arithmetic-bound, so three narrow GEMMs cost more than one wide one, and
-        # concatenating the weights is the same arithmetic row by row: measured 0.51 ms
-        # to 0.23 ms across the eight slots, with bit-identical output.
+        # than arithmetic-bound, so three narrow GEMMs cost more than one wide one:
+        # measured 0.51 ms to 0.23 ms across the eight slots. Every output element is a
+        # dot product over the same 256 inputs either way, but that is the arithmetic
+        # being identical, not the bits -- a 256x2122 matmul may accumulate in a
+        # different order than a 256x1024 one, and whether it does depends on the CPU.
         self.widths = (len(VOCAB), GRID, GRID)
         self.heads = nn.Linear(256, sum(self.widths))
 

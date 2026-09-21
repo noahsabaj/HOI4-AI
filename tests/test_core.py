@@ -157,12 +157,20 @@ def test_action_head_scores_in_float32_even_when_its_weights_are_bfloat16():
     assert torch.equal(entropy, expected_entropy)
 
 
-def test_fused_head_is_exactly_the_three_heads_it_replaced():
+def test_fused_head_computes_the_three_heads_it_replaced():
     """One wide Linear split three ways is the same arithmetic as three narrow ones.
 
-    Concatenating the rows of three weight matrices changes which kernel runs, not what
-    any output row is, so this is an equality rather than a tolerance. If it ever becomes
-    a tolerance, the split offsets are wrong.
+    Same arithmetic, not necessarily the same bits. Every output element is a dot
+    product over the same 256 inputs either way, but a 256x2122 matmul and a 256x1024
+    matmul are free to block and accumulate in different orders, and whether they
+    actually do is a property of the CPU. This was originally written as an equality
+    because that is what it measured on one machine; CI failed it on another, which is
+    the more useful result.
+
+    So the comparison is against a float64 reference, which has no reduction-order
+    freedom worth the name, and the tolerance is four orders below the thing the test
+    exists to catch: a wrong split offset does not perturb an output, it replaces it,
+    and the values here are of order one.
     """
     torch.manual_seed(7)
     actor = ActionHead(memory_dim=16)
@@ -171,11 +179,16 @@ def test_fused_head_is_exactly_the_three_heads_it_replaced():
     assert actor.widths == (len(VOCAB), GRID, GRID)
     offset = 0
     for width, part in zip(actor.widths, parts, strict=True):
+        rows = slice(offset, offset + width)
+        expected = (
+            state.double() @ actor.heads.weight[rows].double().T + actor.heads.bias[rows].double()
+        )
+        assert torch.allclose(part.double(), expected, rtol=0, atol=1e-4)
         separate = nn.Linear(256, width)
         with torch.no_grad():
-            separate.weight.copy_(actor.heads.weight[offset : offset + width])
-            separate.bias.copy_(actor.heads.bias[offset : offset + width])
-        assert torch.equal(part, separate(state))
+            separate.weight.copy_(actor.heads.weight[rows])
+            separate.bias.copy_(actor.heads.bias[rows])
+        assert torch.allclose(part, separate(state), rtol=0, atol=1e-4)
         offset += width
 
 
