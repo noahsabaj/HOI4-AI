@@ -19,11 +19,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     env:
-      # GitHub's Windows runners are a mixed pool, and on some of them torch dispatched a
-      # kernel the CPU does not implement: pytest died with an illegal instruction
-      # (0xc000001d) inside GRUCell, twice in four runs, on an unchanged lockfile. Capping
-      # the dispatch below AVX-512 keeps the same results on every machine in the pool.
+      # GitHub's Windows runners are a mixed pool, and on some of them torch dies with an
+      # illegal instruction (0xc000001d) part-way through the suite, on an unchanged
+      # lockfile. ATEN_CPU_CAPABILITY alone did not stop it: it caps ATen's own dispatch,
+      # but the torch wheel also bundles MKL, which dispatches separately and is capped by
+      # MKL_ENABLE_INSTRUCTIONS. Both are set until a green run proves which one mattered.
       ATEN_CPU_CAPABILITY: avx2
+      MKL_ENABLE_INSTRUCTIONS: AVX2
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -35,7 +37,14 @@ jobs:
       - run: uv sync --python 3.12 --extra dev --frozen
       - run: uv run ruff check src tests scripts
       - run: uv run ruff format --check src tests scripts
-      - run: uv run pytest -q
+      # The crash is a hard fault, so pytest prints no summary and -q leaves only a row of
+      # dots: the run that prompted this showed 25 of them and no test name. -v names the
+      # test that was executing, which is the one thing needed to tell a torch dispatch
+      # problem from a bug of ours.
+      - run: uv run pytest -v
+      # Runs whatever the outcome, so a crashed run still says which machine it was on.
+      - if: always()
+        run: uv run python -c "import platform, torch; print(platform.processor()); print(torch.__config__.show())"
 
   rust:
     # Must be Windows: the entire worker lives in `#[cfg(windows)] mod platform`, so
