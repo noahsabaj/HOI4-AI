@@ -8,7 +8,7 @@ The worker downscales before transport. A `capture` can ask for the five policy 
 
 Pointer positions are quantized onto a square 1024×1024 lattice of the client rectangle. On a 3840×2160 screen that is 3.75 px horizontally and 2.11 px vertically, so controls narrower than about four pixels cannot be addressed exactly and recorded human motion is re-quantized before it becomes a training label.
 
-**Research prototype; no trained combat agent yet.** See [STATUS.md](STATUS.md) for measured results and outstanding acceptance gates. The generated arena reached country selection and crashed on Start; the map data that crash traces to is fixed and checked by `audit-map`, but a match has not yet been played.
+**Research prototype; no trained combat agent yet.** See [STATUS.md](STATUS.md) for measured results and outstanding acceptance gates. The generated arena now starts a match and runs; combat, supply over time and two-machine self-play remain unverified.
 
 ## Setup
 
