@@ -14,7 +14,9 @@ The code implements an initial visual learning pipeline. It does not yet deliver
 | Live worker mouse input | `artifacts/worker-smoke/click-before.png`, `click-after.png` | Menu advanced using a 250 ms button hold |
 | TLS peer transport | `artifacts/pairing-kat/integration/report.json` | Actual KATHPINVICTUS authenticated; foreground 3840×2160 capture, menu click, Escape and held-Shift watchdog verified |
 | LAN screenshot timing | `artifacts/pairing-roundtrip-downscaled.json`, 25 captures per mode | Live path (five views plus template crops) p50 83.9 ms, **p95 99.5 ms**, 0.87 MB; the full frame it replaces is p95 433.8 ms, 33.2 MB |
-| Arena match start | `artifacts/mods/infantry-arena-v10`, five minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | Match starts and runs: war declared, clock advanced 12:00 1 Jan to 20:00 2 Jan 1936, no crash. Combat, supply over time and victory detection **not** yet exercised |
+| Arena match start | `artifacts/mods/infantry-arena-v10`, five minidumps under `Documents/Paradox Interactive/Hearts of Iron IV/crashes` | Match starts and runs: war declared, clock advanced 12:00 1 Jan to 20:00 2 Jan 1936, no crash |
+| Combat resolution | `infantry-arena-v12`, live match, 5 March to mid-May 1936 at game speed four | Battle joined and resolved: 2 Blue divisions attacked 1 Red defender, tooltip gave a running estimate, attacker repulsed, no province changed hands |
+| Victory detection | Arithmetic below, from `00_defines.lua` and the live map | **Not reachable as generated.** Needs the enemy capital plus two outposts, about five province hops and 130 in-game days away, through a front symmetric infantry cannot break |
 
 Earlier encoder timing reports used the old window-DC capture. Treat them as capacity measurements, not a validated live visual benchmark. Re-run with the corrected capture backend, a changing game clock and full capture-to-action timing before accepting any latency result. The worker bundle has been rebuilt with the capture fix.
 
@@ -98,8 +100,10 @@ wall clock **at game speed one**, from 12:00 on 1 January to 10:00 on 7 February
 37 in-game days. Speed one was not the intention. Speed is changed with `+` and `-`
 (`VK_OEM_PLUS` and `VK_OEM_MINUS`, which the worker allows in setup mode and refuses during
 a match, exactly as intended); the number keys do nothing, so the attempt to select speed
-two silently left it at one. A soak at speed two covers more game time per wall second and
-has not been run. No crash dump, no line in `error.log` matching `MAP_ERROR`, `naval base`,
+two silently left it at one. Speed four has since been driven from the `+` control beside the
+clock and measured at 97 in-game hours per 10 wall seconds, about 727 days per 1800 s against
+speed one's 37; a long soak at that rate has not been run. No crash dump, no line in
+`error.log` matching `MAP_ERROR`, `naval base`,
 `has no continent` or `no pixels`, and a steady 2.7 GB working set. That is past the window
 in which a missing naval-base placement is documented to crash an AI evaluation loop.
 
@@ -121,9 +125,77 @@ Two further map defects, found by looking at the running game rather than at a f
   repeats. Red appearing twice is the wrap itself and is correct: a world with two
   countries in it looks like that from either one.
 
-**Still unverified:** combat resolution, victory detection, and anything on two machines.
-The soak ran with RED under an AI that has no strategy plans, so the divisions dispersed but
-nothing tested a fight.
+**Combat resolution, 2026-09-20: verified.** On `infantry-arena-v12`, playing BLU, two
+divisions were ordered across the border into a RED-held province. The battle joined, the
+combat tooltip read `Attacker: 2 divisions (Blue) / Defender: 1 divisions (Red) / We are
+currently losing! / We estimate that the battle will last for another 74 days`, it ran from
+5 March to mid-May 1936, and it concluded with the attacker repulsed and no province
+changing hands. Attack order, battle, and resolution to an outcome all work.
+
+The reason the earlier soak saw nothing is **not** that the AI has no strategy plans. That
+was wrong twice over: `common/ai_strategy_plans` holds only national-focus, research and
+idea picks — it has no key that creates a front, an offensive or a garrison, and 279 of the
+game's 364 tags have neither a plan nor a country `ai_strategy` file and still fight. Fronts
+are engine-generated, and the arena already has one: the debug tooltip reads
+`Front [id=2;idx=0] (RED vs BLU) section IDs: [id=1;idx=0;provs=8]`. The real reason is
+**game speed against province scale**:
+
+| | |
+|---|---|
+| `GAME_SPEED_SECONDS` | `{2.0, 0.5, 0.2, 0.1, 0.0}` wall-seconds per in-game hour |
+| Speed 1, measured | 48 s per in-game day — 37.5 days per 1800 s, matching the soak to 1% |
+| Speed 4, measured | 97 in-game hours per 10 s wall, about 727 days per 1800 s |
+| Arena province | 352x170 px = 59,840 px² |
+| Stock land province, mean | 399 px² over 10,154 provinces — the arena's cells are 150x the area, 14.6x the linear size |
+| One border crossing | 359 px = 2,556 km at the infantry archetype's 4 km/h = **26.6 in-game days** |
+
+The 1800-second soak at speed one covered about 37 days: barely more than a single province
+crossing. Nothing dispersed and nothing failed — the armies had not finished walking.
+
+**Victory detection is not reachable in the arena as generated**, for three compounding
+reasons, each measured rather than assumed:
+
+- `BASE_SURRENDER_LIMIT = 0.8` and surrender worth is victory points alone
+  (`VICTORY_POINT_WORTH_FACTOR = 10`, and the in-game tooltip in
+  `waroverview_l_english.yml:33` states the quantity as the fraction of victory points
+  controlled). The arena's 35 VP weight means an attacker needs 28: the 20-point capital
+  **plus at least two of the three 5-point outposts**. All three outposts without the
+  capital is 15 and capitulates nobody.
+- Each capital sits 1,583 px behind its front by construction, about five province hops, so
+  roughly 130 in-game days of marching before any fighting.
+- Symmetric unsupported infantry does not break through. Six `infantry_equipment_1`
+  battalions give 36 soft attack against 132 defence and 18 breakthrough; the live battle
+  above is the measurement, not a model — two attacking divisions lost to one defender.
+
+`set_stability = 1` and `set_war_support = 1` do **not** make capitulation harder, which had
+been a worry: no stock modifier ties stability to `surrender_limit` at all, and the only
+`surrender_limit` entry in `00_static_modifiers.txt` is `-0.3` inside
+`war_support_bad_modifier`. Max war support pins the limit at 0.8 rather than raising it.
+
+**There is no bare "game over" screen to template.** What the engine actually shows, and
+what a terminal rule would have to anchor on: `surrendered_country_popup` (520x320, centred,
+`gfx/interface/capitulation_bg.dds`); `peaceconference_full_window`, which is
+`width=100% height=100%` and covers the HUD completely — **the winner and the loser get the
+same window**, distinguished only by the top-art sprite
+(`GFX_top_art_winning_conference` vs `GFX_top_art_losing_conference`), so win and loss
+templates must anchor on that banner and not on the screen as a whole; and the end-game
+`playthrough_overview_window` with its CONTINUE/QUIT buttons. `annex_everything` is a peace
+conference cost discount, not an auto-annex.
+
+**The match-side vision rules have never been calibrated.** `ScreenRules` ends a match only
+on a `win`, `loss`, `disconnect` or `desync` template, and the only two `rules.json` files on
+disk hold the four lobby templates and no `clock_rect`, so `require_match_rules()` raises.
+Worse than raising: if a match ends on a screen matching nothing, the liveness budget
+invalidates the episode, but if the HUD simply stays up the runner records a **draw with
+reward 0.0 for both sides** — a silent zero-signal result rather than an error.
+
+Two smaller results from the same pass, both contrary to what was assumed: generals are a
+**degrade, not a blocker** (`PLANNING_CAP_NO_HQ_SCALING = 0.8`, and about 60 stock 1936
+countries have no commander at all and still fight), so the arena's leader-only character is
+worth fixing but is not why nothing moved; and supply reach is about two province hops, so
+the single mid-column front hub leaves the ends of an eight-province front column short.
+
+**Still unverified:** victory detection, a two-agent match, and anything on two machines.
 
 Found by the same audit and deliberately left, none of them crash-level:
 `common/ai_focuses` is still replaced away, which leaves nine `supports_ai_strategy` tokens
@@ -174,7 +246,10 @@ Five Hz is therefore reachable rather than excluded by construction, but it is *
 
 Open acceptance work:
 
-- Run a full 1800-second match on `infantry-arena-v10` and verify armies, combat, supply, fog, multiple routes and side symmetry in gameplay. Match start itself is now verified.
+- Decide how the arena reaches a decision at all. Its provinces are 150x the area of a stock land province, so every crossing costs 26 in-game days and each capital is five hops behind its front. The options are to cut the province size (the generator is already parametric in `COLUMNS_PER_HALF` and `ROWS`, but states, buildings, supply and victory points all scale with it), to raise army speed to suit the scale, or to accept that matches are scored on territory rather than capitulation. Nothing else on this list resolves until this does.
+- Calibrate the match-side screen rules. `win`, `loss`, `healthy`, `disconnect` and `desync` have never been written for a match, and `require_match_rules()` raises without them. The win and loss templates must anchor on the peace conference's top-art banner, since both sides get the same full-screen window.
+- Make an unmatched terminal screen fail loudly. A match that simply runs out with the HUD up is recorded as a draw at reward 0.0 for both sides, which is indistinguishable from a real draw.
+- Run a full 1800-second match at speed four and verify armies, supply over time, fog, multiple routes and side symmetry in gameplay. Match start and combat resolution are now verified.
 - Pairing works; complete two-PC lobby/reset calibration and recovery checks. Menu input and watchdog release are verified remotely; match behavior remains untested.
 - Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and F12 under load. The worker now releases held input even when stdout fails; live regression remains needed.
 - Re-measure the two-PC screenshot round trip with worker-side downscaling enabled.
