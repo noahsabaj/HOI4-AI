@@ -3,18 +3,22 @@ decision_hz = 5
 record_hz = 10
 deadline_ms = 200
 match_seconds = 1800
+# Not loaded. record --game-speed and the pair config's game_speed are what get written.
 game_speed = 2
 worker = "target/release/hoi4-desktop-worker.exe"
 
 [model]
 encoder = "levjepa"
 repository = "galilai-group/LeVJEPA-VideoMix-Large"
-clip_frames = 16
-clip_hz = 7.5
+# Live and prepared clips. The encoder has no fixed length; this is the one that fits the tick.
+clip_frames = 8
+clip_hz = 5
 image_size = 224
+# Global frame, four quadrants, and the native cursor crop. Not loaded: VIEW_COUNT in dataset.py.
+views = 6
 memory_dim = 512
 projection_dim = 384
-auxiliary = "sparse"
+auxiliary = "none"
 
 [training]
 seed = 42
@@ -28,5 +32,8 @@ ppo_clip = 0.2
 gae_lambda = 0.95
 gamma = 0.9999
 entropy_weight = 0.001
-demonstration_weight = 0.1
+# No loss reads a demonstration weight. PPO does not mix behavior-cloning gradients.
 opponent_latest_probability = 0.5
+# Not loaded. train-ppo --burn-in and --kl-limit are what get used; these are their defaults.
+ppo_burn_in = 4
+ppo_kl_limit = 0.02

@@ -31,9 +31,10 @@ Earlier encoder timings used the old window-DC capture; treat them as capacity n
 a live visual benchmark. Re-run with the corrected backend, a changing clock and full
 capture-to-action timing before accepting any latency result.
 
-Automated checks: **81 Python tests, 7 Rust tests, Ruff lint/format, Cargo fmt and Clippy
-pass**, plus locked dependency installation and packaged CLI help. Every fix is
-mutation-tested — reverting it fails at least one test.
+Automated checks: **125 Python tests, 16 Rust tests** (2 of them ignored live-desktop
+checks), Ruff lint/format, Cargo fmt and Clippy pass, plus locked dependency
+installation and packaged CLI help. Every fix is mutation-tested — reverting it
+fails at least one test.
 
 **Still unverified:** victory detection, a two-agent match, and anything on two machines.
 
@@ -105,10 +106,11 @@ healthy HUD raises `uncertain_timeout`.
 
 ## Calibration
 
-`healthy` and `clock_rect` are cut from a live match and stored at 3840×2160 in
-`artifacts/calibration-live/rules.json`. The other five rules are not calibrated, so
-`require_match_rules()` still raises. Getting these two exposed three things worth more than
-the templates:
+`healthy`, `paused`, and `clock_rect` are cut from a live match and stored at 3840×2160 in
+`artifacts/calibration-live/rules.json`. `ready`, `speed`, `win`, `loss`, `disconnect`, and
+`desync` are not calibrated, so `require_match_rules()` still raises. `speed` is the
+selected-speed indicator: a running frame that stops matching it ends the episode. Getting the first two exposed
+three things worth more than the templates:
 
 | Rectangle | Running | Paused |
 |---|---|---|
@@ -125,10 +127,15 @@ the templates:
   with `np.array_equal`, and two captures of a *paused* clock differ by 6.4, so every frame
   looked like a fresh tick. `clock_advanced` now compares with a tolerance of 15, between
   the paused 6.4 and the advancing 44.8.
-- **`running_speed_two` cannot be built on the speed bars.** They read 0.6 between a running
-  and a paused game: the bars show the *selected* speed, not whether time moves. The
-  play/pause glyph separates them at 26.3, but against a 15.6 self-drift — a thin margin for
-  a gate that invalidates an episode.
+- **The pause gate is the play/pause glyph.** The speed bars read 0.6 between a running and
+  a paused game, so they show the selected speed and nothing about whether time moves. The
+  glyph at `[3392, 20, 20, 20]`, cut from `paused-1.png`, differs from `paused-2.png` by 9.8
+  and from the nearer running capture by 32.3 (`match-healthy.png`; the other running capture
+  is 40.8). `paused` is calibrated at `max_mae` 18. Both paused captures match it and both
+  running captures do not, while `healthy` still matches all four. The operator sets the
+  speed. The loop rejects a healthy frame that matches this glyph. A template of the running
+  glyph would have been the thin case: that glyph drifts 15.6 against itself and sits only
+  26.3 from the paused one.
 
 ## The map generator, and why it is defensive
 
@@ -205,7 +212,9 @@ level-1 line on every adjacent land pair, far denser than any stock network.
 | Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
 
 The last two rows predate the optimization pass below, which took the worker's five
-views to 8.3 ms and a 4K `views` call to 6.07 ms.
+downscales to 8.3 ms and a 4K `views` call to 6.07 ms. A live capture asks for six
+views: those five, plus the native cursor crop, which is a copy rather than another
+downscale.
 
 Two-PC round trip, rebuilt worker on both machines, 25 captures per mode:
 
@@ -339,8 +348,8 @@ Two things follow. **Cutting the clip below eight frames buys nothing** -- four 
 measured slightly worse than eight -- so the 16-to-8 change took the available win and
 the encoder is now bound by per-call overhead across its twenty-four blocks rather than
 by how much video it is given. And **the compact encoder is the only lever here that
-closes the gate**, with enough margin left to put the clip back to sixteen frames and
-2.13 s of context.
+closes the gate**, with enough margin left to put the clip back to sixteen frames. At the
+decision rate that is 3.2 s of context.
 
 That is a latency result and not a capability one: the compact variant has not been
 distilled yet, so nothing is known about whether it can play. The `distill` command
@@ -363,6 +372,12 @@ demonstrated: these are simulated timings, and 187.72 ms p95 for one large encod
 room for two actors on one GPU. The resampler changed from PIL bilinear to an exact area
 average so the Rust worker can reproduce it bit for bit.
 
+Clip lookback is the decision interval. `clip_frame_ids` takes eight frames, one decision
+apart, in integer nanoseconds, and both the live actor and training call it. A 10 Hz
+recording and a 5 Hz live history therefore hand the encoder the same timestamps. Eight
+frames is 1.6 s. A 7.5 Hz lookback repeated neighbours on the live actor, which stores one
+view per decision, and picked distinct frames out of a 10 Hz recording.
+
 ## Open work
 
 - **Decide how the arena reaches a decision at all.** Capitulation is measured against
@@ -370,25 +385,34 @@ average so the Rust worker can reproduce it bit for bit.
   of a 600-province country; the harness run took 47% of an undefended Red and stalled. The
   options are a much smaller province grid, a much larger army, or scoring matches on
   territory. Nothing else here resolves until this does.
-- **Build a small-map harness so a capitulation can be produced on demand.** This blocks the
-  five uncalibrated rules. Make `COLUMNS_PER_HALF`, `ROWS`, `STATE_COLUMNS` and `STATE_ROWS`
-  per-call arguments rather than module constants, and generate a grid small enough that an
-  undefended country is overrun in days. The conference and the popup are engine UI and look
-  the same on any map, so templates cut there transfer to the playable arena.
+- **Build a small-map harness so a capitulation can be produced on demand.** The grid is now
+  per call (`columns_per_half`, `rows`, `state_columns`, `state_rows`, optional province
+  pitch). The default is still the 32×24 arena. A pitch centers that lattice on the
+  stock-sized bitmap, so a short country keeps the ~88 px province instead of stretching
+  fewer cells across the map, which is what made one crossing take 26 days. Fewer than
+  three states a side is rejected. The island itself is not generated yet: its depth waits
+  on the stall probe below, and a live re-probe was not taken because another game held
+  the foreground. Templates cut from the popup still transfer to the playable arena.
 - Calibrate `win`, `loss`, `ready`, `disconnect`, `desync`, and a `surrendered_country_popup`
   template anchored on its title box.
-- Flash-attention is closed, not pending: the encoder passes a dense block-causal mask
-  into SDPA at every layer, and torch's flash backend rejects any non-null `attn_mask`.
-  A prebuilt Windows wheel for this exact torch does exist, and installing it would
-  change nothing, because SDPA dispatches to a copy vendored inside `torch_cuda` rather
-  than to the pip package. Measured at this model's shape, the ceiling was 1.97 ms masked
-  against 1.21 ms unmasked -- about 12% end to end, and only by changing what the model
-  computes.
-- Decide what `running_speed_two` should be — the speed bars cannot detect a pause, and the
-  name asserts a speed measurement has ruled out as too slow.
+- The flash-attention note was wrong about the kernel. Re-measured on torch
+  2.11.0+cu128, RTX 4060 Ti: forcing the flash backend raises "Torch was not compiled
+  with flash attention" for the block-causal mask, for no mask, and for `is_causal`.
+  The pip package is not installed, and SDPA would not call it anyway. The live kernel
+  is cutlass memory-efficient attention (`fmha_cutlass`). One layer at 16 frames is
+  1.86 ms masked against 1.27 ms unmasked, which is the old 1.97 / 1.21 pair with the
+  fast side mislabeled as flash. At the deployed 8-frame clip the same layer is 0.49 ms
+  against 0.35 ms, and the whole encoder is 71.9 ms against 69.0 ms. Dropping the mask
+  moves features by a mean absolute of 0.23. cuDNN accepts the mask and the encoder
+  then takes 99.9 ms. FlexAttention keeps the mask, agrees within 0.002, and takes
+  2.52 ms for a layer that memory-efficient attention does in 0.46 ms.
 - Work out why an AI that *does* advance stops. Province size and missing command are both
   eliminated. What has not been established is what it waits for: a supply limit, a front it
-  considers held, or an objective it thinks it has reached.
+  considers held, or an objective it thinks it has reached. Combat, supply level, and the
+  division template stay put until that reading exists. A territory term is now implemented
+  and uncalibrated: `minimap` stores a `minimap_rect`, and the step reward adds the change
+  in Blue's share of that crop only. With no rect the term is zero. It has not been checked
+  against the owned-weight tooltip.
 - Run a full 1800-second match at speed four and verify armies, supply over time, fog,
   multiple routes and side symmetry in gameplay.
 - Complete two-PC lobby/reset calibration and recovery checks; match behaviour is untested
@@ -403,17 +427,20 @@ average so the Rust worker can reproduce it bit for bit.
   p95 for the pair at eight frames, 124.4 at sixteen. So distilling the compact encoder
   is now on the critical path rather than beside it, and the remaining alternative is a
   GPU per side.
-- **The live clip and the training clip are not the same clip.** Decisions happen at
-  5 Hz and the clip samples history at 7.5 Hz, so about two of the eight live frames are
-  repeats of their neighbours, where an offline session recorded at 10 Hz yields eight
-  distinct ones. Neither the clip length nor the resize controls this; it is the sampling
-  rate, and changing it is a modelling decision rather than a performance one.
 - Measure end-to-end scheduling against a live game with two real actors.
 - Record 2–4 hours of expert demonstrations, distil the compact encoder, train the BC
-  baseline and compare held-out gameplay for the auxiliary/XM variants.
+  baseline and compare held-out gameplay for the auxiliary/XM variants. The observation
+  now includes a native 224 crop centered on the pointer, stored as the fifth detail
+  tile. A capture with no cursor is refused: a self-play step keeps only the tiles it
+  was given, so the crop has to be in the recording before the first session. Pass
+  `--game-speed` for the speed the game is actually set to. There is no default.
 - Run recurrent PPO self-play; add an unattended league driver and model-selection schedule.
 - Complete 20 auditable unattended matches and 50 side-swapped evaluation pairs.
 - Test the same screen/input interface in a private unmodified multiplayer lobby.
 
-No gameplay improvement, reliable speed-two operation, trained combat checkpoint, unattended
-match count or ordinary multiplayer win is claimed.
+No gameplay improvement, trained combat checkpoint, unattended match count or ordinary
+multiplayer win is claimed. The loop detects a pause. It does not read the selected speed.
+`record` and `collect-pair` require the speed the operator set and write `game_speed` and
+`seconds_per_hour` into the manifest. Speed 5 records a null rate, because that setting
+does not sleep. Training refuses a missing speed or a mix. PPO normalizes advantages once
+over the episode; the loss does not rescale each 8-step window.

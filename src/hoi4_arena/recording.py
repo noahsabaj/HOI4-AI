@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .dataset import VIEW_SIZE, parse_cursor, recorded_speed
 from .desktop import Desktop
 
 log = logging.getLogger(__name__)
@@ -37,7 +38,9 @@ def split_for_session(session_id: str):
 class Recorder:
     """Lossless native RGB frames; explicit frame index -> capture time, not nominal FPS."""
 
-    def __init__(self, root, first, *, source="human", hz=15, session_id=None, split=None):
+    def __init__(
+        self, root, first, *, game_speed, source="human", hz=15, session_id=None, split=None
+    ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=False)
         self.id = session_id or str(uuid.uuid4())
@@ -51,6 +54,9 @@ class Recorder:
             "height": pixels.shape[0],
             "video_source": "full_frame" if first.rgb is not None else "global_view",
             "nominal_fps": hz,
+            "cursor_crop": VIEW_SIZE,
+            # The operator sets this for the whole session. The match loop leaves it alone.
+            **recorded_speed(game_speed),
             "complete": False,
             "frames": 0,
             "privileged_state": False,
@@ -97,6 +103,9 @@ class Recorder:
 
     def append(self, frame, **extra):
         pixels = audit_pixels(frame)
+        # The full frame can grow the crop later. A frame that never recorded where the
+        # pointer was cannot, and finding that out after the session is the failure.
+        parse_cursor(frame.meta.get("cursor"))
         if pixels.shape != (self.manifest["height"], self.manifest["width"], 3):
             raise ValueError("Resolution changed during recording")
         if frame.meta.get("overflow") or not frame.meta.get("foreground"):
@@ -123,15 +132,19 @@ class Recorder:
         self._manifest()
 
 
-def record(root, seconds, hz=15, command=None, split=None):
+def record(root, seconds, hz=15, command=None, split=None, game_speed=None):
     """Write the manifest whatever happens, then fail loudly if the session is unusable.
+
+    `game_speed` is the speed the operator set for the whole session. It is checked
+    before the worker starts.
 
     An incomplete recording is rejected by prepare_session, so exiting zero on a failed
     or interrupted run would hand the operator a session that can never be trained on.
     """
+    speed = recorded_speed(game_speed)["game_speed"]
     with Desktop(command) as desktop:
         first = desktop.capture()
-        recorder = Recorder(root, first, hz=hz, split=split)
+        recorder = Recorder(root, first, hz=hz, split=split, game_speed=speed)
         start = time.monotonic()
         deadline = start
         reason = None

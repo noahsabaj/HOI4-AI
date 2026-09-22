@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 
 from hoi4_arena.benchmark import gpu_memory
-from hoi4_arena.dataset import normalize, views
+from hoi4_arena.dataset import CLIP_FRAMES, normalize, views
 from hoi4_arena.models import Policy, PredictiveAuxiliary, VideoEncoder
 
 parser = argparse.ArgumentParser()
@@ -27,8 +27,12 @@ report = {
     "baseline_memory": gpu_memory(),
 }
 try:
-    view, tiles = views(np.asarray(Image.open(args.image).convert("RGB")), device="cuda")
-    clip = normalize(torch.stack([view] * 16)).permute(3, 0, 1, 2)[None]
+    image = np.asarray(Image.open(args.image).convert("RGB"))
+    # A saved screenshot has no pointer. The center is only so this capacity check
+    # still builds the same detail tiles a match would. The clip length is the one
+    # the live actor reads; a longer stack times a different forward.
+    view, tiles = views(image, device="cuda", cursor=(image.shape[1] // 2, image.shape[0] // 2))
+    clip = normalize(torch.stack([view] * CLIP_FRAMES)).permute(3, 0, 1, 2)[None]
     tiles = normalize(tiles).permute(0, 3, 1, 2)[None]
     encoder = VideoEncoder("models/levjepa-large", variant=args.variant)
     policy = Policy(encoder).cuda().eval()

@@ -14,7 +14,19 @@ from pathlib import Path
 
 import numpy as np
 
+from .dataset import VIEW_COUNT, parse_cursor
+
 log = logging.getLogger(__name__)
+
+
+def worker_executable() -> str:
+    """The release worker next to this repo, wherever the process was started."""
+    candidate = (
+        Path(__file__).resolve().parents[2] / "target" / "release" / "hoi4-desktop-worker.exe"
+    )
+    if candidate.exists():
+        return str(candidate)
+    return str(Path("target/release/hoi4-desktop-worker.exe").resolve())
 
 
 class DesktopError(RuntimeError):
@@ -35,7 +47,7 @@ class Frame:
 
 class Desktop:
     def __init__(self, command: list[str] | None = None):
-        command = command or [str(Path("target/release/hoi4-desktop-worker.exe").resolve())]
+        command = command or [worker_executable()]
         # The worker's only diagnostic channel is stderr. Capture it instead of letting it
         # escape to an inherited console, so failures land beside the run's other evidence.
         self.process = subprocess.Popen(
@@ -43,8 +55,11 @@ class Desktop:
         )
         self.diagnostics = deque(maxlen=64)
         self.close_error = None
-        self.lock = threading.Lock()
-        self.replies = queue.Queue()
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending = {}
+        self.next_id = 1
+        self.reader_error = None
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._drain, daemon=True).start()
         try:
@@ -56,9 +71,37 @@ class Desktop:
     def _read(self):
         try:
             while True:
-                self.replies.put(read_reply(self.process.stdout))
+                self._deliver(read_reply(self.process.stdout))
         except Exception as error:
-            self.replies.put(error)
+            self._fail_pending(error)
+
+    def _deliver(self, reply):
+        req_id = reply.get("id")
+        with self.pending_lock:
+            box = self.pending.get(req_id)
+        if box is not None:
+            box.put(reply)
+        elif "error" in reply:
+            # An error the worker could not tie to a request, such as a line it could not
+            # parse. Keep it as evidence rather than dropping it silently.
+            self.diagnostics.append(f"unmatched worker error: {reply['error']}")
+            log.warning("unmatched worker error: %s", reply["error"])
+
+    def _fail_pending(self, error):
+        # Under the lock request() registers under, so no request can slip in after the
+        # snapshot and wait on a reader that has already stopped.
+        with self.pending_lock:
+            self.reader_error = error
+            boxes = list(self.pending.values())
+        for box in boxes:
+            box.put(error)
+
+    def _send(self, payload: bytes):
+        self.process.stdin.write(payload)
+        self.process.stdin.flush()
+
+    def _alive(self) -> bool:
+        return self.process.poll() is None
 
     def _drain(self):
         try:
@@ -87,30 +130,54 @@ class Desktop:
             self.process.kill()
             self.process.wait()
 
-    def request(self, op: str, **kwargs) -> dict:
-        with self.lock:
-            if self.process.poll() is not None:
+    def request(self, op: str, timeout: float = 10, **kwargs) -> dict:
+        """One worker operation.
+
+        Capture and apply are in flight together: the dispatch thread applies the
+        eight slots while this thread captures. Replies carry the request id, so
+        they can complete in either order. The write lock only covers the send.
+        """
+        box = queue.Queue()
+        with self.write_lock:
+            if not self._alive():
                 raise DesktopError(self._detail("Desktop worker exited"))
-            self.process.stdin.write((json.dumps({"op": op, **kwargs}) + "\n").encode())
-            self.process.stdin.flush()
+            req_id = self.next_id
+            self.next_id += 1
+            # Strict JSON: the worker rejects NaN, and its reply to an unparseable line
+            # cannot carry the id this request waits on.
+            message = json.dumps({"op": op, "id": req_id, **kwargs}, allow_nan=False)
+            with self.pending_lock:
+                if self.reader_error is not None:
+                    raise DesktopError(self._detail(f"Desktop reader stopped: {self.reader_error}"))
+                self.pending[req_id] = box
             try:
-                reply = self.replies.get(timeout=10)
-            except queue.Empty:
-                self._shutdown()
-                raise DesktopError(self._detail("Desktop response timed out")) from None
-            if isinstance(reply, Exception):
-                raise DesktopError(self._detail(str(reply))) from reply
-            if "error" in reply:
-                raise DesktopError(reply["error"])
-            return reply
+                self._send((message + "\n").encode())
+            except Exception:
+                with self.pending_lock:
+                    self.pending.pop(req_id, None)
+                raise
+        try:
+            reply = box.get(timeout=timeout)
+        except queue.Empty:
+            self._shutdown()
+            raise DesktopError(self._detail("Desktop response timed out")) from None
+        finally:
+            with self.pending_lock:
+                self.pending.pop(req_id, None)
+        if isinstance(reply, Exception):
+            raise DesktopError(self._detail(str(reply))) from reply
+        if "error" in reply:
+            raise DesktopError(reply["error"])
+        return reply
 
     def capture(self, *, views=None, regions=None, full=None) -> Frame:
         """Capture a frame, optionally downscaled and cropped by the worker.
 
-        `views` asks the worker for the five policy views at that size, and `regions`
-        for a list of [x, y, w, h] crops at native resolution. Asking for either keeps
-        the 33 MB frame off the wire; the two together are under a megabyte. The full
-        frame is returned only when nothing narrower was requested, or `full=True`.
+        `views` asks the worker for the policy views at that size: the global frame, four
+        quadrants, and a native crop centered on the pointer. `regions` is a list of
+        [x, y, w, h] crops at native resolution. Asking for either keeps the 33 MB frame
+        off the wire; the two together are under a megabyte. The full frame is returned
+        only when nothing narrower was requested, or `full=True`.
         """
         options = {}
         if views:
@@ -157,9 +224,17 @@ class Desktop:
             offset = full_bytes
         view_pair = None
         if meta.get("views_bytes"):
-            s = meta["view_size"]
+            s = meta.get("view_size")
+            if not isinstance(s, int) or isinstance(s, bool) or s <= 0:
+                raise DesktopError("Worker view payload has no view size")
+            if meta["views_bytes"] != VIEW_COUNT * s * s * 3:
+                raise DesktopError(
+                    "Worker view payload is not the global frame, four quadrants, and "
+                    "cursor crop. Rebuild and redeploy hoi4-desktop-worker."
+                )
             # The worker already emits RGB at policy resolution; no swizzle needed.
-            stack = buffer[offset : offset + meta["views_bytes"]].reshape(5, s, s, 3)
+            # The last tile is the native cursor crop.
+            stack = buffer[offset : offset + meta["views_bytes"]].reshape(VIEW_COUNT, s, s, 3)
             view_pair = (stack[0].copy(), stack[1:].copy())
             offset += meta["views_bytes"]
         crops = None
@@ -168,13 +243,19 @@ class Desktop:
             for (x, y, w, h), n in zip(options["regions"], region_bytes, strict=True):
                 crops.append(buffer[offset : offset + n].reshape(h, w, 4)[:, :, [2, 1, 0]].copy())
                 offset += n
+        try:
+            parse_cursor(meta.get("cursor"))
+        except ValueError as error:
+            raise DesktopError(str(error)) from error
         return Frame(rgb, meta, time.monotonic_ns(), views=view_pair, crops=crops)
 
     def arm(self, *, setup=False):
         self.request("arm", mode="setup" if setup else "match")
 
     def apply(self, events: list[dict]):
-        reply = self.request("apply", events=events)
+        # Short on purpose. A slot that blocks longer than this has lost the worker,
+        # and the dispatch join is waiting to stop the interval.
+        reply = self.request("apply", timeout=2, events=events)
         reply.pop("payload", None)
         return reply
 

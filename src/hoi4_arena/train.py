@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from .dataset import Sessions
+from .dataset import Sessions, require_one_game_speed
 from .learning import save_checkpoint
 from .models import Policy, PredictiveAuxiliary, VideoEncoder, xm_loss
 
@@ -45,9 +45,14 @@ def train_bc(
     seed=42,
 ):
     torch.manual_seed(seed)
+    output = Path(output)
+    if (output / "epoch-0000.pt").exists():
+        raise FileExistsError("Checkpoints are immutable")
     dataset = Sessions(data, length=sequence, burn_in=burn_in)
     validation = Sessions(data, split="validation", length=sequence, burn_in=burn_in)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    require_one_game_speed([dataset.game_speed, validation.game_speed])
+    # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=auxiliary != "none")
     if len(loader) == 0:
         raise ValueError("Need at least two sequences for independent-batch regularization")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,8 +76,8 @@ def train_bc(
         "burn_in": burn_in,
         "batch_size": batch_size,
         "model_path": str(Path(model_path).resolve()),
+        "game_speed": dataset.game_speed,
     }
-    output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     with (output / "metrics.jsonl").open("a") as log:
         for epoch in range(epochs):
@@ -121,17 +126,21 @@ def train_bc(
                         memory = memory.flatten(0, 1)
                         labels = batch["actions"][:, burn_in:].flatten(0, 1)
                         if objective == "xm":
+                            # The same best-of-K choice the training loss makes, not a
+                            # log-sum-exp of candidates the optimizer never saw.
                             scores = torch.stack(
                                 [
                                     policy.actor(
                                         memory,
                                         labels,
-                                        noise=torch.randn(len(memory), 16, device=device),
+                                        noise=torch.randn(
+                                            len(memory), policy.actor.noise_dim, device=device
+                                        ),
                                     )[1]
                                     for _ in range(5)
                                 ]
                             )
-                            score = torch.logsumexp(scores, 0) - torch.log(scores.new_tensor(5.0))
+                            score = scores.max(0).values
                         else:
                             score = policy.actor(memory, labels)[1]
                         validation_losses.extend((-score).float().cpu().tolist())
@@ -159,27 +168,28 @@ def train_bc(
 
 def distill(data, model_path, output, epochs=1, seed=42):
     """Offline teacher only; the deployed student remains a single direct policy encoder."""
+    path = Path(output)
+    if path.exists():
+        raise FileExistsError(path)
     torch.manual_seed(seed)
     dataset = Sessions(data, length=1, burn_in=0)
-    teacher = VideoEncoder(model_path, train_last=0).cuda().eval()
-    student = VideoEncoder(model_path, variant="tiny").cuda()
-    projection = torch.nn.Linear(student.dim, teacher.dim).cuda()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    teacher = VideoEncoder(model_path, train_last=0).to(device).eval()
+    student = VideoEncoder(model_path, variant="tiny").to(device)
+    projection = torch.nn.Linear(student.dim, teacher.dim).to(device)
     optimizer = torch.optim.AdamW([*student.parameters(), *projection.parameters()], lr=1e-4)
     for _ in range(epochs):
         for batch in DataLoader(dataset, batch_size=2, shuffle=True):
-            clip = batch["clips"][:, 0].cuda()
+            clip = batch["clips"][:, 0].to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
                 with torch.no_grad():
                     target = teacher(clip)
                 features = student(clip)
                 loss = torch.nn.functional.mse_loss(projection(features).float(), target.float())
             loss.backward()
             optimizer.step()
-    path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise FileExistsError(path)
     torch.save(
         {"encoder": student.state_dict(), "teacher": model_path, "seed": seed, "trained": True},
         path,

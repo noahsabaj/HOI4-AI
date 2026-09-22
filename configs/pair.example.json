@@ -4,12 +4,15 @@
   "seconds": 1800,
   "seed": 42,
   "deterministic": false,
+  "game_speed": 4,
   "model_path": "models/levjepa-large",
   "left": {
+    "country": "BLU",
     "rules": "artifacts/calibration-left/rules.json",
     "recipe": "artifacts/calibration-left/reset.json"
   },
   "right": {
+    "country": "RED",
     "peer": "artifacts/pairing/peer.json",
     "rules": "artifacts/calibration-right/rules.json",
     "recipe": "artifacts/calibration-right/reset.json"

@@ -94,14 +94,55 @@ def add_template(screenshot, rules, name, rect, max_mae=DEFAULT_MAX_MAE):
 
 def set_clock_rect(screenshot, rules, rect):
     """Calibrate the changing-clock ROI. Collection refuses to start without it."""
+    return _set_rect(screenshot, rules, rect, "clock_rect", "Clock", "clock calibration")
+
+
+def set_minimap_rect(screenshot, rules, rect):
+    """Calibrate the political minimap. The territory reward reads nothing else."""
+    return _set_rect(screenshot, rules, rect, "minimap_rect", "Minimap", "minimap calibration")
+
+
+def _set_rect(screenshot, rules, rect, key, label, replacement):
     path, image, spec = _open_spec(screenshot, rules)
-    checked = _checked_rect(image, rect, "Clock")
-    existing = spec.get("clock_rect")
+    checked = _checked_rect(image, rect, label)
+    existing = spec.get(key)
     if existing is not None and list(existing) != checked:
-        raise ValueError("Explicitly remove the old clock calibration before recalibrating")
-    spec["clock_rect"] = checked
+        raise ValueError(f"Explicitly remove the old {replacement} before recalibrating")
+    spec[key] = checked
     path.write_text(json.dumps(spec, indent=2))
-    return {"clock_rect": checked, "calibration": str(path)}
+    return {key: checked, "calibration": str(path)}
+
+
+# The colours the map generator writes for the two countries. The minimap shades them,
+# so a match is a distance rather than an exact pixel, and chrome farther than this
+# from both is ignored.
+BLUE = (40, 100, 220)
+RED = (220, 60, 60)
+
+
+def occupation_balance(crop, colour=BLUE, tolerance=48.0):
+    """`colour`'s share of the pixels that read as one of the two countries.
+
+    The default colour is Blue, which is what the original calls measured. A match
+    passes the acting country's colour: Red's reward is Red's share, so the two
+    sides move in opposite directions when the front moves. None means the crop
+    contained neither country. The caller must not turn that into a swing.
+    """
+    pixels = np.asarray(crop, dtype=np.float32)
+    if pixels.size == 0 or pixels.ndim != 3:
+        return None
+    chosen = tuple(int(v) for v in colour)
+    if chosen not in (BLUE, RED):
+        raise ValueError("occupation colour must be the blue or red country colour")
+    to_blue = np.linalg.norm(pixels - np.array(BLUE, dtype=np.float32), axis=-1)
+    to_red = np.linalg.norm(pixels - np.array(RED, dtype=np.float32), axis=-1)
+    is_blue = (to_blue <= tolerance) & (to_blue <= to_red)
+    is_red = (to_red <= tolerance) & (to_red < to_blue)
+    total = int(is_blue.sum() + is_red.sum())
+    if total == 0:
+        return None
+    owned = is_blue if chosen == BLUE else is_red
+    return float(owned.sum() / total)
 
 
 class ScreenRules:
@@ -109,15 +150,8 @@ class ScreenRules:
         path = Path(path)
         spec = json.loads(path.read_text())
         self.width, self.height = spec["resolution"]
-        self.clock_rect = spec.get("clock_rect")
-        if self.clock_rect is not None:
-            # A hand-edited rules.json can carry floats, which would slice the frame with a
-            # TypeError deep inside the match loop. Reject them here instead.
-            if not all(isinstance(v, int) and not isinstance(v, bool) for v in self.clock_rect):
-                raise ValueError("clock_rect must be four integers")
-            x, y, w, h = self.clock_rect
-            if min(x, y) < 0 or min(w, h) < 1 or x + w > self.width or y + h > self.height:
-                raise ValueError("Calibrated clock_rect lies outside the calibrated resolution")
+        self.clock_rect = self._stored_rect(spec.get("clock_rect"), "clock_rect")
+        self.minimap_rect = self._stored_rect(spec.get("minimap_rect"), "minimap_rect")
         self.rules = spec["rules"]
         self.templates = {}
         for name, rule in self.rules.items():
@@ -127,23 +161,48 @@ class ScreenRules:
         self.last = None
         self.count = 0
 
+    def _stored_rect(self, rect, label):
+        # A hand-edited rules.json can carry floats, which would slice the frame with a
+        # TypeError deep inside the match loop. Reject them here instead.
+        if rect is None:
+            return None
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in rect):
+            raise ValueError(f"{label} must be four integers")
+        x, y, w, h = rect
+        if min(x, y) < 0 or min(w, h) < 1 or x + w > self.width or y + h > self.height:
+            raise ValueError(f"Calibrated {label} lies outside the calibrated resolution")
+        return [int(v) for v in rect]
+
     def require_match_rules(self):
-        required = {"ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"}
+        required = {
+            "ready",
+            "healthy",
+            "paused",
+            "speed",
+            "win",
+            "loss",
+            "disconnect",
+            "desync",
+        }
         if not required.issubset(self.rules) or self.clock_rect is None:
             raise ValueError(
-                "Calibrate all match outcomes, running speed two, and clock_rect before collection"
+                "Calibrate all match outcomes, the pause glyph, the speed indicator, "
+                "and clock_rect before collection"
             )
 
     def capture_regions(self):
-        """The rects the match loop reads, in a stable order: every rule, then the clock.
+        """The rects the match loop reads, in a stable order.
 
-        The worker crops exactly these and sends nothing else, so the order here is the
-        wire order. Sorted by name so it does not depend on JSON key ordering.
+        Every rule, then the clock, then the minimap. The worker crops exactly these
+        and sends nothing else, so the order here is the wire order. Sorted by name so
+        it does not depend on JSON key ordering.
         """
         names = sorted(self.rules)
         rects = [self.rules[name]["rect"] for name in names]
         if self.clock_rect is not None:
             rects.append(self.clock_rect)
+        if self.minimap_rect is not None:
+            rects.append(self.minimap_rect)
         return names, rects
 
     def matches_crop(self, name, crop):
@@ -197,11 +256,14 @@ class Observation:
             if len(frame.crops) != len(rects):
                 raise ValueError("Worker returned a different region set than was calibrated")
             self.crops = dict(zip(names, frame.crops, strict=False))
-            self.clock = frame.crops[len(names)] if rules.clock_rect is not None else None
+            extra = list(frame.crops[len(names) :])
+            self.clock = extra.pop(0) if rules.clock_rect is not None else None
+            self.minimap = extra.pop(0) if rules.minimap_rect is not None else None
         elif frame.rgb is None:
             raise ValueError("Capture carries neither a full frame nor calibrated crops")
         else:
             self.clock = None
+            self.minimap = None
 
     def matches(self, name):
         if self.crops is not None:
@@ -217,6 +279,12 @@ class Observation:
         if self.clock is not None:
             return self.clock
         x, y, w, h = self.rules.clock_rect
+        return self.frame.rgb[y : y + h, x : x + w]
+
+    def minimap_pixels(self):
+        if self.minimap is not None:
+            return self.minimap
+        x, y, w, h = self.rules.minimap_rect
         return self.frame.rgb[y : y + h, x : x + w]
 
 
