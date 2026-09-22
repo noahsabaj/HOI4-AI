@@ -1,0 +1,293 @@
+"""Record AI-vs-AI games on an arena map, one after another, until a time budget runs out.
+
+Each game launches HOI4 with the arena, starts as Blue, hands both countries to the AI with
+the `observe` console command, sets speed 4, and records native frames while a second worker
+connection moves the camera the way a player would. A game ends when the peace summary
+popup ("Treaty of ...") appears, or at the cap. The winner is read from the colour square in
+that popup.
+
+The recordings carry no actions, so they cannot teach clicks. They are for the encoder, for
+predicting who wins, and for measuring how often a match ends inside the time limit.
+
+    python scripts/record_ai_games.py artifacts/ai-games --minutes 90
+
+It takes over this PC's screen. Anything else that takes focus stops input to the game.
+"""
+
+import argparse
+import json
+import random
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+from hoi4_arena.desktop import Desktop, DesktopError
+from hoi4_arena.recording import Recorder
+from hoi4_arena.vision import ScreenRules
+
+SCRIPTS = Path(__file__).resolve().parent
+# Where the treaty popup's title sits at 3840x2160, and the row holding the winner's colour.
+TREATY_RECT = (1700, 842, 210, 36)
+WINNER_ROW = (1650, 955, 400, 20)
+
+
+def say(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
+def pwsh(*args, timeout=300):
+    command = ["pwsh", "-NoProfile", *args]
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+
+
+def focus():
+    pwsh("-Command", "(New-Object -ComObject WScript.Shell).AppActivate((Get-Process hoi4).Id)")
+    time.sleep(0.5)
+
+
+def act(events, pause=0.15):
+    focus()
+    with Desktop() as desk:
+        desk.arm(setup=True)
+        try:
+            for event in events:
+                desk.apply([event])
+                time.sleep(pause)
+        finally:
+            desk.release()
+
+
+def click(x, y):
+    press = [{"kind": "button", "button": 0, "down": d} for d in (True, False)]
+    act([{"kind": "move", "x": x, "y": y}, *press])
+
+
+def key(vk):
+    act([{"kind": "key", "vk": vk, "down": d} for d in (True, False)])
+
+
+def shot():
+    with Desktop() as desk:
+        return desk.capture(full=True).rgb
+
+
+def crop(rgb, rect):
+    x, y, w, h = rect
+    return rgb[y : y + h, x : x + w].astype(np.float32)
+
+
+def treaty_winner(rgb, template):
+    """BLU or RED once the peace summary popup is up, otherwise None."""
+    if float(np.abs(crop(rgb, TREATY_RECT) - template).mean()) > 12:
+        return None
+    row = crop(rgb, WINNER_ROW).astype(int)
+    r, g, b = row[..., 0], row[..., 1], row[..., 2]
+    blue = int(((b - r > 100) & (b > 150) & (g < 150)).sum())
+    red = int(((r > 150) & (g < 90) & (b < 90)).sum())
+    return "BLU" if blue > red else "RED" if red > blue else "unknown"
+
+
+def kill_game():
+    pwsh(
+        "-Command",
+        "Get-Process hoi4 -ErrorAction SilentlyContinue | Stop-Process -Force; "
+        "while (Get-Process hoi4 -ErrorAction SilentlyContinue) { Start-Sleep 1 }",
+    )
+
+
+def start_game(mod, rules, failure_shot):
+    kill_game()
+    out = pwsh("-File", str(SCRIPTS / "Test-ArenaLoad.ps1"), "-Mod", str(mod))
+    say("launch:", out.stdout.strip().replace("\n", " | "), out.stderr.strip()[-200:])
+    time.sleep(25)
+    click(0.5, 0.325)  # Single Player
+    time.sleep(5)
+    click(0.5, 0.415)  # New Game
+    time.sleep(40)
+    click(0.535, 0.732)  # Select Country (Blue is preselected)
+    time.sleep(40)
+    click(0.944, 0.970)  # Start
+    time.sleep(20)
+    rgb = shot()
+    if not rules.matches("healthy", rgb):
+        Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
+        raise RuntimeError("game did not reach the map")
+    pwsh("-File", str(SCRIPTS / "Send-HoiConsole.ps1"), "observe")
+    act([{"kind": "move", "x": 0.5, "y": 0.5}] + [{"kind": "wheel", "delta": -120}] * 14, 0.1)
+    # The framing the hand-centred runs used: right for 0.5 s, then left for 0.28 s.
+    act([{"kind": "key", "vk": 0x27, "down": d} for d in (True, False)], pause=0.5)
+    act([{"kind": "key", "vk": 0x25, "down": d} for d in (True, False)], pause=0.28)
+    for _ in range(3):
+        click(0.948, 0.0145)  # The on-screen + button: speed 1 to 4.
+    act([{"kind": "move", "x": 0.5, "y": 0.75}])
+    key(0x20)  # Unpause
+    time.sleep(2)
+    rgb = shot()
+    if not rules.matches("speed", rgb) or rules.matches("paused", rgb):
+        Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
+        raise RuntimeError("game is not running at speed 4")
+
+
+def camera(stop):
+    """Look around like a player, always coming back to the start view.
+
+    Every pan is undone by the opposite pan of the same length, and every zoom-in by a
+    zoom-out at the same pointer position. A random walk drifted off the arena onto open
+    sea within minutes, because pan speed changes with zoom.
+    """
+    rng = random.Random()
+    opposite = {0x25: 0x27, 0x27: 0x25, 0x26: 0x28, 0x28: 0x26}
+    with Desktop() as desk:
+
+        def do(events, pause=0.08):
+            # The worker disarms after 750 ms without input, so arm for each burst.
+            desk.arm(setup=True)
+            for event in events:
+                desk.apply([event])
+                time.sleep(pause)
+
+        def hold(vk, seconds):
+            desk.arm(setup=True)
+            desk.apply([{"kind": "key", "vk": vk, "down": True}])
+            try:
+                time.sleep(seconds)
+            finally:
+                desk.apply([{"kind": "key", "vk": vk, "down": False}])
+
+        def linger():
+            # Point around while away, like a player reading the map.
+            for _ in range(rng.randint(1, 3)):
+                if stop.wait(rng.uniform(0.6, 1.8)):
+                    return
+                x, y = rng.uniform(0.1, 0.9), rng.uniform(0.15, 0.85)
+                do([{"kind": "move", "x": x, "y": y}])
+
+        try:
+            while not stop.wait(rng.uniform(0.8, 2.5)):
+                try:
+                    roll = rng.random()
+                    if roll < 0.35:
+                        vk = rng.choice(list(opposite))
+                        seconds = rng.uniform(0.08, 0.25)
+                        hold(vk, seconds)
+                        linger()
+                        hold(opposite[vk], seconds)
+                    elif roll < 0.65:
+                        x, y = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
+                        notches = rng.randint(1, 4)
+                        at = {"kind": "move", "x": x, "y": y}
+                        do([at] + [{"kind": "wheel", "delta": 120}] * notches)
+                        linger()
+                        do([at] + [{"kind": "wheel", "delta": -120}] * notches)
+                    else:
+                        linger()
+                except DesktopError as error:
+                    say("  camera:", error)
+                    focus()
+        finally:
+            desk.release()
+
+
+def play(root, template, args):
+    stop = threading.Event()
+    mover = threading.Thread(target=camera, args=(stop,), daemon=True)
+    outcome, reason, seen = "timeout", None, 0
+    with Desktop() as desk:
+        first = desk.capture()
+        rec = Recorder(root, first, game_speed=4, source="ai", hz=args.hz)
+        start = deadline = time.monotonic()
+        late = 0
+        try:
+            rec.append(first)
+            mover.start()
+            while time.monotonic() - start < args.cap_minutes * 60:
+                deadline += 1 / args.hz
+                time.sleep(max(0, deadline - time.monotonic()))
+                frame = desk.capture()
+                if not frame.meta.get("foreground"):
+                    focus()
+                    continue
+                rec.append(frame)
+                if time.monotonic() - deadline > 1:
+                    late += 1
+                    deadline = time.monotonic()
+                winner = treaty_winner(frame.rgb, template)
+                seen = seen + 1 if winner else 0
+                if seen >= 2:
+                    outcome = winner
+                    Image.fromarray(frame.rgb).save(Path(root) / "treaty.png")
+                    break
+                if rec.manifest["frames"] % (60 * int(args.hz)) == 0:
+                    say(f"  {rec.manifest['frames'] // int(args.hz) // 60} min recorded")
+        except Exception as error:  # noqa: BLE001 - recorded in the manifest.
+            reason = f"{type(error).__name__}: {error}"
+        finally:
+            stop.set()
+            mover.join(timeout=10)
+            rec.manifest.update(
+                winner=outcome,
+                seconds=round(time.monotonic() - start),
+                late_ticks=late,
+                arena=Path(args.mod).name,
+                driver="observe + scripted camera",
+            )
+            rec.close(complete=reason is None, reason=reason)
+    return outcome, reason, rec.manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("output")
+    parser.add_argument("--minutes", type=float, required=True, help="Total time budget.")
+    parser.add_argument("--mod", default="artifacts/mods/small-arena-v1")
+    parser.add_argument("--rules", default="artifacts/calibration-live/rules.json")
+    parser.add_argument(
+        "--treaty",
+        default="artifacts/match-end-screens-2026-09-22/observer-peace-summary-popup.png",
+        help="A 3840x2160 capture of the peace summary popup, to cut its title from.",
+    )
+    parser.add_argument("--hz", type=float, default=5)
+    parser.add_argument("--cap-minutes", type=float, default=32)
+    args = parser.parse_args()
+    out_root = Path(args.output)
+    out_root.mkdir(parents=True, exist_ok=True)
+    rules = ScreenRules(args.rules)
+    template = crop(np.asarray(Image.open(args.treaty).convert("RGB")), TREATY_RECT)
+    end = time.monotonic() + args.minutes * 60
+    results = []
+    # A game needs about 3 minutes to launch and most end within 10; do not start one
+    # that cannot plausibly finish.
+    while time.monotonic() + 12 * 60 < end:
+        name = time.strftime("ai-%Y%m%d-%H%M%S")
+        try:
+            start_game(args.mod, rules, out_root / f"{name}-start-failed.png")
+        except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
+            say("start failed:", error)
+            results.append({"game": name, "error": str(error)})
+            continue
+        say("recording", name)
+        outcome, reason, manifest = play(out_root / name, template, args)
+        say("finished", name, "winner", outcome, "after", manifest["seconds"], "s", reason or "")
+        results.append(
+            {
+                "game": name,
+                "winner": outcome,
+                "seconds": manifest["seconds"],
+                "frames": manifest["frames"],
+                "complete": manifest["complete"],
+                "reason": reason,
+            }
+        )
+        (out_root / f"results-{time.strftime('%Y%m%d')}.json").write_text(
+            json.dumps(results, indent=2)
+        )
+    kill_game()
+    say("done", json.dumps(results))
+
+
+if __name__ == "__main__":
+    main()

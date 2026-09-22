@@ -2,12 +2,30 @@
 # PowerShell 7.5+ (.NET 9+): the bridge loads its certificate with X509CertificateLoader.
 #
 # .\Start-Worker.ps1            Run the worker bridge here, restarting it after updates.
-# .\Start-Worker.ps1 -Install   Also start it minimized at every logon, and start it now.
-#                               Undo by deleting "HOI4 Worker" from shell:startup.
-param([switch]$Install, [switch]$Bridge)
+# .\Start-Worker.ps1 -Install   Also start it hidden at every logon, and (re)start it now.
+#                               Undo with -Stop, then delete "HOI4 Worker" from shell:startup.
+# .\Start-Worker.ps1 -Stop      Stop a running worker, hidden or not.
+# The worker has no window to close by accident. Its output goes to worker.log beside this
+# script, which the first PC can read through the share.
+param([switch]$Install, [switch]$Stop, [switch]$Bridge)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $pwsh = (Get-Process -Id $PID).Path
+$log = Join-Path $PSScriptRoot 'worker.log'
+
+function Stop-Worker {
+    $script = Split-Path $PSCommandPath -Leaf
+    Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*$script*" -and $_.CommandLine -notlike '* -Install*' -and $_.CommandLine -notlike '* -Stop*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-Process hoi4-desktop-worker -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+if ($Stop) {
+    Stop-Worker
+    Write-Output 'Stopped the HOI4 worker.'
+    return
+}
 
 if ($Install) {
     $link = Join-Path ([Environment]::GetFolderPath('Startup')) 'HOI4 Worker.lnk'
@@ -18,29 +36,65 @@ if ($Install) {
     ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
     $shortcut.TargetPath = if ($stable) { $stable } else { $pwsh }
-    $shortcut.Arguments = "-NoProfile -File `"$PSCommandPath`""
+    $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -File `"$PSCommandPath`""
     $shortcut.WorkingDirectory = $PSScriptRoot
-    $shortcut.WindowStyle = 7  # Minimized.
+    $shortcut.WindowStyle = 7  # Minimized, for the moment before -WindowStyle hides it.
     $shortcut.Save()
+    # Replace a running copy, such as one started by an older, windowed shortcut.
+    Stop-Worker
     Start-Process -FilePath $link
-    Write-Output "Installed $link and started the worker in a minimized window."
+    Write-Output "Installed $link and started the worker hidden. Its log is $log."
     return
 }
 
 if (-not $Bridge) {
+    # One supervisor per session: a second one would only fail to bind the port forever.
+    $mutex = [Threading.Mutex]::new($false, 'Local\HOI4Worker')
+    if (-not $mutex.WaitOne(0)) {
+        Write-Output 'The HOI4 worker is already running.'
+        return
+    }
+    if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -gt 1MB) {
+        Move-Item -LiteralPath $log -Destination "$log.old" -Force
+    }
+    function Write-Log($text) { Add-Content -LiteralPath $log "$(Get-Date -Format s) $text" }
+    Write-Log "Supervisor started (PID $PID)."
     # Supervisor. The bridge runs in a child pwsh because a compiled type cannot be
     # reloaded in place. An idle bridge exits with code 3 when Deploy-Peer replaces this
     # script or the pairing, and starts again from the new files. Any other exit, such as
     # the network not being up yet at logon, is retried.
     while ($true) {
-        & $pwsh -NoProfile -File $PSCommandPath -Bridge
+        & $pwsh -NoProfile -File $PSCommandPath -Bridge *>> $log
         if ($LASTEXITCODE -eq 3) {
-            Write-Output 'Update deployed. Restarting the bridge.'
+            Write-Log 'Update deployed. Restarting the bridge.'
             continue
         }
-        Write-Output "Bridge stopped (exit $LASTEXITCODE). Retrying in 10 s; close this window to stop."
+        Write-Log "Bridge stopped (exit $LASTEXITCODE). Retrying in 10 s."
         Start-Sleep -Seconds 10
     }
+}
+
+# A launch request from the first PC (Deploy-Peer -Launch): start HOI4 with an arena mod
+# that Deploy-Peer mirrored into mods\. The request names a folder there, never a path,
+# and a game that is already running is left alone. The outcome is written beside it.
+$request = Join-Path $PSScriptRoot 'launch.txt'
+if (Test-Path -LiteralPath $request) {
+    $name = (Get-Content -LiteralPath $request -Raw).Trim()
+    $age = (Get-Date) - (Get-Item -LiteralPath $request).LastWriteTime
+    Remove-Item -LiteralPath $request
+    $mod = Join-Path $PSScriptRoot "mods\$name"
+    $result = Join-Path $PSScriptRoot 'launch-result.txt'
+    # A request left waiting while this PC was off must not open a game at the next logon.
+    if ($age.TotalMinutes -gt 30) {
+        Set-Content -LiteralPath $result "refused: request is $([int]$age.TotalMinutes) minutes old"
+    } elseif ($name -notmatch '^[\w.-]+$' -or -not (Test-Path -LiteralPath (Join-Path $mod 'descriptor.mod'))) {
+        Set-Content -LiteralPath $result "refused: no arena mod named '$name' in mods"
+    } elseif (Get-Process hoi4 -ErrorAction SilentlyContinue) {
+        Set-Content -LiteralPath $result 'refused: HOI4 is already running'
+    } else {
+        & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Test-ArenaLoad.ps1') -Mod $mod *> $result
+    }
+    Write-Output "Launch request for '$name': $((Get-Content -LiteralPath $result) -join ' ')"
 }
 
 $spec = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server.json') -Raw | ConvertFrom-Json
@@ -158,5 +212,5 @@ public static class Hoi4Bridge {
 $pairing = Join-Path $PSScriptRoot 'server.json'
 $pfx = Join-Path $PSScriptRoot 'worker.pfx'
 $restart = [Hoi4Bridge]::Run($spec.bind, $spec.port, $spec.coordinator, $pfx, $spec.pfx_password, $spec.token,
-    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'), @($PSCommandPath, $pairing, $pfx))
+    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'), @($PSCommandPath, $pairing, $pfx, $request))
 if ($restart) { exit 3 }

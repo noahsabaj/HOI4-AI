@@ -17,12 +17,13 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | Combat | `infantry-arena-v12` | Orders, battles and results all work. Two Blue divisions attacked one Red defender and lost |
 | Long run | `capitulation-harness-v2` | 1936 to May 1940 at speed 4–5 with no crash |
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
+| **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
 Automated checks: 125 Python tests and 16 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
-**Not yet shown:** a match between two agents, a full 1800-second match, and a match
-played across two PCs.
+**Not yet shown:** a match between two agents. A two-player match across the two PCs
+was played to a surrender on 2026-09-22, driven from this PC.
 
 ## How a country surrenders
 
@@ -37,6 +38,12 @@ played across two PCs.
   provinces in 4 states (6 columns by 4 rows) inside the normal-size grid. Blue declared
   war on 1 Jan 1936, and by 29 Jan Red had surrendered and lost 2 states in the peace
   deal. At speed 5 that took seconds of real time.
+- **With both sides armed it still finishes.** On `small-arena-v1` (same map, both
+  armies) both runs ended in a surrender, after about 14 months of game time in one and
+  6 months in the other. The winner took land in the peace deal but did not annex the
+  loser, and the game kept running at peace. So a match must end at the surrender, not when a country disappears.
+- Observer mode: the `observe` console command (debug mode) hands both countries to the
+  AI. The console key is outside the worker's allowed keys, so it is sent separately.
 - Useful game constants: `BASE_SURRENDER_LEVEL = 1.0` (`NDiplomacy`) is the surrender
   threshold. `BASE_SURRENDER_LIMIT = 0.8` is an occupation fraction, not the threshold.
 - Game speed in wall-clock seconds per in-game hour: `{2.0, 0.5, 0.2, 0.1, 0.0}` for
@@ -44,22 +51,41 @@ played across two PCs.
 
 ## Match-end screens
 
-HOI4 has no "game over" screen. A one-against-one surrender goes:
-`surrendered_country_popup` (520×320, centred) → peace conference (full screen) →
-"Calculating Effects..." → `peace_summary_popup_window` → back to the map.
+HOI4 has no "game over" screen. What each side actually sees when the other surrenders
+(single player, 2026-09-22, frames in `artifacts/match-end-screens-2026-09-22/`):
 
-- The surrender popup uses the same frame art as the exile popup, so its template must
-  be cut from the title text.
-- Winner and loser see the same peace conference window. Only the banner art at the top
-  differs, so `win` and `loss` templates must be cut from the banner.
-- The popup is small. If it doesn't cover the `healthy` rectangle, the match loop keeps
-  running and a real surrender ends as a timeout draw.
+- **The winning player** gets the full-screen peace conference ("Make your Demands",
+  "Confirm and Exit") with a "Red has capitulated" equipment popup on top. The game
+  waits there until the player confirms. `healthy` stops matching on this screen.
+- **The losing player, with an AI winner,** sees no surrender popup and no conference.
+  The first sign is the peace summary popup, "Treaty of East Capital: Blue took 2
+  states", over the map. The treaty is named after the loser's capital. Observer mode
+  sees the same popup.
+- **In a two-player match both players get the peace conference.** Tested 2026-09-22
+  with this PC hosting Blue and the second PC as Red, joined by Server ID. When Red
+  surrendered, Blue got "Make your Demands" with the capitulation popup, and Red got
+  the same window titled **Defeated** ("You have been defeated. The victors are
+  currently making demands"). Both games wait there.
+- Switching sides mid-game: the `tag BLU` console command. That is how the winner's view
+  was captured: play Red, then take Blue just before Red surrenders.
 
 ## Screen calibration
 
-Calibrated at 3840×2160 in `artifacts/calibration-live/rules.json`: `healthy`, `paused`
-and `clock_rect`. **Still needed before a match can run:** `ready`, `speed`, `win`,
-`loss`, `disconnect`, `desync`, and a `minimap_rect` for the territory reward.
+Calibrated at 3840×2160 in `artifacts/calibration-live/rules.json`: `healthy`, `paused`,
+`clock_rect`, `speed` (the speed-4 bars at `[3416, 52, 186, 9]`), `win` (the "Make your
+Demands" text at `[1810, 140, 215, 30]`) and `loss` (the "Defeated" title at
+`[181, 166, 137, 28]`), `disconnect` (the "Server Lost!" title at `[1770, 915, 300, 45]`)
+and `ready` (the clock reading "12:00, 1 Jan, 1936" at the start of a game, max 23).
+Each matches only its own screen: the nearest other captured screen is 21 away for
+`win`, 33 for `loss`, 26 for `disconnect` and 29 for `ready`. **Still needed before a
+match can run:** `desync`, which can't be produced on demand, and a `minimap_rect` for
+the territory reward, which needs a design decision because HOI4 has no minimap.
+
+- The start clock drifts by up to 19 between captures of the same paused frame (the
+  pause hatching moves), so `ready` needs a looser threshold than the other rules.
+- The client shows "Server Lost!" 25 to 65 seconds after the host dies, not at once.
+  The host is healthy the whole time, so it stays in the match; a match needs its own
+  timeout on that wait.
 
 What calibration taught us:
 
@@ -143,19 +169,21 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Size the playable arena.** The small map produces a surrender quickly with one
-   side unarmed. Next, test it with both sides armed and see whether an 1800-second
-   match at speed 4 reaches a result. If not, try a slightly larger block or scoring on
-   territory.
-2. **Calibrate the remaining screens** on the small map: capture the surrender popup,
-   the peace conference win and loss banners, `ready`, `speed`, `disconnect`, `desync`,
-   and the minimap rectangle. The harness can now produce a surrender whenever needed.
-3. **Record 2–4 hours of human play** on the chosen arena, with `--game-speed` set to
-   the speed actually used. Recordings need the cursor position, which the worker now
-   sends.
-4. **Distil the compact encoder** from those recordings. It is the only measured way to
-   fit two actors in one tick on one GPU; the other is one GPU per side.
+1. **Finish calibration**: `desync`, and decide how the territory reward reads the map
+   (a fixed-camera crop, or an overlay only the reward sees). All other screens are done.
+2. **Record AI-vs-AI games** on the arena with `scripts/record_ai_games.py`. They have
+   no actions, so they can't teach clicks, but they need no human time and are enough
+   for the encoder (step 4), for learning to predict who wins, and as a first opponent.
+   Three recorded so far (Red, Red, Blue; 7 to 15 minutes each). Every armed game so far,
+   five of five, ended inside 1800 s. At native 4K a game is 7 to 19 GB, so pick a
+   smaller storage format before recording many.
+3. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
+   speed actually used. This is the only source of real actions. Recordings need the
+   cursor position, which the worker now sends.
+4. **Distil the compact encoder** from the AI games and human recordings. It is the only
+   measured way to fit two actors in one tick on one GPU; the other is one GPU per side.
 5. Train the behaviour-cloning baseline, then recurrent PPO self-play with a league.
-6. Run a two-PC match, and check reset and recovery when something goes wrong.
+6. Run a two-PC match between agents, and check reset and recovery when something goes
+   wrong. (A two-PC match driven by hand, from this PC, works.)
 7. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
 8. Test the same interface in an unmodified private multiplayer lobby.

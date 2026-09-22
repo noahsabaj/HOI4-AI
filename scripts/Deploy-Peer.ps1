@@ -5,7 +5,12 @@
 param(
     [string]$PeerConfig = 'artifacts\pairing\peer.json',
     [string]$Share,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Arena mods to mirror into the share's mods folder, so the second PC can launch the
+    # same map with Test-ArenaLoad.ps1 for a two-player match.
+    [string[]]$Mod = @(),
+    # Ask the second PC's idle Start-Worker to launch HOI4 with this deployed mod.
+    [string]$Launch
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -27,6 +32,7 @@ if (-not (Test-Path -LiteralPath $Share)) {
 $files = [ordered]@{
     'hoi4-desktop-worker.exe' = 'target\release\hoi4-desktop-worker.exe'
     'Start-Worker.ps1'        = 'scripts\Start-Worker.ps1'
+    'Test-ArenaLoad.ps1'      = 'scripts\Test-ArenaLoad.ps1'
     'server.json'             = Join-Path $bundle 'server.json'
     'worker.pfx'              = Join-Path $bundle 'worker.pfx'
 }
@@ -52,5 +58,19 @@ foreach ($name in $files.Keys) {
     }
     Move-Item -LiteralPath $stage -Destination $live -Force
     Write-Output "deployed $name"
+}
+foreach ($path in $Mod) {
+    $source = (Resolve-Path -LiteralPath $path).Path
+    $target = Join-Path $Share "mods\$(Split-Path $source -Leaf)"
+    # Mirror, so a regenerated map leaves no stale files behind. Robocopy exit codes
+    # below 8 are success.
+    robocopy $source $target /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Copying $path failed (robocopy $LASTEXITCODE)" }
+    Write-Output "deployed mod $(Split-Path $source -Leaf)"
+}
+if ($Launch) {
+    Remove-Item -LiteralPath (Join-Path $Share 'launch-result.txt') -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath (Join-Path $Share 'launch.txt') $Launch
+    Write-Output "requested launch of $Launch; the outcome appears in launch-result.txt"
 }
 Write-Output 'Done. A running Start-Worker picks this up on its own; a new worker takes effect on the next connection.'
