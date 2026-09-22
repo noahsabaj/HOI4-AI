@@ -33,6 +33,15 @@ def main():
     record.add_argument("--seconds", type=float, default=1200)
     record.add_argument("--hz", type=float, default=10)
     record.add_argument("--split", choices=["train", "validation", "test"])
+    record.add_argument(
+        "--game-speed",
+        type=int,
+        required=True,
+        choices=[1, 2, 3, 4, 5],
+        help="Speed the game is set to for the whole session. Written into the manifest. "
+        "There is no default: a 1.6 s clip is 3.2 in-game hours at speed 2 and 16 at "
+        "speed 4, and the speed bars are not read back.",
+    )
     prepare = sub.add_parser("prepare")
     prepare.add_argument("source")
     prepare.add_argument("output")
@@ -86,8 +95,22 @@ def main():
     clock.add_argument("screenshot")
     clock.add_argument("rules")
     clock.add_argument("--rect", nargs=4, type=int, required=True, metavar=("X", "Y", "W", "H"))
+    minimap = sub.add_parser(
+        "minimap", help="Calibrate the political-minimap crop the territory reward reads"
+    )
+    minimap.add_argument("screenshot")
+    minimap.add_argument("rules")
+    minimap.add_argument("--rect", nargs=4, type=int, required=True, metavar=("X", "Y", "W", "H"))
     evaluation = sub.add_parser("evaluate")
     evaluation.add_argument("results")
+    league_add = sub.add_parser("league-add", help="Register an immutable checkpoint in a league")
+    league_add.add_argument("league")
+    league_add.add_argument("checkpoint")
+    league_sample = sub.add_parser(
+        "league-sample", help="Sample one registered checkpoint. Does not start a match."
+    )
+    league_sample.add_argument("league")
+    league_sample.add_argument("--seed", type=int, default=42)
     generation = sub.add_parser("generate-map")
     generation.add_argument("output")
     generation.add_argument("--game", required=True)
@@ -97,11 +120,23 @@ def main():
         help="Field no divisions for this country. A diagnostic, not a playable arena: "
         "an empty front an AI never enters says it is not attacking at all.",
     )
+    generation.add_argument("--columns-per-half", type=int)
+    generation.add_argument("--rows", type=int)
+    generation.add_argument("--state-columns", type=int)
+    generation.add_argument("--state-rows", type=int)
+    generation.add_argument(
+        "--pitch",
+        nargs=2,
+        type=int,
+        metavar=("X", "Y"),
+        help="Province pitch in pixels. Centers the lattice instead of stretching it "
+        "across the bitmap, so a short country keeps the playable arena's province size.",
+    )
     generation.add_argument(
         "--victory-points-on-border",
         action="store_true",
-        help="Put every victory point on the border column, so one crossing takes the "
-        "whole surrender weight. Used to put a real capitulation on screen to template.",
+        help="Put every victory point on the border column. This does not capitulate a "
+        "country: surrender is territorial. Kept as the measurement that showed that.",
     )
     inspection = sub.add_parser(
         "audit-map", help="Check a generated arena for references the engine cannot resolve"
@@ -119,6 +154,8 @@ def main():
     ppo.add_argument("--epochs", type=int, default=3)
     ppo.add_argument("--model-path")
     ppo.add_argument("--seed", type=int, default=42)
+    ppo.add_argument("--burn-in", type=int, default=4)
+    ppo.add_argument("--kl-limit", type=float, default=0.02)
     args = vars(parser.parse_args())
     command = args.pop("command")
     logging.basicConfig(
@@ -203,20 +240,46 @@ def _dispatch(command, args):
         from .vision import set_clock_rect
 
         result = set_clock_rect(**args)
+    elif command == "minimap":
+        from .vision import set_minimap_rect
+
+        result = set_minimap_rect(**args)
     elif command == "evaluate":
         from .learning import paired_evaluation
 
         result = paired_evaluation(
-            [json.loads(line) for line in Path(args["results"]).read_text().splitlines()]
+            [
+                json.loads(line)
+                for line in Path(args["results"]).read_text().splitlines()
+                if line.strip()
+            ]
         )
+    elif command == "league-add":
+        from .learning import League
+
+        league = League(args["league"])
+        league.add(args["checkpoint"])
+        result = {"entries": len(league.entries)}
+    elif command == "league-sample":
+        from .learning import League
+
+        result = League(args["league"], seed=args["seed"]).sample()
     elif command == "generate-map":
         from .mapgen import audit, generate
 
+        grid = {
+            "columns_per_half": args["columns_per_half"],
+            "rows": args["rows"],
+            "state_columns": args["state_columns"],
+            "state_rows": args["state_rows"],
+            "pitch": args["pitch"],
+        }
         result = generate(
             args["game"],
             args["output"],
             undefended=args["undefended"],
             victory_points_on_border=args["victory_points_on_border"],
+            **{key: value for key, value in grid.items() if value is not None},
         )
         result["audit"] = audit(args["output"])
         # The map is on disk either way; a bad one must not exit zero, because the next

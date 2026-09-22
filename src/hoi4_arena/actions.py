@@ -13,7 +13,18 @@ from __future__ import annotations
 
 import numpy as np
 
-KEYS = [0x10, 0x11, *range(0x25, 0x29), *range(0x41, 0x5B)]
+# Append-only. Existing kind indices are checkpoints and prepared labels. Speed
+# keys stay out: a match that can press +/- would make the recorded game speed a lie.
+# Space and escape stay out too: both pause the game, which invalidates the match.
+KEYS = [
+    0x10,
+    0x11,
+    *range(0x25, 0x29),
+    *range(0x41, 0x5B),
+    0x09,
+    0x0D,
+    *range(0x30, 0x3A),
+]
 GRID = 1024
 SLOTS = 8
 PERIOD = 0.2
@@ -42,6 +53,13 @@ def encode_event(event):
             round(np.clip(event["x"], 0, 1) * (GRID - 1)),
             round(np.clip(event["y"], 0, 1) * (GRID - 1)),
         ]
+    if event["kind"] == "wheel":
+        delta = event.get("delta", 0)
+        if not isinstance(delta, int) or isinstance(delta, bool) or delta == 0:
+            raise ValueError(f"Demonstration contains unsupported match input: {event}")
+        # High-resolution wheels report multiples of a notch. One slot can carry one
+        # notch; the sign is the part the policy can replay.
+        event = {"kind": "wheel", "delta": 120 if delta > 0 else -120}
     try:
         return [VOCAB.index(event), 0, 0]
     except ValueError:

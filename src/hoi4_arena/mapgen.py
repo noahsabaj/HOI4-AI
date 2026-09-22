@@ -181,20 +181,45 @@ def shore_heights(ground):
     return np.round(middle + half * ramp).astype(np.uint8)
 
 
-def generate(game, output, *, undefended=None, victory_points_on_border=False):
-    """Write an arena. The two keyword arguments build diagnostics, not playable arenas.
+def generate(
+    game,
+    output,
+    *,
+    undefended=None,
+    victory_points_on_border=False,
+    columns_per_half=COLUMNS_PER_HALF,
+    rows=ROWS,
+    state_columns=STATE_COLUMNS,
+    state_rows=STATE_ROWS,
+    pitch=None,
+):
+    """Write an arena. The keyword arguments build diagnostics, not playable arenas.
 
     `undefended` fields no divisions for one side. `victory_points_on_border` moves every
-    victory point onto the border column, so a single crossing takes the whole surrender
-    weight. Both exist to make something happen on screen that a balanced arena cannot be
-    asked to produce on demand, and `generation.json` records which were used.
+    victory point onto the border column. That does not produce a surrender: capitulation
+    is territorial, and taking the whole victory-point weight was measured to leave the
+    country in the war. Both exist to make something happen on screen that a balanced
+    arena cannot be asked to produce on demand, and `generation.json` records which were
+    used.
+
+    The grid defaults stretch across the stock-sized bitmap. `pitch` is a pair of pixels
+    per column and row: the lattice is then centered instead of stretched, so a short
+    country keeps the province size of the playable arena and the rest of the bitmap is
+    ocean. One state a side is below the theatre minimum, and a land grid that does not
+    divide into the state grid is rejected here rather than left for the engine.
     """
     game, root = Path(game), Path(output).resolve()
     if not (game / "map/provinces.bmp").exists():
         raise ValueError("Point --game at the installed HOI4 directory")
     if undefended is not None and undefended not in COUNTRY_COLOUR:
         raise ValueError("undefended names a country tag: BLU or RED")
-    root.mkdir(parents=True, exist_ok=False)
+    if columns_per_half <= OCEAN_RINGS or rows <= 2 * OCEAN_RINGS:
+        raise ValueError("grid leaves no land after the ocean rings")
+    land_columns, land_rows = columns_per_half - OCEAN_RINGS, rows - 2 * OCEAN_RINGS
+    if land_columns % state_columns or land_rows % state_rows:
+        raise ValueError("land grid does not divide into whole states")
+    if state_columns * state_rows < 3:
+        raise ValueError("a country needs at least three states for theatre generation")
 
     def write(name, text):
         path = root / name
@@ -207,30 +232,42 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
 
     # Both dimensions must be a multiple of 256 and the area must stay under 13238272 px.
     width, height = MAP_SIZE
-    step_x, step_y = width // (2 * COLUMNS_PER_HALF), height // ROWS
-    half_count = COLUMNS_PER_HALF * ROWS
+    if pitch is None:
+        # Stretch across the bitmap. The remainder stays on the last row, as it always has:
+        # centering it would move every province and invalidate the measured arena.
+        step_x, step_y = width // (2 * columns_per_half), height // rows
+        origin_x = origin_y = 0
+    else:
+        step_x, step_y = (int(v) for v in pitch)
+        if min(step_x, step_y) < 1:
+            raise ValueError("province pitch must be at least one pixel")
+        lattice_w, lattice_h = 2 * columns_per_half * step_x, rows * step_y
+        if lattice_w > width or lattice_h > height:
+            raise ValueError("pitched lattice does not fit the bitmap")
+        origin_x, origin_y = (width - lattice_w) // 2, (height - lattice_h) // 2
+    root.mkdir(parents=True, exist_ok=False)
+    half_count = columns_per_half * rows
     total_provinces = 2 * half_count
     left = np.array(
         [
             (
-                x * step_x + step_x // 2,
-                y * step_y + step_y // 2 + (x % 2) * (step_y // 4),
+                origin_x + x * step_x + step_x // 2,
+                origin_y + y * step_y + step_y // 2 + (x % 2) * (step_y // 4),
             )
-            for x in range(COLUMNS_PER_HALF)
-            for y in range(ROWS)
+            for x in range(columns_per_half)
+            for y in range(rows)
         ]
     )
     points = np.concatenate([left, [width - 1, height - 1] - left])
     yy, xx = np.mgrid[:height, :width]
     ids = cKDTree(points).query(np.stack([xx.ravel(), yy.ravel()], 1))[1].reshape(height, width) + 1
-    # Two rings of provinces on every side are sea, so the land sits in open water rather
-    # than running off the edge of the world.
-    land = (
-        (points[:, 0] >= OCEAN_RINGS * step_x)
-        & (points[:, 0] < width - OCEAN_RINGS * step_x)
-        & (points[:, 1] >= OCEAN_RINGS * step_y)
-        & (points[:, 1] < height - OCEAN_RINGS * step_y)
-    )
+    # Two rings of provinces on the outer edges are sea, so the land sits in open water
+    # rather than running off the edge of the world. Indexing the lattice, rather than
+    # the bitmap edge, keeps those rings sea when a pitched island does not fill the map.
+    # The right half is the left half rotated, so it shares the left half's land flags.
+    column, row = np.divmod(np.arange(half_count), rows)
+    half_land = (column >= OCEAN_RINGS) & (row >= OCEAN_RINGS) & (row < rows - OCEAN_RINGS)
+    land = np.concatenate([half_land, half_land])
     # Break pixel-only four-way contacts, preserving rotational symmetry. The map wraps
     # horizontally, so the seam between the last and first column is a contact too.
     for _ in range(3):
@@ -260,7 +297,7 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
     ground = land[ids - 1]
     # Forest on every sixth row, so the same one-in-six share of the map as the 8x12 grid
     # painted, which is close to the share the stock terrain.bmp gives palette index 1.
-    terrain_types = ["forest" if i % ROWS % 6 == 3 else "plains" for i in range(half_count)] * 2
+    terrain_types = ["forest" if i % rows % 6 == 3 else "plains" for i in range(half_count)] * 2
     terrain_ids = np.array([TERRAIN_INDEX[t] for t in terrain_types], dtype=np.uint8)
     neighbours = adjacency(ids, len(points))
     # A coast is a shared edge between the two classes, so it belongs to both provinces.
@@ -311,9 +348,11 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
         water = np.empty((height // step, width // step, 4), dtype=np.uint8)
         water[...] = WATER_COLOUR
         write_dds(root / f"map/terrain/colormap_water_{level}.dds", water)
-    for name, (columns, rows) in MINIMAP_SIZES.items():
+    for name, (widget_columns, widget_rows) in MINIMAP_SIZES.items():
         shrunk = np.array(
-            Image.fromarray(ground.astype(np.uint8) * 255).resize((columns, rows), Image.BILINEAR)
+            Image.fromarray(ground.astype(np.uint8) * 255).resize(
+                (widget_columns, widget_rows), Image.BILINEAR
+            )
         )
         picture = np.where(shrunk[..., None] > 127, np.array(MINIMAP_LAND), np.array(MINIMAP_SEA))
         write_dds(root / name, picture.astype(np.uint8))
@@ -413,9 +452,8 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
 
     left_land = (np.flatnonzero(land[:half_count]) + 1).tolist()
     right_land = [i + half_count for i in left_land]
-    land_columns, land_rows = COLUMNS_PER_HALF - OCEAN_RINGS, ROWS - 2 * OCEAN_RINGS
-    state_width, state_height = land_columns // STATE_COLUMNS, land_rows // STATE_ROWS
-    states_per_country = STATE_COLUMNS * STATE_ROWS
+    state_width, state_height = land_columns // state_columns, land_rows // state_rows
+    states_per_country = state_columns * state_rows
     # One division per row of the border column, so a side actually holds its own front
     # instead of leaving gaps an opponent can walk through unopposed.
     divisions_per_country = land_rows
@@ -428,9 +466,9 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
         rotationally symmetric for free.
         """
         index = (province - 1) % half_count
-        column = index // ROWS - OCEAN_RINGS
-        row = index % ROWS - OCEAN_RINGS
-        return (column // state_width) * STATE_ROWS + row // state_height
+        column = index // rows - OCEAN_RINGS
+        row = index % rows - OCEAN_RINGS
+        return (column // state_width) * state_rows + row // state_height
 
     states, state_owner, capitals, capital_states, victory_points = {}, {}, [], [], {}
     for half, (tag, province_list) in enumerate([("BLU", left_land), ("RED", right_land)]):
@@ -456,17 +494,13 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
             states.setdefault(state, []).append(province)
             state_owner[state] = tag
         capital_states.append(half * states_per_country + state_cell(capital) + 1)
-        # Surrender weight follows victory points, so putting all of it on the capital
-        # ends a match the moment one province changes hands. Four points spread across
-        # the half make the result follow the front rather than a single tile. Surrender
-        # needs 80% of the worth, so an attacker must take the capital and two outposts.
-        #
-        # The harness inverts that on purpose: it masses the entire 35-point weight onto
-        # one border province, directly across the seam from the enemy's own starting
-        # division. One order takes 100% of a side's victory points, which is the only
-        # way to ask for a capitulation on demand. It is a calibration fixture, and it
-        # is also the measurement of whether victory points alone decide a surrender:
-        # if taking all of them does not capitulate, something else carries the weight.
+        # Victory points are not the surrender threshold. A measured match gave Red a
+        # single border province carrying all 35 of them; Blue took it on 13 January
+        # and Red had not capitulated by May 1940. Surrender is occupation.
+        # BASE_SURRENDER_LIMIT is that fraction, and BASE_SURRENDER_LEVEL is the level
+        # that has to be reached. The spread below is so the tooltip is not one tile.
+        # The harness puts the whole weight on the border anyway, because that was the
+        # measurement that separated the two.
         if victory_points_on_border:
             outposts = []
         else:
@@ -759,14 +793,15 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
         "history/states",
         "history/units",
         "common/bookmarks",
-        "common/on_actions",
         "common/national_focus",
         "common/ai_focuses",
         "common/ai_strategy_plans",
         "common/decisions",
         "common/decisions/categories",
         "common/strategic_locations",
-        "events",
+        # events and common/on_actions are not replaced. Replacing them deleted every
+        # stock on_capitulation effect. The arena's on_startup file merges with the
+        # stock ones, and the engine's peace-conference path keeps its scripts.
         "map/strategicregions",
         "map/supplyareas",
     ]
@@ -788,6 +823,11 @@ def generate(game, output, *, undefended=None, victory_points_on_border=False):
         "land_provinces_per_country": len(left_land),
         "states_per_country": states_per_country,
         "divisions_per_country": divisions_per_country,
+        "columns_per_half": columns_per_half,
+        "rows": rows,
+        "state_columns": state_columns,
+        "state_rows": state_rows,
+        "province_pitch": None if pitch is None else [step_x, step_y],
         "undefended": undefended,
         "victory_points_on_border": victory_points_on_border,
         "army_speed_factor": ARMY_SPEED_FACTOR,

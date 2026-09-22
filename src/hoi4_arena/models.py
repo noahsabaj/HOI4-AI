@@ -6,6 +6,7 @@ from torch import nn
 
 from .actions import GRID, SLOTS, VOCAB
 from .benchmark import load_encoder, verify_model_source
+from .dataset import TILES
 
 
 class VideoEncoder(nn.Module):
@@ -166,7 +167,8 @@ class Policy(nn.Module):
         self.encoder = encoder
         self.details = DetailEncoder()
         self.previous_action = nn.Linear(SLOTS * 3, 64)
-        self.fusion = nn.Linear(encoder.dim + 4 * 256 + 64, memory_dim)
+        # 256 is one tile of DetailEncoder. The fifth tile is the cursor crop.
+        self.fusion = nn.Linear(encoder.dim + TILES * 256 + 64, memory_dim)
         self.memory = nn.GRUCell(memory_dim, memory_dim)
         self.actor = ActionHead(memory_dim)
         self.value = nn.Linear(memory_dim, 1)

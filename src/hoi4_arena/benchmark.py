@@ -8,9 +8,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
-from .dataset import CAPTURE_HZ, CLIP_FRAMES
+from .actions import PERIOD
+from .dataset import CLIP_FRAMES
 from .desktop import Desktop
 
 MODEL_ID = "galilai-group/LeVJEPA-VideoMix-Large"
@@ -47,11 +49,19 @@ def load_encoder(path: str | Path):
 
 
 def preprocess(rgb: np.ndarray, size=224):
-    image = Image.fromarray(rgb).resize((size, size), Image.Resampling.BILINEAR)
-    x = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).float() / 255
-    return (x - torch.tensor([0.485, 0.456, 0.406])[:, None, None]) / torch.tensor(
-        [0.229, 0.224, 0.225]
-    )[:, None, None]
+    """Area-average the frame the way `views` and the worker do, then normalize.
+
+    Bilinear is a different image. An encoder timed on it is not the encoder the
+    policy runs.
+    """
+    frame = np.ascontiguousarray(rgb)
+    if not frame.flags.writeable:
+        frame = frame.copy()
+    source = torch.from_numpy(frame).permute(2, 0, 1)[None].float()
+    scaled = F.interpolate(source, (size, size), mode="area")[0] / 255
+    mean = scaled.new_tensor([0.485, 0.456, 0.406])[:, None, None]
+    std = scaled.new_tensor([0.229, 0.224, 0.225])[:, None, None]
+    return (scaled - mean) / std
 
 
 def benchmark(model_path, output, iterations=30, offline=False, command=None):
@@ -60,13 +70,13 @@ def benchmark(model_path, output, iterations=30, offline=False, command=None):
     report = {
         "model": MODEL_ID,
         "revision": MODEL_REVISION,
-        "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "gameplay_verified": False,
         "mode": "offline_training" if offline else "live_inference",
     }
-    report["baseline_memory"] = gpu_memory()
     try:
+        report["device"] = torch.cuda.get_device_name()
+        report["baseline_memory"] = gpu_memory()
         model = load_encoder(model_path).cuda().to(torch.bfloat16)
         if offline:
             frame_path = output / "screen.png"
@@ -93,7 +103,7 @@ def benchmark(model_path, output, iterations=30, offline=False, command=None):
                 for _ in range(CLIP_FRAMES):
                     f = desktop.capture()
                     frames.append(preprocess(f.rgb))
-                    time.sleep(1 / CAPTURE_HZ)
+                    time.sleep(PERIOD)
                 Image.fromarray(f.rgb).save(output / "screen.png")
                 report["capture_shape"] = list(f.rgb.shape)
                 report["capture_backend"] = desktop.attached["backend"]

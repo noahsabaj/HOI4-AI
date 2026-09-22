@@ -7,16 +7,25 @@ import json
 import logging
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from .actions import SLOTS
-from .dataset import CAPTURE_HZ, CLIP_FRAMES, normalize, views
+from .dataset import (
+    CLIP_FRAMES,
+    TILES,
+    clip_frame_ids,
+    normalize,
+    recorded_speed,
+    require_one_game_speed,
+    views,
+)
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
-from .learning import file_hash
+from .learning import approximate_kl, file_hash
 from .models import Policy, VideoEncoder, halve_frozen
 from .recording import Recorder
 from .remote import RemoteDesktop
@@ -113,6 +122,12 @@ class Actor:
         self.history = deque(maxlen=64)
         self.compiled = compile_head and device == "cuda" and self._compile_head()
 
+    def reset_episode(self):
+        """Drop the GRU state and the clip. A second match on this actor must not see the first."""
+        self.hidden = None
+        self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
+        self.history.clear()
+
     def _compile_head(self):
         """Capture the action head into a CUDA graph, and prove it before trusting it.
 
@@ -176,7 +191,7 @@ class Actor:
         self.policy.actor = getattr(self.policy.actor, "_orig_mod", self.policy.actor)
         self.compiled = False
 
-    def act(self, rgb, timestamp, precomputed=None):
+    def act(self, rgb, timestamp_ns, precomputed=None, cursor=None):
         device = self.device
         # A replay from the wrong thread would take the match down with an assertion
         # from inside inductor. Losing the graph costs about seven milliseconds a tick;
@@ -185,15 +200,25 @@ class Actor:
             self._uncompile("the cuda graph was captured on another thread")
         # The worker downscales on the capture side when it can, which keeps a 33 MB
         # frame off the wire and the resize out of this loop entirely. Fall back to
-        # resizing here, on the GPU, when it handed back a full frame instead.
-        global_view, tiles = precomputed if precomputed is not None else views(rgb, device=device)
+        # resizing here, on the GPU, when it handed back a full frame instead. The
+        # fallback still needs the pointer, because the cursor crop is part of the tiles.
+        if precomputed is None:
+            global_view, tiles = views(rgb, device=device, cursor=cursor)
+        else:
+            global_view, tiles = precomputed
         # The worker hands back numpy; the local fallback hands back device tensors.
         global_view = torch.as_tensor(global_view, device=device)
         tiles = torch.as_tensor(tiles, device=device)
-        self.history.append((timestamp, global_view))
-        times = np.array([t for t, _ in self.history])
-        desired = timestamp - np.arange(CLIP_FRAMES - 1, -1, -1) / CAPTURE_HZ
-        ids = np.searchsorted(times, desired, side="right") - 1
+        if tiles.shape[0] != TILES:
+            raise ValueError(
+                f"detail tiles must include the cursor crop ({TILES} tiles, got {tiles.shape[0]})"
+            )
+        # Same lookback Sessions uses. Integer nanoseconds: dividing t_ns by 1e9 and
+        # stepping in float seconds would not land on the same frames.
+        timestamp_ns = int(timestamp_ns)
+        self.history.append((timestamp_ns, global_view))
+        times = np.array([t for t, _ in self.history], dtype=np.int64)
+        ids = clip_frame_ids(times, timestamp_ns)
         clip = torch.stack([self.history[max(0, int(i))][1] for i in ids])
         before = (
             np.zeros(self.policy.memory_dim, np.float32)
@@ -219,19 +244,83 @@ class Actor:
             action, logp, _ = self.policy.actor(
                 self.hidden, noise=noise, deterministic=self.deterministic
             )
-        action = action[0].cpu().numpy()
+        # One host transfer for the whole sample. Four separate .cpu()/.item() calls
+        # each waited for the GPU, on the same thread that has to start the next capture.
+        host = {
+            "clip": clip.detach().to("cpu", non_blocking=True),
+            "tiles": tiles.detach().to("cpu", non_blocking=True),
+            "action": action[0].detach().to("cpu", non_blocking=True),
+            "old_logp": logp.detach().to("cpu", non_blocking=True),
+            "old_value": value.detach().to("cpu", non_blocking=True),
+            "noise": noise[0].detach().to("cpu", non_blocking=True),
+        }
+        if torch.device(device).type == "cuda":
+            torch.cuda.current_stream().synchronize()
+        action_np = host["action"].numpy()
         sample = {
-            "clip": clip.cpu().numpy(),
-            "tiles": tiles.cpu().numpy(),
+            "clip": host["clip"].numpy(),
+            "tiles": host["tiles"].numpy(),
             "hidden": before,
             "previous": self.previous.copy(),
-            "action": action,
-            "old_logp": logp.item(),
-            "old_value": value.item(),
-            "noise": noise[0].cpu().numpy(),
+            "action": action_np,
+            "old_logp": float(host["old_logp"]),
+            "old_value": float(host["old_value"]),
+            "noise": host["noise"].numpy(),
         }
-        self.previous = action
-        return action, sample
+        self.previous = action_np
+        return action_np, sample
+
+
+def commit_transition(held, result):
+    """Attach this step's observation to the action that just finished.
+
+    step() captures at the start of the action it was given, after joining the
+    previous interval. The reward on that frame was produced by the action already
+    in flight, not by the one that is about to start.
+    """
+    if held is None:
+        return None
+    _observation, reward, terminated, truncated, info = result
+    finished = dict(held)
+    finished.update(
+        reward=reward,
+        terminal=bool(terminated or truncated),
+        valid=bool(info["valid"]),
+        elapsed=float(info.get("elapsed_seconds", 0.0)),
+    )
+    return finished
+
+
+class TransitionWriter:
+    """Compress rollout samples off the decision thread.
+
+    np.savez_compressed of an eight-frame clip is the Python work that misses the
+    interval. Actor.act builds every array fresh, so nothing is copied here. The queue
+    is bounded: a writer that falls behind blocks the next save, and the stall shows
+    as a deadline miss instead of growing memory by ~20 MB/s until the match dies.
+    """
+
+    def __init__(self, backlog=64):
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-save")
+        self.slots = threading.BoundedSemaphore(backlog)
+        self.pending = []
+
+    def save(self, path, sample):
+        self.slots.acquire()
+        job = self.pool.submit(np.savez_compressed, path, **sample)
+        job.add_done_callback(lambda _job: self.slots.release())
+        self.pending.append(job)
+
+    def finish(self):
+        errors = []
+        for job in self.pending:
+            try:
+                job.result()
+            except Exception as error:  # noqa: BLE001 - reported with the manifest.
+                errors.append(error)
+        self.pool.shutdown(wait=True)
+        if errors:
+            raise errors[0]
 
 
 def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
@@ -241,6 +330,9 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
     Model weights are loaded once; neither actor gets its opponent's observations.
     """
     config = json.loads(Path(config_path).read_text())
+    # Before the run directory exists. A match with no recorded speed cannot grow one,
+    # and the documented default of 2 is not what the long runs used.
+    speed = recorded_speed(config.get("game_speed"))
     root = Path(output)
     root.mkdir(parents=True, exist_ok=False)
     # Salt with the pair id so each match is independently seeded yet reproducible.
@@ -270,10 +362,12 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         "deterministic": deterministic,
         "record_full": record_full,
         "clip_frames": CLIP_FRAMES,
+        **speed,
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     reason = None
     count = 0
+    writer = None
     try:
         for side in ["left", "right"]:
             spec = config[side]
@@ -286,19 +380,31 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
                     json.loads(Path(spec["recipe"]).read_text()),
                     seconds=config.get("seconds", 1800),
                     downscale=config.get("downscale", True),
+                    # West is Blue and east is Red unless the pair says otherwise.
+                    # The territory reward is that country's own share.
+                    country=spec.get("country", "BLU" if side == "left" else "RED"),
                 )
             )
         for env in environments:
             env.record_full = record_full
+        for actor in actors:
+            actor.reset_episode()
         pair = ArenaPair(*environments)
         pair.reset()
+        writer = TransitionWriter()
+        held = [None, None]
         for index, env in enumerate(environments):
             recorder = Recorder(
-                root / f"player-{index}" / "recording", env.last, source="policy", hz=5
+                root / f"player-{index}" / "recording",
+                env.last,
+                source="policy",
+                hz=5,
+                game_speed=speed["game_speed"],
             )
             recorder.append(env.last)
             recorders.append(recorder)
             env.recorder = recorder
+        tick = 0
         while True:
             actions = []
             samples = []
@@ -306,27 +412,32 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
             # the worker already downscaled, so no full frame is needed or resized here.
             for actor, env in zip(actors, environments, strict=True):
                 action, sample = actor.act(
-                    env.last.rgb, env.last.meta["t_ns"] / 1e9, precomputed=env.last.views
+                    env.last.rgb,
+                    env.last.meta["t_ns"],
+                    precomputed=env.last.views,
+                    cursor=env.last.meta.get("cursor"),
                 )
                 actions.append(action)
                 samples.append(sample)
             results = pair.step(actions)
+            saved = False
             for i, (sample, result) in enumerate(zip(samples, results, strict=True)):
-                _, reward, terminated, truncated, info = result
-                # Time-limit draws are terminal game outcomes, not bootstrapped truncations.
-                sample.update(
-                    reward=reward,
-                    terminal=terminated or truncated,
-                    valid=info["valid"],
-                    elapsed=info.get("elapsed_seconds", 0.0),
-                )
-                np.savez_compressed(root / f"player-{i}" / f"{count:06d}.npz", **sample)
-            count += 1
-            if count % 25 == 0:
+                finished = commit_transition(held[i], result)
+                if finished is not None:
+                    writer.save(root / f"player-{i}" / f"{count:06d}.npz", finished)
+                    saved = True
+                # The action just started has not had its effect captured yet. A terminal
+                # or invalid step aborts that action, so it is not a training sample.
+                ended = bool(result[2] or result[3]) or not result[4]["valid"]
+                held[i] = None if ended else sample
+            if saved:
+                count += 1
+            tick += 1
+            if tick % 25 == 0:
                 misses = sum(bool(r[4].get("deadline_miss")) for r in results)
                 log.info(
                     "step %d: elapsed=%.1f s deadline_misses_this_step=%d",
-                    count,
+                    tick,
                     max(r[4].get("elapsed_seconds", 0.0) for r in results),
                     misses,
                 )
@@ -357,6 +468,11 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
                 reason = reason or f"Worker cleanup failed: {error}"
         if pair is not None:
             pair.pool.shutdown(wait=True)
+        if writer is not None:
+            try:
+                writer.finish()
+            except Exception as error:  # noqa: BLE001 - the manifest has to record it.
+                reason = reason or f"Rollout save failed: {error}"
         for recorder in recorders:
             try:
                 recorder.close(complete=reason is None, reason=reason)
@@ -392,6 +508,11 @@ def replay_batch(files, device):
     batch = {
         name: torch.as_tensor(np.stack([r[name] for r in rows]), device=device) for name in rows[0]
     }
+    if batch["tiles"].shape[1] != TILES:
+        raise ValueError(
+            "detail tiles must include the cursor crop "
+            f"({TILES} tiles, got {batch['tiles'].shape[1]})"
+        )
     batch["clips"] = (
         (
             batch.pop("clip").float() / 255
@@ -407,24 +528,48 @@ def replay_batch(files, device):
 
 
 def train_ppo(
-    rollouts, checkpoint, output, epochs=3, sequence=8, burn_in=2, model_path=None, seed=42
+    rollouts,
+    checkpoint,
+    output,
+    epochs=3,
+    sequence=8,
+    burn_in=4,
+    model_path=None,
+    seed=42,
+    kl_limit=0.02,
 ):
-    from .learning import gae, ppo_loss, save_checkpoint
+    """Recurrent PPO. Windows are shuffled, and training stops once the KL leaves the trust region.
 
+    `burn_in` refreshes the GRU from the behavior policy's stored state. Two steps were
+    not enough once the encoder's last blocks had moved; four is the default. The first
+    window whose approximate KL exceeds `kl_limit` ends every remaining epoch, not just
+    the current one.
+    """
+    from .learning import gae, normalize_advantages, ppo_loss, save_checkpoint
+
+    output = Path(output)
+    if output.exists():
+        raise FileExistsError("Checkpoints are immutable")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     seed = seed_everything(seed)
-    policy, config, digest = load_policy(checkpoint, model_path)
+    policy, config, digest = load_policy(checkpoint, model_path, device)
     policy.train()
     optimizer = torch.optim.AdamW([p for p in policy.parameters() if p.requires_grad], lr=1e-5)
     episodes = []
+    speeds = []
     for manifest_path in sorted(Path(rollouts).glob("*/manifest.json")):
         meta = json.loads(manifest_path.read_text())
         excluded = ppo_exclusion(meta)
         if excluded:
             log.info("excluding rollout %s: %s", manifest_path.parent, excluded)
             continue
-        for player in range(2):
-            if meta["checkpoint_sha256"][player] != digest:
-                continue  # Historical opponents are not on-policy training data.
+        on_policy = [player for player in range(2) if meta["checkpoint_sha256"][player] == digest]
+        if not on_policy:
+            continue  # Historical opponents are not on-policy training data.
+        # A rollout that would train with no recorded speed is a data error, not a skip.
+        speed = recorded_speed(meta.get("game_speed"))["game_speed"]
+        require_one_game_speed([*speeds, speed])
+        for player in on_policy:
             files = sorted((manifest_path.parent / f"player-{player}").glob("*.npz"))
             scalars = []
             for path in files:
@@ -449,16 +594,24 @@ def train_ppo(
                 get("valid"),
                 get("elapsed"),
             )
-            episodes.append((files, advantages.float(), returns.float()))
+            episodes.append((files, normalize_advantages(advantages), returns.float()))
+            speeds.append(speed)
     if not episodes:
         raise ValueError("No completed valid on-policy episodes; collection must precede PPO")
+    game_speed = require_one_game_speed(speeds)
     losses = []
+    rng = np.random.default_rng(seed)
+    early_stop = False
     for _ in range(epochs):
-        for files, advantages, returns in episodes:
-            for start in range(0, len(files), sequence):
+        order = rng.permutation(len(episodes))
+        for index in order:
+            files, advantages, returns = episodes[int(index)]
+            starts = list(range(0, len(files), sequence))
+            rng.shuffle(starts)
+            for start in starts:
                 begin = max(0, start - burn_in)
                 end = min(start + sequence, len(files))
-                batch = replay_batch(files[begin:end], "cuda")
+                batch = replay_batch(files[begin:end], device)
                 hidden = batch["hidden"][0:1].float()
                 logps = []
                 values = []
@@ -468,7 +621,7 @@ def train_ppo(
                     burn = begin + t < start
                     with (
                         torch.set_grad_enabled(not burn),
-                        torch.autocast("cuda", dtype=torch.bfloat16),
+                        torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"),
                     ):
                         hidden, value, _ = policy(
                             batch["clips"][t : t + 1],
@@ -486,12 +639,19 @@ def train_ppo(
                             values.append(value)
                             entropies.append(entropy)
                 offset = start - begin
+                new_logp = torch.cat(logps)
+                old_logp = batch["old_logp"][offset:].float()
+                kl = approximate_kl(new_logp.detach(), old_logp)
+                if float(kl) > kl_limit:
+                    log.info("stopping PPO, approximate KL %.4f", float(kl))
+                    early_stop = True
+                    break
                 loss = ppo_loss(
-                    torch.cat(logps),
-                    batch["old_logp"][offset:].float(),
+                    new_logp,
+                    old_logp,
                     torch.cat(values),
-                    returns[start:end].cuda(),
-                    advantages[start:end].cuda(),
+                    returns[start:end].to(device),
+                    advantages[start:end].to(device),
                     torch.cat(entropies),
                 )
                 if not torch.isfinite(loss):
@@ -500,6 +660,10 @@ def train_ppo(
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
                 optimizer.step()
                 losses.append(loss.item())
+            if early_stop:
+                break
+        if early_stop:
+            break
     save_checkpoint(
         output,
         policy,
@@ -510,16 +674,19 @@ def train_ppo(
             "rollouts": str(Path(rollouts).resolve()),
             "episodes": len(episodes),
             "seed": seed,
+            "game_speed": game_speed,
             "epochs": epochs,
             "sequence": sequence,
             "burn_in": burn_in,
+            "kl_limit": kl_limit,
             "gameplay_verified": False,
         },
     )
     return {
         "episodes": len(episodes),
         "updates": len(losses),
-        "mean_loss": float(np.mean(losses)),
+        "mean_loss": float(np.mean(losses)) if losses else None,
+        "early_stop": early_stop,
         "seed": seed,
         "selection_requires_held_out_games": True,
     }

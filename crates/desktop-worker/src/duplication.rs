@@ -84,6 +84,19 @@ impl std::fmt::Display for Unavailable {
     }
 }
 
+/// Whether this failure should spend one of the rebuilds that retire the fast path.
+///
+/// A window that has moved off the duplicated output is a geometry miss. Rebuilding
+/// the duplicator for the new output is cheap. Counting it as a lost device retires
+/// Desktop Duplication after three moves and leaves the rest of the match on the blit.
+pub fn should_retire(reason: &Unavailable) -> bool {
+    match reason {
+        Unavailable::NotReadyYet => false,
+        Unavailable::Lost(text) if text.contains("client_rect_outside") => false,
+        Unavailable::Lost(_) => true,
+    }
+}
+
 pub struct Duplicator {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -404,6 +417,17 @@ mod tests {
                 Err(Unavailable::Lost(reason)) => panic!("duplication failed: {reason}"),
             },
         }
+    }
+
+    #[test]
+    fn a_window_leaving_the_output_does_not_retire_duplication() {
+        assert!(!should_retire(&Unavailable::Lost(
+            "client_rect_outside_duplicated_output".into()
+        )));
+        assert!(!should_retire(&Unavailable::NotReadyYet));
+        assert!(should_retire(&Unavailable::Lost(
+            "duplication_access_lost".into()
+        )));
     }
 
     /// Cropping outside the duplicated output is refused rather than read out of bounds.

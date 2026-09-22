@@ -17,10 +17,24 @@ try {
     $config=[Text.Encoding]::UTF8.GetString($original) | ConvertFrom-Json
     $config.enabled_mods=@('mod/codex_visual_arena.mod')
     [IO.File]::WriteAllText($selection,($config|ConvertTo-Json -Compress))
+    $launched=Get-Date
     $gameProcess=Start-Process -FilePath (Join-Path $game 'hoi4.exe') -WorkingDirectory $game -ArgumentList '-debug_mode','-gdpr-compliant' -WindowStyle Normal -PassThru
     Write-Output "Arena load test PID $($gameProcess.Id)"
-    # Mod selection is read during startup. Restore its exact bytes before returning.
-    Start-Sleep -Seconds 20
+    # Mod selection is read during startup. Wait until the log shows the game got that
+    # far, up to 90s, instead of restoring the user's file on a fixed 20s guess.
+    # Only a log written after launch counts: the previous session's game.log already
+    # contains these lines.
+    $log = Join-Path $userDir 'logs\game.log'
+    $deadline = (Get-Date).AddSeconds(90)
+    $seen = $false
+    while ((Get-Date) -lt $deadline) {
+        if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).LastWriteTime -gt $launched) {
+            $text = Get-Content -LiteralPath $log -Tail 80 -ErrorAction SilentlyContinue
+            if ($text -match 'codex_visual_arena|Loading map|Executing') { $seen = $true; break }
+        }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $seen) { Write-Output 'Timed out waiting for the game log; restoring mod selection anyway.' }
 } finally {
     [IO.File]::WriteAllBytes($selection,$original)
     Remove-Item -LiteralPath $descriptorPath -ErrorAction SilentlyContinue

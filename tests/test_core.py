@@ -14,7 +14,14 @@ from hoi4_arena.actions import GRID, SLOTS, VOCAB, decode, encode_interval
 from hoi4_arena.dataset import CLIP_FRAMES
 from hoi4_arena.desktop import DesktopError, read_reply
 from hoi4_arena.environment import ArenaPair
-from hoi4_arena.learning import League, gae, paired_evaluation, ppo_loss, save_checkpoint
+from hoi4_arena.learning import (
+    League,
+    gae,
+    normalize_advantages,
+    paired_evaluation,
+    ppo_loss,
+    save_checkpoint,
+)
 from hoi4_arena.models import (
     ActionHead,
     PredictiveAuxiliary,
@@ -54,7 +61,16 @@ def test_input_overflow_and_unsupported_keys_are_quarantined():
             0,
         )
     with pytest.raises(ValueError, match="unsupported"):
-        encode_interval([{"t_ns": 0, "event": {"kind": "key", "vk": 0x20, "down": True}}], 0)
+        encode_interval([{"t_ns": 0, "event": {"kind": "key", "vk": 0xBB, "down": True}}], 0)
+    # Tab is a real demonstration key; space pauses the game and is refused. A
+    # high-resolution wheel notch snaps to one slot instead of dropping the decision.
+    tab = encode_interval([{"t_ns": 0, "event": {"kind": "key", "vk": 0x09, "down": True}}], 0)
+    assert decode(tab[0]) == [{"kind": "key", "vk": 0x09, "down": True}]
+    for vk in (0x20, 0x1B):
+        with pytest.raises(ValueError, match="unsupported"):
+            encode_interval([{"t_ns": 0, "event": {"kind": "key", "vk": vk, "down": True}}], 0)
+    wheel = encode_interval([{"t_ns": 0, "event": {"kind": "wheel", "delta": 240}}], 0)
+    assert decode(wheel[0]) == [{"kind": "wheel", "delta": 120}]
 
 
 def test_framed_transport_handles_binary_newlines_and_truncation():
@@ -319,6 +335,40 @@ def test_ppo_has_finite_gradients():
     assert torch.isfinite(lp.grad).all() and torch.isfinite(value.grad).all()
 
 
+def test_a_flat_window_is_not_renormalized_inside_the_loss():
+    """Window normalization turns a 1e-4 wiggle into a unit advantage."""
+    advantages = torch.tensor([0.0, 1e-4])
+    lp = torch.zeros(2, requires_grad=True)
+    loss = ppo_loss(lp, torch.zeros(2), torch.zeros(2), torch.zeros(2), advantages, torch.zeros(2))
+    loss.backward()
+    assert lp.grad.abs().max() < 1e-3
+
+
+def test_advantages_are_normalized_over_the_episode():
+    window = torch.tensor([0.0, 1e-4, 0.0, 2e-4, 0.0, 1e-4, 0.0, 1e-4])
+    episode = torch.cat([window, torch.tensor([1.0])])
+    scaled = normalize_advantages(episode)
+    assert scaled[:-1].std(unbiased=False) < 0.01
+    assert scaled[-1] > 1
+    assert torch.equal(normalize_advantages(torch.zeros(32)), torch.zeros(32))
+    assert torch.equal(normalize_advantages(torch.full((8,), 0.25)), torch.zeros(8))
+    # Centering a single transition would erase the only reward, including a one-step win.
+    assert torch.equal(normalize_advantages(torch.tensor([1.0])), torch.tensor([1.0]))
+    flicker = torch.zeros(16)
+    flicker[-1] = 1e-4
+    scaled_flicker = normalize_advantages(flicker)
+    assert scaled_flicker.abs().max() < 2e-2
+    # No cliff at the floor: spreads just either side of it scale alike.
+    below = normalize_advantages(torch.tensor([-0.0099, 0.0099])).abs().max()
+    above = normalize_advantages(torch.tensor([-0.0101, 0.0101])).abs().max()
+    assert abs(float(above) - float(below)) < 0.05
+    lp = torch.zeros(8, requires_grad=True)
+    loss = ppo_loss(lp, torch.zeros(8), torch.zeros(8), torch.zeros(8), scaled[:8], torch.zeros(8))
+    loss.backward()
+    # The eight steps share the episode scale, so the gradient does not wiggle at unit size.
+    assert lp.grad.std(unbiased=False) < 1e-3
+
+
 def test_checkpoint_immutability_and_league_integrity(tmp_path):
     path = tmp_path / "model.pt"
     save_checkpoint(path, nn.Linear(2, 2), {})
@@ -427,7 +477,9 @@ _COLOURS = [
     (255, 0, 255),
     (0, 255, 255),
     (255, 255, 255),
+    (128, 64, 0),
 ]
+_MATCH = ["ready", "healthy", "paused", "speed", "win", "loss", "disconnect", "desync"]
 
 
 def _screen(rules, active):
@@ -445,9 +497,9 @@ def _screen(rules, active):
 
 
 def test_screen_helper_matches_only_the_named_templates(tmp_path):
-    names = ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
+    names = _MATCH
     rules = _rules_with(tmp_path, names)
-    for wanted in ([], ["healthy"], ["win"], ["healthy", "running_speed_two"]):
+    for wanted in ([], ["healthy"], ["win"], ["healthy", "paused"]):
         frame = _screen(rules, wanted)
         matched = {name for name in names if rules.matches(name, frame)}
         assert matched == set(wanted), f"expected {set(wanted)}, matched {matched}"
@@ -469,10 +521,13 @@ def test_clock_rect_is_calibratable_and_bounds_checked(tmp_path):
 
 
 def test_require_match_rules_is_satisfiable_from_calibration_alone(tmp_path):
-    names = ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    _rules_with(tmp_path, names).require_match_rules()
+    _rules_with(tmp_path, _MATCH).require_match_rules()
     with pytest.raises(ValueError, match="clock_rect"):
-        _rules_with(tmp_path / "no-clock", names, clock=False).require_match_rules()
+        _rules_with(tmp_path / "no-clock", _MATCH, clock=False).require_match_rules()
+    with pytest.raises(ValueError, match="speed indicator"):
+        _rules_with(
+            tmp_path / "no-speed", [name for name in _MATCH if name != "speed"]
+        ).require_match_rules()
 
 
 def test_unhealthy_screen_cannot_buy_unbounded_grace_from_a_flickering_outcome(tmp_path):
@@ -482,9 +537,7 @@ def test_unhealthy_screen_cannot_buy_unbounded_grace_from_a_flickering_outcome(t
     from hoi4_arena.environment import ArenaEnv
     from hoi4_arena.vision import TERMINAL_GRACE_FRAMES
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
+    rules = _rules_with(tmp_path, _MATCH)
     # 'win' and 'loss' alternate, so ScreenRules.outcome never reaches its debounce and
     # rules.last is never None -- the exact state that used to skip every liveness gate.
     frames = [_screen(rules, ["win" if i % 2 == 0 else "loss"]) for i in range(40)]
@@ -516,9 +569,7 @@ def test_step_invalidates_on_screenrules_value_errors_instead_of_escaping(tmp_pa
     from hoi4_arena.desktop import Frame
     from hoi4_arena.environment import ArenaEnv
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
+    rules = _rules_with(tmp_path, _MATCH)
     desktop = Mock()
     # reset() captures twice: run_setup's final ready check, then the first observation.
     # A frame at the wrong resolution makes ScreenRules raise ValueError, not DesktopError.
@@ -598,15 +649,13 @@ def test_legitimate_terminal_screen_is_confirmed_through_its_transition_frames(t
     from hoi4_arena.environment import ArenaEnv
     from hoi4_arena.vision import OUTCOME_FRAMES
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
+    rules = _rules_with(tmp_path, _MATCH)
     # The HUD vanishes two frames before the victory panel renders, then it debounces.
     sequence = [[], []] + [["win"]] * OUTCOME_FRAMES
     desktop = Mock()
     desktop.capture.side_effect = [
-        Frame(_screen(rules, ["ready", "healthy", "running_speed_two"]), {}, 0),
-        Frame(_screen(rules, ["healthy", "running_speed_two"]), {}, 1),
+        Frame(_screen(rules, ["ready", "healthy"]), {}, 0),
+        Frame(_screen(rules, ["healthy"]), {}, 1),
         *[Frame(_screen(rules, active), {}, 2 + i) for i, active in enumerate(sequence)],
     ]
     desktop.apply.return_value = {}
@@ -670,11 +719,13 @@ def test_actor_threads_deterministic_into_the_policy_and_is_reproducible():
     # be unaffected by the stream, for both objectives. This fails if either the argmax
     # or the pinned latent is missing.
     for objective in ("bc", "xm"):
-        greedy = [build(True, objective, s).act(rgb, 10.0)[0] for s in range(4)]
+        greedy = [
+            build(True, objective, s).act(rgb, 10_000_000_000, cursor=(16, 16))[0] for s in range(4)
+        ]
         assert all(np.array_equal(greedy[0], other) for other in greedy[1:]), (
             f"deterministic actor is not reproducible for objective={objective}"
         )
-    sampled = [build(False, "bc", s).act(rgb, 10.0)[0] for s in range(8)]
+    sampled = [build(False, "bc", s).act(rgb, 10_000_000_000, cursor=(16, 16))[0] for s in range(8)]
     assert any(not np.array_equal(sampled[0], other) for other in sampled[1:]), (
         "a non-deterministic actor must still sample"
     )
@@ -817,14 +868,12 @@ def test_screen_matching_nothing_is_rejected_fast_not_on_the_terminal_budget(tmp
     from hoi4_arena.environment import ArenaEnv
     from hoi4_arena.vision import TERMINAL_GRACE_FRAMES, UNKNOWN_FRAMES
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
+    rules = _rules_with(tmp_path, _MATCH)
     blank = _screen(rules, [])
     desktop = Mock()
     desktop.capture.side_effect = [
-        Frame(_screen(rules, ["ready", "healthy", "running_speed_two"]), {}, 0),
-        Frame(_screen(rules, ["healthy", "running_speed_two"]), {}, 1),
+        Frame(_screen(rules, ["ready", "healthy"]), {}, 0),
+        Frame(_screen(rules, ["healthy"]), {}, 1),
         *[Frame(blank, {}, 2 + i) for i in range(TERMINAL_GRACE_FRAMES + 4)],
     ]
     desktop.apply.return_value = {}
@@ -1002,8 +1051,8 @@ def test_views_uses_the_pinned_resampler_and_tiles_the_frame():
 
     # Same source bytes as the golden case: BGRA from the LCG, swizzled to RGB.
     rgb = _lcg(16 * 9 * 4).reshape(9, 16, 4)[:, :, [2, 1, 0]].copy()
-    g, tiles = views(rgb, size=4)
-    assert g.shape == (4, 4, 3) and tiles.shape == (4, 4, 4, 3)
+    g, tiles = views(rgb, size=4, cursor=(2, 2))
+    assert g.shape == (4, 4, 3) and tiles.shape == (5, 4, 4, 3)
     assert g.dtype == torch.uint8
     # The global view of this frame is the third golden case, computed the same way.
     _, _, _, expected = _DOWNSCALE_GOLDEN[2]
@@ -1015,12 +1064,12 @@ def test_observation_from_worker_crops_answers_exactly_like_a_full_frame(tmp_pat
     """The two capture paths must be indistinguishable to the match loop."""
     from hoi4_arena.desktop import Frame
 
-    names = ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
+    names = _MATCH
     rules = _rules_with(tmp_path, names)
     order, rects = rules.capture_regions()
     assert order == sorted(names) and len(rects) == len(names) + 1  # + clock_rect
 
-    for active in ([], ["healthy"], ["win"], ["healthy", "running_speed_two"], ["win", "loss"]):
+    for active in ([], ["healthy"], ["win"], ["healthy", "paused"], ["win", "loss"]):
         rgb = _screen(rules, active)
         crops = [rgb[y : y + h, x : x + w].copy() for x, y, w, h in rects]
         full = rules.observe(Frame(rgb, {}, 0))
@@ -1037,9 +1086,7 @@ def test_observation_from_worker_crops_answers_exactly_like_a_full_frame(tmp_pat
 def test_observation_rejects_a_capture_it_cannot_read(tmp_path):
     from hoi4_arena.desktop import Frame
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
+    rules = _rules_with(tmp_path, _MATCH)
     with pytest.raises(ValueError, match="neither a full frame nor calibrated crops"):
         rules.observe(Frame(None, {}, 0))
     _, rects = rules.capture_regions()
@@ -1054,7 +1101,7 @@ def test_capture_splits_a_downscaled_worker_payload():
     from hoi4_arena.desktop import Desktop
 
     size, regions = 4, [[1, 2, 3, 2], [0, 0, 2, 2]]
-    views_block = _lcg(5 * size * size * 3)
+    views_block = _lcg(6 * size * size * 3)
     crop_blocks = [_lcg(3 * 2 * 4), _lcg(2 * 2 * 4)]
     payload = bytes(views_block) + b"".join(bytes(c) for c in crop_blocks)
 
@@ -1070,14 +1117,17 @@ def test_capture_splits_a_downscaled_worker_payload():
             "view_size": size,
             "views_bytes": len(views_block),
             "region_bytes": [len(c) for c in crop_blocks],
+            "cursor": [1, 2],
             "payload": payload,
         }
     )
     frame = desktop.capture(views=size, regions=regions)
     assert frame.rgb is None, "a views-only capture must not carry the full frame"
     g, tiles = frame.views
-    assert g.shape == (size, size, 3) and tiles.shape == (4, size, size, 3)
+    assert g.shape == (size, size, 3) and tiles.shape == (5, size, size, 3)
     assert np.array_equal(g.ravel(), views_block[: size * size * 3])
+    assert np.array_equal(tiles[-1].ravel(), views_block[-size * size * 3 :])
+    assert frame.meta["cursor"] == [1, 2]
     assert [c.shape for c in frame.crops] == [(2, 3, 3), (2, 2, 3)]
     # Crops arrive BGRA and must be swizzled to RGB like the full frame is.
     assert np.array_equal(frame.crops[0], crop_blocks[0].reshape(2, 3, 4)[:, :, [2, 1, 0]])
@@ -1099,7 +1149,7 @@ def test_capture_rejects_a_payload_that_contradicts_its_header():
             "stopped": False,
             "full_bytes": 0,
             "view_size": 2,
-            "views_bytes": 5 * 2 * 2 * 3,
+            "views_bytes": 6 * 2 * 2 * 3,
             "region_bytes": [],
             "payload": b"\x00" * 7,
         }
@@ -1128,7 +1178,7 @@ def test_views_rounds_ties_to_even_like_the_worker():
     from hoi4_arena.dataset import views
 
     bgra = np.array([[[4, 2, 0, 0], [5, 3, 1, 0]]], np.uint8)
-    g, _ = views(bgra[:, :, [2, 1, 0]].copy(), size=1)
+    g, _ = views(bgra[:, :, [2, 1, 0]].copy(), size=1, cursor=(0, 0))
     assert g.numpy().ravel().tolist() == [0, 2, 4]
 
 
@@ -1143,9 +1193,9 @@ def test_views_orders_quadrants_top_left_top_right_bottom_left_bottom_right():
             10 * (idx + 1) + 1,
             10 * (idx + 1) + 2,
         ]
-    g, tiles = views(src, size=1)
+    g, tiles = views(src, size=1, cursor=(0, 0))
     assert g.numpy().ravel().tolist() == [25, 26, 27]
-    assert tiles.reshape(4, 3).numpy().tolist() == [
+    assert tiles[:4].reshape(4, 3).numpy().tolist() == [
         [10, 11, 12],
         [20, 21, 22],
         [30, 31, 32],
@@ -1164,8 +1214,46 @@ def test_views_accumulates_in_float32_so_the_worker_can_match_it():
 
     rng = np.random.default_rng(7)
     big = rng.integers(0, 256, (288, 512, 3), dtype=np.uint8)
-    g, _ = views(big, size=16)
+    g, _ = views(big, size=16, cursor=(0, 0))
     assert int(g.sum()) == 97902, "resize no longer accumulates in float32"
+
+
+def test_a_paused_glyph_invalidates_the_step_and_a_running_frame_does_not(tmp_path):
+    """The gate matches the pause glyph. It does not require a speed reading."""
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv
+
+    rules = _rules_with(tmp_path, _MATCH)
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+
+    paused = Mock()
+    paused.capture.side_effect = [
+        Frame(_screen(rules, ["ready"]), {}, 0),
+        Frame(_screen(rules, ["ready", "healthy"]), {}, 1),
+        Frame(_screen(rules, ["healthy", "paused"]), {}, 2),
+    ]
+    paused.apply.return_value = {}
+    env = ArenaEnv(paused, rules, [])
+    env.reset()
+    info = env.step(action)[4]
+    assert not info["valid"] and "game_paused" in info["error"]
+    assert not env.active
+
+    rules.last, rules.count = None, 0
+    running = Mock()
+    running.capture.side_effect = [
+        Frame(_screen(rules, ["ready"]), {}, 0),
+        Frame(_screen(rules, ["ready", "healthy"]), {}, 1),
+        Frame(_screen(rules, ["healthy", "speed"]), {}, 2),
+    ]
+    running.apply.return_value = {}
+    env = ArenaEnv(running, rules, [])
+    env.reset()
+    info = env.step(action)[4]
+    assert info["valid"], info.get("error")
+    env.close()
 
 
 def _cadence_env(tmp_path, capture_ms=0.0):
@@ -1176,10 +1264,8 @@ def _cadence_env(tmp_path, capture_ms=0.0):
     from hoi4_arena.desktop import Frame
     from hoi4_arena.environment import ArenaEnv
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
-    live = _screen(rules, ["ready", "healthy", "running_speed_two"])
+    rules = _rules_with(tmp_path, _MATCH)
+    live = _screen(rules, ["ready", "healthy", "speed"])
     ticking = [0]
 
     def capture(**_):
@@ -1264,11 +1350,9 @@ def test_terminal_and_fault_stop_the_interval_in_flight(tmp_path):
     from hoi4_arena.desktop import Frame
     from hoi4_arena.environment import ArenaEnv, disarm
 
-    rules = _rules_with(
-        tmp_path, ["ready", "healthy", "running_speed_two", "win", "loss", "disconnect", "desync"]
-    )
+    rules = _rules_with(tmp_path, _MATCH)
     for terminal in (["win"] * 4, ["disconnect"] * 4):
-        frames = [_screen(rules, ["ready", "healthy", "running_speed_two"])] + [
+        frames = [_screen(rules, ["ready", "healthy"])] + [
             _screen(rules, active) for active in ([t] for t in terminal)
         ]
         desktop = Mock()
@@ -1501,6 +1585,63 @@ def _stub_desktop(reply):
     return desktop
 
 
+def test_capture_rejects_a_worker_that_omits_the_cursor_crop():
+    """Five views is the old payload. The sixth is the crop, and it cannot be added later."""
+    size = 2
+    n = 5 * size * size * 3
+    reply = {
+        "payload": bytes(_lcg(n)),
+        "width": 8,
+        "height": 8,
+        "encoding": "raw",
+        "overflow": False,
+        "stopped": False,
+        "full_bytes": 0,
+        "view_size": size,
+        "views_bytes": n,
+        "region_bytes": [],
+        "cursor": [0, 0],
+    }
+    with pytest.raises(DesktopError, match="cursor crop"):
+        _stub_desktop(reply).capture(views=size)
+
+
+def test_capture_rejects_a_frame_that_did_not_record_the_cursor():
+    reply = {
+        "payload": bytes(2 * 2 * 4),
+        "width": 2,
+        "height": 2,
+        "encoding": "raw",
+        "overflow": False,
+        "stopped": False,
+    }
+    with pytest.raises(DesktopError, match="cursor"):
+        _stub_desktop(reply).capture()
+
+
+def test_act_and_replay_refuse_tiles_without_the_cursor_crop(tmp_path):
+    from hoi4_arena.runner import Actor, replay_batch
+
+    actor = Actor.__new__(Actor)
+    actor.device = "cpu"
+    actor.compiled = False
+    global_view = np.zeros((4, 4, 3), np.uint8)
+    with pytest.raises(ValueError, match="cursor crop"):
+        actor.act(
+            None,
+            1,
+            precomputed=(global_view, np.zeros((4, 4, 4, 3), np.uint8)),
+        )
+    path = tmp_path / "step.npz"
+    np.savez(
+        path,
+        tiles=np.zeros((4, 8, 8, 3), np.uint8),
+        clip=np.zeros((8, 8, 8, 3), np.uint8),
+    )
+    with pytest.raises(ValueError, match="cursor crop"):
+        replay_batch([path], "cpu")
+
+
 def test_capture_rejects_a_worker_that_ignores_the_requested_views():
     """A worker predating worker-side downscaling accepts views and sends 33 MB anyway."""
     stale = {
@@ -1622,6 +1763,8 @@ def test_a_pair_shares_one_match_clock():
     def finishing_at(env, when):
         def run(**_):
             env.start = when
+            env.deadline = when + 0.2
+            env.last_time = when
             return "ok", {}
 
         return run
@@ -1630,6 +1773,9 @@ def test_a_pair_shares_one_match_clock():
     second.reset.side_effect = finishing_at(second, 1030.0)
     ArenaPair(first, second).reset()
     assert first.start == second.start == 1030.0
+    assert first.deadline == second.deadline
+    assert first.last_time == second.last_time
+    assert first.deadline >= 1030.2
 
 
 def test_both_countries_have_a_general_who_is_actually_recruited(arena):
@@ -1730,3 +1876,258 @@ def test_a_paused_clock_reads_as_stalled_despite_capture_noise():
     ticked = np.clip(reading.astype(np.int16) + 45, 0, 255).astype(np.uint8)
     assert clock_advanced(ticked, reading)
     assert clock_advanced(reading, None), "the first frame always counts as a change"
+
+
+def test_occupation_balance_counts_country_colours_and_ignores_chrome():
+    from hoi4_arena.mapgen import COUNTRY_COLOUR
+    from hoi4_arena.vision import BLUE, RED, occupation_balance
+
+    assert BLUE == COUNTRY_COLOUR["BLU"]
+    assert RED == COUNTRY_COLOUR["RED"]
+    crop = np.zeros((4, 4, 3), np.uint8)
+    crop[:, :2] = RED
+    crop[:, 2:] = BLUE
+    assert occupation_balance(crop) == pytest.approx(0.5)
+    assert occupation_balance(crop, RED) == pytest.approx(0.5)
+    crop[:, :] = BLUE
+    assert occupation_balance(crop) == pytest.approx(1.0)
+    assert occupation_balance(crop, RED) == pytest.approx(0.0)
+    assert occupation_balance(np.zeros((4, 4, 3), np.uint8)) is None
+
+
+def test_territory_reward_follows_the_minimap_crop(tmp_path):
+    """A shift from red to blue inside the crop pays. The same shift outside does not."""
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv
+    from hoi4_arena.vision import BLUE, RED, set_minimap_rect
+
+    _rules_with(tmp_path, _MATCH)
+    set_minimap_rect(tmp_path / "screen.png", tmp_path / "rules.json", [24, 24, 16, 8])
+    rules = ScreenRules(tmp_path / "rules.json")
+    x, y, w, h = rules.minimap_rect
+
+    def frame(minimap, outside):
+        image = _screen(rules, ["ready", "healthy", "speed"])
+        image[y : y + h, x : x + w] = minimap
+        if outside is not None:
+            image[16:20, 40:60] = outside
+        return image
+
+    red = np.array(RED, np.uint8)
+    blue = np.array(BLUE, np.uint8)
+    shots = [
+        frame(red, None),
+        frame(red, None),
+        frame(red, blue),
+        frame(red, None),
+        frame(blue, None),
+    ]
+    desktop = Mock()
+    desktop.capture.side_effect = [
+        Frame(shot, {"foreground": True}, index) for index, shot in enumerate(shots)
+    ]
+    desktop.apply.return_value = {"applied": 1}
+    env = ArenaEnv(desktop, rules, [], downscale=False)
+    env.reset()
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    _, reward, _, _, first = env.step(action)
+    _, held_reward, _, _, held = env.step(action)
+    _, moved_reward, _, _, moved = env.step(action)
+    assert first["valid"] and first["territory"] == pytest.approx(0.0)
+    assert reward == 0.0 and first["territory_reward"] == 0.0
+    assert held_reward == 0.0 and held["territory_reward"] == 0.0
+    assert moved["territory_reward"] == pytest.approx(1.0)
+    assert moved_reward == pytest.approx(1.0) and moved["outcome"] is None
+    env.close()
+
+    bare = _rules_with(tmp_path / "bare", _MATCH)
+    quiet = Mock()
+    quiet.capture.side_effect = [
+        Frame(_screen(bare, ["ready"]), {}, 0),
+        Frame(_screen(bare, ["ready", "healthy", "speed"]), {}, 1),
+        Frame(_screen(bare, ["healthy", "speed"]), {}, 2),
+    ]
+    quiet.apply.return_value = {}
+    other = ArenaEnv(quiet, bare, [], downscale=False)
+    other.reset()
+    _, reward, _, _, info = other.step(action)
+    assert info["valid"]
+    assert info["territory"] == "uncalibrated"
+    assert info["territory_reward"] == 0.0 and reward == 0.0
+    other.close()
+
+
+def test_red_is_paid_when_red_gains_land_and_not_when_blue_does(tmp_path):
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv
+    from hoi4_arena.vision import BLUE, RED, set_minimap_rect
+
+    _rules_with(tmp_path, _MATCH)
+    set_minimap_rect(tmp_path / "screen.png", tmp_path / "rules.json", [24, 24, 16, 8])
+    rules = ScreenRules(tmp_path / "rules.json")
+    x, y, w, h = rules.minimap_rect
+
+    def shot(colour):
+        image = _screen(rules, ["ready", "healthy", "speed"])
+        image[y : y + h, x : x + w] = colour
+        return image
+
+    desktop = Mock()
+    desktop.capture.side_effect = [
+        Frame(shot(RED), {}, 0),
+        Frame(shot(RED), {}, 1),
+        Frame(shot(RED), {}, 2),
+        Frame(shot(BLUE), {}, 3),
+    ]
+    desktop.apply.return_value = {}
+    env = ArenaEnv(desktop, rules, [], downscale=False, country="RED")
+    env.reset()
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    assert env.step(action)[4]["valid"]
+    _, reward, _, _, info = env.step(action)
+    assert info["valid"], info.get("error")
+    assert reward == pytest.approx(-1.0)
+    env.close()
+
+
+def test_a_terminal_candidate_is_not_thrown_away_for_pause_or_a_stopped_clock(tmp_path):
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv
+
+    rules = _rules_with(tmp_path, _MATCH)
+    desktop = Mock()
+    # The popup is up, the pause glyph is lit, and the HUD is still visible.
+    # Debounce has not finished, so this must not become game_paused.
+    panel = _screen(rules, ["healthy", "paused", "win"])
+    desktop.capture.side_effect = [
+        Frame(_screen(rules, ["ready"]), {}, 0),
+        Frame(panel, {}, 1),
+        Frame(panel, {}, 2),
+    ]
+    desktop.apply.return_value = {}
+    env = ArenaEnv(desktop, rules, [], downscale=False)
+    env.reset()
+    _, _, done, _, info = env.step(np.zeros((SLOTS, 3), dtype=np.int64))
+    assert info["valid"], info.get("error")
+    assert not done
+    env.close()
+
+
+def test_a_changed_speed_indicator_invalidates_the_step(tmp_path):
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import ArenaEnv
+
+    rules = _rules_with(tmp_path, _MATCH)
+    desktop = Mock()
+    desktop.capture.side_effect = [
+        Frame(_screen(rules, ["ready"]), {}, 0),
+        Frame(_screen(rules, ["healthy", "speed"]), {}, 1),
+        Frame(_screen(rules, ["healthy"]), {}, 2),
+    ]
+    desktop.apply.return_value = {}
+    env = ArenaEnv(desktop, rules, [], downscale=False)
+    env.reset()
+    info = env.step(np.zeros((SLOTS, 3), dtype=np.int64))[4]
+    assert not info["valid"] and "game_speed_changed" in info["error"]
+    env.close()
+
+
+def test_a_dispatch_timeout_sets_the_stop_before_dropping_the_thread(tmp_path):
+    import threading
+    import time as _time
+
+    env, desktop = _cadence_env(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def apply(_events):
+        started.set()
+        release.wait(2)
+        return {}
+
+    desktop.apply.side_effect = apply
+    env.join_timeout = 0.05
+    env.join_grace = 0.05
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    try:
+        env.reset()
+        env.step(action)
+        assert started.wait(2)
+        info = env.step(action)[4]
+        assert not info["valid"]
+        assert env.stop_dispatch.is_set()
+    finally:
+        release.set()
+        _time.sleep(0.05)
+        env.close()
+
+
+def test_the_reward_is_stored_on_the_action_that_finished():
+    from hoi4_arena.runner import commit_transition
+
+    held = {"action": "previous"}
+    result = (None, 1.0, True, False, {"valid": True, "elapsed_seconds": 0.2})
+    finished = commit_transition(held, result)
+    assert finished["action"] == "previous"
+    assert finished["reward"] == 1.0 and finished["terminal"] and finished["valid"]
+    assert commit_transition(None, result) is None
+
+
+def test_requests_match_replies_by_id_when_they_complete_out_of_order():
+    import json
+    import threading
+    from collections import deque
+
+    from hoi4_arena.desktop import Desktop
+
+    desk = Desktop.__new__(Desktop)
+    desk.write_lock = threading.Lock()
+    desk.pending_lock = threading.Lock()
+    desk.pending = {}
+    desk.next_id = 1
+    desk.reader_error = None
+    desk.diagnostics = deque()
+    desk._alive = lambda: True
+    desk._detail = lambda message: message
+    sent = []
+
+    def _send(payload):
+        sent.append(json.loads(payload))
+
+    desk._send = _send
+    boxes = {}
+
+    def run(op):
+        boxes[op] = desk.request(op, timeout=2)
+
+    threads = [threading.Thread(target=run, args=(op,)) for op in ("capture", "apply")]
+    for thread in threads:
+        thread.start()
+    for _ in range(50):
+        if len(sent) == 2:
+            break
+        threading.Event().wait(0.01)
+    ids = {item["op"]: item["id"] for item in sent}
+    # Apply finishes first. Capture must still receive its own body.
+    desk._deliver({"id": ids["apply"], "applied": 1})
+    desk._deliver({"id": ids["capture"], "seq": 7})
+    for thread in threads:
+        thread.join(2)
+    assert boxes["capture"]["seq"] == 7
+    assert boxes["apply"]["applied"] == 1
+
+
+def test_approximate_kl_is_zero_when_the_policy_has_not_moved():
+    from hoi4_arena.learning import approximate_kl
+
+    logp = torch.tensor([-0.2, -1.5])
+    assert float(approximate_kl(logp, logp)) == pytest.approx(0.0)
+    assert float(approximate_kl(logp, logp - 1)) > 0

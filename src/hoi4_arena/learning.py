@@ -33,8 +33,35 @@ def gae(rewards, values, bootstrap, terminated, valid, elapsed, gamma=0.9999, la
     return advantages, advantages + values
 
 
+def normalize_advantages(advantages):
+    """One scale for the whole episode.
+
+    An 8-step window of a flat reward has a tiny standard deviation. Dividing by that
+    window turns the noise into a unit-scale advantage, and the ratio then trains on it.
+    A constant episode has no relative advantage; leave it at zero rather than dividing
+    by a floor. A single transition is already the whole episode: centering it would
+    erase the only reward, including a one-step win. The divisor is floored at 1e-2, so
+    a spread too small to be a terminal return stays proportionally small and flicker
+    cannot grow to 1, and the scale is continuous across the floor.
+    """
+    advantages = advantages.float()
+    if advantages.numel() < 2:
+        return advantages.clone()
+    scale = advantages.std(unbiased=False)
+    if not torch.isfinite(scale) or float(scale) < 1e-6:
+        return torch.zeros_like(advantages)
+    centered = advantages - advantages.mean()
+    return centered / max(float(scale), 1e-2)
+
+
+def approximate_kl(logp, old_logp):
+    """Schulman's non-negative approximation of the mean KL from the behavior policy."""
+    log_ratio = logp - old_logp
+    return (log_ratio.exp() - 1 - log_ratio).mean()
+
+
 def ppo_loss(logp, old_logp, values, returns, advantages, entropy, clip=0.2):
-    advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-6)
+    """Score one window. Advantages are already scaled over the episode; do not rescale."""
     ratio = (logp - old_logp).exp()
     policy = -torch.minimum(ratio * advantages, ratio.clamp(1 - clip, 1 + clip) * advantages).mean()
     value = 0.5 * (values - returns).square().mean()

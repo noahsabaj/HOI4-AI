@@ -106,7 +106,8 @@ fn downscale_row(
 }
 
 /// The global frame plus the four spatially ordered quadrants, in the order the policy
-/// expects. Mirrors `hoi4_arena.dataset.quadrants`.
+/// expects. Mirrors `hoi4_arena.dataset.quadrants`. The cursor crop is not one of these
+/// boxes: it is a native copy, appended after them by `cursor_crop_bgra`.
 pub fn view_boxes(width: usize, height: usize) -> [[usize; 4]; 5] {
     let (hh, hw) = (height / 2, width / 2);
     [
@@ -118,6 +119,47 @@ pub fn view_boxes(width: usize, height: usize) -> [[usize; 4]; 5] {
     ]
 }
 
+/// Native `size` square of RGB centered on the client-pixel pointer.
+///
+/// The pointer lands on output pixel `(size / 2, size / 2)`. Samples outside the frame
+/// are zero, so the pointer stays on that pixel at a screen edge instead of the window
+/// sliding. This is a copy, not an average: an in-bounds window is what `downscale_bgra`
+/// returns when the box is already `size` on a side. It must match
+/// `hoi4_arena.dataset.cursor_crop`, which sees RGB that has already been swizzled.
+pub fn cursor_crop_bgra(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; size * size * 3];
+    if size == 0 || width == 0 || height == 0 {
+        return out;
+    }
+    let origin_x = x as i64 - (size / 2) as i64;
+    let origin_y = y as i64 - (size / 2) as i64;
+    for oy in 0..size {
+        let sy = origin_y + oy as i64;
+        if sy < 0 || sy >= height as i64 {
+            continue;
+        }
+        for ox in 0..size {
+            let sx = origin_x + ox as i64;
+            if sx < 0 || sx >= width as i64 {
+                continue;
+            }
+            let i = (sy as usize * width + sx as usize) * 4;
+            let o = (oy * size + ox) * 3;
+            out[o] = src[i + 2];
+            out[o + 1] = src[i + 1];
+            out[o + 2] = src[i];
+        }
+    }
+    out
+}
+
 fn valid_event(e: &Event, setup: bool) -> bool {
     match *e {
         Event::Move { x, y } => {
@@ -126,13 +168,15 @@ fn valid_event(e: &Event, setup: bool) -> bool {
         Event::Button { button, .. } => button < 3,
         Event::Wheel { delta } => delta.unsigned_abs() <= 1200,
         Event::Key { vk, .. } => {
-            // Never allow OS keys, Alt, console, F12 (emergency stop), or speed changes in matches.
-            matches!(vk, 0x10 | 0x11 | 0x25..=0x28 | 0x41..=0x5a)
-                || (setup
-                    && matches!(
-                        vk,
-                        0x08 | 0x09 | 0x0d | 0x1b | 0x20 | 0x30..=0x39 | 0xbb | 0xbd
-                    ))
+            // Match input is the demonstration vocabulary: modifiers, arrows, letters,
+            // tab, enter, and digits. OS keys, Alt, the console, F12, and the speed keys
+            // stay refused, and so do space and escape: space pauses and escape opens the
+            // pause menu, which the match loop rejects as game_paused. Speed is
+            // operator-declared; a match that can change it falsifies the manifest.
+            matches!(
+                vk,
+                0x09 | 0x0d | 0x10 | 0x11 | 0x25..=0x28 | 0x30..=0x39 | 0x41..=0x5a
+            ) || (setup && matches!(vk, 0x08 | 0x1b | 0x20 | 0xbb | 0xbd))
         }
     }
 }
@@ -141,7 +185,7 @@ fn valid_event(e: &Event, setup: bool) -> bool {
 mod platform {
     use super::*;
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeSet, VecDeque},
         io::{self, BufRead, Write},
         mem::{size_of, zeroed},
         ptr::null_mut,
@@ -164,6 +208,37 @@ mod platform {
     static STOP: AtomicBool = AtomicBool::new(false);
     static OVERFLOW: AtomicBool = AtomicBool::new(false);
     static EVENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+    static LOG: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+    fn note(message: &str) {
+        eprintln!("{message}");
+        if let Ok(mut log) = LOG.lock() {
+            if log.len() >= 64 {
+                log.pop_front();
+            }
+            log.push_back(message.to_string());
+        }
+    }
+    fn respond(cmd: &serde_json::Value, result: Result<(serde_json::Value, Vec<u8>), String>) {
+        let (mut response, bytes) = match result {
+            Ok(value) => value,
+            Err(error) => (serde_json::json!({"error": error}), Vec::new()),
+        };
+        if let Some(id) = cmd.get("id").filter(|id| !id.is_null()) {
+            response["id"] = id.clone();
+        }
+        response["bytes"] = serde_json::json!(bytes.len());
+        let mut out = io::stdout().lock();
+        if writeln!(out, "{response}").is_ok() {
+            let _ = out.write_all(&bytes);
+            let _ = out.flush();
+        }
+    }
+    fn disarm(shared: &Arc<Mutex<InputState>>) {
+        if let Ok(mut state) = shared.lock() {
+            state.held.release();
+            state.armed = false;
+        }
+    }
     fn ns() -> u64 {
         ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
     }
@@ -172,6 +247,15 @@ mod platform {
             GetForegroundWindow() as usize == TARGET.load(Ordering::Relaxed)
                 && TARGET.load(Ordering::Relaxed) != 0
         }
+    }
+    /// Where the pointer is in client pixels, including positions outside the window.
+    /// Injected moves and a human hand both land here, because both move the OS cursor.
+    unsafe fn client_cursor(hwnd: HWND) -> Result<(i32, i32), String> {
+        let mut point: POINT = zeroed();
+        if GetCursorPos(&mut point) == 0 || ScreenToClient(hwnd, &mut point) == 0 {
+            return Err("cursor_unavailable".into());
+        }
+        Ok((point.x, point.y))
     }
     fn record(e: Event) {
         if !foreground() {
@@ -384,7 +468,9 @@ mod platform {
             *screen = match crate::duplication::Duplicator::new((origin.x, origin.y)) {
                 Ok(duplicator) => Screen::Active(Box::new(duplicator)),
                 Err(reason) => {
-                    eprintln!("desktop duplication unavailable, using gdi: {reason}");
+                    note(&format!(
+                        "desktop duplication unavailable, using gdi: {reason}"
+                    ));
                     Screen::Retired
                 }
             };
@@ -412,12 +498,18 @@ mod platform {
                 // duplication handles best and must not be the one that retires it.
                 Err(crate::duplication::Unavailable::NotReadyYet) => {}
                 Err(reason) => {
-                    *rebuilds += 1;
+                    // A geometry miss rebuilds against the output that now holds the
+                    // window. It does not spend the retirement budget.
+                    if crate::duplication::should_retire(&reason) {
+                        *rebuilds += 1;
+                    }
                     *screen = if *rebuilds <= DUPLICATION_REBUILDS {
-                        eprintln!("desktop duplication lost, rebuilding: {reason}");
+                        note(&format!("desktop duplication lost, rebuilding: {reason}"));
                         Screen::Untried
                     } else {
-                        eprintln!("desktop duplication lost {rebuilds} times, using gdi: {reason}");
+                        note(&format!(
+                            "desktop duplication lost {rebuilds} times, using gdi: {reason}"
+                        ));
                         Screen::Retired
                     };
                 }
@@ -623,25 +715,93 @@ mod platform {
             state.armed = false;
         }
     }
+    /// Arm, release, apply, and status. These stay off the capture thread so a blit
+    /// cannot bunch the 25 ms slots up behind it.
+    fn fast_op(
+        shared: &Arc<Mutex<InputState>>,
+        cmd: &serde_json::Value,
+    ) -> Result<(serde_json::Value, Vec<u8>), String> {
+        let mut state = shared.lock().map_err(|_| "input_lock")?;
+        let InputState {
+            held,
+            armed,
+            setup,
+            last,
+        } = &mut *state;
+        match cmd["op"].as_str().unwrap_or("") {
+            "arm" => {
+                if !foreground() {
+                    return Err("game_not_foreground".into());
+                }
+                *setup = cmd["mode"] == "setup";
+                STOP.store(false, Ordering::SeqCst);
+                *armed = true;
+                *last = Instant::now();
+                Ok((serde_json::json!({"armed": true}), vec![]))
+            }
+            "release" => {
+                held.release();
+                *armed = false;
+                Ok((serde_json::json!({"armed": false}), vec![]))
+            }
+            "events" => {
+                let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
+                Ok((
+                    serde_json::json!({"events": events, "t_ns": ns(), "overflow": OVERFLOW.swap(false, Ordering::Relaxed)}),
+                    vec![],
+                ))
+            }
+            "apply" => {
+                if !*armed || STOP.load(Ordering::SeqCst) || !foreground() {
+                    return Err("input_not_armed_or_focus_lost".into());
+                }
+                let events: Vec<Event> =
+                    serde_json::from_value(cmd["events"].clone()).map_err(|e| e.to_string())?;
+                if events.len() > 64 || !events.iter().all(|e| valid_event(e, *setup)) {
+                    return Err("invalid_event_batch".into());
+                }
+                for e in &events {
+                    if !foreground() || STOP.load(Ordering::SeqCst) {
+                        held.release();
+                        *armed = false;
+                        return Err("focus_lost_during_batch".into());
+                    }
+                    held.apply(e)?;
+                }
+                *last = Instant::now();
+                Ok((
+                    serde_json::json!({"applied": events.len(), "t_ns": ns()}),
+                    vec![],
+                ))
+            }
+            "status" => {
+                let log_lines: Vec<String> = LOG
+                    .lock()
+                    .map(|log| log.iter().cloned().collect())
+                    .unwrap_or_default();
+                Ok((
+                    serde_json::json!({
+                        "armed": *armed,
+                        "foreground": foreground(),
+                        "stopped": STOP.load(Ordering::SeqCst),
+                        "held_keys": held.keys,
+                        "held_buttons": held.buttons,
+                        "t_ns": ns(),
+                        "log": log_lines,
+                    }),
+                    vec![],
+                ))
+            }
+            _ => Err("unknown_operation".into()),
+        }
+    }
+
     pub fn run() -> Result<(), String> {
         unsafe {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
         ORIGIN.get_or_init(Instant::now);
         hooks()?;
-        let (tx, rx) = mpsc::sync_channel(8);
-        thread::spawn(move || {
-            for line in io::stdin().lock().lines() {
-                match line {
-                    Ok(v) => {
-                        if tx.send(v).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
         let shared = Arc::new(Mutex::new(InputState {
             held: Held {
                 keys: BTreeSet::new(),
@@ -666,67 +826,79 @@ mod platform {
                 state.armed = false;
             }
         });
+        // Unbounded: a capture in progress must not stop the reader from pulling the
+        // next apply off stdin. A bounded send here would freeze the slots behind the blit.
+        let (tx, rx) = mpsc::channel();
+        let reader_state = Arc::clone(&shared);
+        thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let line = match line {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let cmd: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        respond(&serde_json::Value::Null, Err(error.to_string()));
+                        continue;
+                    }
+                };
+                let op = cmd["op"].as_str().unwrap_or("");
+                if op == "capture" || op == "attach" {
+                    if tx.send(cmd).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let result = fast_op(&reader_state, &cmd);
+                if result.is_err() {
+                    disarm(&reader_state);
+                }
+                respond(&cmd, result);
+            }
+        });
         let mut seq = 0u64;
         // One duplication per process, held across ticks: the device, the output
         // enumeration and the staging texture all cost far more to create than the
-        // capture they serve.
+        // capture they serve. It stays on this thread. Apply runs on the reader.
         let mut screen = Screen::Untried;
         let mut rebuilds = 0u32;
-        let mut out = io::BufWriter::new(io::stdout().lock());
-        loop {
-            let line = match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(v) => v,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            };
+        while let Ok(cmd) = rx.recv() {
             let result = (|| -> Result<(serde_json::Value, Vec<u8>), String> {
-                let mut state = shared.lock().map_err(|_| "input_lock")?;
-                let InputState {
-                    held,
-                    armed,
-                    setup,
-                    last,
-                } = &mut *state;
-                let cmd: serde_json::Value =
-                    serde_json::from_str(&line).map_err(|e| e.to_string())?;
                 match cmd["op"].as_str().unwrap_or("") {
                     "attach" => {
-                        held.release();
-                        *armed = false;
-                        let hwnd = unsafe { select()? };
-                        held.hwnd = hwnd as usize;
-                        TARGET.store(hwnd as usize, Ordering::Relaxed);
-                        // Try the fast path once here so the reply names the backend a
-                        // match will really use, instead of whichever one the first tick
-                        // happens to reach. A failure is reported, not raised: GDI works.
+                        let hwnd = {
+                            let mut state = shared.lock().map_err(|_| "input_lock")?;
+                            state.held.release();
+                            state.armed = false;
+                            let hwnd = unsafe { select()? };
+                            state.held.hwnd = hwnd as usize;
+                            TARGET.store(hwnd as usize, Ordering::Relaxed);
+                            hwnd
+                        };
+                        // The probe capture is the slow part. Apply can proceed while it runs.
+                        // A failed probe is not a GDI frame; saying so hid a game that was
+                        // not in front.
                         screen = Screen::Untried;
                         rebuilds = 0;
                         let attached_backend =
                             match unsafe { capture(&mut screen, &mut rebuilds, hwnd) } {
-                                Ok(frame) => frame.backend,
-                                Err(_) => "gdi_bgra",
+                                Ok(frame) => frame.backend.to_string(),
+                                Err(reason) => {
+                                    note(&format!("attach probe failed: {reason}"));
+                                    "unavailable".to_string()
+                                }
                             };
                         Ok((
-                            serde_json::json!({"hwnd":hwnd as usize,"foreground":foreground(),"clock_ns":ns(),"backend":attached_backend,"computer":std::env::var("COMPUTERNAME").unwrap_or_default()}),
+                            serde_json::json!({"hwnd": hwnd as usize, "foreground": foreground(), "clock_ns": ns(), "backend": attached_backend, "computer": std::env::var("COMPUTERNAME").unwrap_or_default()}),
                             vec![],
                         ))
                     }
-                    "arm" => {
-                        if !foreground() {
-                            return Err("game_not_foreground".into());
-                        }
-                        *setup = cmd["mode"] == "setup";
-                        STOP.store(false, Ordering::SeqCst);
-                        *armed = true;
-                        *last = Instant::now();
-                        Ok((serde_json::json!({"armed":true}), vec![]))
-                    }
-                    "release" => {
-                        held.release();
-                        *armed = false;
-                        Ok((serde_json::json!({"armed":false}), vec![]))
-                    }
                     "capture" => {
+                        let hwnd = {
+                            let state = shared.lock().map_err(|_| "input_lock")?;
+                            state.held.hwnd as HWND
+                        };
                         let Capture {
                             bytes: raw,
                             width: w,
@@ -734,11 +906,9 @@ mod platform {
                             start_ns: start,
                             end_ns: end,
                             backend,
-                        } = unsafe { capture(&mut screen, &mut rebuilds, held.hwnd as HWND)? };
+                        } = unsafe { capture(&mut screen, &mut rebuilds, hwnd)? };
                         let (uw, uh) = (w as usize, h as usize);
-                        // Downscaling here keeps a 33 MB frame off the wire: the five
-                        // policy views plus the calibrated template crops are about
-                        // 800 KB. The caller asks for exactly what it will look at.
+                        let (cx, cy) = unsafe { client_cursor(hwnd)? };
                         let view_size = cmd["views"].as_u64().unwrap_or(0) as usize;
                         if view_size > 1024 {
                             return Err("view_size_too_large".into());
@@ -762,8 +932,6 @@ mod platform {
                                 regions.push([y, x, rh, rw]);
                             }
                         }
-                        // The full frame is implied only when nothing narrower was asked
-                        // for; requesting it alongside views is explicit.
                         let want_full = if view_size == 0 && regions.is_empty() {
                             true
                         } else {
@@ -781,6 +949,12 @@ mod platform {
                                 views_bytes += v.len();
                                 payload.extend_from_slice(&v);
                             }
+                            // Cropped from the same frame as the other views, on either
+                            // backend. prepare_session crops the recorded full frame, so a
+                            // separate, later blit would disagree exactly at the pointer.
+                            let v = cursor_crop_bgra(&raw, uw, uh, cx, cy, view_size);
+                            views_bytes += v.len();
+                            payload.extend_from_slice(&v);
                         }
                         let mut region_bytes: Vec<usize> = Vec::new();
                         for r in &regions {
@@ -806,60 +980,17 @@ mod platform {
                         seq += 1;
                         let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                         Ok((
-                            serde_json::json!({"seq":seq,"width":w,"height":h,"encoding":encoding,"capture_start_ns":start,"t_ns":end,"events":events,"overflow":OVERFLOW.swap(false,Ordering::Relaxed),"stopped":STOP.load(Ordering::SeqCst),"foreground":foreground(),"full_bytes":full_bytes,"view_size":view_size,"views_bytes":views_bytes,"region_bytes":region_bytes,"backend":backend}),
+                            serde_json::json!({"seq": seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": start, "t_ns": end, "events": events, "overflow": OVERFLOW.swap(false, Ordering::Relaxed), "stopped": STOP.load(Ordering::SeqCst), "foreground": foreground(), "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": backend}),
                             bytes,
                         ))
                     }
-                    "events" => {
-                        let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
-                        Ok((
-                            serde_json::json!({"events":events,"t_ns":ns(),"overflow":OVERFLOW.swap(false,Ordering::Relaxed)}),
-                            vec![],
-                        ))
-                    }
-                    "apply" => {
-                        if !*armed || STOP.load(Ordering::SeqCst) || !foreground() {
-                            return Err("input_not_armed_or_focus_lost".into());
-                        }
-                        let events: Vec<Event> = serde_json::from_value(cmd["events"].clone())
-                            .map_err(|e| e.to_string())?;
-                        if events.len() > 64 || !events.iter().all(|e| valid_event(e, *setup)) {
-                            return Err("invalid_event_batch".into());
-                        }
-                        for e in &events {
-                            if !foreground() || STOP.load(Ordering::SeqCst) {
-                                held.release();
-                                *armed = false;
-                                return Err("focus_lost_during_batch".into());
-                            }
-                            held.apply(e)?;
-                        }
-                        *last = Instant::now();
-                        Ok((
-                            serde_json::json!({"applied":events.len(),"t_ns":ns()}),
-                            vec![],
-                        ))
-                    }
-                    "status" => Ok((
-                        serde_json::json!({"armed":*armed,"foreground":foreground(),"stopped":STOP.load(Ordering::SeqCst),"held_keys":held.keys,"held_buttons":held.buttons,"t_ns":ns()}),
-                        vec![],
-                    )),
-                    _ => Err("unknown_operation".into()),
+                    _ => fast_op(&shared, &cmd),
                 }
             })();
-            let (mut response, bytes) = match result {
-                Ok(v) => v,
-                Err(e) => {
-                    let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    state.held.release();
-                    state.armed = false;
-                    (serde_json::json!({"error":e}), vec![])
-                }
-            };
-            response["bytes"] = serde_json::json!(bytes.len());
-            writeln!(out, "{}", response).map_err(|e| e.to_string())?;
-            out.write_all(&bytes).map_err(|e| e.to_string())?;
-            out.flush().map_err(|e| e.to_string())?;
+            if result.is_err() {
+                disarm(&shared);
+            }
+            respond(&cmd, result);
         }
         shared
             .lock()
@@ -1046,6 +1177,40 @@ mod tests {
         }
     }
 
+    /// Same 3x3 image and same RGB bytes as test_cursor_crop_keeps_the_pointer_pixel_centered.
+    #[test]
+    fn cursor_crop_keeps_the_pointer_pixel_and_pads_outside_with_zero() {
+        let rgb = [
+            1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27,
+        ];
+        let mut src = Vec::with_capacity(3 * 3 * 4);
+        for px in rgb.chunks(3) {
+            src.extend_from_slice(&[px[2], px[1], px[0], 0]);
+        }
+        assert_eq!(cursor_crop_bgra(&src, 3, 3, 1, 1, 3), rgb);
+        assert_eq!(
+            cursor_crop_bgra(&src, 3, 3, 0, 0, 3),
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0, 0, 10, 11, 12, 13, 14,
+                15,
+            ]
+        );
+        assert_eq!(cursor_crop_bgra(&src, 3, 3, 9, -4, 3), vec![0u8; 27]);
+    }
+
+    /// An in-bounds window is a 1:1 area average, so the crop and the resampler agree.
+    #[test]
+    fn interior_cursor_crop_matches_downscale_of_that_box() {
+        let (w, h, size) = (8usize, 8usize, 4usize);
+        let src = lcg(w * h * 4);
+        // Center index is size/2 = 2, so cursor (5, 6) opens the box at (3, 4).
+        assert_eq!(
+            cursor_crop_bgra(&src, w, h, 5, 6, size),
+            downscale_bgra(&src, w, [4, 3, size, size], size)
+        );
+    }
+
     #[test]
     fn view_boxes_cover_the_frame_without_overlap() {
         let (w, h) = (3840usize, 2160usize);
@@ -1060,8 +1225,17 @@ mod tests {
 
     #[test]
     fn blocks_os_and_speed_keys() {
-        for vk in [0x5b, 0x5c, 0x12, 0xc0, 0x7b, 0x20, 0xbb, 0xbd] {
-            assert!(!valid_event(&Event::Key { vk, down: true }, false));
+        for vk in [0x5b, 0x5c, 0x12, 0xc0, 0x7b, 0xbb, 0xbd, 0x1b, 0x20] {
+            assert!(
+                !valid_event(&Event::Key { vk, down: true }, false),
+                "vk {vk:#x} should be refused in a match"
+            );
+        }
+        for vk in [0x09, 0x0d, 0x30, 0x39] {
+            assert!(
+                valid_event(&Event::Key { vk, down: true }, false),
+                "vk {vk:#x} is part of the demonstration vocabulary"
+            );
         }
     }
     #[test]

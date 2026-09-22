@@ -4,7 +4,7 @@ Project code is dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-A
 
 One direct policy: screenshots → video encoder and detail crops → GRU memory → raw mouse/keyboard events. The deployed actor has no world-state API or planner. Python supplies recording, training and match coordination; a Rust Windows worker captures pixels and applies input.
 
-The worker downscales before transport. A `capture` can ask for the five policy views and the calibrated template crops instead of the native frame, which takes the payload from 33.2 MB to 1.15 MB (3.46 MB to 0.77 MB after lz4) and removes the resize from the decision loop. The worker's resampler is an exact integer-binned area average that reproduces the training resize bit for bit; both implementations assert the same golden vectors, because a filter mismatch would not fail loudly, it would quietly feed the policy different pixels than it trained on. Producing the five views costs the worker about 18 ms of CPU per frame.
+The worker downscales before transport. A `capture` can ask for the six policy views — one global frame, four quadrants, and a native crop centered on the pointer — plus the calibrated template crops, instead of the native frame. That is what takes the payload from 33.2 MB down to about a megabyte and removes the resize from the decision loop. The worker's resampler is an exact integer-binned area average that reproduces the training resize bit for bit; both implementations assert the same golden vectors, because a filter mismatch would not fail loudly, it would quietly feed the policy different pixels than it trained on. Apply is handled while that capture runs, so the eight 25 ms slots are not stuck behind the blit.
 
 Pointer positions are quantized onto a square 1024×1024 lattice of the client rectangle. On a 3840×2160 screen that is 3.75 px horizontally and 2.11 px vertically, so controls narrower than about four pixels cannot be addressed exactly and recorded human motion is re-quantized before it becomes a training label.
 
@@ -12,7 +12,7 @@ Pointer positions are quantized onto a square 1024×1024 lattice of the client r
 
 ## Setup
 
-Requires Windows, HOI4, Rust, uv and ffmpeg on PATH. From the repository root:
+Requires Windows, PowerShell 7.5+ (`pwsh`), HOI4, Rust, uv and ffmpeg on PATH. From the repository root:
 
 ```powershell
 .\scripts\Setup.ps1
@@ -26,7 +26,25 @@ The worker only attaches to `hoi4.exe`. It requires foreground focus to apply in
 
 ## Second PC
 
-The prepared private bundle is written to the path you pass to `bundle-peer`. Extract it on the peer machine, open HOI4 and run `Start-Worker.ps1`. It prints `HOI4 worker ready`. No Python is needed there. Keep the ZIP private: it contains pairing credentials.
+`bundle-peer` writes the pairing to the path you pass it: `peer.json` for this PC and a private `second-pc` folder for the other one. No Python is needed on the second PC, only PowerShell 7.5 or later (`pwsh`; Windows PowerShell 5.1 cannot load the bridge).
+
+The second PC runs from one shared folder that this PC deploys into. Set it up once, on the second PC, in an elevated PowerShell 7:
+
+```powershell
+New-Item -ItemType Directory "$HOME\HOI4Worker"
+New-SmbShare -Name HOI4Worker -Path "$HOME\HOI4Worker" -ChangeAccess ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -EncryptData $true
+```
+
+If that account has no usable password (a Microsoft account signed in by PIN), create a local account for the share instead and grant it the share and the folder (`New-LocalUser`, `Grant-SmbShareAccess -AccessRight Change`, `icacls /grant <name>:(OI)(CI)M`).
+
+On this PC, save that account's sign-in once (`cmdkey` asks for the password), then deploy. `Deploy-Peer.ps1` builds the worker and copies it, `Start-Worker.ps1` and the pairing files into the share, skipping anything unchanged.
+
+```powershell
+cmdkey /add:<second-pc-ip> /user:<second-pc-account> /pass
+.\scripts\Deploy-Peer.ps1
+```
+
+Then on the second PC, once, in PowerShell 7: `& "$HOME\HOI4Worker\Start-Worker.ps1" -Install`. That starts the worker now and, minimized, at every logon; it prints `HOI4 worker ready`. Undo it by deleting `HOI4 Worker` from `shell:startup`. After that, deploys need nothing on the second PC: a new worker is swapped in before the next connection, and a changed script or pairing restarts the bridge once it is idle, never during a match. Keep the folder private: it contains pairing credentials.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe probe-peer artifacts/pairing/peer.json
@@ -37,10 +55,10 @@ The connection uses a pinned TLS certificate, a random token and the coordinator
 
 ## Demonstrations and learning
 
-Record 2–4 hours of human combat, in complete sessions, with HOI4 foreground. Reserve entire sessions for validation and test. Real input timestamps and frame capture intervals are stored alongside native-resolution lossless FFV1 video; video frame rate alone is not the timing source.
+Record 2–4 hours of human combat, in complete sessions, with HOI4 foreground. Reserve entire sessions for validation and test. Real input timestamps and frame capture intervals are stored alongside native-resolution lossless FFV1 video; video frame rate alone is not the timing source. `--game-speed` is the speed the game is set to for that whole session. It is required, it is written into the manifest, and a prepared set that mixes speeds is refused. A 1.6 s clip is 3.2 in-game hours at speed 2 and 16 at speed 4. The speed bars are not read.
 
 ```powershell
-.venv\Scripts\hoi4-arena.exe record data/raw/session-001 --seconds 1200 --hz 10 --split train
+.venv\Scripts\hoi4-arena.exe record data/raw/session-001 --seconds 1200 --hz 10 --split train --game-speed 4
 .venv\Scripts\hoi4-arena.exe prepare data/raw/session-001 data/prepared/session-001
 .venv\Scripts\hoi4-arena.exe distill data/prepared models/student.pt
 .venv\Scripts\hoi4-arena.exe train-bc data/prepared artifacts/bc-none --variant tiny --student models/student.pt --auxiliary none
@@ -66,21 +84,21 @@ Generation requires a new output directory. The disposable launch script tempora
 
 `generate-map` audits what it wrote and exits non-zero if anything is wrong, and `audit-map` re-checks a mod on disk. The audit exists because the engine does not report bad map data: `CProvinceProvider::GetProvince` returns null for any id below 1, and the match-start callers dereference the result without checking, so an unset province id ends the process with an access violation and no log line. It checks every province id the generated files ask the engine to resolve, that both sides of a coast agree, that every province carries the unit-counter anchors and building placements the stock database supplies for it, and that each strategic region has all twelve weather periods.
 
-`template` creates screenshot ROI templates and `clock` calibrates the changing-clock ROI; collection refuses to start without both. `configs/pair.example.json` shows the two-player configuration, including its `seed` and `deterministic` keys. Real ready/healthy/speed-two/win/loss/disconnect/desync templates, a changing-clock ROI and observed lobby/reset recipes must be calibrated before collection. Missing evidence fails closed. There are no fabricated default victory templates.
+`template` creates screenshot ROI templates. `clock` calibrates the changing-clock ROI and `speed` is the selected-speed indicator; collection refuses to start without them. A running frame that stops matching `speed` ends the episode, because a click on the speed control would otherwise falsify the manifest. `configs/pair.example.json` shows the two-player configuration, including its `seed` and `deterministic` keys. Real ready/healthy/paused/win/loss/disconnect/desync templates, a changing-clock ROI and observed lobby/reset recipes must be calibrated before collection. Missing evidence fails closed. There are no fabricated default victory templates.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe template screen.png artifacts/calibration-left/rules.json healthy --rect 100 40 220 60
 .venv\Scripts\hoi4-arena.exe clock screen.png artifacts/calibration-left/rules.json --rect 3420 60 180 34
 ```
 
-A screen that stops matching `healthy` gets two bounded budgets: a short one while it matches no template at all, and a longer one once some terminal template is in flight, since the outcome debounce cannot start until the panel renders. A terminal template that never converges exhausts the longer budget and invalidates the episode, so it cannot suppress the speed-two and clock-liveness gates. Any fault inside a step — including a template or resolution mismatch — ends the episode as invalid rather than aborting the coordinator.
+A screen that stops matching `healthy` gets two bounded budgets: a short one while it matches no template at all, and a longer one once some terminal template is in flight, since the outcome debounce cannot start until the panel renders. A terminal template that never converges exhausts the longer budget and invalidates the episode, so it cannot suppress the pause and clock-liveness gates. Any fault inside a step — including a template or resolution mismatch — ends the episode as invalid rather than aborting the coordinator.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe collect-pair configs/pair.json artifacts/rollouts/match-001 artifacts/bc-none/epoch-0000.pt artifacts/bc-none/epoch-0000.pt
 .venv\Scripts\hoi4-arena.exe train-ppo artifacts/rollouts artifacts/bc-none/epoch-0000.pt artifacts/ppo
 ```
 
-Set `"downscale": false` in the pair config to make the worker send native frames, and `"record_full": true` to keep native-resolution audit video; by default the audit video records the global view the policy actually saw, and the manifest's `video_source` says which. Checkpoints are hashed and frozen during collection. Both commands seed torch, CUDA and NumPy and record the seed in the run manifest or checkpoint provenance; collection salts the seed with `pair_id` so matches stay reproducible without replaying one RNG stream across a league. Set `"deterministic": true` in the pair config for evaluation matches: the actor then takes the argmax *and* pins its latent, which an xm checkpoint needs to be greedy at all. Greedy rollouts are recorded in the manifest and excluded from PPO, since their likelihoods are not samples from the behavior policy. Leave it false for self-play. Progress and worker diagnostics go to stderr (`--log-level`), JSON results to stdout, and each run writes the worker's captured stderr beside its manifest. Both long-running commands write their evidence and then exit non-zero on failure. Recurrent PPO excludes invalid episodes and historical-opponent data, and accounts for elapsed wall time. The league class samples current/historical checkpoints, but an unattended league scheduler is not yet wired to the CLI. Collection currently runs both policy actors on the coordinator GPU. A tick dispatches its eight event slots on their own thread, so capture and inference overlap the interval rather than following it; the next tick blocks on that dispatch finishing, which is the cadence barrier. The loop therefore holds 5 Hz for any policy whose capture and inference fit inside the interval, and records `late_seconds` and `deadline_miss` when they do not. Locally, with a simulated 150 ms policy and a 20 ms capture, the tick held 203 ms where the previous serial loop would have taken 370 ms. This has not been measured end to end against a live game with two real actors.
+Set `"downscale": false` in the pair config to make the worker send native frames, and `"record_full": true` to keep native-resolution audit video; by default the audit video records the global view the policy actually saw, and the manifest's `video_source` says which. Checkpoints are hashed and frozen during collection. Both commands seed torch, CUDA and NumPy and record the seed in the run manifest or checkpoint provenance; collection salts the seed with `pair_id` so matches stay reproducible without replaying one RNG stream across a league. Set `"deterministic": true` in the pair config for evaluation matches: the actor then takes the argmax *and* pins its latent, which an xm checkpoint needs to be greedy at all. Greedy rollouts are recorded in the manifest and excluded from PPO, since their likelihoods are not samples from the behavior policy. Leave it false for self-play. Progress and worker diagnostics go to stderr (`--log-level`), JSON results to stdout, and each run writes the worker's captured stderr beside its manifest. Both long-running commands write their evidence and then exit non-zero on failure. Recurrent PPO excludes invalid episodes and historical-opponent data, accounts for elapsed wall time, and normalizes advantages once over the episode. A rollout with no recorded game speed, or a set of rollouts at more than one speed, does not train. The pair config's `game_speed` is that record; `configs/pair.example.json` shows it. The league class samples current/historical checkpoints, but an unattended league scheduler is not yet wired to the CLI. Collection currently runs both policy actors on the coordinator GPU. A tick dispatches its eight event slots on their own thread, so capture and inference overlap the interval rather than following it; the next tick blocks on that dispatch finishing, which is the cadence barrier. The loop therefore holds 5 Hz for any policy whose capture and inference fit inside the interval, and records `late_seconds` and `deadline_miss` when they do not. Locally, with a simulated 150 ms policy and a 20 ms capture, the tick held 203 ms where the previous serial loop would have taken 370 ms. This has not been measured end to end against a live game with two real actors.
 
 `evaluate results.jsonl` analyzes complete side-swapped pairs. Each row contains `pair_id`, candidate `side` (`left` or `right`), `scenario`, `valid`, and candidate `outcome` (`win`, `draw`, `loss`). Use a frozen imitation baseline and 50 predeclared pairs. The report includes pair-aware uncertainty, invalid exclusions and a sample-completion flag. Training metrics do not select the winner.
 

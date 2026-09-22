@@ -23,7 +23,11 @@ def inspect(ip, source):
             if connection.connect_ex((ip, port)) == 0:
                 result["open_ports"].append(port)
                 if port == 22:
-                    result["ssh_banner"] = connection.recv(256).decode(errors="replace").strip()
+                    # A silent or resetting SSH port must not abort the whole scan.
+                    try:
+                        result["ssh_banner"] = connection.recv(256).decode(errors="replace").strip()
+                    except OSError:
+                        result["ssh_banner"] = ""
     return result
 
 
