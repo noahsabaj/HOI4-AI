@@ -74,10 +74,18 @@ HOI4 has no "game over" screen. What each side actually sees when the other surr
 Calibrated at 3840×2160 in `artifacts/calibration-live/rules.json`: `healthy`, `paused`,
 `clock_rect`, `speed` (the speed-4 bars at `[3416, 52, 186, 9]`), `win` (the "Make your
 Demands" text at `[1810, 140, 215, 30]`) and `loss` (the "Defeated" title at
-`[181, 166, 137, 28]`). `win` and `loss` each match only their own screen; the nearest
-other screen is 21 away for `win` and 33 for `loss`. **Still needed before a match can
-run:** `ready`, `disconnect`, `desync`, and a `minimap_rect` for the territory reward.
-Lobby screens from the two-player test are saved for `ready`.
+`[181, 166, 137, 28]`), `disconnect` (the "Server Lost!" title at `[1770, 915, 300, 45]`)
+and `ready` (the clock reading "12:00, 1 Jan, 1936" at the start of a game, max 23).
+Each matches only its own screen: the nearest other captured screen is 21 away for
+`win`, 33 for `loss`, 26 for `disconnect` and 29 for `ready`. **Still needed before a
+match can run:** `desync`, which can't be produced on demand, and a `minimap_rect` for
+the territory reward, which needs a design decision because HOI4 has no minimap.
+
+- The start clock drifts by up to 19 between captures of the same paused frame (the
+  pause hatching moves), so `ready` needs a looser threshold than the other rules.
+- The client shows "Server Lost!" 25 to 65 seconds after the host dies, not at once.
+  The host is healthy the whole time, so it stays in the match; a match needs its own
+  timeout on that wait.
 
 What calibration taught us:
 
@@ -161,8 +169,8 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Calibrate the remaining screens**: `ready`, `disconnect`, `desync`, and the
-   minimap rectangle. `win`, `loss` and `speed` are done.
+1. **Finish calibration**: `desync`, and decide how the territory reward reads the map
+   (a fixed-camera crop, or an overlay only the reward sees). All other screens are done.
 2. **Record AI-vs-AI games** on the arena with `scripts/record_ai_games.py`. They have
    no actions, so they can't teach clicks, but they need no human time and are enough
    for the encoder (step 4), for learning to predict who wins, and as a first opponent.
