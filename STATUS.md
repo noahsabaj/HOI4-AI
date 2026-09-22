@@ -1,446 +1,161 @@
-# Verification status — 2026-09-21
+# Status — 2026-09-22
 
-The code implements an initial visual learning pipeline. It does not yet deliver reliable
-self-play or a winning multiplayer agent. This file records what has been *measured*.
-Where a claim here was later found wrong, it is corrected in place — the history of the
-correction is in `git log`, not here.
+The pipeline runs end to end in pieces, but there is no trained agent yet and no match
+between two agents has been played. This file lists what has actually been measured.
+Wrong claims are fixed in place; `git log` keeps the history.
 
-## Measured
+## What works
 
 | Check | Evidence | Result |
 |---|---|---|
-| Local hardware | Consumer desktop: 8 GB VRAM GPU, 32 GB RAM | The figures every benchmark below is read against; the peer is identical |
-| Released 303M encoder, game menu | `artifacts/benchmark/inference.json` | p95 148.73 ms, minimum 1553 MiB free |
-| Released encoder, loaded vanilla game | `artifacts/benchmark-loaded/inference.json` | p95 187.72 ms, only 710 MiB free: **fails 1 GB headroom**; game was paused |
-| Offline large-encoder training capacity | `artifacts/benchmark-loaded/training.json` | Two BF16 Adam updates on a synthetic objective — capacity, not behavioural training |
-| Compact full policy | `artifacts/benchmark-policy-tiny.json` | Untrained 5.49M encoder, full-policy p95 51.46 ms, game closed |
-| Native 3840×2160 capture | `artifacts/worker-menu-v3-new`, `-select` | Desktop-DC capture follows two real menu transitions; the old window-DC path returned stale/scaled pixels |
-| Held input watchdog | `artifacts/worker-smoke/result.json` | Held Shift released after timeout |
-| Live worker mouse input | `artifacts/worker-smoke/click-*.png` | Menu advanced on a 250 ms button hold |
-| TLS peer transport | `artifacts/pairing/integration/report.json` | the peer machine authenticated; remote 4K capture, menu click, Escape and watchdog all verified |
-| LAN screenshot timing | `artifacts/pairing-roundtrip-downscaled.json`, 25 captures per mode | Views plus template crops p50 83.9 ms, **p95 99.5 ms**, 0.87 MB, against p95 433.8 ms / 33.2 MB for the full frame it replaces |
-| Arena match start | `infantry-arena-v10` | War declared, clock advanced 1–2 Jan 1936, no crash dump |
-| Rescaled map starts a match | `infantry-arena-v13`, `logs/game.log` | `Loaded 1537 provinces`, start-date 1936.1.1.12, ran to 11 Apr 1936 at speed four. Zero `MAP_ERROR`, `TOO LARGE BOX`, `has no continent`, `no pixels` or naval-base lines; state names resolve |
-| Combat resolution | `infantry-arena-v12`, 5 Mar – mid-May 1936 | Two Blue divisions attacked one Red defender; tooltip gave a running estimate (`...another 74 days`); attacker repulsed, no province changed hands. Order, battle and resolution all work |
-| Victory detection | `capitulation-harness-v2`, 1936-01-01 to 1940-05-05 | **Not reached.** Blue held Red's entire placed victory-point weight from 1936-01-13; Red had not capitulated 52 months later. Victory points are not what decides a surrender — see below |
-| An AI against an enemy with no army at all | `capitulation-harness-v2` (Red fielding zero divisions), same run | **It advances, then stops.** Blue was AI-driven throughout: its owned weight rose 950 → 1400 between 1936-01-17 and 1936-10-13 against no opposition, then read exactly 1400 again on 1938-05-03, 1938-07-08 and 1940-05-05. Roughly 47% of an undefended country, then nothing for 43 in-game months |
-| Four-year unattended run | Same match, speed four to five | 1936-01-01 to 1940-05-05, no crash dump, no new `error.log` line. The longest the arena has run |
-| Live screen stability | Four worker captures at 3840×2160, two running and two paused | **Nothing on screen holds still to within the old hardcoded 5 MAE.** HUD drifts a mean of 6.9 between captures seconds apart while running, 1.6 paused — the day/night terminator sweeping under a translucent HUD |
+| Hardware | Consumer desktop, 8 GB VRAM, 32 GB RAM; the second PC is the same | All timings below are on this machine |
+| Screen capture at 3840×2160 | `artifacts/worker-menu-v3-*` | Follows real menu changes. Desktop Duplication is the fast path, GDI blit the fallback |
+| Mouse and keyboard input | `artifacts/worker-smoke/` | Clicks advance menus. A held key is released by the watchdog |
+| Second PC | `artifacts/pairing/integration/report.json`; `probe-peer` and a 4K capture, 2026-09-22 | TLS connection, remote capture, clicks, Escape and the watchdog all work |
+| LAN capture per tick | `artifacts/pairing-roundtrip-downscaled.json` | Views plus screen checks: 83.9 ms p50, 99.5 ms p95, 0.87 MB |
+| Arena loads and runs | `infantry-arena-v13`, `logs/game.log` | 1537 provinces, no map errors, ran to April 1936 at speed 4 |
+| Combat | `infantry-arena-v12` | Orders, battles and results all work. Two Blue divisions attacked one Red defender and lost |
+| Long run | `capitulation-harness-v2` | 1936 to May 1940 at speed 4–5 with no crash |
+| **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 
-Earlier encoder timings used the old window-DC capture; treat them as capacity numbers, not
-a live visual benchmark. Re-run with the corrected backend, a changing clock and full
-capture-to-action timing before accepting any latency result.
+Automated checks: 125 Python tests and 16 Rust tests (2 need a live desktop and are
+skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
-Automated checks: **125 Python tests, 16 Rust tests** (2 of them ignored live-desktop
-checks), Ruff lint/format, Cargo fmt and Clippy pass, plus locked dependency
-installation and packaged CLI help. Every fix is mutation-tested — reverting it
-fails at least one test.
+**Not yet shown:** a match between two agents, a full 1800-second match, and a match
+played across two PCs.
 
-**Still unverified:** victory detection, a two-agent match, and anything on two machines.
+## How a country surrenders
 
-## What a surrender actually costs
+- **Surrender depends on occupied territory, not victory points.** In
+  `capitulation-harness-v2`, Blue held all of Red's victory points from 13 Jan 1936 and
+  Red still had not surrendered by May 1940. The tooltip value that matters grows as
+  land is occupied.
+- **On the full map, the AI stops early.** With Red fielding no army at all, Blue's AI
+  took about 47% of Red's 600 provinces in 1936 and then did nothing for 43 months. Why
+  is unknown: supply, a front it considers held, or an objective it thinks it reached.
+- **On a small map it finishes.** `capitulation-harness-v5` gives each side 24 land
+  provinces in 4 states (6 columns by 4 rows) inside the normal-size grid. Blue declared
+  war on 1 Jan 1936, and by 29 Jan Red had surrendered and lost 2 states in the peace
+  deal. At speed 5 that took seconds of real time.
+- Useful game constants: `BASE_SURRENDER_LEVEL = 1.0` (`NDiplomacy`) is the surrender
+  threshold. `BASE_SURRENDER_LIMIT = 0.8` is an occupation fraction, not the threshold.
+- Game speed in wall-clock seconds per in-game hour: `{2.0, 0.5, 0.2, 0.1, 0.0}` for
+  speeds 1 to 5. Speed 1 is 48 s per in-game day. Speed 5 does not wait at all.
 
-**Taking every victory point a country owns does not capitulate it.** `capitulation-harness-v2`
-gives Red a single province carrying its whole 35-point weight on the border column, with no
-divisions anywhere in the country. Blue took that province on 1936-01-13 — debug tooltip
-`Province ID = 1524 ... Owner = Red / Controller = Blue / Local VP: 35` — and Red had not
-capitulated by 1940-05-05, far past `DAYS_OF_WAR_BEFORE_SURRENDER = 7`.
+## Match-end screens
 
-The quantity surrender is measured against is territorial. The tooltip reads `Owned VPs: 950`
-for a fresh 30-state country whose placed victory points total 35, and `State value: 22.3`
-for a state holding none — 30 states at about 31.7 is roughly 950. Blue's own figure rose
-from 950 to 1400 as it occupied ground, not as it took victory points.
+HOI4 has no "game over" screen. A one-against-one surrender goes:
+`surrendered_country_popup` (520×320, centred) → peace conference (full screen) →
+"Calculating Effects..." → `peace_summary_popup_window` → back to the map.
 
-`BASE_SURRENDER_LIMIT = 0.8` (in `NCountry`) is an occupation fraction and is *not* the
-threshold; `BASE_SURRENDER_LEVEL = 1.0` in `NDiplomacy` is the one commented "Surrender when
-level reached". `set_stability = 1` and `set_war_support = 1` do not make capitulation
-harder: no stock modifier ties stability to `surrender_limit`, and the only entry in
-`00_static_modifiers.txt` is `-0.3` inside `war_support_bad_modifier`.
+- The surrender popup uses the same frame art as the exile popup, so its template must
+  be cut from the title text.
+- Winner and loser see the same peace conference window. Only the banner art at the top
+  differs, so `win` and `loss` templates must be cut from the banner.
+- The popup is small. If it doesn't cover the `healthy` rectangle, the match loop keeps
+  running and a real surrender ends as a timeout draw.
 
-Two constraints on reaching a decision still hold: each capital sits about five province
-hops behind its front, and symmetric unsupported infantry does not break through — six
-`infantry_equipment_1` battalions give 36 soft attack against 132 defence and 18
-breakthrough, and the live battle above is the measurement, not a model.
+## Screen calibration
 
-Province scale was the reason the first soak saw nothing, and is fixed. `GAME_SPEED_SECONDS`
-is `{2.0, 0.5, 0.2, 0.1, 0.0}` wall-seconds per in-game hour; speed one measures 48 s per
-in-game day (37.5 days per 1800 s, matching the soak to 1%) and speed four about 727 days
-per 1800 s. The original 8×12 grid gave provinces 150× the area of a mean stock land
-province, so one border crossing cost 26.6 in-game days and the 1800-second soak at speed
-one covered barely one crossing — nothing had failed, the armies had not finished walking.
-The grid is now 32×24 per half (1536 provinces, ~88×85 px), and an `arena_march_speed`
-country spirit multiplies army speed by 4, putting a crossing near 1.6 days. Speed is
-changed with `+`/`-` (`VK_OEM_PLUS`/`VK_OEM_MINUS`, allowed in setup and refused during a
-match); the number keys do nothing, which is how the first soak silently ran at speed one.
+Calibrated at 3840×2160 in `artifacts/calibration-live/rules.json`: `healthy`, `paused`
+and `clock_rect`. **Still needed before a match can run:** `ready`, `speed`, `win`,
+`loss`, `disconnect`, `desync`, and a `minimap_rect` for the territory reward.
 
-## Terminal screens
+What calibration taught us:
 
-There is no bare "game over" screen, and the end-game window is not a fallback. Read out of
-the shipped files and adversarially re-checked:
+- Nothing on a live screen holds perfectly still. The HUD drifts by a mean absolute
+  error of about 7 between captures, because the day/night line moves under it.
+  Templates take `--max-mae`; `healthy` uses 15.
+- The play/pause glyph at `[3392, 20, 20, 20]` is the reliable pause check (`paused`,
+  max 18). The speed bars look the same running or paused, so they only show which
+  speed is selected.
+- The clock check allows a difference of 15 between crops, because even a paused clock
+  differs by 6.4 between captures.
+- Speed changes with `+` and `-` in setup mode only; the number keys do nothing. Space
+  and Escape pause the game, so they are not allowed during a match either.
 
-- A one-versus-one capitulation **does** open a conference. The engine's capitulation path
-  creates it (`"Creating peace conference between %s and %s"` sits beside the surrender log
-  in `country.cpp`), a single-winner conference is a serialized state (`solo_winner`), and
-  the peace-conference AI refuses to run for a human country. The only annex-on-war-end path
-  in the shipped files is the civil-war one.
-- The sequence is `surrendered_country_popup` (520×320) → `peaceconference_full_window`
-  (100%×100%) → "Calculating Effects..." → `peace_summary_popup_window` (480×382) → map.
-- **`playthrough_overview_window` never fires on conquest.** HOI4 has no victory-condition
-  concept anywhere in script or engine; the only end-of-game define is `END_DATE = 1949.1.1.1`.
-- `surrendered_country_popup` is `orientation = center`, `position = { -225 -160 }`,
-  `size = { 520 320 }`, `moveable = yes`, on a 527×322 `GFX_popup_capitulation_bg`.
-  **`exile_country_popup` reuses the same sprite and geometry byte for byte**, so a template
-  cut from the frame art cannot tell them apart — it must anchor on the title text box.
-- Winner and loser get the same `peaceconference_full_window`, distinguished only by the
-  top-art sprite (`GFX_top_art_winning_conference` vs `..._losing_conference`), so win and
-  loss templates must anchor on that banner rather than the screen as a whole.
-- `annex_everything` is neither an auto-annex nor a peace-conference cost discount: its two
-  discount lines are commented out in `common/wargoals/00_invasion.txt:145-146`.
+## The map generator
 
-Since it is 520×320 and centred, the popup need not cover whichever rectangle `healthy` is
-calibrated on. If it does not, the HUD keeps matching, the loop keeps stepping, and a real
-capitulation ends as an ordinary timeout draw. `ScreenRules` is otherwise explicit about
-failure: a screen matching nothing raises `unrecognized_match_screen`, a terminal candidate
-that never converges raises `terminal_screen_never_confirmed`, and a timeout without a
-healthy HUD raises `uncertain_timeout`.
+`hoi4-arena generate-map` writes an arena mod, and `audit-map` checks it for anything
+the engine would crash on. The engine does not report bad map data, it crashes, so
+every rule below came from a crash dump or the stock files.
 
-## Calibration
-
-`healthy`, `paused`, and `clock_rect` are cut from a live match and stored at 3840×2160 in
-`artifacts/calibration-live/rules.json`. `ready`, `speed`, `win`, `loss`, `disconnect`, and
-`desync` are not calibrated, so `require_match_rules()` still raises. `speed` is the
-selected-speed indicator: a running frame that stops matching it ends the episode. Getting the first two exposed
-three things worth more than the templates:
-
-| Rectangle | Running | Paused |
-|---|---|---|
-| HUD icon row, two captures seconds apart | **6.9** | 1.6 |
-| Clock crop | **44.8** | 6.4 |
-| Speed bars, running versus paused | **0.6** | |
-| Play/pause glyph, running versus paused | **26.3**, against 15.6 running-versus-running | |
-
-- **No live screen holds still to within 5.** A `healthy` rectangle cut from one capture
-  rejected the next capture of the same screen at 7.3. `template` now takes `--max-mae`
-  (bounded 1..96, above which a crop matches anything), and `healthy` is calibrated at 15 on
-  `[168, 64, 600, 52]`, verified across four captures spanning four in-game years.
-- **The clock stall detector could never fire.** The loop compared successive clock crops
-  with `np.array_equal`, and two captures of a *paused* clock differ by 6.4, so every frame
-  looked like a fresh tick. `clock_advanced` now compares with a tolerance of 15, between
-  the paused 6.4 and the advancing 44.8.
-- **The pause gate is the play/pause glyph.** The speed bars read 0.6 between a running and
-  a paused game, so they show the selected speed and nothing about whether time moves. The
-  glyph at `[3392, 20, 20, 20]`, cut from `paused-1.png`, differs from `paused-2.png` by 9.8
-  and from the nearer running capture by 32.3 (`match-healthy.png`; the other running capture
-  is 40.8). `paused` is calibrated at `max_mae` 18. Both paused captures match it and both
-  running captures do not, while `healthy` still matches all four. The operator sets the
-  speed. The loop rejects a healthy frame that matches this glyph. A template of the running
-  glyph would have been the thin case: that glyph drifts 15.6 against itself and sits only
-  26.3 from the paused one.
-
-## The map generator, and why it is defensive
-
-The engine does not report bad map data; it dereferences it. `hoi4-arena audit-map` checks
-for that without the game, and `generate-map` audits what it wrote and exits non-zero. Four
-distinct crashes were read out of minidumps rather than guessed:
-
-| Fault | Evidence | Cause | Fix |
-|---|---|---|---|
-| `areas.cpp`, walking a `CControllerArea` province list | `GetProvince` returns null below id 1; `rdx` held **0** | a province association the map never set | write the placements and anchors the stock database supplies for every province |
-| `ingameidler.cpp`, `GenerateNonHistoricalAttributes` | `character_manager.cpp:261 Failed to generate a name ... for country Blue`, ×5 | no `common/names` entry and no country leader, so every generated character was nameless | ship a name list and a `country_leader` for both tags |
-| same frame, null `this` | `rax` = **0x226 = 550**, `rbx` = ASCII `state` | stock `tutorial/tutorial.txt` hard-codes state 550 and provinces 5010/5091/12766, resolved at every match start | override the file — `replace_path = "tutorial"` does **not** unload it |
-| same function, later | `mov rcx,[rax+rcx*8-8]`, `rax = 0`, `rcx = 0` | the loader marks the **last** hint entry, so an empty tutorial indexes element −1 | ship exactly one block naming no state and no province |
-
-Map facts the generator depends on, each checked against the stock database:
-
-- The `-1;-1;;-1;...` row in `adjacencies.csv` is the engine's end-of-file marker, not a
-  stray sentinel, and is required even when the file holds no rows.
-- Terrain palette 0 and 1 are the plain plains/forest the stock map paints over 9.8% and
-  5.7% of the world. Index 19 is `plains_17` (`perm_snow`) and 13 is `forest_13`
-  (`type = urban`, `spawn_city`) — neither can stand in for ordinary ground.
-- `trees.bmp` is fixed at 75/256 of the province bitmap, not a quarter.
-- A sea strategic region needs `naval_terrain`; it is where sea provinces take their terrain.
-- `cities.bmp` index 0 is the stock sparse-city group; index 4 is claimed by no group and is
-  how you ask for no cities.
-- Since 1.11 the bitmap decides coastal status and `definition.csv` only has to agree.
-- Map colour comes from `common/countries/colors.txt` with the space named — `color = rgb { }`.
-  A bare `color = { }` in a country file is not the map colour, which is why Blue rendered
-  green and Red pale cyan while their flags were right.
-- The camera's zoom-out limit is fixed in world units, not fitted to the map, so the arena is
-  5632×2048 — the stock map's exact dimensions. Anything smaller shows sky past the edges and
-  more than one map width across, which on a horizontally wrapping world draws the same
-  countries two and a half times over.
-- Also fixed by audit: coastal cliffs replaced by a ramp with a maximum neighbour step of 1;
-  ship-in-port anchors for provinces with naval bases; surrender weight spread instead of
-  sitting on one province; weather objects anchored over the right region; an X-crossing
-  breaker that now looks at the horizontal wrap seam; and adjective, ideology and
-  victory-point localisation, absent of which Red's capital was labelled "Kargopol".
-- **The vanilla Earth showed over the arena's ocean** because five map-shaped textures were
-  never shipped, so the engine stretched the stock world over the new map:
-  `colormap_rgb_cityemissivemask_a.dds`, `colormap_water_0/1/2.dds` (at provinces/2, /4, /8),
-  `fow_rgb_waterspec_a.dds`, and both minimap widgets. All are now generated from the arena's
-  own land mask as uncompressed 8.8.8.8 ARGB with no mip chain.
-
-Two findings that were assumed to be blockers and are not: generals are a **degrade**
-(`PLANNING_CAP_NO_HQ_SCALING = 0.8`, and about 60 stock 1936 countries have no commander and
-still fight), and `common/ai_strategy_plans` holds only focus, research and idea picks — it
-has no key that creates a front, an offensive or a garrison, and 279 of the game's 364 tags
-have neither a plan nor a country `ai_strategy` file and still fight. Fronts are
-engine-generated and the arena has one. Supply reach is about two province hops.
-
-The generator carries two diagnostic options, recorded in `generation.json`, neither
-producing a playable arena: `--undefended BLU|RED` fields no divisions for that side, which
-is what separated "the AI attacks and fails" from "the AI does not attack";
-`--victory-points-on-border` masses a side's whole weight on one border province. The second
-was built to force a capitulation, did not, and is how the victory-point assumption above
-came to be refuted.
-
-Known and deliberately left, none crash-level: `common/ai_focuses` is replaced away, leaving
-nine `supports_ai_strategy` tokens in a file that still loads; the 351 stock tags exist with
-their history files deleted; `map/ambient_object.txt` is emptied rather than inherited, as
-the stock world frame is positioned for a 5632×2048 map; and the railway generator lays a
-level-1 line on every adjacent land pair, far denser than any stock network.
-`common/ai_strategy` was removed from the replaced list because wiping it also removed
-`default.txt`, the only country-agnostic AI behaviour file.
+- **Small countries must be a land block inside the normal grid** (`--land-columns`,
+  `--land-rows`). A smaller grid centred on the map left the surrounding sea to a few
+  provinces up to 2245×769 px, and the game crashed while loading.
+- **Stock `events` and `common/on_actions` must be replaced.** They refer to states the
+  arena doesn't have, and the game crashed on its first daily tick.
+- Other crash causes, all fixed: provinces the map never placed; countries with no name
+  list or leader; stock `tutorial/tutorial.txt` pointing at state 550; an empty tutorial
+  file. The tutorial has to be overridden with exactly one block that names nothing.
+- Map facts: the `-1;-1;...` row ends `adjacencies.csv` and is required. Terrain
+  palette 0 and 1 are plain plains and forest. A sea strategic region needs
+  `naval_terrain`. Map colour comes from `common/countries/colors.txt`. The map must be
+  5632×2048 (the stock size) or the camera shows the world repeating.
+- Province size is about 88×85 px on a 32×24 grid per side, and armies march 4× faster,
+  so one border crossing takes about 1.6 days. The old 8×12 grid took 26 days a crossing.
+- Not blockers: missing generals only slow planning, and fronts are made by the engine
+  rather than by AI strategy files.
+- Diagnostics: `--undefended BLU|RED` gives one side no army. `--victory-points-on-border`
+  puts all victory points on one border province; it showed that victory points alone do
+  not cause a surrender.
 
 ## Performance
 
-| Change | Before | After |
-|---|---|---|
-| Per-tick resize in the decision loop | 60.2 ms p50 (PIL, CPU) | 0 ms; the worker sends views |
-| Capture payload | 33.2 MB raw / 3.46 MB lz4 | 1.15 MB raw / 0.77 MB lz4 |
-| Worker CPU to produce five views | n/a | 18.0 ms p50 |
-| Offline `views` on a 4K frame | 51.3 ms (PIL) | 16.0 ms (GPU, float32) |
+All on an RTX 4060 Ti with the game at 3840×2160.
 
-The last two rows predate the optimization pass below, which took the worker's five
-downscales to 8.3 ms and a 4K `views` call to 6.07 ms. A live capture asks for six
-views: those five, plus the native cursor crop, which is a copy rather than another
-downscale.
+| | Result |
+|---|---|
+| One actor, whole tick with a live game | 135.0 ms p50, 148.7 ms p95. **Fits the 200 ms tick** |
+| Two actors on one GPU (self-play on one PC) | 243.6 ms p50, 279.9 ms p95 of GPU per tick. **Does not fit** |
+| Two compact-encoder actors, 8 frames | 85.6 ms p50, 103.6 ms p95. Fits, but the compact encoder is untrained |
+| Capture, Desktop Duplication vs GDI blit | 16.2 ms vs 67.1 ms on the same loaded screen |
+| Encoder forward, 16 vs 8 frames | 131.5 ms vs 64.9 ms. Fewer than 8 frames gains nothing |
+| Worker, five downscaled views | 8.3 ms |
 
-Two-PC round trip, rebuilt worker on both machines, 25 captures per mode:
+What made the difference: removing hidden GPU syncs in `torch.distributions` argument
+checks, capturing the action head as a CUDA graph (26× faster), Desktop Duplication
+instead of the blit, and storing frozen weights in bfloat16 (640 MiB instead of 1170).
 
-| Request | p50 | p95 | On the wire |
-|---|---|---|---|
-| Full frame, the old path | 419.2 ms | 433.8 ms | 33.178 MB |
-| Five policy views only | 92.1 ms | 108.8 ms | 0.753 MB |
-| **Views plus template crops, what a tick asks for** | **83.9 ms** | **99.5 ms** | 0.868 MB |
+Tried and not taken: `channels_last` (slower), TF32 (no gain, available as `--tf32`),
+resizing on the GPU (would mean sending 33 MB frames), compiling the encoder (changes
+stored log-probabilities, which PPO compares against).
 
-That meets the 200 ms decision budget with half to spare and leaves about 100 ms for
-inference: the compact policy at 51.46 ms p95 fits, and the released 303M encoder at
-187.72 ms did not until the pass below. The first attempt returned 424.8 ms p50 for all three modes because both workers —
-and the binary in `target/release` — predated worker-side downscaling and silently returned
-the whole frame. `Desktop.capture` now raises when a worker accepts `views` and answers
-without them; rebuild and redeploy after touching the Rust crate rather than trusting
-`target/release`.
+Things to know:
 
-### The optimization pass, measured on an RTX 4060 Ti
+- A fresh Desktop Duplication has no image until the screen changes, so the worker
+  uses the blit for that one tick instead of giving up on duplication.
+- The fused action head is not bit-identical across CPUs; matmul order differs.
+- Clips use one frame per decision (200 ms apart, 8 frames = 1.6 s), the same live and
+  in training.
+- After any change to the Rust worker, rebuild and redeploy it. `Desktop.capture` raises
+  if a worker returns the wrong views.
 
-Every number here is from this machine with the game closed, so they are component
-timings rather than a live tick; the loaded-game figures above are what a match actually
-faced. What changed:
+## Second PC
 
-| | before | after |
-|---|---|---|
-| One GPU tick, the shapes `Actor.act` builds | 145.1 ms p50 | **65.1 ms p50** |
-| Peak VRAM for that tick | 1311 MiB | **710 MiB** |
-| `ActionHead` forward, sampling | 21.6 ms | 7.72 ms eager, **0.741 ms** captured |
-| Encoder forward | 131.5 ms at 16 frames | 64.9 ms at 8 |
-| Worker CPU for the five views | 25.3 ms serial | **8.3 ms** on four threads |
-| Desktop capture, 3840x2160, idle screen | 53.8 ms blit | **12.8 ms** duplication |
-
-Where the time actually was, which is not where the list said:
-
-- **Not sampling — synchronizing.** `torch.distributions` validates its arguments
-  whenever `__debug__` is set, and each validation ends in `Tensor.__bool__` on a CUDA
-  tensor. That is 48 host-device stalls per action head forward, including on the
-  teacher-forcing path that never samples. The deterministic path measured 15.8 ms
-  against the same loop's 0.571 ms with no distribution objects in it.
-- **Not `torch.compile` — CUDA graphs.** Compiling the action head is worth 1.15x
-  (19.2 to 16.7 ms). Capturing it with `reduce-overhead` is worth 26x.
-- **Not the round trip — the blit.** The 99.5 ms in the table above is a two-PC LAN
-  round trip. The blit alone is 87.1 ms p50, bracketed by the worker's own
-  `capture_start_ns` and `t_ns` in `artifacts/pairing/integration`.
-- **Not quantization — float32 weights nothing read.** Parameters were 1170 MiB of a
-  1319 MiB peak; activations were 136 MiB. The live path shipped float32 weights and
-  then ran every matmul through autocast in bfloat16 anyway.
-
-Four things on the list were measured and **not** taken:
-
-A second correction, found by CI rather than by reasoning: a freshly created
-duplication has no desktop image until something is presented, and on a still screen
-`AcquireNextFrame` simply times out. Treating that as a failure would have retired the
-fast path back to the 87 ms blit on exactly the screens it handles best. It is now a
-distinct outcome from a lost duplication -- the worker keeps the duplication and takes
-the blit for that one tick.
-
-- **`channels_last` on the conv stem is slower here:** 0.2069 ms contiguous against
-  0.2601 ms channels_last, at 4 tiles of 224px in bfloat16. The stem is 0.27 ms of a
-  200 ms tick either way.
-- **TF32 buys nothing on any current path.** Every matmul runs under autocast in
-  bfloat16, and autocast lowers `matmul`, `addmm`, `linear` and `GRUCell` whatever
-  reaches them; `ActionHead`'s `.float()` casts the head's *output*, after the Linear has
-  already run in bfloat16. A synthetic float32 matmul at these shapes measures 1.01x to
-  1.18x, while TF32's ten mantissa bits moved results by up to 2.1e-2. There is a
-  `--tf32` flag and it defaults off.
-- **Moving the resize to the GPU is the wrong direction.** It already exists as a
-  fallback at 6.07 ms, but reaching it means sending the whole 33 MB frame instead of
-  735 KiB of views: 2.9 ms to compress and 8.3 ms to decompress before any transport,
-  and over the LAN socket the second machine uses, 33 MB five times a second is not
-  slower but impossible. Parallelizing the Rust loop was 3.07x with byte-identical
-  output instead.
-- **Compiling the encoder is not free even though it is faster.** It is worth about
-  24 ms, and it moves a stored `old_logp` by 4.6e-4. No configuration removes that:
-  inductor's no-grad graph and its grad graph differ from each other by 3.4e-4, so
-  compiling PPO's side does not close it. Eager collection and eager update agree
-  *exactly* today. The action head is the opposite case -- compiled it measured
-  bit-for-bit identical to the eager head on this GPU -- so only the head is captured.
-
-One claim here was wrong and is worth keeping as a correction: the fused action head
-was written up as producing bit-identical output to the three Linears it replaced,
-because that is what it measured on this machine. CI failed it on another. Every output
-element is a dot product over the same 256 inputs either way, but a 256x2122 matmul and
-a 256x1024 one may accumulate in different orders, and whether they do is a property of
-the CPU. The arithmetic is identical; the bits are not guaranteed.
-
-Casting the trainable weights to bfloat16 as well was measured and rejected for the same
-reason: another 55 MiB, and a 1.02e-2 shift in `old_logp`, which is a systematic 1.01x
-PPO ratio on every sample before a single gradient step. Only the frozen weights are
-halved, and `load_policy` serves both collection and PPO so both run the same function.
-
-### The live run, 2026-09-21, with a game actually loaded
-
-Everything above was measured with HOI4 closed. This was not: a vanilla 1936 German
-Reich game, 3840x2160, time running, capture through the worker's own path and the
-policy at the shapes `Actor.act` builds, including the host transfers a tick waits on.
-Fifty ticks, after five discarded to warm up.
-
-| | float32 weights, eager head | halved, compiled head |
-|---|---|---|
-| Resident weights | 1170.1 MiB | **640.0 MiB** |
-| Peak torch allocation | 1239.6 MiB | **705.7 MiB** |
-| Minimum free VRAM | 1324 MiB | **1822 MiB** |
-| Capture p50 / p95 | 27.8 / 32.9 ms | 28.2 / 33.8 ms |
-| Policy p50 / p95 | 126.4 / 138.4 ms | **107.0 / 120.9 ms** |
-| Whole tick p50 / p95 | 152.3 / 168.0 ms | **135.0 / 148.7 ms** |
-
-**One actor fits the 200 ms interval with about 51 ms to spare.** Capture is 28.2 ms
-p50 against the 87.1 ms the blit cost, and a direct comparison on the same loaded
-screen puts duplication at 16.2 ms against the blit's 67.1 ms, 4.1x. The backend
-reported itself as `dxgi_bgra` throughout.
-
-**A pair does not.** `collect_pair` runs both actors on the coordinator's GPU, one
-after the other, and that is 243.6 ms p50 and 279.9 ms p95 of GPU work per tick before
-any capture -- against a 200 ms interval. Two policies resident leave 1226 MiB free, so
-memory is not what stops it. This is now the gate, and nothing in the optimization pass
-moves it: the remaining options are a GPU per side, the compact encoder variant, or a
-smaller observation.
-
-Which of the three options actually closes it, measured the same day, both actors per
-row, synthetic input so this is GPU work alone:
-
-| Encoder and clip | pair p50 | pair p95 | |
-|---|---|---|---|
-| large, 8 frames | 186.2 ms | 283.1 ms | over |
-| large, 4 frames | 192.8 ms | 286.1 ms | over |
-| compact, 8 frames | 85.6 ms | **103.6 ms** | fits |
-| compact, 16 frames | 87.8 ms | **124.4 ms** | fits |
-
-Two things follow. **Cutting the clip below eight frames buys nothing** -- four frames
-measured slightly worse than eight -- so the 16-to-8 change took the available win and
-the encoder is now bound by per-call overhead across its twenty-four blocks rather than
-by how much video it is given. And **the compact encoder is the only lever here that
-closes the gate**, with enough margin left to put the clip back to sixteen frames. At the
-decision rate that is 3.2 s of context.
-
-That is a latency result and not a capability one: the compact variant has not been
-distilled yet, so nothing is known about whether it can play. The `distill` command
-exists for exactly this and is the path the open work already names. Free-VRAM figures
-in that table are not comparable between rows, because the four configurations shared
-one process and one allocator.
-
-**What is not shown here is a pass of the old 710 MiB figure.** That number came from a
-different run on a different day, and the unoptimized control above reports 1324 MiB
-under today's conditions, so the two are not a before and after. What today measures is
-the difference the change makes under one set of conditions: 498 MiB of headroom and
-17 ms of tick.
-
-The step loop no longer serializes the interval against capture and inference: each tick
-dispatches its eight slots on a separate thread and blocks the next tick on that dispatch.
-Simulated against a fake desktop, a tick costs one interval rather than interval plus
-capture plus inference — 203 ms (4.93 Hz) at 51+15, 102+15 and 150+20 ms per tick, against
-266/317/370 ms serial. Five Hz is therefore not excluded by construction, but it is **not**
-demonstrated: these are simulated timings, and 187.72 ms p95 for one large encoder leaves no
-room for two actors on one GPU. The resampler changed from PIL bilinear to an exact area
-average so the Rust worker can reproduce it bit for bit.
-
-Clip lookback is the decision interval. `clip_frame_ids` takes eight frames, one decision
-apart, in integer nanoseconds, and both the live actor and training call it. A 10 Hz
-recording and a 5 Hz live history therefore hand the encoder the same timestamps. Eight
-frames is 1.6 s. A 7.5 Hz lookback repeated neighbours on the live actor, which stores one
-view per decision, and picked distinct frames out of a 10 Hz recording.
+The second PC runs the worker from one shared folder. From this PC,
+`scripts/Deploy-Peer.ps1` builds and copies the worker, `Start-Worker.ps1` and the
+pairing files there, skipping unchanged files. On the second PC, `Start-Worker.ps1
+-Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
+updates by itself, but only between connections, never mid-match. See the README.
 
 ## Open work
 
-- **Decide how the arena reaches a decision at all.** Capitulation is measured against
-  territory, not the victory points the generator places, so a decision means occupying most
-  of a 600-province country; the harness run took 47% of an undefended Red and stalled. The
-  options are a much smaller province grid, a much larger army, or scoring matches on
-  territory. Nothing else here resolves until this does.
-- **Build a small-map harness so a capitulation can be produced on demand.** The grid is now
-  per call (`columns_per_half`, `rows`, `state_columns`, `state_rows`, optional province
-  pitch). The default is still the 32×24 arena. A pitch centers that lattice on the
-  stock-sized bitmap, so a short country keeps the ~88 px province instead of stretching
-  fewer cells across the map, which is what made one crossing take 26 days. Fewer than
-  three states a side is rejected. The island itself is not generated yet: its depth waits
-  on the stall probe below, and a live re-probe was not taken because another game held
-  the foreground. Templates cut from the popup still transfer to the playable arena.
-- Calibrate `win`, `loss`, `ready`, `disconnect`, `desync`, and a `surrendered_country_popup`
-  template anchored on its title box.
-- The flash-attention note was wrong about the kernel. Re-measured on torch
-  2.11.0+cu128, RTX 4060 Ti: forcing the flash backend raises "Torch was not compiled
-  with flash attention" for the block-causal mask, for no mask, and for `is_causal`.
-  The pip package is not installed, and SDPA would not call it anyway. The live kernel
-  is cutlass memory-efficient attention (`fmha_cutlass`). One layer at 16 frames is
-  1.86 ms masked against 1.27 ms unmasked, which is the old 1.97 / 1.21 pair with the
-  fast side mislabeled as flash. At the deployed 8-frame clip the same layer is 0.49 ms
-  against 0.35 ms, and the whole encoder is 71.9 ms against 69.0 ms. Dropping the mask
-  moves features by a mean absolute of 0.23. cuDNN accepts the mask and the encoder
-  then takes 99.9 ms. FlexAttention keeps the mask, agrees within 0.002, and takes
-  2.52 ms for a layer that memory-efficient attention does in 0.46 ms.
-- Work out why an AI that *does* advance stops. Province size and missing command are both
-  eliminated. What has not been established is what it waits for: a supply limit, a front it
-  considers held, or an objective it thinks it has reached. Combat, supply level, and the
-  division template stay put until that reading exists. A territory term is now implemented
-  and uncalibrated: `minimap` stores a `minimap_rect`, and the step reward adds the change
-  in Blue's share of that crop only. With no rect the term is zero. It has not been checked
-  against the owned-weight tooltip.
-- Run a full 1800-second match at speed four and verify armies, supply over time, fog,
-  multiple routes and side symmetry in gameplay.
-- Complete two-PC lobby/reset calibration and recovery checks; match behaviour is untested
-  remotely even though menu input and watchdog release are verified.
-- Verify physical capture/input alignment, live dragging, keyboard effect, focus loss and
-  F12 under load.
-- **Fit a pair inside the interval.** Measured live on 2026-09-21, both actors together
-  need 279.9 ms p95 of GPU against a 200 ms tick, where one needs 120.9 ms. Free VRAM is
-  not the constraint (1226 MiB with both resident). Until this is resolved, unattended
-  self-play on one coordinator GPU is arithmetically excluded, whatever the screen path
-  does. Measured: a shorter clip does not help, and the compact encoder does -- 103.6 ms
-  p95 for the pair at eight frames, 124.4 at sixteen. So distilling the compact encoder
-  is now on the critical path rather than beside it, and the remaining alternative is a
-  GPU per side.
-- Measure end-to-end scheduling against a live game with two real actors.
-- Record 2–4 hours of expert demonstrations, distil the compact encoder, train the BC
-  baseline and compare held-out gameplay for the auxiliary/XM variants. The observation
-  now includes a native 224 crop centered on the pointer, stored as the fifth detail
-  tile. A capture with no cursor is refused: a self-play step keeps only the tiles it
-  was given, so the crop has to be in the recording before the first session. Pass
-  `--game-speed` for the speed the game is actually set to. There is no default.
-- Run recurrent PPO self-play; add an unattended league driver and model-selection schedule.
-- Complete 20 auditable unattended matches and 50 side-swapped evaluation pairs.
-- Test the same screen/input interface in a private unmodified multiplayer lobby.
+In order:
 
-No gameplay improvement, trained combat checkpoint, unattended match count or ordinary
-multiplayer win is claimed. The loop detects a pause. It does not read the selected speed.
-`record` and `collect-pair` require the speed the operator set and write `game_speed` and
-`seconds_per_hour` into the manifest. Speed 5 records a null rate, because that setting
-does not sleep. Training refuses a missing speed or a mix. PPO normalizes advantages once
-over the episode; the loss does not rescale each 8-step window.
+1. **Size the playable arena.** The small map produces a surrender quickly with one
+   side unarmed. Next, test it with both sides armed and see whether an 1800-second
+   match at speed 4 reaches a result. If not, try a slightly larger block or scoring on
+   territory.
+2. **Calibrate the remaining screens** on the small map: capture the surrender popup,
+   the peace conference win and loss banners, `ready`, `speed`, `disconnect`, `desync`,
+   and the minimap rectangle. The harness can now produce a surrender whenever needed.
+3. **Record 2–4 hours of human play** on the chosen arena, with `--game-speed` set to
+   the speed actually used. Recordings need the cursor position, which the worker now
+   sends.
+4. **Distil the compact encoder** from those recordings. It is the only measured way to
+   fit two actors in one tick on one GPU; the other is one GPU per side.
+5. Train the behaviour-cloning baseline, then recurrent PPO self-play with a league.
+6. Run a two-PC match, and check reset and recovery when something goes wrong.
+7. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
+8. Test the same interface in an unmodified private multiplayer lobby.

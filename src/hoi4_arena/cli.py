@@ -125,12 +125,13 @@ def main():
     generation.add_argument("--state-columns", type=int)
     generation.add_argument("--state-rows", type=int)
     generation.add_argument(
-        "--pitch",
-        nargs=2,
+        "--land-columns",
         type=int,
-        metavar=("X", "Y"),
-        help="Province pitch in pixels. Centers the lattice instead of stretching it "
-        "across the bitmap, so a short country keeps the playable arena's province size.",
+        help="Shrink each country to this many columns of the full grid, touching the "
+        "seam. The rest is sea at the same province size.",
+    )
+    generation.add_argument(
+        "--land-rows", type=int, help="Rows of land per country, centered vertically."
     )
     generation.add_argument(
         "--victory-points-on-border",
@@ -272,7 +273,8 @@ def _dispatch(command, args):
             "rows": args["rows"],
             "state_columns": args["state_columns"],
             "state_rows": args["state_rows"],
-            "pitch": args["pitch"],
+            "land_columns": args["land_columns"],
+            "land_rows": args["land_rows"],
         }
         result = generate(
             args["game"],
