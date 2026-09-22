@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -87,8 +88,13 @@ class Recorder:
                 "ffv1",
                 "-level",
                 "3",
+                # Sliced so the encode spreads over cores. With four threads and no
+                # slices, a busy 4K map encoded at about 16 fps offline and could not hold
+                # 5 Hz beside a running game; sixteen slices measured about 70 fps.
+                "-slices",
+                "16",
                 "-threads",
-                "4",
+                str(min(16, os.cpu_count() or 4)),
                 str(self.root / "screen.mkv"),
             ],
             stdin=subprocess.PIPE,

@@ -44,7 +44,9 @@ cmdkey /add:<second-pc-ip> /user:<second-pc-account> /pass
 .\scripts\Deploy-Peer.ps1
 ```
 
-Then on the second PC, once, in PowerShell 7: `& "$HOME\HOI4Worker\Start-Worker.ps1" -Install`. That starts the worker now and, minimized, at every logon; it prints `HOI4 worker ready`. Undo it by deleting `HOI4 Worker` from `shell:startup`. After that, deploys need nothing on the second PC: a new worker is swapped in before the next connection, and a changed script or pairing restarts the bridge once it is idle, never during a match. Keep the folder private: it contains pairing credentials.
+Then on the second PC, once, in PowerShell 7: `& "$HOME\HOI4Worker\Start-Worker.ps1" -Install`. That starts the worker now and at every logon, hidden, so there is no window to close by accident. It writes `worker.log` in that folder, which this PC can read through the share (`HOI4 worker ready` means it is listening). `-Stop` stops it; undo the install with `-Stop` and by deleting `HOI4 Worker` from `shell:startup`. After that, deploys need nothing on the second PC: a new worker is swapped in before the next connection, and a changed script or pairing restarts the bridge once it is idle, never during a match. Keep the folder private: it contains pairing credentials.
+
+For a two-player match, `Deploy-Peer.ps1 -Mod artifacts\mods\<arena> -Launch <arena>` copies the arena there and asks the idle worker to start HOI4 with it. The outcome lands in `launch-result.txt`. The worker does nothing if HOI4 is already running or the request is over 30 minutes old.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe probe-peer artifacts/pairing/peer.json

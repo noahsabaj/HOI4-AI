@@ -1,14 +1,32 @@
-param([string]$Mod='artifacts\mods\infantry-arena-v5')
+param([string]$Mod='artifacts\mods\infantry-arena-v5', [string]$Game)
 $ErrorActionPreference='Stop'
 if (Get-Process hoi4 -ErrorAction SilentlyContinue) { throw 'Close the disposable test game first.' }
-$game='C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV'
+# Steam records where it installed the game (app 394360); the second PC's library may
+# not be on C:.
+if (-not $Game) {
+    $key='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 394360'
+    $Game=(Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue).InstallLocation
+    if (-not $Game) { $Game='C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV' }
+}
+$game=$Game
+if (-not (Test-Path -LiteralPath (Join-Path $game 'hoi4.exe'))) { throw "No hoi4.exe in $game; pass -Game." }
 $userDir=Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Paradox Interactive\Hearts of Iron IV'
 $selection=Join-Path $userDir 'dlc_load.json'
-$original=[IO.File]::ReadAllBytes($selection)
 $modDir=Join-Path $userDir 'mod'
 New-Item -ItemType Directory -Path $modDir -Force | Out-Null
 $descriptorPath=Join-Path $modDir 'codex_visual_arena.mod'
+# The player's own mod selection is kept on disk until it is restored, so a launch that
+# was killed before its finally block ran is undone by the next one instead of leaving
+# the arena as the player's mod list.
+$backup="$selection.arena-backup"
+if (Test-Path -LiteralPath $backup) {
+    Copy-Item -LiteralPath $backup -Destination $selection -Force
+    Remove-Item -LiteralPath $descriptorPath -ErrorAction SilentlyContinue
+    Write-Output 'Restored the mod selection an interrupted launch left behind.'
+}
 if (Test-Path -LiteralPath $descriptorPath) { throw 'Test descriptor already exists; inspect it before replacing.' }
+$original=[IO.File]::ReadAllBytes($selection)
+[IO.File]::WriteAllBytes($backup,$original)
 $modPath=(Resolve-Path -LiteralPath $Mod).Path
 $descriptor=Get-Content (Join-Path $modPath 'descriptor.mod') -Raw
 $descriptor += "`npath = `"$($modPath.Replace('\','/'))`"`n"
@@ -38,5 +56,6 @@ try {
 } finally {
     [IO.File]::WriteAllBytes($selection,$original)
     Remove-Item -LiteralPath $descriptorPath -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backup -ErrorAction SilentlyContinue
 }
 Write-Output 'Original mod selection restored. Inspect the live screen and logs for the test result.'
