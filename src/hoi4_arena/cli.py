@@ -34,6 +34,13 @@ def main():
     record.add_argument("--hz", type=float, default=10)
     record.add_argument("--split", choices=["train", "validation", "test"])
     record.add_argument(
+        "--codec",
+        choices=["ffv1", "x264"],
+        default="ffv1",
+        help="ffv1 is lossless. x264 is visually lossless (CRF 18, 4:4:4) at about a "
+        "hundredth of the size.",
+    )
+    record.add_argument(
         "--game-speed",
         type=int,
         required=True,
