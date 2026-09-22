@@ -191,7 +191,8 @@ def generate(
     rows=ROWS,
     state_columns=STATE_COLUMNS,
     state_rows=STATE_ROWS,
-    pitch=None,
+    land_columns=None,
+    land_rows=None,
 ):
     """Write an arena. The keyword arguments build diagnostics, not playable arenas.
 
@@ -202,11 +203,13 @@ def generate(
     arena cannot be asked to produce on demand, and `generation.json` records which were
     used.
 
-    The grid defaults stretch across the stock-sized bitmap. `pitch` is a pair of pixels
-    per column and row: the lattice is then centered instead of stretched, so a short
-    country keeps the province size of the playable arena and the rest of the bitmap is
-    ocean. One state a side is below the theatre minimum, and a land grid that does not
-    divide into the state grid is rejected here rather than left for the engine.
+    `land_columns` and `land_rows` shrink each country to a block of the full grid: the
+    block touches the seam and is centered vertically, and every other cell is sea. Every
+    province keeps the playable arena's size. Centering a smaller lattice on the bitmap
+    instead left the margin to a handful of sea provinces up to 2245x769 px, and the
+    engine crashed loading them. Fewer than three states a side is below the theatre
+    minimum, and a land block that does not divide into the state grid is rejected here
+    rather than left for the engine.
     """
     game, root = Path(game), Path(output).resolve()
     if not (game / "map/provinces.bmp").exists():
@@ -215,7 +218,15 @@ def generate(
         raise ValueError("undefended names a country tag: BLU or RED")
     if columns_per_half <= OCEAN_RINGS or rows <= 2 * OCEAN_RINGS:
         raise ValueError("grid leaves no land after the ocean rings")
-    land_columns, land_rows = columns_per_half - OCEAN_RINGS, rows - 2 * OCEAN_RINGS
+    full_columns, full_rows = columns_per_half - OCEAN_RINGS, rows - 2 * OCEAN_RINGS
+    land_columns = full_columns if land_columns is None else int(land_columns)
+    land_rows = full_rows if land_rows is None else int(land_rows)
+    if not (0 < land_columns <= full_columns and 0 < land_rows <= full_rows):
+        raise ValueError("land block must fit inside the ocean rings")
+    if (rows - land_rows) % 2:
+        # The right half is the left rotated, so an off-centre block would meet its
+        # mirror a row out of step along the seam.
+        raise ValueError("rows minus land rows must be even so the two fronts line up")
     if land_columns % state_columns or land_rows % state_rows:
         raise ValueError("land grid does not divide into whole states")
     if state_columns * state_rows < 3:
@@ -232,27 +243,19 @@ def generate(
 
     # Both dimensions must be a multiple of 256 and the area must stay under 13238272 px.
     width, height = MAP_SIZE
-    if pitch is None:
-        # Stretch across the bitmap. The remainder stays on the last row, as it always has:
-        # centering it would move every province and invalidate the measured arena.
-        step_x, step_y = width // (2 * columns_per_half), height // rows
-        origin_x = origin_y = 0
-    else:
-        step_x, step_y = (int(v) for v in pitch)
-        if min(step_x, step_y) < 1:
-            raise ValueError("province pitch must be at least one pixel")
-        lattice_w, lattice_h = 2 * columns_per_half * step_x, rows * step_y
-        if lattice_w > width or lattice_h > height:
-            raise ValueError("pitched lattice does not fit the bitmap")
-        origin_x, origin_y = (width - lattice_w) // 2, (height - lattice_h) // 2
+    # Stretch across the bitmap. The remainder stays on the last row, as it always has:
+    # centering it would move every province and invalidate the measured arena.
+    step_x, step_y = width // (2 * columns_per_half), height // rows
+    # The land block of the left half. The default is everything inside the ocean rings.
+    column0, row0 = columns_per_half - land_columns, (rows - land_rows) // 2
     root.mkdir(parents=True, exist_ok=False)
     half_count = columns_per_half * rows
     total_provinces = 2 * half_count
     left = np.array(
         [
             (
-                origin_x + x * step_x + step_x // 2,
-                origin_y + y * step_y + step_y // 2 + (x % 2) * (step_y // 4),
+                x * step_x + step_x // 2,
+                y * step_y + step_y // 2 + (x % 2) * (step_y // 4),
             )
             for x in range(columns_per_half)
             for y in range(rows)
@@ -261,12 +264,12 @@ def generate(
     points = np.concatenate([left, [width - 1, height - 1] - left])
     yy, xx = np.mgrid[:height, :width]
     ids = cKDTree(points).query(np.stack([xx.ravel(), yy.ravel()], 1))[1].reshape(height, width) + 1
-    # Two rings of provinces on the outer edges are sea, so the land sits in open water
-    # rather than running off the edge of the world. Indexing the lattice, rather than
-    # the bitmap edge, keeps those rings sea when a pitched island does not fill the map.
-    # The right half is the left half rotated, so it shares the left half's land flags.
+    # At least two rings of provinces on the outer edges are sea, so the land sits in open
+    # water rather than running off the edge of the world. A smaller land block leaves
+    # more of the grid as sea, at the same province size. The right half is the left half
+    # rotated, so it shares the left half's land flags.
     column, row = np.divmod(np.arange(half_count), rows)
-    half_land = (column >= OCEAN_RINGS) & (row >= OCEAN_RINGS) & (row < rows - OCEAN_RINGS)
+    half_land = (column >= column0) & (row >= row0) & (row < row0 + land_rows)
     land = np.concatenate([half_land, half_land])
     # Break pixel-only four-way contacts, preserving rotational symmetry. The map wraps
     # horizontally, so the seam between the last and first column is a contact too.
@@ -466,17 +469,19 @@ def generate(
         rotationally symmetric for free.
         """
         index = (province - 1) % half_count
-        column = index // rows - OCEAN_RINGS
-        row = index % rows - OCEAN_RINGS
+        column = index // rows - column0
+        row = index % rows - row0
         return (column // state_width) * state_rows + row // state_height
 
     states, state_owner, capitals, capital_states, victory_points = {}, {}, [], [], {}
     for half, (tag, province_list) in enumerate([("BLU", left_land), ("RED", right_land)]):
-        centre = (
-            [width // 4, height // 2]
-            if half == 0
-            else [width - 1 - width // 4, height - 1 - height // 2]
-        )
+        if (land_columns, land_rows) != (full_columns, full_rows):
+            centre = points[np.array(province_list) - 1].mean(axis=0)
+        elif half == 0:
+            # Kept exactly as measured, so the playable arena's capital does not move.
+            centre = [width // 4, height // 2]
+        else:
+            centre = [width - 1 - width // 4, height - 1 - height // 2]
         # The border column: one province per land row, nearest the vertical seam. The
         # starting divisions stand here, and the harness puts every victory point here
         # too, so it is computed once and shared.
@@ -799,9 +804,11 @@ def generate(
         "common/decisions",
         "common/decisions/categories",
         "common/strategic_locations",
-        # events and common/on_actions are not replaced. Replacing them deleted every
-        # stock on_capitulation effect. The arena's on_startup file merges with the
-        # stock ones, and the engine's peace-conference path keeps its scripts.
+        # Stock events and on_actions refer to states and countries this map lacks. Left
+        # in, the game crashed on the first daily tick (1936-01-02, 2026-09-22). Replaced,
+        # a capitulation still ran all the way through its peace conference.
+        "events",
+        "common/on_actions",
         "map/strategicregions",
         "map/supplyareas",
     ]
@@ -827,7 +834,8 @@ def generate(
         "rows": rows,
         "state_columns": state_columns,
         "state_rows": state_rows,
-        "province_pitch": None if pitch is None else [step_x, step_y],
+        "land_columns": land_columns,
+        "land_rows": land_rows,
         "undefended": undefended,
         "victory_points_on_border": victory_points_on_border,
         "army_speed_factor": ARMY_SPEED_FACTOR,

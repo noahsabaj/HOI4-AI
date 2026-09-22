@@ -51,7 +51,7 @@ def test_map_has_balanced_forces_and_nonempty_engine_placement_files(tmp_path):
     assert report["land_provinces_per_country"] == land_columns * land_rows
     assert report["states_per_country"] == STATE_COLUMNS * STATE_ROWS
     assert report["provinces"] == 2 * COLUMNS_PER_HALF * ROWS
-    assert report["province_pitch"] is None
+    assert (report["land_columns"], report["land_rows"]) == (land_columns, land_rows)
     assert not report["gameplay_verified"]
     # The land grid has to divide into whole states, or a state straddles the map edge.
     assert land_columns % STATE_COLUMNS == 0 and land_rows % STATE_ROWS == 0
@@ -140,55 +140,46 @@ def test_the_harness_capital_moves_with_its_victory_point(tmp_path):
         assert held & _garrison(root, tag), f"{tag} capital state holds no front-line point"
 
 
-def test_a_pitched_island_keeps_province_size_and_can_field_nobody(tmp_path):
-    """Fewer provinces must not be stretched across the bitmap.
+def test_a_small_country_keeps_every_province_arena_sized(tmp_path):
+    """A small country is a land block in the full grid, not a smaller grid.
 
-    The 8 by 12 grid did that, and one crossing then took weeks. A pitch keeps the
-    playable arena's cell size and leaves the rest of the bitmap as ocean.
+    Centering a smaller lattice on the bitmap left the margin to a few sea provinces up
+    to 2245x769 px, and the engine crashed loading them. Every province, sea included,
+    must stay near the playable arena's cell size.
     """
-    from hoi4_arena.mapgen import OCEAN_RINGS, audit
+    from hoi4_arena.mapgen import MAP_SIZE, audit
 
     output = tmp_path / "island"
-    pitch = (88, 85)
     report = generate(
         _fixture_game(tmp_path),
         output,
         undefended="RED",
-        columns_per_half=8,
-        rows=8,
         state_columns=2,
         state_rows=2,
-        pitch=pitch,
+        land_columns=6,
+        land_rows=4,
     )
     assert report["states_per_country"] == 4
-    assert report["province_pitch"] == list(pitch)
+    assert report["land_provinces_per_country"] == 24
+    assert report["provinces"] == 2 * COLUMNS_PER_HALF * ROWS
+    assert (report["land_columns"], report["land_rows"]) == (6, 4)
     assert not _garrison(output, "RED")
     assert _garrison(output, "BLU")
     assert audit(output)["problems"] == []
-    land_columns, land_rows = 8 - OCEAN_RINGS, 8 - 2 * OCEAN_RINGS
-    assert report["land_provinces_per_country"] == land_columns * land_rows
-    rows = [
-        line.split(";") for line in (output / "map/definition.csv").read_text().splitlines() if line
-    ]
-    land_ids = {int(row[0]) for row in rows if row[4] == "land"}
-    colour_of = {(int(row[1]), int(row[2]), int(row[3])): int(row[0]) for row in rows}
+    # Stock events and on_actions crashed the game on its first daily tick.
+    descriptor = (output / "descriptor.mod").read_text()
+    assert 'replace_path = "events"' in descriptor
+    assert 'replace_path = "common/on_actions"' in descriptor
     bitmap = np.asarray(Image.open(output / "map/provinces.bmp"))
     packed = (
         bitmap[:, :, 0].astype(np.uint32) << 16
         | bitmap[:, :, 1].astype(np.uint32) << 8
         | bitmap[:, :, 2].astype(np.uint32)
     )
-    colours, counts = np.unique(packed, return_counts=True)
-    land_counts = [
-        int(count)
-        for colour, count in zip(colours, counts, strict=True)
-        if colour_of[((int(colour) >> 16) & 255, (int(colour) >> 8) & 255, int(colour) & 255)]
-        in land_ids
-    ]
-    cell = pitch[0] * pitch[1]
-    assert len(land_counts) == 2 * report["land_provinces_per_country"]
-    assert max(land_counts) < cell * 3
-    assert abs(float(np.median(land_counts)) - cell) / cell < 0.25
+    _, counts = np.unique(packed, return_counts=True)
+    cell = (MAP_SIZE[0] // (2 * COLUMNS_PER_HALF)) * (MAP_SIZE[1] // ROWS)
+    assert len(counts) == report["provinces"]
+    assert max(counts) < cell * 3
 
 
 def test_an_undivided_or_undersized_state_grid_is_refused(tmp_path):
@@ -199,5 +190,11 @@ def test_an_undivided_or_undersized_state_grid_is_refused(tmp_path):
         )
     with pytest.raises(ValueError, match="three states"):
         generate(game, tmp_path / "one", columns_per_half=8, rows=8, state_columns=1, state_rows=1)
+    with pytest.raises(ValueError, match="line up"):
+        generate(
+            game, tmp_path / "offset", state_columns=2, state_rows=1, land_columns=6, land_rows=3
+        )
+    with pytest.raises(ValueError, match="ocean rings"):
+        generate(game, tmp_path / "wide", land_columns=COLUMNS_PER_HALF, land_rows=4)
     assert not (tmp_path / "uneven").exists()
     assert not (tmp_path / "one").exists()
