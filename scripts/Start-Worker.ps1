@@ -1,4 +1,48 @@
+#Requires -Version 7.5
+# PowerShell 7.5+ (.NET 9+): the bridge loads its certificate with X509CertificateLoader.
+#
+# .\Start-Worker.ps1            Run the worker bridge here, restarting it after updates.
+# .\Start-Worker.ps1 -Install   Also start it minimized at every logon, and start it now.
+#                               Undo by deleting "HOI4 Worker" from shell:startup.
+param([switch]$Install, [switch]$Bridge)
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
+$pwsh = (Get-Process -Id $PID).Path
+
+if ($Install) {
+    $link = Join-Path ([Environment]::GetFolderPath('Startup')) 'HOI4 Worker.lnk'
+    # A path that survives PowerShell updates: the Store build's own path names its version.
+    $stable = @(
+        (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+    $shortcut.TargetPath = if ($stable) { $stable } else { $pwsh }
+    $shortcut.Arguments = "-NoProfile -File `"$PSCommandPath`""
+    $shortcut.WorkingDirectory = $PSScriptRoot
+    $shortcut.WindowStyle = 7  # Minimized.
+    $shortcut.Save()
+    Start-Process -FilePath $link
+    Write-Output "Installed $link and started the worker in a minimized window."
+    return
+}
+
+if (-not $Bridge) {
+    # Supervisor. The bridge runs in a child pwsh because a compiled type cannot be
+    # reloaded in place. An idle bridge exits with code 3 when Deploy-Peer replaces this
+    # script or the pairing, and starts again from the new files. Any other exit, such as
+    # the network not being up yet at logon, is retried.
+    while ($true) {
+        & $pwsh -NoProfile -File $PSCommandPath -Bridge
+        if ($LASTEXITCODE -eq 3) {
+            Write-Output 'Update deployed. Restarting the bridge.'
+            continue
+        }
+        Write-Output "Bridge stopped (exit $LASTEXITCODE). Retrying in 10 s; close this window to stop."
+        Start-Sleep -Seconds 10
+    }
+}
+
 $spec = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server.json') -Raw | ConvertFrom-Json
 # The bridge accepts only raw worker requests. It exposes no shell or filesystem API.
 Add-Type -TypeDefinition @'
@@ -9,8 +53,10 @@ using System.Net;
 using System.Net.Sockets;
 using System.Net.Security;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 public static class Hoi4Bridge {
     private static async Task Pump(Stream source, Stream destination) {
@@ -21,29 +67,68 @@ public static class Hoi4Bridge {
             await destination.FlushAsync();
         }
     }
-    public static void Run(string bind, int port, string peer, string pfx, string password, string token, string exe) {
-        var cert = new X509Certificate2(pfx, password, X509KeyStorageFlags.UserKeySet);
+    // Content hashes, not timestamps: Copy-Item keeps the source's write time.
+    private static string Stamp(string[] files) {
+        var stamp = new StringBuilder();
+        foreach (var file in files) {
+            stamp.Append(File.Exists(file) ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))) : "missing");
+            stamp.Append('|');
+        }
+        return stamp.ToString();
+    }
+    // True when the watched files changed and the caller should restart from them.
+    public static bool Run(string bind, int port, string peer, string pfx, string password, string token, string exe, string[] watch) {
+        var stamp = Stamp(watch);
+        var cert = X509CertificateLoader.LoadPkcs12FromFile(pfx, password, X509KeyStorageFlags.UserKeySet);
         var listener = new TcpListener(IPAddress.Parse(bind), port);
         listener.Start(1);
         Console.WriteLine("HOI4 worker ready at " + bind + ":" + port + ". F12 stops game input.");
         try {
             while (true) {
+                // Updates are picked up only between connections, never during a match.
+                for (int tick = 0; !listener.Pending(); tick++) {
+                    if (tick % 2 == 1) {
+                        string now;
+                        try { now = Stamp(watch); } catch (IOException) { now = stamp; }
+                        if (now != stamp) return true;
+                    }
+                    Thread.Sleep(500);
+                }
                 using (var client = listener.AcceptTcpClient()) {
                     if (!((IPEndPoint)client.Client.RemoteEndPoint).Address.Equals(IPAddress.Parse(peer))) continue;
                     using (var tls = new SslStream(client.GetStream(), false)) {
                         Process worker = null;
+                        StreamWriter errorLog = null;
+                        Task errors = null;
                         try {
                             tls.ReadTimeout = 10000; tls.WriteTimeout = 10000;
                             tls.AuthenticateAsServer(cert, false, SslProtocols.Tls12, false);
                             var incoming = new StringBuilder();
                             for (int i=0; i<65; i++) { int b=tls.ReadByte(); if(b==10) break; if(b<0) throw new IOException(); incoming.Append((char)b); }
                             if (incoming.ToString() != token) continue;
+                            // Deploy-Peer stages a new worker beside the running one. No
+                            // worker is running between connections, so swap it in here.
+                            if (File.Exists(exe + ".new")) {
+                                try { File.Move(exe + ".new", exe, true); Console.WriteLine("Updated worker."); }
+                                catch (Exception error) { Console.WriteLine("Worker update deferred: " + error.Message); }
+                            }
                             worker = new Process();
                             worker.StartInfo = new ProcessStartInfo(exe) {
                                 UseShellExecute=false, CreateNoWindow=true,
-                                RedirectStandardInput=true, RedirectStandardOutput=true
+                                RedirectStandardInput=true, RedirectStandardOutput=true,
+                                RedirectStandardError=true
                             };
                             worker.Start();
+                            errorLog = new StreamWriter(Path.Combine(Path.GetDirectoryName(exe), "worker-stderr.log"), true);
+                            var log = errorLog;
+                            errors = Task.Run(() => {
+                                string line;
+                                while ((line = worker.StandardError.ReadLine()) != null) {
+                                    Console.Error.WriteLine(line);
+                                    log.WriteLine(line);
+                                    log.Flush();
+                                }
+                            });
                             var input = Pump(tls, worker.StandardInput.BaseStream);
                             var output = Pump(worker.StandardOutput.BaseStream, tls);
                             Task.WaitAny(input, output);
@@ -52,8 +137,16 @@ public static class Hoi4Bridge {
                             if (worker != null) {
                                 worker.StandardInput.Close();
                                 if (!worker.WaitForExit(2000)) worker.Kill();
-                                worker.Dispose();
                             }
+                            // The worker has exited, so stderr reaches EOF. Let the reader
+                            // write a crash's last lines before the log closes under it.
+                            if (errors != null) {
+                                try { errors.Wait(2000); } catch (Exception) {}
+                            }
+                            if (errorLog != null) {
+                                try { errorLog.Dispose(); } catch (Exception) {}
+                            }
+                            if (worker != null) worker.Dispose();
                         }
                     }
                 }
@@ -62,6 +155,8 @@ public static class Hoi4Bridge {
     }
 }
 '@
-[Hoi4Bridge]::Run($spec.bind, $spec.port, $spec.coordinator,
-    (Join-Path $PSScriptRoot 'worker.pfx'), $spec.pfx_password, $spec.token,
-    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'))
+$pairing = Join-Path $PSScriptRoot 'server.json'
+$pfx = Join-Path $PSScriptRoot 'worker.pfx'
+$restart = [Hoi4Bridge]::Run($spec.bind, $spec.port, $spec.coordinator, $pfx, $spec.pfx_password, $spec.token,
+    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'), @($PSCommandPath, $pairing, $pfx))
+if ($restart) { exit 3 }
