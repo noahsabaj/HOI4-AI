@@ -87,7 +87,13 @@ Video from elsewhere (a friend's recording, a published video) has no inputs and
 .venv\Scripts\hoi4-arena.exe pointer artifacts/screens-1080p/pointer-menu.png
 .venv\Scripts\hoi4-arena.exe import-video clip.mp4 data/unlabelled/clip-001 --pointers artifacts/screens-1080p/pointer-*.png --game-speed 3
 ```
-`--variant screen` swaps the LeVJEPA video encoder for SigLIP 2 (`google/siglip2-base-patch16-naflex`, kept in a local folder passed as `--model`), which reads the four quadrants as one 896 px screen. `distill` trains the compact LeVJEPA student from any recordings.
+The default image encoder (`--variant screen`) is the vision tower of Qwen3.5-0.8B, which reads the four quadrants as one 896 px screen. It was chosen from the 2026 encoders by probing each on our own frames (STATUS.md). Its weights (timm's `qwen3_vit_88m_enc.qwen3_5_0_8b`, Apache-2.0, 400 MB) go in `models/qwen3-vit-88m`, which is `--model`'s default:
+
+```powershell
+.venv\Scripts\hf.exe download timm/qwen3_vit_88m_enc.qwen3_5_0_8b model.safetensors --local-dir models/qwen3-vit-88m
+```
+
+`--variant large` keeps the LeVJEPA video encoder (`--model models/levjepa-large`), and `distill` trains its compact student. `scripts/probe_encoders.py` reruns the comparison on any two recordings.
 Repeat BC with `--auxiliary dense` and `--auxiliary sparse`, holding seed, demonstrations, encoder initialization and other settings fixed. Compare `--objective xm --auxiliary none` separately. This is a discrete, noise-conditioned best-of-five **XM-inspired adaptation**, not a faithful reproduction of a continuous-action XM method.
 
 Dense and sparse predictive objectives use separate projection modules. Sparse training uses RepReLU and a rectified-Laplace RDM regularizer inspired by LpWM; 256 projections are a hardware adaptation. Neither auxiliary runs at deployment. These mechanisms have gradient tests, not demonstrated HOI4 learning gains.

@@ -71,7 +71,7 @@ def train_bc(
     model_path,
     output,
     *,
-    variant="large",
+    variant="screen",
     student=None,
     auxiliary="none",
     objective="bc",

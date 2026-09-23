@@ -197,8 +197,8 @@ The policy was rebuilt so it can read the screen and point at what it sees:
   The worker now draws it (live: the gauntlet pointer, fingertip on the position, views
   still byte-identical to `dataset.views`). `import-video` finds it again in video from
   elsewhere by matching saved pointer images, so that video can be labelled.
-- **Screen encoder option** (`--variant screen`, SigLIP 2 base): reads the quadrants as one
-  896 px screen.
+- **The image encoder is now the vision tower of Qwen3.5-0.8B** (`--variant screen`, the
+  default), reading the quadrants as one 896 px screen; see "Choosing the screen encoder".
 
 Measured at batch one in bfloat16 on the 4060 Ti (random weights of the real sizes where
 no trained ones exist yet):
@@ -208,10 +208,10 @@ no trained ones exist yet):
 | Whole policy step with LeVJEPA: encoder, reader, cells, memory, 8-slot head (eager) | 73.8 ms p50, 761 MiB peak |
 | LeVJEPA encoder alone, 8 frames | 63.5 ms |
 | Detail reader, four 448 px quadrants | 2.7 ms |
-| SigLIP 2 screen encoder at 448 / 672 / 896 px | 8.2 / 16.2 / 31.4 ms |
+| Whole policy step with the Qwen3.5 screen encoder, real weights | 50.4 ms p50, 51.3 ms p95, 353 MiB peak |
 
-At 31.4 ms the screen encoder costs half of LeVJEPA, so two actors on one GPU should fit
-with it; that is measured once it has weights.
+Two actors with the screen encoder take about 100 ms of the 200 ms tick, where two with
+LeVJEPA did not fit.
 
 **End to end, 2026-09-23.** One `record-ai` game on each PC with all of the above: both
 launched and closed through the worker, both ended on the log's surrender (Red both
@@ -223,15 +223,48 @@ to 20.5 in 20 steps.
 **Training memory.** A training step keeps every step's activations for the backward
 pass, and at batch 2 (windows of 8 steps after 2 of burn-in) that reached 7 GB of the
 card's 8. Windows then quietly moves GPU memory into system memory instead of failing,
-and a step took 34.6 s. Recomputing each step in the backward pass (activation
-checkpointing, now the default for `train-bc`, `train-idm` and `train-critic`;
-`--no-checkpoint` turns it off). And every command now caps its own GPU use at 90% of the card (`--gpu-memory`), so running out raises out-of-memory instead of spilling:
+and a step took 34.6 s. Two fixes: training recomputes each step in the backward pass
+(activation checkpointing, the default for `train-bc`, `train-idm` and `train-critic`;
+`--no-checkpoint` turns it off), and every command caps its GPU use at 90% of the card
+(`--gpu-memory`), so running out raises out-of-memory instead of spilling.
 
 | | Time per window | Peak |
 |---|---|---|
 | Batch 1 | 1.0 s | 4.3 GB |
 | Batch 1, recomputed | 1.6 s | 2.1 GB |
 | Batch 2, recomputed | 1.3 s | 2.5 GB |
+
+## Choosing the screen encoder (2026-09-23)
+
+Four search agents (arXiv, Hugging Face and GitHub, screen and OCR models, small
+encoders) and Grok on X listed every image encoder released in 2026, with weight to
+July–September. No new screen-specific standalone encoder shipped then; GUI agents reuse
+the vision towers of small vision-language models. The candidates that fit an 8 GB card
+were probed, frozen, on frames of two recorded AI games (`scripts/probe_encoders.py`):
+characters of 10–12 px drawn on the game's own pixels, named by a linear read-out from
+the patch they sit in (chance 2.8%), and the pointer found among all patches. Train on one
+game, test on the other; times are the whole frame at batch one in bfloat16.
+
+| Encoder (release) | Input | Time | Reads text | Finds pointer |
+|---|---|---|---|---|
+| **Qwen3.5-0.8B vision tower** (Feb 2026; timm 10 Sep 2026) | 896 square | 40.7 ms | **58.4%** | 93.1% |
+| same | 1152x640 | 36.9 ms | 59.6% | 91.9% |
+| same | 1280x720 | 49.1 ms | 67.8% | 85.6% |
+| same | 768 / 672 square | 28.3 / 21.5 ms | 39.4 / 26.3% | 85.0 / 78.1% |
+| Holo-3.1-0.8B's copy, GUI-tuned (weights about 1% apart) | 1152x640 | 36.8 ms | 56.2% | 93.1% |
+| MonkeyOCRv2-B (Jul 2026, OCR-trained) | 1008x560 / 1120x616 | 50.8 / 63.5 ms | 46.4 / 48.8% | 98.1 / 96.2% |
+| TIPSv2-B/14 (Apr 2026) | 896 square | 47.5 ms | 16.6% | 98.1% |
+| EUPE ConvNeXt-S (Mar 2026) | 896 square | 24.5 ms | 12.7% | 100% |
+| EUPE ViT-S (Mar 2026) | 896 square | 18.1 ms | 9.6% | 98.8% |
+| LingBot-Vision ViT-B / ViT-S (Jul 2026) | 896 square | 39.5 / 17.7 ms | 9.5 / 4.8% | 100 / 83.1% |
+| Gemma 4 E4B vision tower (Jul 2026) | 864 square | 88.3 ms | 4.4% | 64.4% |
+
+The Qwen tower reads small text four to six times better than the general-purpose
+encoders; it was trained inside a vision-language model on documents, screenshots and
+GUIs. It became the default screen encoder (Apache-2.0). The pointer test is noisy with 160
+test frames (a rerun of the Qwen row gave 85.6%). Larger towers (C-RADIOv4, the 300M
+Qwen3.5-2B tower, Qwen4-Exp, which is also gated) cost 120–160 ms at 896 px. UltraViT,
+TuringViT and LiAuto-MindViT have no public weights yet.
 
 ## Performance
 
