@@ -183,6 +183,20 @@ def test_a_small_country_keeps_every_province_arena_sized(tmp_path):
     assert "random_list = { 50 = {" in on_actions
     assert on_actions.count("{") == on_actions.count("}")
     assert 'log = "ARENA player [THIS.GetTag]"' in on_actions
+    # Since v4 the war starts from the recorder's own coin flip, through the console, and
+    # the game's flip is a fallback after the first day that neither event has fired.
+    startup = on_actions.split("on_startup", 1)[1].splitlines()[0]
+    assert "declare_war_on" not in startup
+    events = (output / "events/arena.txt").read_text()
+    assert events.startswith("add_namespace = arena")
+    for number, (tag, enemy) in enumerate((("BLU", "RED"), ("RED", "BLU")), 1):
+        event = events.split(f"id = arena.{number} ", 1)[1].splitlines()[0]
+        assert f"{tag} = {{ declare_war_on = {{ target = {enemy} " in event
+        assert "set_global_flag = arena_declared" in event and "is_triggered_only = yes" in event
+    assert events.count("{") == events.count("}")
+    blue_daily = on_actions.split("on_daily_BLU", 1)[1].splitlines()[0]
+    assert "NOT = { has_global_flag = arena_declared }" in blue_daily
+    assert "random_list" not in on_actions.split("on_daily_RED", 1)[1].splitlines()[0]
     # Since v3 each side also reports its state every day, with its divisions in each state.
     for tag in ("BLU", "RED"):
         assert f"on_daily_{tag} = {{ effect = {{" in on_actions

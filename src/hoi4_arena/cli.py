@@ -74,7 +74,7 @@ def main():
     ai.add_argument(
         "--ok-button",
         nargs="+",
-        default=["artifacts/screens-1080p/ok-button.png"],
+        default=["artifacts/screens-1080p/ok-button.png", "artifacts/screens-1080p/event-ok.png"],
         help="1920x1080 crops of popup Ok buttons, clicked wherever they appear.",
     )
     ai.add_argument("--hz", type=float, default=5)

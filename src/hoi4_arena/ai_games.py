@@ -56,6 +56,16 @@ SINGLE_PLAYER, NEW_GAME = (0.5, 290 / 1080), (0.5, 420 / 1080)
 SELECT_COUNTRY, START = (1043 / 1920, 875 / 1080), (1777 / 1920, 1038 / 1080)
 SPEED_UP = (1789 / 1920, 20 / 1080)
 GRAVE, ENTER = 0xC0, 0x0D
+# Keys whose character is not their virtual-key code: the space, and the period in an
+# event id (VK_OEM_PERIOD). Letters and digits are their own codes.
+CONSOLE_KEYS = {" ": 0x20, ".": 0xBE}
+# The arena's events that start the war (arenas since v4): Blue declares, Red declares.
+DECLARE_EVENT = {"BLU": "arena.1", "RED": "arena.2"}
+# Fired from the console, even a hidden event opens its window ("Blue declares war on
+# Red", Ok), wider than a popup's Ok. Left open, it covered the map through the scripted
+# player's setup on 2026-09-23. The crop of its Ok scored 0.000 there, 0.26 and up
+# elsewhere.
+EVENT_OK = "artifacts/screens-1080p/event-ok.png"
 # The top bar and the bottom panels are chrome, not map.
 MAP_TOP, MAP_BOTTOM = 80, 120
 # The selected country's flag in the picker's top bar, 1080p pixels (x0, y0, x1, y1).
@@ -221,7 +231,7 @@ def console(desk, command):
     """Type a console command through the worker, which allows the console key in setup."""
     act(desk, tap(GRAVE))
     time.sleep(0.6)
-    keys = [e for c in command.upper() for e in tap(0x20 if c == " " else ord(c))]
+    keys = [e for c in command.upper() for e in tap(CONSOLE_KEYS.get(c, ord(c)))]
     act(desk, keys + tap(ENTER), pause=0.05)
     time.sleep(0.4)
     act(desk, tap(GRAVE))
@@ -378,13 +388,19 @@ def run_at(desk, rules, speed, failure_shot=None):
         click(desk, *SPEED_UP)
 
 
-def start_game(desk, rules, failure_shot, country="BLU", speed=4, observe=True):
+def start_game(desk, rules, failure_shot, country="BLU", speed=4, observe=True, declarer=None):
     """From the main menu to an AI-vs-AI game running at `speed` (4 or 5), as `country`.
 
     Which country the game starts as is varied because only one side ever won while the
     recorder always started as Blue; the arena logs the country each human started as.
     Without `observe` the game is left paused at its start, as `country`, for the scripted
     player (scripted.Planner) to set up and run while it is recorded.
+
+    `declarer` starts the war from the console (arenas since v4). The game's own coin
+    flip at startup is not random: its random draw comes out the same for the same setup,
+    and Red declared in 36 of 44 AI games and in all 13 started as Red on the second PC.
+    The recorder flips the coin instead. Arenas before v4 have declared already, and the
+    command does nothing there; the arena log's `declare` line is the truth either way.
     """
     click(desk, *SINGLE_PLAYER)
     time.sleep(8)
@@ -409,11 +425,28 @@ def start_game(desk, rules, failure_shot, country="BLU", speed=4, observe=True):
     else:
         Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
         raise RuntimeError("game did not reach the map")
+    if declarer:
+        console(desk, f"event {DECLARE_EVENT[declarer]}")
+        close_event(desk)
     if not observe:
         return
     console(desk, "observe")
     recentre(desk)
     run_at(desk, rules, speed, failure_shot)
+
+
+def close_event(desk, seconds=6):
+    """Click Ok on the event window the console's `event` opens. True if one closed."""
+    template = np.asarray(Image.open(EVENT_OK).convert("RGB"))
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = find_template(screen(desk), template, OK_MATCH)
+        if found is not None:
+            click(desk, *found)
+            time.sleep(0.5)
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def front_points(rgb):
@@ -715,6 +748,8 @@ def run_station(station, out_root, rules, templates, settings, end):
         name = time.strftime(f"{kind}-{station.name}-%Y%m%d-%H%M%S")
         country, speed = game_plan(station.name, len(results), settings["speeds"])
         entry = {"game": name, "station": station.name, "started_as": country, "speed": speed}
+        # A fair coin for who declares, independent of the side played (start_game).
+        entry["declare_drawn"] = rng.choice(("BLU", "RED"))
         player = None
         if scripted:
             player = {"plan": choose_plan(rng), "templates": settings["buttons"], "rules": rules}
@@ -728,7 +763,7 @@ def run_station(station, out_root, rules, templates, settings, end):
                     raise RuntimeError("could not bring the game window to the front")
                 start_game(
                     desk, rules, out_root / f"{name}-start-failed.png", country, speed,
-                    observe=not scripted,
+                    observe=not scripted, declarer=entry["declare_drawn"],
                 )  # fmt: skip
                 say(station.name, "recording", name, "as", country, "at speed", speed)
                 outcome, reason, manifest = play(
@@ -783,7 +818,7 @@ def record_ai_games(
     *,
     mod="artifacts/mods/arena-12x8-v2",
     rules="artifacts/calibration-1080p/rules.json",
-    ok_button=("artifacts/screens-1080p/ok-button.png",),
+    ok_button=("artifacts/screens-1080p/ok-button.png", EVENT_OK),
     hz=5,
     codec="x264",
     cap_minutes=45,

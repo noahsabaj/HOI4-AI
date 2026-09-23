@@ -296,12 +296,12 @@ fn valid_event(e: &Event, setup: bool) -> bool {
             // stay refused, and so do space and escape: space pauses and escape opens the
             // pause menu, which the match loop rejects as game_paused. Speed is
             // operator-declared; a match that can change it falsifies the manifest.
-            // Setup may also open the console (grave, 0xc0), to type `observe` on a PC
-            // nobody is sitting at.
+            // Setup may also open the console (grave, 0xc0), to type `observe` or
+            // `event arena.1` (the period, 0xbe) on a PC nobody is sitting at.
             matches!(
                 vk,
                 0x09 | 0x0d | 0x10 | 0x11 | 0x25..=0x28 | 0x30..=0x39 | 0x41..=0x5a
-            ) || (setup && matches!(vk, 0x08 | 0x1b | 0x20 | 0xbb | 0xbd | 0xc0))
+            ) || (setup && matches!(vk, 0x08 | 0x1b | 0x20 | 0xbb | 0xbd | 0xbe | 0xc0))
         }
     }
 }
@@ -2019,7 +2019,7 @@ mod tests {
 
     #[test]
     fn blocks_os_and_speed_keys() {
-        for vk in [0x5b, 0x5c, 0x12, 0xc0, 0x7b, 0xbb, 0xbd, 0x1b, 0x20] {
+        for vk in [0x5b, 0x5c, 0x12, 0xc0, 0x7b, 0xbb, 0xbd, 0xbe, 0x1b, 0x20] {
             assert!(
                 !valid_event(&Event::Key { vk, down: true }, false),
                 "vk {vk:#x} should be refused in a match"

@@ -71,3 +71,20 @@ def test_the_create_army_plus_is_found_by_its_green_however_brightly_it_glows():
         lit[1012:1018, 975:1002] = (60, glow, 60)
         x, y = green_plus(lit)
         assert abs(x * 1920 - 988.5) < 2 and abs(y * 1080 - 1015) < 3
+
+
+def test_the_console_types_an_event_id_with_its_period():
+    from unittest.mock import Mock
+
+    from hoi4_arena import ai_games
+
+    desk = Mock()
+    desk.focus.return_value = True
+    ai_games.console(desk, "event arena.1")
+    keys = [
+        call.args[0][0]["vk"]
+        for call in desk.apply.call_args_list
+        if call.args[0][0]["kind"] == "key" and call.args[0][0]["down"]
+    ]
+    # Grave, then e v e n t, space, a r e n a, period, 1, enter, grave.
+    assert keys == [0xC0, *b"EVENT", 0x20, *b"ARENA", 0xBE, ord("1"), 0x0D, 0xC0]
