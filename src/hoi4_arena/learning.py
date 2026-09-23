@@ -31,6 +31,10 @@ GAE_LAMBDA = 1.0
 # is 1, and the log's shaping sums to the change in a potential that stays within 2 either
 # side (arena_log: surrender progress difference within 1, half a state share within 1).
 RETURN_BOUND = 5.0
+# InfoPPO's adaptive clip (Zeng et al., 2026, Appendix B): the ratio may move within
+# [1 / (1 + log(1 + low * rho)), 1 + log(1 + high * rho)], rho the step's information
+# density in [0, 1].
+INFO_CLIP = (10.0, 20.0)
 
 
 def scale_return(returns):
@@ -59,8 +63,50 @@ def critic_loss(value_logit, target, weight=None):
     return F.binary_cross_entropy_with_logits(value_logit.float(), scaled, reduction="none")
 
 
-def gae(rewards, values, bootstrap, terminated, valid, elapsed, gamma=GAMMA, lam=GAE_LAMBDA):
-    """Discount actual wall time in units of 200ms. Never learn from invalid episodes."""
+def information_density(entropies):
+    """Each step's entropy under the collecting policy over the largest in the update.
+
+    InfoPPO's clock (Zeng et al., 2026): a step advances time by how uncertain the policy
+    was there, in [0, 1], rather than by one. A slot's entropy counts where to point only
+    in proportion to the chance of moving at all, so a tick the policy confidently spends
+    waiting is close to zero and a real decision is not. Normalized over the whole update,
+    the paper's "batch level", which was steadier than per episode. A list of per-episode
+    tensors in, a list out.
+    """
+    largest = max((float(e.max()) for e in entropies if e.numel()), default=0.0)
+    if largest <= 0:
+        return [torch.zeros_like(e, dtype=torch.float32) for e in entropies]
+    return [(e.float() / largest).clamp(0, 1) for e in entropies]
+
+
+def adaptive_clip(density, info_clip=INFO_CLIP):
+    """InfoPPO's per-step ratio bounds: wide where the policy was unsure, tight where not.
+
+    A softmax policy's total-variation move from one gradient step is bounded by its
+    entropy (their Proposition 4.3), so an unsure state can move further for the same
+    guarantee. Logarithmic in the density, their conservative choice over linear.
+    """
+    low, high = info_clip
+    return 1 / (1 + torch.log1p(low * density)), 1 + torch.log1p(high * density)
+
+
+def gae(
+    rewards,
+    values,
+    bootstrap,
+    terminated,
+    valid,
+    elapsed,
+    gamma=GAMMA,
+    lam=GAE_LAMBDA,
+    density=None,
+):
+    """Discount actual wall time in units of 200ms. Never learn from invalid episodes.
+
+    `density` (information_density) makes time information time instead: each step's
+    discount and trace decay are raised to its density, so waiting costs no horizon and
+    a match is discounted over its decisions (InfoPPO, their Eq. 23).
+    """
     if not valid.all():
         raise ValueError("Invalid episodes must be quarantined, not assigned zero reward")
     advantages = torch.zeros_like(rewards)
@@ -68,9 +114,10 @@ def gae(rewards, values, bootstrap, terminated, valid, elapsed, gamma=GAMMA, lam
     next_value = bootstrap
     for t in reversed(range(rewards.shape[0])):
         continuation = (~terminated[t]).float()
-        discount = gamma ** (elapsed[t] / 0.2)
+        clock = 1.0 if density is None else density[t]
+        discount = gamma ** (elapsed[t] / 0.2 * clock)
         delta = rewards[t] + discount * next_value * continuation - values[t]
-        carry = delta + discount * lam * continuation * carry
+        carry = delta + discount * lam**clock * continuation * carry
         advantages[t] = carry
         next_value = values[t]
     return advantages, advantages + values
@@ -103,14 +150,19 @@ def approximate_kl(logp, old_logp):
     return (log_ratio.exp() - 1 - log_ratio).mean()
 
 
-def ppo_loss(logp, old_logp, value_logits, returns, advantages, entropy, clip=0.2):
+def ppo_loss(logp, old_logp, value_logits, returns, advantages, entropy, clip=0.2, bounds=None):
     """Score one window. Advantages are already scaled over the episode; do not rescale.
 
     `value_logits` None leaves the critic out: the actor-then-critic mode trains it in a
-    phase of its own, after the actor.
+    phase of its own, after the actor. `bounds`, per-step (low, high) from adaptive_clip,
+    replace the fixed [1 - clip, 1 + clip].
     """
     ratio = (logp - old_logp).exp()
-    policy = -torch.minimum(ratio * advantages, ratio.clamp(1 - clip, 1 + clip) * advantages).mean()
+    if bounds is None:
+        clipped = ratio.clamp(1 - clip, 1 + clip)
+    else:
+        clipped = torch.minimum(torch.maximum(ratio, bounds[0]), bounds[1])
+    policy = -torch.minimum(ratio * advantages, clipped * advantages).mean()
     loss = policy - 0.001 * entropy.mean()
     if value_logits is not None:
         loss = loss + 0.5 * critic_loss(value_logits, returns).mean()

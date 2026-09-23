@@ -246,7 +246,7 @@ class Actor:
                 self.deterministic,
                 device,
             )
-            action, logp, _ = self.policy.actor(
+            action, logp, entropy = self.policy.actor(
                 self.hidden, cells, noise=noise, deterministic=self.deterministic
             )
         # One host transfer for the whole sample. Four separate .cpu()/.item() calls
@@ -257,6 +257,7 @@ class Actor:
             "fovea": fovea.detach().to("cpu", non_blocking=True),
             "action": action[0].detach().to("cpu", non_blocking=True),
             "old_logp": logp.detach().to("cpu", non_blocking=True),
+            "old_entropy": entropy.float().detach().to("cpu", non_blocking=True),
             "old_value": value_estimate(value).detach().to("cpu", non_blocking=True),
             "noise": noise[0].detach().to("cpu", non_blocking=True),
         }
@@ -272,6 +273,8 @@ class Actor:
             "previous": self.previous.copy(),
             "action": action_np,
             "old_logp": float(host["old_logp"]),
+            # The collecting policy's entropy here: InfoPPO's information density.
+            "old_entropy": float(host["old_entropy"]),
             "old_value": float(host["old_value"]),
             "noise": host["noise"].numpy(),
         }
@@ -595,6 +598,9 @@ def train_ppo(
     critic="pact",
     critic_epochs=1,
     ratio_range=(0.0, 6.0),
+    clock="ticks",
+    clip="fixed",
+    info_clip=None,
 ):
     """Recurrent PPO. Windows are shuffled, and training stops once the KL leaves the trust region.
 
@@ -614,11 +620,21 @@ def train_ppo(
     - "joint": the usual PPO, a value term in the same loss, critic one update behind.
 
     Both train the critic with binary cross-entropy on the scaled return (learning).
+
+    InfoPPO (Zeng et al., 2026) measures each step by the collecting policy's entropy
+    there, its information density. `clock="information"` discounts over that instead of
+    ticks, so the many ticks a policy confidently spends waiting cost no horizon, and
+    `clip="adaptive"` lets the ratio move further where the policy was unsure and less
+    where it was sure (`info_clip`, default learning.INFO_CLIP). Their gains were on
+    language models; both are off by default until self-play can compare them.
     """
     from .learning import (
         GAE_LAMBDA,
+        INFO_CLIP,
+        adaptive_clip,
         critic_loss,
         gae,
+        information_density,
         normalize_advantages,
         ppo_loss,
         save_checkpoint,
@@ -626,6 +642,12 @@ def train_ppo(
 
     if critic not in {"pact", "joint"}:
         raise ValueError("critic must be 'pact' or 'joint'")
+    if clock not in {"ticks", "information"} or clip not in {"fixed", "adaptive"}:
+        raise ValueError("clock is 'ticks' or 'information', clip 'fixed' or 'adaptive'")
+    info_clip = tuple(INFO_CLIP if info_clip is None else info_clip)
+    informed = clock == "information" or clip == "adaptive"
+    keys = ["reward", "old_value", "terminal", "valid", "elapsed"]
+    keys += ["old_entropy"] if informed else []
     gae_lambda = GAE_LAMBDA if gae_lambda is None else gae_lambda
     output = Path(output)
     if output.exists():
@@ -635,7 +657,7 @@ def train_ppo(
     policy, config, digest = load_policy(checkpoint, model_path, device)
     policy.train()
     optimizer = torch.optim.AdamW([p for p in policy.parameters() if p.requires_grad], lr=1e-5)
-    episodes = []
+    episodes, pending = [], []
     speeds = []
     for manifest_path in sorted(Path(rollouts).glob("*/manifest.json")):
         meta = json.loads(manifest_path.read_text())
@@ -655,31 +677,38 @@ def train_ppo(
             scalars = []
             for path in files:
                 with np.load(path) as archive:
-                    scalars.append(
-                        {
-                            key: archive[key]
-                            for key in ["reward", "old_value", "terminal", "valid", "elapsed"]
-                        }
-                    )
+                    if informed and "old_entropy" not in archive:
+                        raise ValueError(
+                            f"{path} was collected before steps stored the policy's entropy,"
+                            " which the information clock and adaptive clip need"
+                        )
+                    scalars.append({key: archive[key] for key in keys})
             if not scalars or not scalars[-1]["terminal"]:
                 raise ValueError("Incomplete episode cannot enter PPO")
-
-            def get(key):
-                return torch.as_tensor(np.array([r[key] for r in scalars]))
-
-            advantages, returns = gae(
-                get("reward"),
-                get("old_value"),
-                torch.tensor(0.0),
-                get("terminal"),
-                get("valid"),
-                get("elapsed"),
-                lam=gae_lambda,
-            )
-            episodes.append((files, normalize_advantages(advantages), returns.float()))
+            columns = {k: torch.as_tensor(np.array([r[k] for r in scalars])) for k in keys}
+            pending.append((files, columns))
             speeds.append(speed)
-    if not episodes:
+    if not pending:
         raise ValueError("No completed valid on-policy episodes; collection must precede PPO")
+    # The density is normalized over the whole update, so it waits for every episode.
+    densities = (
+        information_density([columns["old_entropy"] for _, columns in pending])
+        if informed
+        else [None] * len(pending)
+    )
+    for (files, columns), density in zip(pending, densities, strict=True):
+        advantages, returns = gae(
+            columns["reward"],
+            columns["old_value"],
+            torch.tensor(0.0),
+            columns["terminal"],
+            columns["valid"],
+            columns["elapsed"],
+            lam=gae_lambda,
+            density=density if clock == "information" else None,
+        )
+        bounds = adaptive_clip(density, info_clip) if clip == "adaptive" else None
+        episodes.append((files, normalize_advantages(advantages), returns.float(), bounds))
     game_speed = sorted(set(speeds))
     losses, critic_losses = [], []
     kept = total = 0
@@ -687,7 +716,9 @@ def train_ppo(
     early_stop = False
     for _ in range(epochs):
         for index, start, begin, end in _windows(episodes, sequence, burn_in, rng):
-            files, advantages, returns = episodes[index]
+            files, advantages, returns, bounds = episodes[index]
+            if bounds is not None:
+                bounds = tuple(b[start:end].to(device) for b in bounds)
             batch = replay_batch(files[begin:end], device)
             optimizer.zero_grad(set_to_none=True)
             _, values, new_logp, entropies = _replay(policy, batch, start - begin, device)
@@ -704,6 +735,7 @@ def train_ppo(
                 returns[start:end].to(device),
                 advantages[start:end].to(device),
                 entropies,
+                bounds=bounds,
             )
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite PPO objective")
@@ -717,7 +749,7 @@ def train_ppo(
         head = torch.optim.AdamW(policy.value.parameters(), lr=1e-4)
         for _ in range(critic_epochs):
             for index, start, begin, end in _windows(episodes, sequence, burn_in, rng):
-                files, _, returns = episodes[index]
+                files, _, returns, _ = episodes[index]
                 batch = replay_batch(files[begin:end], device)
                 with torch.no_grad():
                     hiddens, _, new_logp, _ = _replay(
@@ -757,6 +789,9 @@ def train_ppo(
             "kl_limit": kl_limit,
             "gae_lambda": gae_lambda,
             "critic": critic,
+            "clock": clock,
+            "clip": clip,
+            "info_clip": list(info_clip) if clip == "adaptive" else None,
             "gameplay_verified": False,
         },
     )
@@ -765,6 +800,8 @@ def train_ppo(
         "updates": len(losses),
         "mean_loss": float(np.mean(losses)) if losses else None,
         "critic": critic,
+        "clock": clock,
+        "clip": clip,
         "critic_updates": len(critic_losses),
         "mean_critic_loss": float(np.mean(critic_losses)) if critic_losses else None,
         "critic_ratio_kept": kept / total if total else None,
