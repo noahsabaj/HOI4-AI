@@ -94,6 +94,13 @@ Other demonstrations:
 .venv\Scripts\hoi4-arena.exe train-bc data/raw artifacts/bc-idm --sources human idm --idm-weight 0.5
 ```
 
+Offline reinforcement learning, before any live self-play: `advantage` has a trained critic (`train-critic`) value every decision of one of your recordings, with the memory carried from the game's start, and writes how much each input improved the position over the next 25 decisions (5 s), from your side. `train-bc --advantage` then counts each decision in proportion to exp(advantage / beta): advantage-weighted imitation (AWR, 1910.00177), the simplest form of learning from outcomes offline (AlphaStar Unplugged, 2308.03526; RECAP, 2511.14759). AI games are refused: their recorded inputs are the camera's, and the game's AI decided who won.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe advantage artifacts/critic.pt data/human/session-001
+.venv\Scripts\hoi4-arena.exe train-bc data/human artifacts/bc-awr --advantage
+```
+
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
 
 ```powershell
