@@ -2015,6 +2015,33 @@ def test_red_is_paid_when_red_gains_land_and_not_when_blue_does(tmp_path):
     env.close()
 
 
+def test_a_frozen_clock_ends_the_match_within_the_stall_limit(tmp_path):
+    """A dropped connection freezes the clock long before "Server Lost!" appears."""
+    import time as _time
+    from unittest.mock import Mock
+
+    from hoi4_arena.desktop import Frame
+    from hoi4_arena.environment import CLOCK_STALL_SECONDS, ArenaEnv
+
+    assert CLOCK_STALL_SECONDS <= 15
+    rules = _rules_with(tmp_path, _MATCH)
+    running = _screen(rules, ["ready", "healthy", "speed"])
+    desktop = Mock()
+    desktop.capture.side_effect = [Frame(running, {}, i) for i in range(6)]
+    desktop.apply.return_value = {}
+    env = ArenaEnv(desktop, rules, [], downscale=False)
+    env.reset()
+    action = np.zeros((SLOTS, 3), dtype=np.int64)
+    assert env.step(action)[4]["valid"]
+    # The same clock, just inside the limit, is still a live game.
+    env.clock_changed = _time.monotonic() - (CLOCK_STALL_SECONDS - 2)
+    assert env.step(action)[4]["valid"]
+    env.clock_changed = _time.monotonic() - (CLOCK_STALL_SECONDS + 1)
+    info = env.step(action)[4]
+    assert not info["valid"] and info["error"] == "game_clock_stalled"
+    env.close()
+
+
 def test_a_terminal_candidate_is_not_thrown_away_for_pause_or_a_stopped_clock(tmp_path):
     from unittest.mock import Mock
 

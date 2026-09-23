@@ -77,9 +77,10 @@ if (-not $Bridge) {
 # A launch request from the first PC (Deploy-Peer -Launch): start HOI4 with an arena mod
 # that Deploy-Peer mirrored into mods\. The request names a folder there, never a path,
 # and a game that is already running is left alone. The outcome is written beside it.
+# An optional second word asks for a window of that size, such as "small-arena-v1 1920x1080".
 $request = Join-Path $PSScriptRoot 'launch.txt'
 if (Test-Path -LiteralPath $request) {
-    $name = (Get-Content -LiteralPath $request -Raw).Trim()
+    $name, $window = -split (Get-Content -LiteralPath $request -Raw)
     $age = (Get-Date) - (Get-Item -LiteralPath $request).LastWriteTime
     Remove-Item -LiteralPath $request
     $mod = Join-Path $PSScriptRoot "mods\$name"
@@ -89,10 +90,14 @@ if (Test-Path -LiteralPath $request) {
         Set-Content -LiteralPath $result "refused: request is $([int]$age.TotalMinutes) minutes old"
     } elseif ($name -notmatch '^[\w.-]+$' -or -not (Test-Path -LiteralPath (Join-Path $mod 'descriptor.mod'))) {
         Set-Content -LiteralPath $result "refused: no arena mod named '$name' in mods"
+    } elseif ($window -and $window -notmatch '^\d{3,4}x\d{3,4}$') {
+        Set-Content -LiteralPath $result "refused: '$window' is not a window size like 1920x1080"
     } elseif (Get-Process hoi4 -ErrorAction SilentlyContinue) {
         Set-Content -LiteralPath $result 'refused: HOI4 is already running'
     } else {
-        & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Test-ArenaLoad.ps1') -Mod $mod *> $result
+        $launch = @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'Test-ArenaLoad.ps1'), '-Mod', $mod)
+        if ($window) { $launch += @('-Window', $window) }
+        & $pwsh @launch *> $result
     }
     Write-Output "Launch request for '$name': $((Get-Content -LiteralPath $result) -join ' ')"
 }

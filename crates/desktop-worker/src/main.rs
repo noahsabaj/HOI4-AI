@@ -744,6 +744,35 @@ mod platform {
                 *armed = false;
                 Ok((serde_json::json!({"armed": false}), vec![]))
             }
+            // Bring the attached game window to the front, for setup only. A windowed
+            // game started by a background process does not take focus, and nobody may be
+            // at the second PC to click it. Windows only lets a process that has just sent
+            // input change the foreground window, so this taps Alt first; the tap goes to
+            // whatever window had focus, before the game has it.
+            "focus" => {
+                if *armed {
+                    return Err("focus_refused_while_armed".into());
+                }
+                let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
+                if hwnd.is_null() {
+                    return Err("focus_before_attach".into());
+                }
+                unsafe {
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    let mut alt: [INPUT; 2] = zeroed();
+                    for (i, up) in [false, true].into_iter().enumerate() {
+                        alt[i].r#type = INPUT_KEYBOARD;
+                        alt[i].Anonymous.ki.wVk = VK_MENU;
+                        alt[i].Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
+                    }
+                    SendInput(2, alt.as_ptr(), size_of::<INPUT>() as i32);
+                    SetForegroundWindow(hwnd);
+                }
+                thread::sleep(Duration::from_millis(150));
+                Ok((serde_json::json!({"foreground": foreground()}), vec![]))
+            }
             "events" => {
                 let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                 Ok((

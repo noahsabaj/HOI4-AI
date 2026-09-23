@@ -79,10 +79,23 @@ the game to windowed and puts the player's own display settings back after the g
 exits (HOI4 writes them back on exit, so restoring them sooner is undone).
 
 Calibrated at 1920×1080 in `artifacts/calibration-1080p/rules.json`: `ready`, `paused`,
-`healthy`, `speed`, `clock_rect` and the territory crop. On a running game `healthy`
-and `speed` read 0 and `ready` 35 or more; on the start frame `speed` reads 43.
-`win`, `loss` and `disconnect` exist only at 4K so far and need recapturing at 1080p
-(a two-player match). The layout differs from 4K, so no 4K rect carries over.
+`healthy`, `speed`, `clock_rect`, the territory crop, and, from a two-player match on
+2026-09-22 with both PCs at 1080p, `win` ("Make your Demands", `[889, 93, 138, 18]`),
+`loss` ("Defeated", `[120, 111, 92, 18]`) and `disconnect` ("Server Lost!",
+`[862, 431, 192, 26]`). Each matches only its own screen: the nearest other captured
+screen is 36 away for `win` and `loss` and 42 for `disconnect`. On a running game
+`healthy` and `speed` read 0 and `ready` 35 or more. Only `desync` is left. The layout
+differs from 4K, so no 4K rect carries over.
+
+- At 1080p the client showed "Server Lost!" 19 s after the host died.
+- A windowed game started by a background process does not take focus, so the worker
+  has a setup-only `focus` command (`Desktop.focus()`) that brings the game to the
+  front. It is refused while armed. Anything else in front, such as the Claude app,
+  stops input and capture until the game has focus again.
+- A settings file that never had a windowed size gets one added; without it the second
+  PC opened its window at the desktop size.
+- In a two-player match the host's lobby panel has its own Start button, and the game
+  does not begin until it is pressed.
 
 **Territory reward.** HOI4 has no minimap, so the reward reads the main view, but only
 when the camera shows the whole arena at full zoom-out: the arena is then 469 px wide
@@ -192,8 +205,9 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Finish calibration at 1080p**: recapture `win`, `loss` and `disconnect` in a
-   two-player match, and `desync` whenever one happens.
+1. **Record AI games on both PCs at once.** Needs the console key on the second PC
+   (setup only) so `observe` can be sent there, and a recorder that drives both.
+   `desync` gets calibrated whenever one happens.
 2. **Record AI-vs-AI games** on the arena with `scripts/record_ai_games.py`. They have
    no actions, so they can't teach clicks, but they need no human time and are enough
    for the encoder (step 4), for learning to predict who wins, and as a first opponent.

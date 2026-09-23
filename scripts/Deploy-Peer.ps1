@@ -9,8 +9,10 @@ param(
     # Arena mods to mirror into the share's mods folder, so the second PC can launch the
     # same map with Test-ArenaLoad.ps1 for a two-player match.
     [string[]]$Mod = @(),
-    # Ask the second PC's idle Start-Worker to launch HOI4 with this deployed mod.
-    [string]$Launch
+    # Ask the second PC's idle Start-Worker to launch HOI4 with this deployed mod, in a
+    # window of -Window's size if given (as Test-ArenaLoad.ps1 -Window).
+    [string]$Launch,
+    [string]$Window
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -70,7 +72,7 @@ foreach ($path in $Mod) {
 }
 if ($Launch) {
     Remove-Item -LiteralPath (Join-Path $Share 'launch-result.txt') -ErrorAction SilentlyContinue
-    Set-Content -LiteralPath (Join-Path $Share 'launch.txt') $Launch
+    Set-Content -LiteralPath (Join-Path $Share 'launch.txt') "$Launch $Window".Trim()
     Write-Output "requested launch of $Launch; the outcome appears in launch-result.txt"
 }
 Write-Output 'Done. A running Start-Worker picks this up on its own; a new worker takes effect on the next connection.'

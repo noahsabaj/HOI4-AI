@@ -262,6 +262,14 @@ class Desktop:
     def release(self):
         self.request("release")
 
+    def focus(self):
+        """Bring the game window to the front, for setup only. True if it is now in front.
+
+        A windowed game started on the second PC does not take focus by itself, and the
+        worker refuses input and capture until it has it. Refused while armed.
+        """
+        return bool(self.request("focus")["foreground"])
+
     def close(self):
         # Record rather than raise: close() runs from __exit__, where raising would
         # replace whatever exception is already propagating. Callers that treat a failed
