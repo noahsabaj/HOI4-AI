@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 127 Python tests and 16 Rust tests (2 need a live desktop and are
+Automated checks: 135 Python tests and 16 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -98,7 +98,15 @@ differs from 4K, so no 4K rect carries over.
 - In a two-player match the host's lobby panel has its own Start button, and the game
   does not begin until it is pressed.
 
-**Territory reward.** HOI4 has no minimap, so the reward reads the main view, but only
+**Reward from the log.** On the arena a match is now scored from the mod's game.log
+lines (`reward: "log"`, the default in the pair config), not from pixels. The surrender
+line gives the win or loss. Between surrenders the reward is the change in a potential:
+the enemy's surrender progress minus one's own, plus half the difference in states held
+as a share of one side's states. That is potential-based shaping, so it adds early
+signal without changing which policy is best, and it does not depend on the camera.
+Screen scoring stays for a vanilla lobby, which has no mod.
+
+**Territory reward from the screen.** HOI4 has no minimap, so the reward reads the main view, but only
 when the camera shows the whole arena at full zoom-out: the arena is then 469 px wide
 at 1080p (`minimap_span`), and any frame whose land is not within 15% of that width is
 not a reading. The map draws the country colours faintly (Blue's land about
@@ -204,7 +212,7 @@ updates by itself, but only between connections, never mid-match. See the README
 
 ## Recording AI games
 
-`scripts/record_ai_games.py` plays AI-vs-AI games in observer mode and records them.
+`hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.
 
 - **The arena reports itself in game.log.** The mod logs, without changing any rule,
   `ARENA` lines at the start, every week (states held, divisions, surrender progress per
@@ -231,7 +239,7 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Record AI-vs-AI games in bulk** on the arena with `scripts/record_ai_games.py`,
+1. **Record AI-vs-AI games in bulk** on the arena with `hoi4-arena record-ai`,
    on both PCs at once with `--peer artifacts/pairing/peer.json`. The second PC's games
    are launched and closed through its worker (`launch.txt`, and `quit` to close) and
    its frames are recorded here: a full 1080p frame takes about 86 ms over the network,

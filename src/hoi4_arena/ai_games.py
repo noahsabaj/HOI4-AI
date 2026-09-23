@@ -6,38 +6,39 @@ moves and clears popups the way a player would. The arena mod reports itself in 
 log, so a game ends when the log names a surrender and its winner, or at the cap, and a
 game whose weekly report stops has a stuck clock.
 
-With --peer, the second PC records its own games at the same time, driven over its worker
+With a peer, the second PC records its own games at the same time, driven over its worker
 connection; its frames are recorded here. The second PC's worker must be running and the
-arena deployed to it (Deploy-Peer.ps1 -Mod), which this script does itself.
+arena deployed to it (Deploy-Peer.ps1 -Mod), which this does itself.
 
 The recordings carry no actions, so they cannot teach clicks. They are for the encoder, for
 predicting who wins, and for measuring how often a match ends inside the time limit.
-
-    python scripts/record_ai_games.py artifacts/ai-games-1080p --minutes 90
-    python scripts/record_ai_games.py artifacts/ai-games-1080p --minutes 90 --peer artifacts/pairing/peer.json
 
 It takes over the screen of each PC it uses. Anything else that takes focus stops input to
 the game until the recorder brings it back.
 """
 
-import argparse
+from __future__ import annotations
+
 import json
+import logging
 import random
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 from PIL import Image
 
-from hoi4_arena.desktop import Desktop, DesktopError
-from hoi4_arena.recording import Recorder
-from hoi4_arena.remote import RemoteDesktop
-from hoi4_arena.vision import ScreenRules, country_pixels
+from .arena_log import ArenaLog
+from .desktop import Desktop, DesktopError
+from .recording import Recorder
+from .remote import RemoteDesktop
+from .vision import ScreenRules, country_pixels, find_template
 
-SCRIPTS = Path(__file__).resolve().parent
+log = logging.getLogger(__name__)
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 # The game runs in a 1920x1080 window (Test-ArenaLoad -Window), and these are fractions of
 # it, measured on 2026-09-22.
 WINDOW = "1920x1080"
@@ -51,10 +52,14 @@ SINGLE_PLAYER, NEW_GAME = (0.5, 290 / 1080), (0.5, 420 / 1080)
 SELECT_COUNTRY, START = (1043 / 1920, 875 / 1080), (1777 / 1920, 1038 / 1080)
 SPEED_UP = (1789 / 1920, 20 / 1080)
 GRAVE, ENTER = 0xC0, 0x0D
+# The top bar and the bottom panels are chrome, not map.
+MAP_TOP, MAP_BOTTOM = 80, 120
+# Close enough to the middle, as a fraction of the screen.
+CENTRED = 0.03
 
 
 def say(station, *parts):
-    print(time.strftime("%H:%M:%S"), f"[{station}]", *parts, flush=True)
+    log.info("[%s] %s", station, " ".join(str(p) for p in parts))
 
 
 def pwsh(*args, timeout=300):
@@ -70,9 +75,10 @@ class Popups:
     player would: after a short, varying pause to read it.
     """
 
-    def __init__(self, templates, rng=None):
+    def __init__(self, templates, rng=None, clock=time.monotonic):
         self.templates = templates
         self.rng = rng or random.Random()
+        self.clock = clock
         self.lock = threading.Lock()
         self.pending = None
 
@@ -81,20 +87,16 @@ class Popups:
             if self.pending is not None:
                 return
         for template in self.templates:
-            score, _, (x, y), _ = cv2.minMaxLoc(
-                cv2.matchTemplate(rgb, template, cv2.TM_SQDIFF_NORMED)
-            )
-            if score < OK_MATCH:
-                h, w = template.shape[:2]
-                at = ((x + w / 2) / rgb.shape[1], (y + h / 2) / rgb.shape[0])
+            found = find_template(rgb, template, OK_MATCH)
+            if found is not None:
                 with self.lock:
-                    self.pending = (at, time.monotonic() + self.rng.uniform(1, 4))
+                    self.pending = (found, self.clock() + self.rng.uniform(1, 4))
                 return
 
     def due(self):
         """The Ok button to click now, if one has waited its reading time."""
         with self.lock:
-            if self.pending and time.monotonic() >= self.pending[1]:
+            if self.pending and self.clock() >= self.pending[1]:
                 at, self.pending = self.pending[0], None
                 return at
         return None
@@ -237,6 +239,20 @@ def hold(desk, vk, seconds):
         desk.apply([{"kind": "key", "vk": vk, "down": False}])
 
 
+def arena_offset(rgb):
+    """Where the middle of the arena is, as (down, right) fractions from the screen centre.
+
+    None when no country's land is on screen, such as over a menu.
+    """
+    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+    blue, red = country_pixels(rgb[top:bottom])
+    if blue is None or not (blue | red).any():
+        return None
+    ys, xs = np.nonzero(blue | red)
+    centre = ((ys.min() + ys.max()) / 2 + top, (xs.min() + xs.max()) / 2)
+    return centre[0] / rgb.shape[0] - 0.5, centre[1] / rgb.shape[1] - 0.5
+
+
 def recentre(desk, tries=10):
     """Zoom fully out and pan until the arena sits in the middle of the screen.
 
@@ -249,16 +265,10 @@ def recentre(desk, tries=10):
     keys = {(0, 1): 0x27, (0, -1): 0x25, (1, 1): 0x28, (1, -1): 0x26}
     for _ in range(tries):
         time.sleep(0.5)
-        rgb = screen(desk)
-        # Leave out the top bar and the bottom panels, whose chrome is not the map.
-        top, bottom = 80, rgb.shape[0] - 120
-        blue, red = country_pixels(rgb[top:bottom])
-        if blue is None or not (blue | red).any():
+        offsets = arena_offset(screen(desk))
+        if offsets is None:
             return False
-        ys, xs = np.nonzero(blue | red)
-        centre = ((ys.min() + ys.max()) / 2 + top, (xs.min() + xs.max()) / 2)
-        offsets = [centre[0] / rgb.shape[0] - 0.5, centre[1] / rgb.shape[1] - 0.5]
-        if max(abs(o) for o in offsets) < 0.03:
+        if max(abs(o) for o in offsets) < CENTRED:
             return True
         # Pan along whichever axis is further out: right/left for x, down/up for y.
         axis = 0 if abs(offsets[1]) >= abs(offsets[0]) else 1
@@ -377,42 +387,21 @@ def camera(desk, stop, station, popups, recentre_every=(60, 150)):
             pass
 
 
-class ArenaLog:
-    """The arena mod's game.log lines for one game: its surrender and its heartbeat."""
-
-    def __init__(self, desk):
-        self.desk, self.offset, self.lines = desk, 0, []
-        self.winner = self.surrendered = None
-        self.last_week = time.monotonic()
-
-    def poll(self):
-        lines, self.offset = self.desk.game_log(self.offset)
-        for line in lines:
-            self.lines.append(line)
-            words = line.split()
-            if words[0] == "week":
-                self.last_week = time.monotonic()
-            elif words[0] == "capitulated" and self.winner is None:
-                # "capitulated RED winner BLU <date>"
-                self.winner, self.surrendered = words[3], " ".join(words[4:])
-        if time.monotonic() - self.last_week > WEEK_SILENCE:
-            raise RuntimeError(f"the game clock stopped: no weekly report for {WEEK_SILENCE} s")
-
-
-def play(desk, root, popups, args, station):
+def play(desk, root, popups, settings, station):
     stop = threading.Event()
     mover = threading.Thread(target=camera, args=(desk, stop, station, popups), daemon=True)
     outcome, reason = "timeout", None
     first = desk.capture()
-    rec = Recorder(root, first, game_speed=4, source="ai", hz=args.hz, codec=args.codec)
-    log = ArenaLog(desk)
+    hz = settings["hz"]
+    rec = Recorder(root, first, game_speed=4, source="ai", hz=hz, codec=settings["codec"])
+    arena = ArenaLog(desk, silence=WEEK_SILENCE)
     start = deadline = next_poll = time.monotonic()
     late, ending = 0, None
     try:
         rec.append(first)
         mover.start()
-        while time.monotonic() - start < args.cap_minutes * 60:
-            deadline += 1 / args.hz
+        while time.monotonic() - start < settings["cap_minutes"] * 60:
+            deadline += 1 / hz
             time.sleep(max(0, deadline - time.monotonic()))
             frame = on_screen(desk.capture())
             if not frame.meta.get("foreground"):
@@ -423,32 +412,32 @@ def play(desk, root, popups, args, station):
             if now - deadline > 1:
                 late += 1
                 deadline = now
-            if rec.manifest["frames"] % int(args.hz) == 0:
+            if rec.manifest["frames"] % int(hz) == 0:
                 popups.look(frame.rgb)  # About once a second; a search costs ~70 ms.
             if now >= next_poll:
                 next_poll = now + 2
-                log.poll()
-                if log.winner and ending is None:
+                arena.poll()
+                if arena.winner and ending is None:
                     # Keep a few seconds of the surrender on screen, then stop.
                     ending = now + 5
                     Image.fromarray(frame.rgb).save(Path(root) / "capitulation.png")
             if ending is not None and now >= ending:
-                outcome = log.winner
+                outcome = arena.winner
                 break
-            if rec.manifest["frames"] % (60 * int(args.hz)) == 0:
-                say(station, f"{rec.manifest['frames'] // int(args.hz) // 60} min recorded")
+            if rec.manifest["frames"] % (60 * int(hz)) == 0:
+                say(station, f"{rec.manifest['frames'] // int(hz) // 60} min recorded")
     except Exception as error:  # noqa: BLE001 - recorded in the manifest.
         reason = f"{type(error).__name__}: {error}"
     finally:
         stop.set()
         mover.join(timeout=10)
-        (Path(root) / "arena-log.txt").write_text("\n".join(log.lines) + "\n")
+        (Path(root) / "arena-log.txt").write_text("\n".join(arena.lines) + "\n")
         rec.manifest.update(
             winner=outcome,
-            surrendered=log.surrendered,
+            surrendered=arena.surrendered,
             seconds=round(time.monotonic() - start),
             late_ticks=late,
-            arena=Path(args.mod).name,
+            arena=Path(settings["mod"]).name,
             driver="observe + scripted camera + popup clicks",
             station=station,
         )
@@ -456,7 +445,7 @@ def play(desk, root, popups, args, station):
     return outcome, reason, rec.manifest
 
 
-def run_station(station, out_root, rules, templates, args, end):
+def run_station(station, out_root, rules, templates, settings, end):
     results = []
     # A game needs about 3 minutes to launch and most end within 10; do not start one
     # that cannot plausibly finish.
@@ -465,7 +454,7 @@ def run_station(station, out_root, rules, templates, args, end):
         entry = {"game": name, "station": station.name}
         try:
             station.quit()
-            station.launch(args.mod)
+            station.launch(settings["mod"])
             time.sleep(25)
             with station.connect() as desk:
                 if not focus(desk):
@@ -473,7 +462,7 @@ def run_station(station, out_root, rules, templates, args, end):
                 start_game(desk, rules, out_root / f"{name}-start-failed.png")
                 say(station.name, "recording", name)
                 outcome, reason, manifest = play(
-                    desk, out_root / name, Popups(templates), args, station.name
+                    desk, out_root / name, Popups(templates), settings, station.name
                 )
         except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
             say(station.name, "start failed:", error)
@@ -508,47 +497,47 @@ def run_station(station, out_root, rules, templates, args, end):
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("output")
-    parser.add_argument("--minutes", type=float, required=True, help="Total time budget.")
-    parser.add_argument("--mod", default="artifacts/mods/arena-12x8-v1")
-    parser.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
-    parser.add_argument(
-        "--ok-button",
-        nargs="+",
-        default=["artifacts/screens-1080p/ok-button.png"],
-        help="1920x1080 crops of popup Ok buttons, clicked wherever they appear.",
-    )
-    parser.add_argument("--hz", type=float, default=5)
-    parser.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
-    parser.add_argument("--cap-minutes", type=float, default=32)
-    parser.add_argument("--peer", help="The second PC's pairing file, to record there too.")
-    parser.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
-    args = parser.parse_args()
-    out_root = Path(args.output)
+def record_ai_games(
+    output,
+    minutes,
+    *,
+    mod="artifacts/mods/arena-12x8-v1",
+    rules="artifacts/calibration-1080p/rules.json",
+    ok_button=("artifacts/screens-1080p/ok-button.png",),
+    hz=5,
+    codec="x264",
+    cap_minutes=45,
+    peer=None,
+    peer_only=False,
+):
+    """Record on this PC, the second PC, or both at once, until `minutes` run out."""
+    out_root = Path(output)
     out_root.mkdir(parents=True, exist_ok=True)
-    rules = ScreenRules(args.rules)
-    templates = [np.asarray(Image.open(path).convert("RGB")) for path in args.ok_button]
-    stations = [] if args.peer_only else [Station("here")]
-    if args.peer:
+    screen_rules = ScreenRules(rules)
+    templates = [np.asarray(Image.open(path).convert("RGB")) for path in ok_button]
+    settings = {"mod": mod, "hz": hz, "codec": codec, "cap_minutes": cap_minutes}
+    stations = [] if peer_only else [Station("here")]
+    if peer:
         deploy = pwsh(
-            "-File", str(SCRIPTS / "Deploy-Peer.ps1"), "-SkipBuild", "-PeerConfig", args.peer,
-            "-Mod", args.mod,
+            "-File", str(SCRIPTS / "Deploy-Peer.ps1"), "-SkipBuild", "-PeerConfig", peer,
+            "-Mod", mod,
         )  # fmt: skip
         if deploy.returncode:
-            raise SystemExit(f"Deploy-Peer failed: {deploy.stdout}{deploy.stderr}")
-        stations.append(Station("peer", args.peer))
-    end = time.monotonic() + args.minutes * 60
-    threads = [
-        threading.Thread(target=run_station, args=(s, out_root, rules, templates, args, end))
-        for s in stations
-    ]
+            raise RuntimeError(f"Deploy-Peer failed: {deploy.stdout}{deploy.stderr}")
+        stations.append(Station("peer", peer))
+    if not stations:
+        raise ValueError("--peer-only needs --peer")
+    end = time.monotonic() + minutes * 60
+    results = {}
+
+    def run(station):
+        results[station.name] = run_station(
+            station, out_root, screen_rules, templates, settings, end
+        )
+
+    threads = [threading.Thread(target=run, args=(s,)) for s in stations]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-
-
-if __name__ == "__main__":
-    main()
+    return results

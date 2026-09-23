@@ -5,6 +5,7 @@
   "seed": 42,
   "deterministic": false,
   "game_speed": 4,
+  "reward": "log",
   "model_path": "models/levjepa-large",
   "left": {
     "country": "BLU",

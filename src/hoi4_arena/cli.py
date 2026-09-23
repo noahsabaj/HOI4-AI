@@ -49,6 +49,26 @@ def main():
         "There is no default: a 1.6 s clip is 3.2 in-game hours at speed 2 and 16 at "
         "speed 4, and the speed bars are not read back.",
     )
+    ai = sub.add_parser(
+        "record-ai",
+        help="Record AI-vs-AI arena games on this PC, the second PC, or both, until the "
+        "time budget runs out",
+    )
+    ai.add_argument("output")
+    ai.add_argument("--minutes", type=float, required=True, help="Total time budget.")
+    ai.add_argument("--mod", default="artifacts/mods/arena-12x8-v1")
+    ai.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    ai.add_argument(
+        "--ok-button",
+        nargs="+",
+        default=["artifacts/screens-1080p/ok-button.png"],
+        help="1920x1080 crops of popup Ok buttons, clicked wherever they appear.",
+    )
+    ai.add_argument("--hz", type=float, default=5)
+    ai.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
+    ai.add_argument("--cap-minutes", type=float, default=45)
+    ai.add_argument("--peer", help="The second PC's pairing file, to record there too.")
+    ai.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
     prepare = sub.add_parser("prepare")
     prepare.add_argument("source")
     prepare.add_argument("output")
@@ -208,6 +228,10 @@ def _dispatch(command, args):
         from .recording import record
 
         record(args.pop("output"), **args)
+    elif command == "record-ai":
+        from .ai_games import record_ai_games
+
+        result = record_ai_games(args.pop("output"), **args)
     elif command == "prepare":
         from .dataset import prepare_session
 

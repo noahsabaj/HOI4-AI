@@ -9,6 +9,7 @@ import gymnasium as gym
 import numpy as np
 
 from .actions import GRID, PERIOD, SLOTS, VOCAB, decode
+from .arena_log import ArenaLog
 from .desktop import DesktopError
 from .vision import (
     BLUE,
@@ -44,6 +45,11 @@ FAULTS = (DesktopError, TimeoutError, OSError, ValueError, KeyError)
 # clock; it does not have to absorb the difference between two independent setups.
 PAIR_CONFIRM_SECONDS = 3
 
+# How often a match scored from the log asks for new lines: every 2 s at 5 Hz. The mod
+# writes weekly, which is 17 s of wall time at speed 4 and 84 s at speed 2, so reading
+# more often only finds nothing.
+LOG_EVERY = 10
+
 
 def disarm(env):
     env.active = False
@@ -78,10 +84,18 @@ class ArenaEnv(gym.Env):
         downscale=True,
         view_size=224,
         country="BLU",
+        reward="screen",
     ):
         rules.require_match_rules()
         if country not in COUNTRY_COLOUR:
             raise ValueError("country must be BLU or RED")
+        if reward not in {"screen", "log"}:
+            raise ValueError("reward must be 'screen' or 'log'")
+        # "log" scores the match from the arena mod's game.log lines (arena_log): the
+        # surrender names the winner, and the weekly counts pay for ground taken wherever
+        # the camera is. "screen" reads both from pixels, which is all a vanilla lobby has.
+        self.reward_source = reward
+        self.arena_log = None
         self.country = country
         self.colour = COUNTRY_COLOUR[country]
         self.desktop, self.rules, self.recipe = desktop, rules, recipe
@@ -127,7 +141,37 @@ class ArenaEnv(gym.Env):
         self.clock_changed = self.start
         self.unhealthy = self.unknown = 0
         self.territory = None
+        self.ticks = 0
+        self.potential = None
+        self.unpaid = 0.0
+        if self.reward_source == "log":
+            self.arena_log = ArenaLog(self.desktop)
+            self.arena_log.poll()
+            self.potential = self.arena_log.potential(self.country)
         return self.last.rgb, {"capture": self.last.meta, "valid": True}
+
+    def _read_log(self):
+        """New mod lines: the change in potential since the last reading, and any outcome."""
+        self.arena_log.poll()
+        change = 0.0
+        potential = self.arena_log.potential(self.country)
+        if potential is not None:
+            if self.potential is not None:
+                change = potential - self.potential
+            self.potential = potential
+        return change, self.arena_log.outcome(self.country)
+
+    def confirm_outcome(self, screen):
+        """The result a finished step is waiting to agree on: the log's, or the screen's.
+
+        A reading here can also move the potential. That change is kept in `unpaid` for
+        the confirming step to add, so the shaping still sums to the final potential.
+        """
+        if self.arena_log is not None:
+            change, outcome = self._read_log()
+            self.unpaid += change
+            return outcome
+        return screen.outcome()
 
     def _dispatch(self, action, start, stop):
         """Apply the eight slots across one interval, on their own thread."""
@@ -257,12 +301,22 @@ class ArenaEnv(gym.Env):
                     self.clock_pixels = clock.copy()
                 elif time.monotonic() - self.clock_changed > CLOCK_STALL_SECONDS:
                     raise DesktopError("game_clock_stalled")
+            self.ticks += 1
+            log_change = 0.0
+            if self.arena_log is not None:
+                # Every LOG_EVERY ticks, and on every tick a result may be forming: the
+                # surrender line is written as the peace screens open.
+                if self.ticks % LOG_EVERY == 0 or not healthy or outcome is not None:
+                    log_change, outcome = self._read_log()
+                else:
+                    outcome = self.arena_log.outcome(self.country)
             now = time.monotonic()
             reward = {"win": 1.0, "loss": -1.0}.get(outcome, 0.0)
             # The change in the acting country's share of the arena, read from the main
             # view only when it shows the whole arena at the calibrated zoom. The camera
             # moves, so any other frame is not a reading: it adds nothing and the last
-            # reading stands. An uncalibrated crop adds nothing either.
+            # reading stands. An uncalibrated crop adds nothing either. Scored from the
+            # log instead, it is still measured but only reported.
             territory_reward = 0.0
             territory = "uncalibrated"
             if self.rules.minimap_rect is not None:
@@ -273,6 +327,8 @@ class ArenaEnv(gym.Env):
                     territory_reward = territory - self.territory
                 if territory is not None:
                     self.territory = territory
+            if self.arena_log is not None:
+                territory_reward = log_change
             reward += territory_reward
             done = outcome in {"win", "loss"}
             timeout = now - self.start >= self.seconds and not done
@@ -289,6 +345,8 @@ class ArenaEnv(gym.Env):
                 "applied": applied,
                 "territory": territory,
                 "territory_reward": territory_reward,
+                "reward_source": self.reward_source,
+                "potential": self.potential,
             }
             self.last_time = now
             self.last = frame
@@ -403,7 +461,7 @@ class ArenaPair:
                     try:
                         frame = env.observe()
                         screen = env.rules.observe(frame)
-                        outcomes[i] = screen.outcome()
+                        outcomes[i] = env.confirm_outcome(screen)
                         if (
                             outcomes[i] is None
                             and time.monotonic() - env.start >= env.seconds
@@ -417,6 +475,8 @@ class ArenaPair:
                         # territory change already measured on that step.
                         reward = {"win": 1.0, "loss": -1.0}.get(outcomes[i], 0.0)
                         reward += float(info.get("territory_reward") or 0.0)
+                        reward += getattr(env, "unpaid", 0.0)
+                        env.unpaid = 0.0
                         results[i] = (
                             frame.rgb,
                             reward,
