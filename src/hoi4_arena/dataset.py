@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 
 from .actions import PERIOD, SLOTS, encode_interval
+from .learning import GAMMA
 
 # How many past global views one decision looks at. Eight frames is what fits the
 # 200 ms tick: on the 4060 Ti the encoder forward fell from 131.5 ms at sixteen frames
@@ -272,6 +273,13 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
             raise ValueError("IDM labels were made on a different decision grid; label again")
         actions, valid = stored["actions"].copy(), stored["valid"].copy()
         label_source = "idm"
+    # A recorded AI game names its winner. Every decision then has a return to predict:
+    # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
+    # discounted by the wall time left until the recording ends. It pre-trains the
+    # critic (train-critic) before any self-play; other recordings have none (NaN).
+    sign = {"BLU": 1.0, "RED": -1.0}.get(manifest.get("winner"))
+    left = (times[-1] - decisions) / PERIOD_NS
+    outcome = GAMMA**left * sign if sign is not None else np.full(len(decisions), np.nan)
     # Frames the reader needs that the video does not have.
     readable = decisions + max(clip_shift, detail_shift) * PERIOD_NS <= times[-1]
     valid &= readable
@@ -287,6 +295,7 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
         # The last frame each decision reads, so a window is cut only once it is decoded.
         "last_frame": np.maximum(clip_ids.max(-1), frame_ids),
         "readable": readable,
+        "outcome": outcome.astype(np.float32),
         "actions": actions,
         "valid": valid,
         "excluded": excluded,
@@ -370,6 +379,7 @@ class _Stream:
             "previous": previous,
             "valid": torch.from_numpy(labels["valid"][start : start + n].copy()),
             "speed": torch.full((n,), labels["speed"], dtype=torch.long),
+            "outcome": torch.from_numpy(labels["outcome"][start : start + n].copy()),
             "start": start,
         }
 

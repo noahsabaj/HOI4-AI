@@ -241,6 +241,34 @@ def main():
     ppo.add_argument("--seed", type=int, default=42)
     ppo.add_argument("--burn-in", type=int, default=4)
     ppo.add_argument("--kl-limit", type=float, default=0.02)
+    ppo.add_argument(
+        "--gae-lambda",
+        type=float,
+        help="GAE's lambda. Default 1.0: with a reward that comes mostly at the end, "
+        "anything lower carries every intermediate value error into the advantage.",
+    )
+    ppo.add_argument(
+        "--critic",
+        choices=["pact", "joint"],
+        default="pact",
+        help="pact: update the actor, then the value head alone on importance-corrected "
+        "returns under the updated policy. joint: the usual single PPO loss.",
+    )
+    ppo.add_argument("--critic-epochs", type=int, default=1)
+    critic = sub.add_parser(
+        "train-critic",
+        help="Pre-train a policy checkpoint's critic on recorded AI games, whose winners are known",
+    )
+    critic.add_argument("data")
+    critic.add_argument("checkpoint")
+    critic.add_argument("output")
+    critic.add_argument("--model-path")
+    critic.add_argument("--epochs", type=int, default=1)
+    critic.add_argument("--batch-size", type=int, default=2)
+    critic.add_argument("--seed", type=int, default=42)
+    critic.add_argument(
+        "--trunk", action="store_true", help="Also train the shared trunk, not only the head."
+    )
     args = vars(parser.parse_args())
     command = args.pop("command")
     logging.basicConfig(
@@ -445,6 +473,10 @@ def _dispatch(command, args):
         from .runner import train_ppo
 
         result = train_ppo(**args)
+    elif command == "train-critic":
+        from .train import train_critic
+
+        result = train_critic(args.pop("data"), args.pop("checkpoint"), args.pop("output"), **args)
     return result
 
 
