@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def file_hash(path):
@@ -16,7 +17,49 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def gae(rewards, values, bootstrap, terminated, valid, elapsed, gamma=0.9999, lam=0.95):
+# Discount per 200 ms of wall time.
+GAMMA = 0.9999
+# GAE's lambda. One, not the customary 0.95. A match is thousands of decisions scored
+# mostly at its end, so the true credit of most decisions is near zero (Fu et al., 2026,
+# "PACT", Theorem 4: the expected number of credits larger than e is at most 1/(4e^2) for
+# a reward in [0, 1], however long the episode). With lambda below one every intermediate
+# value error is carried into the advantage and can swamp that credit; at one they cancel
+# and only the value error at the step itself remains. Their PPO at 0.95 collapsed where
+# 1.0 did not.
+GAE_LAMBDA = 1.0
+# Every return this project can produce lies within plus or minus this: a win or a loss
+# is 1, and the log's shaping sums to the change in a potential that stays within 2 either
+# side (arena_log: surrender progress difference within 1, half a state share within 1).
+RETURN_BOUND = 5.0
+
+
+def scale_return(returns):
+    """A return mapped into [0, 1], the range the critic predicts in."""
+    return (returns + RETURN_BOUND) / (2 * RETURN_BOUND)
+
+
+def value_estimate(value_logit):
+    """The critic's output, a logit, as a return."""
+    return torch.sigmoid(value_logit.float()) * (2 * RETURN_BOUND) - RETURN_BOUND
+
+
+def critic_loss(value_logit, target, weight=None):
+    """Binary cross-entropy against a target in return units, per step.
+
+    The critic predicts the scaled return through a sigmoid and is trained with BCE, not
+    squared error. For a target in [0, 1] both have the same minimizer, the conditional
+    mean, but in PACT's controlled comparison the BCE critic converged faster and told
+    winning from losing trajectories apart better. `weight` multiplies the target, for
+    the importance-corrected targets of the critic phase; the conditional mean it
+    recovers is still that of the weighted target, which is the point.
+    """
+    scaled = scale_return(target.float())
+    if weight is not None:
+        scaled = scaled * weight
+    return F.binary_cross_entropy_with_logits(value_logit.float(), scaled, reduction="none")
+
+
+def gae(rewards, values, bootstrap, terminated, valid, elapsed, gamma=GAMMA, lam=GAE_LAMBDA):
     """Discount actual wall time in units of 200ms. Never learn from invalid episodes."""
     if not valid.all():
         raise ValueError("Invalid episodes must be quarantined, not assigned zero reward")
@@ -60,12 +103,18 @@ def approximate_kl(logp, old_logp):
     return (log_ratio.exp() - 1 - log_ratio).mean()
 
 
-def ppo_loss(logp, old_logp, values, returns, advantages, entropy, clip=0.2):
-    """Score one window. Advantages are already scaled over the episode; do not rescale."""
+def ppo_loss(logp, old_logp, value_logits, returns, advantages, entropy, clip=0.2):
+    """Score one window. Advantages are already scaled over the episode; do not rescale.
+
+    `value_logits` None leaves the critic out: the actor-then-critic mode trains it in a
+    phase of its own, after the actor.
+    """
     ratio = (logp - old_logp).exp()
     policy = -torch.minimum(ratio * advantages, ratio.clamp(1 - clip, 1 + clip) * advantages).mean()
-    value = 0.5 * (values - returns).square().mean()
-    return policy + 0.5 * value - 0.001 * entropy.mean()
+    loss = policy - 0.001 * entropy.mean()
+    if value_logits is not None:
+        loss = loss + 0.5 * critic_loss(value_logits, returns).mean()
+    return loss
 
 
 def save_checkpoint(path, policy, config, *, auxiliary=None, optimizer=None, provenance=None):

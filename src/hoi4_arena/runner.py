@@ -17,7 +17,7 @@ from .actions import GRID, SLOTS
 from .dataset import CLIP_FRAMES, clip_frame_ids, normalize, recorded_speed, views
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
-from .learning import approximate_kl, file_hash
+from .learning import approximate_kl, file_hash, value_estimate
 from .models import CELL_DIM, Policy, build_encoder, halve_frozen
 from .recording import Recorder
 from .remote import RemoteDesktop
@@ -257,7 +257,7 @@ class Actor:
             "fovea": fovea.detach().to("cpu", non_blocking=True),
             "action": action[0].detach().to("cpu", non_blocking=True),
             "old_logp": logp.detach().to("cpu", non_blocking=True),
-            "old_value": value.detach().to("cpu", non_blocking=True),
+            "old_value": value_estimate(value).detach().to("cpu", non_blocking=True),
             "noise": noise[0].detach().to("cpu", non_blocking=True),
         }
         if torch.device(device).type == "cuda":
@@ -535,6 +535,52 @@ def replay_batch(files, device):
     return batch
 
 
+def _replay(policy, batch, burned, device, *, policy_grad=True):
+    """Run stored steps through the policy, warming the memory on the first `burned`.
+
+    Returns the scored steps' memories, value logits, log-likelihoods of the stored
+    actions and entropies. `policy_grad` False keeps the whole pass out of the graph.
+    """
+    hidden = batch["hidden"][0:1].float()
+    hiddens, values, logps, entropies = [], [], [], []
+    for t in range(batch["clips"].shape[0]):
+        burn = t < burned
+        with (
+            torch.set_grad_enabled(policy_grad and not burn),
+            torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"),
+        ):
+            step = slice(t, t + 1)
+            hidden, value, _, cells = policy(
+                batch["clips"][step],
+                batch["quadrants"][step],
+                batch["fovea"][step],
+                batch["previous"][step],
+                batch["speed"][step],
+                hidden,
+            )
+            if burn:
+                hidden = hidden.detach()
+                continue
+            _, logp, entropy = policy.actor(
+                hidden, cells, batch["action"][step], noise=batch["noise"][step]
+            )
+            hiddens.append(hidden)
+            values.append(value)
+            logps.append(logp)
+            entropies.append(entropy)
+    return torch.cat(hiddens), torch.cat(values), torch.cat(logps), torch.cat(entropies)
+
+
+def _windows(episodes, sequence, burn_in, rng):
+    """Every (episode, start, begin, end) window of every episode, in shuffled order."""
+    for index in rng.permutation(len(episodes)):
+        files = episodes[int(index)][0]
+        starts = list(range(0, len(files), sequence))
+        rng.shuffle(starts)
+        for start in starts:
+            yield int(index), start, max(0, start - burn_in), min(start + sequence, len(files))
+
+
 def train_ppo(
     rollouts,
     checkpoint,
@@ -545,6 +591,10 @@ def train_ppo(
     model_path=None,
     seed=42,
     kl_limit=0.02,
+    gae_lambda=None,
+    critic="pact",
+    critic_epochs=1,
+    ratio_range=(0.0, 6.0),
 ):
     """Recurrent PPO. Windows are shuffled, and training stops once the KL leaves the trust region.
 
@@ -552,9 +602,31 @@ def train_ppo(
     not enough once the encoder's last blocks had moved; four is the default. The first
     window whose approximate KL exceeds `kl_limit` ends every remaining epoch, not just
     the current one.
-    """
-    from .learning import gae, normalize_advantages, ppo_loss, save_checkpoint
 
+    `critic` chooses how the value head learns:
+
+    - "pact" (Fu et al., 2026): the actor is updated first, without a value term. Then
+      each stored step is replayed under the updated policy, and the value head alone is
+      trained toward the return weighted by that step's likelihood ratio between the
+      updated and the collecting policy, so it estimates the value of the policy just
+      trained rather than of the one before it. Ratios outside `ratio_range` are left out.
+      Only the head moves in that phase: the memory it reads is the actor's.
+    - "joint": the usual PPO, a value term in the same loss, critic one update behind.
+
+    Both train the critic with binary cross-entropy on the scaled return (learning).
+    """
+    from .learning import (
+        GAE_LAMBDA,
+        critic_loss,
+        gae,
+        normalize_advantages,
+        ppo_loss,
+        save_checkpoint,
+    )
+
+    if critic not in {"pact", "joint"}:
+        raise ValueError("critic must be 'pact' or 'joint'")
+    gae_lambda = GAE_LAMBDA if gae_lambda is None else gae_lambda
     output = Path(output)
     if output.exists():
         raise FileExistsError("Checkpoints are immutable")
@@ -602,80 +674,72 @@ def train_ppo(
                 get("terminal"),
                 get("valid"),
                 get("elapsed"),
+                lam=gae_lambda,
             )
             episodes.append((files, normalize_advantages(advantages), returns.float()))
             speeds.append(speed)
     if not episodes:
         raise ValueError("No completed valid on-policy episodes; collection must precede PPO")
     game_speed = sorted(set(speeds))
-    losses = []
+    losses, critic_losses = [], []
+    kept = total = 0
     rng = np.random.default_rng(seed)
     early_stop = False
     for _ in range(epochs):
-        order = rng.permutation(len(episodes))
-        for index in order:
-            files, advantages, returns = episodes[int(index)]
-            starts = list(range(0, len(files), sequence))
-            rng.shuffle(starts)
-            for start in starts:
-                begin = max(0, start - burn_in)
-                end = min(start + sequence, len(files))
-                batch = replay_batch(files[begin:end], device)
-                hidden = batch["hidden"][0:1].float()
-                logps = []
-                values = []
-                entropies = []
-                optimizer.zero_grad(set_to_none=True)
-                for t in range(end - begin):
-                    burn = begin + t < start
-                    with (
-                        torch.set_grad_enabled(not burn),
-                        torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"),
-                    ):
-                        step = slice(t, t + 1)
-                        hidden, value, _, cells = policy(
-                            batch["clips"][step],
-                            batch["quadrants"][step],
-                            batch["fovea"][step],
-                            batch["previous"][step],
-                            batch["speed"][step],
-                            hidden,
-                        )
-                        if burn:
-                            hidden = hidden.detach()
-                        else:
-                            _, logp, entropy = policy.actor(
-                                hidden, cells, batch["action"][step], noise=batch["noise"][step]
-                            )
-                            logps.append(logp)
-                            values.append(value)
-                            entropies.append(entropy)
-                offset = start - begin
-                new_logp = torch.cat(logps)
-                old_logp = batch["old_logp"][offset:].float()
-                kl = approximate_kl(new_logp.detach(), old_logp)
-                if float(kl) > kl_limit:
-                    log.info("stopping PPO, approximate KL %.4f", float(kl))
-                    early_stop = True
-                    break
-                loss = ppo_loss(
-                    new_logp,
-                    old_logp,
-                    torch.cat(values),
-                    returns[start:end].to(device),
-                    advantages[start:end].to(device),
-                    torch.cat(entropies),
-                )
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("Nonfinite PPO objective")
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                optimizer.step()
-                losses.append(loss.item())
-            if early_stop:
+        for index, start, begin, end in _windows(episodes, sequence, burn_in, rng):
+            files, advantages, returns = episodes[index]
+            batch = replay_batch(files[begin:end], device)
+            optimizer.zero_grad(set_to_none=True)
+            _, values, new_logp, entropies = _replay(policy, batch, start - begin, device)
+            old_logp = batch["old_logp"][start - begin :].float()
+            kl = approximate_kl(new_logp.detach(), old_logp)
+            if float(kl) > kl_limit:
+                log.info("stopping PPO, approximate KL %.4f", float(kl))
+                early_stop = True
                 break
+            loss = ppo_loss(
+                new_logp,
+                old_logp,
+                values if critic == "joint" else None,
+                returns[start:end].to(device),
+                advantages[start:end].to(device),
+                entropies,
+            )
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite PPO objective")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            losses.append(loss.item())
         if early_stop:
             break
+    if critic == "pact":
+        head = torch.optim.AdamW(policy.value.parameters(), lr=1e-4)
+        for _ in range(critic_epochs):
+            for index, start, begin, end in _windows(episodes, sequence, burn_in, rng):
+                files, _, returns = episodes[index]
+                batch = replay_batch(files[begin:end], device)
+                with torch.no_grad():
+                    hiddens, _, new_logp, _ = _replay(
+                        policy, batch, start - begin, device, policy_grad=False
+                    )
+                # The current step's ratio only, detached: the whole continuation's
+                # product is exact but its variance grows with every step of a long match.
+                ratio = (new_logp.float() - batch["old_logp"][start - begin :].float()).exp()
+                inside = (ratio >= ratio_range[0]) & (ratio <= ratio_range[1])
+                kept += int(inside.sum())
+                total += len(ratio)
+                if not inside.any():
+                    continue
+                head.zero_grad(set_to_none=True)
+                logits = policy.value(hiddens.float()).squeeze(-1)
+                per_step = critic_loss(logits, returns[start:end].to(device), weight=ratio)
+                loss = (per_step * inside).sum() / inside.sum()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Nonfinite critic objective")
+                loss.backward()
+                head.step()
+                critic_losses.append(loss.item())
     save_checkpoint(
         output,
         policy,
@@ -691,6 +755,8 @@ def train_ppo(
             "sequence": sequence,
             "burn_in": burn_in,
             "kl_limit": kl_limit,
+            "gae_lambda": gae_lambda,
+            "critic": critic,
             "gameplay_verified": False,
         },
     )
@@ -698,6 +764,10 @@ def train_ppo(
         "episodes": len(episodes),
         "updates": len(losses),
         "mean_loss": float(np.mean(losses)) if losses else None,
+        "critic": critic,
+        "critic_updates": len(critic_losses),
+        "mean_critic_loss": float(np.mean(critic_losses)) if critic_losses else None,
+        "critic_ratio_kept": kept / total if total else None,
         "early_stop": early_stop,
         "seed": seed,
         "selection_requires_held_out_games": True,

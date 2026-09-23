@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -197,6 +198,115 @@ def train_bc(
                 provenance={"dataset": str(Path(data).resolve()), "gameplay_verified": False},
             )
     return config
+
+
+def train_critic(
+    data,
+    checkpoint,
+    output,
+    *,
+    model_path=None,
+    epochs=1,
+    batch_size=2,
+    sequence=8,
+    burn_in=2,
+    seed=42,
+    trunk=False,
+):
+    """Pre-train a policy's critic on recorded AI games, whose winners are known.
+
+    Each decision's target is the game's result from Blue's side, discounted by the time
+    left (session_labels' `outcome`), scored with the same binary cross-entropy PPO uses.
+    Self-play then starts with a critic that already tells a winning position from a
+    losing one, instead of learning that from its own first, poor games; PACT pre-trained
+    its critics the same way before comparing objectives. Only the value head trains
+    unless `trunk`, so a behaviour-cloned policy acts exactly as before.
+
+    Validation reports the loss, how often the predicted return has the winner's sign,
+    and the separation: the mean scaled prediction in games Blue won minus in games it
+    lost.
+    """
+    from .learning import critic_loss, save_checkpoint, scale_return, value_estimate
+    from .runner import load_policy
+
+    torch.manual_seed(seed)
+    output = Path(output)
+    if output.exists():
+        raise FileExistsError("Checkpoints are immutable")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    policy, config, digest = load_policy(checkpoint, model_path, device)
+    policy.train()
+    if not trunk:
+        policy.requires_grad_(False)
+        policy.value.requires_grad_(True)
+    params = [p for p in policy.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=1e-4)
+    common = {"length": sequence, "burn_in": burn_in, "sources": ("ai",), "seed": seed}
+    dataset = VideoSessions(data, device=device, **common)
+    try:
+        validation = VideoSessions(data, split="validation", device=device, **common)
+    except ValueError:
+        validation = []  # Few games may hash none into validation; the report says so.
+    autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
+    history = []
+    for epoch in range(epochs):
+        for batch in DataLoader(dataset, batch_size=batch_size):
+            batch = batch_to_device(batch, device)
+            target = batch["outcome"][:, burn_in:]
+            known = torch.isfinite(target)
+            if not known.any():
+                continue
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(**autocast):
+                _, values, _, _ = unroll(policy, batch, burn_in)
+            loss = critic_loss(values[known], target[known]).mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite critic objective")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            optimizer.step()
+            history.append(loss.item())
+    policy.eval()
+    losses, right, wins, losses_side = [], [], [], []
+    with torch.no_grad():
+        for batch in DataLoader(validation, batch_size=batch_size):
+            batch = batch_to_device(batch, device)
+            target = batch["outcome"][:, burn_in:]
+            known = torch.isfinite(target)
+            if not known.any():
+                continue
+            with torch.autocast(**autocast):
+                _, values, _, _ = unroll(policy, batch, burn_in, training=False)
+            values, target = values[known].float(), target[known].float()
+            losses.extend(critic_loss(values, target).tolist())
+            right.extend((value_estimate(values).sign() == target.sign()).float().tolist())
+            scaled = scale_return(value_estimate(values))
+            wins.extend(scaled[target > 0].tolist())
+            losses_side.extend(scaled[target < 0].tolist())
+    report = {
+        "train_steps": len(history),
+        "train_loss_first": history[0] if history else None,
+        "train_loss_last": history[-1] if history else None,
+        "validation_loss": float(np.mean(losses)) if losses else None,
+        "validation_sign_accuracy": float(np.mean(right)) if right else None,
+        "validation_separation": (
+            float(np.mean(wins) - np.mean(losses_side)) if wins and losses_side else None
+        ),
+        "trunk": trunk,
+    }
+    save_checkpoint(
+        output,
+        policy,
+        config,
+        optimizer=optimizer,
+        provenance={
+            "parent": digest,
+            "critic_pretraining": str(Path(data).resolve()),
+            **report,
+            "gameplay_verified": False,
+        },
+    )
+    return report
 
 
 def distill(data, model_path, output, epochs=1, seed=42, sources=("human", "ai")):

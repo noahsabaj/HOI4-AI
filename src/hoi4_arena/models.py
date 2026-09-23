@@ -349,8 +349,10 @@ class Policy(nn.Module):
     def forward(self, clip, quadrants, fovea, previous, speed, hidden=None, reset=None):
         """One decision. `speed` is the game speed, 1 to 5 (0 unknown), per sample.
 
-        Returns the new memory, the value, the summary token (for the auxiliary loss) and
-        the cells (for the action head).
+        Returns the new memory, the value logit, the summary token (for the auxiliary
+        loss) and the cells (for the action head). The value is a logit of the scaled
+        return: `learning.value_estimate` turns it into a return, and it is trained with
+        binary cross-entropy (`learning.critic_loss`).
         """
         if hidden is None:
             hidden = clip.new_zeros(clip.shape[0], self.memory_dim)
