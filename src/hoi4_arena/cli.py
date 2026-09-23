@@ -292,11 +292,16 @@ def main():
         "control",
         help="Launch, close or inspect HOI4 through the worker, here or on the second PC",
     )
-    control.add_argument("action", choices=["launch", "quit", "report", "restart-discord"])
+    control.add_argument("action", choices=["launch", "quit", "report", "saves", "restart-discord"])
     control.add_argument("--peer", help="The second PC's peer.json; this PC if omitted")
     control.add_argument("--mod", help="Arena mod folder name to launch, as deployed")
     control.add_argument(
         "--window", default="1920x1080", help="Client size of the windowed game to launch"
+    )
+    control.add_argument(
+        "--save",
+        help="Load this save game at launch, skipping the main menu: its name in the save "
+        "games folder, without .hoi4 (letters, digits and _). `control saves` lists them.",
     )
     job = sub.add_parser(
         "job",
@@ -482,7 +487,7 @@ def _report(problems):
         raise ValueError(f"{len(problems)} references the game cannot resolve")
 
 
-def control(action, peer=None, mod=None, window="1920x1080"):
+def control(action, peer=None, mod=None, window="1920x1080", save=None):
     """One control operation through a worker that is not attached to any game.
 
     On the second PC the worker finds its script and mods beside itself; here they are
@@ -499,7 +504,7 @@ def control(action, peer=None, mod=None, window="1920x1080"):
         else Desktop(worker_args=local_control_args(), attach=False)
     ) as desktop:
         if action == "launch":
-            return desktop.launch(mod, window=window)
+            return desktop.launch(mod, window=window, save=save)
         return getattr(desktop, action.replace("-", "_"))()
 
 

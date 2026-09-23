@@ -363,15 +363,27 @@ class Desktop:
             raise DesktopError(f"{op} exited {reply.get('exit')}: {output}")
         return output
 
-    def launch(self, mod: str, window: str | None = "1920x1080", timeout: float = 600) -> str:
+    def launch(
+        self,
+        mod: str,
+        window: str | None = "1920x1080",
+        timeout: float = 600,
+        save: str | None = None,
+    ) -> str:
         """Start HOI4 with the arena mod in that folder of the worker's mods directory.
 
         `mod` is a folder name, not a path. `window` is the client size of a windowed
-        game, or None for the player's own display mode. Refused if HOI4 is running. A
-        game that never logged far enough to load is not a failure here: the output says
-        "Timed out waiting for the game log", and the caller decides what to do.
+        game, or None for the player's own display mode. `save`, a save game's name
+        (letters, digits and _), loads it straight away, skipping the main menu: a match
+        can start mid-game. Refused if HOI4 is running. A game that never logged far
+        enough to load is not a failure here: the output says "Timed out waiting for the
+        game log", and the caller decides what to do.
         """
-        return self._control("launch", timeout, mod=mod, window=window)
+        return self._control("launch", timeout, mod=mod, window=window, save=save)
+
+    def saves(self, timeout: float = 60) -> str:
+        """The save games on the worker's PC, newest first, to choose a mid-game start from."""
+        return self._control("saves", timeout)
 
     def job(
         self,
