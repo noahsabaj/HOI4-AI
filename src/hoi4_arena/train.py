@@ -56,11 +56,14 @@ def unroll(policy, batch, burn_in=2, training=True, checkpoint=False):
     )
 
 
-def imitation_score(policy, memory, cells, actions, objective):
-    """Per-step log-likelihood of the demonstrated actions, flattened over time."""
+def imitation_score(policy, memory, cells, actions, objective, xm=None):
+    """Per-step log-likelihood of the demonstrated actions, flattened over time.
+
+    `xm` holds xm_loss's options (candidates, form) for the "xm" objective.
+    """
     memory, cells, actions = memory.flatten(0, 1), cells.flatten(0, 1), actions.flatten(0, 1)
     if objective == "xm":
-        return -xm_loss(policy.actor, memory, cells, actions)
+        return -xm_loss(policy.actor, memory, cells, actions, **(xm or {}))
     if objective == "bc":
         return policy.actor(memory, cells, actions)[1]
     raise ValueError(objective)
@@ -85,6 +88,9 @@ def train_bc(
     sparsity_shift=0.0,
     temporal_jaccard=0.0,
     projections=256,
+    xm_candidates=5,
+    xm_form="hard",
+    xm_latents=0,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -125,7 +131,8 @@ def train_bc(
         encoder.load_state_dict(
             torch.load(student, map_location="cpu", weights_only=True)["encoder"]
         )
-    policy = Policy(encoder).to(device)
+    policy = Policy(encoder, latents=xm_latents).to(device)
+    xm = {"candidates": xm_candidates, "form": xm_form}
     aux = PredictiveAuxiliary(
         feature_dim=encoder.dim,
         mode=auxiliary,
@@ -141,6 +148,9 @@ def train_bc(
         "sparsity_shift": sparsity_shift,
         "temporal_jaccard": temporal_jaccard,
         "projections": projections,
+        "xm_candidates": xm_latents or xm_candidates,
+        "xm_form": xm_form,
+        "xm_latents": xm_latents,
         "objective": objective,
         "seed": seed,
         "sequence": sequence,
@@ -163,7 +173,7 @@ def train_bc(
                         policy, batch, burn_in, checkpoint=recompute
                     )
                     actions = batch["actions"][:, burn_in:]
-                    bc = -imitation_score(policy, memory, cells, actions, objective).mean()
+                    bc = -imitation_score(policy, memory, cells, actions, objective, xm).mean()
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
                     loss = bc + 0.1 * predictive
                 if not torch.isfinite(loss):
@@ -188,26 +198,9 @@ def train_bc(
                     with torch.autocast(**autocast):
                         memory, _, _, cells = unroll(policy, batch, burn_in, training=False)
                         labels = batch["actions"][:, burn_in:]
-                        if objective == "xm":
-                            # The same best-of-K choice the training loss makes, not a
-                            # log-sum-exp of candidates the optimizer never saw.
-                            flat_memory, flat_cells = memory.flatten(0, 1), cells.flatten(0, 1)
-                            scores = torch.stack(
-                                [
-                                    policy.actor(
-                                        flat_memory,
-                                        flat_cells,
-                                        labels.flatten(0, 1),
-                                        noise=torch.randn(
-                                            len(flat_memory), policy.actor.noise_dim, device=device
-                                        ),
-                                    )[1]
-                                    for _ in range(5)
-                                ]
-                            )
-                            score = scores.max(0).values
-                        else:
-                            score = imitation_score(policy, memory, cells, labels, "bc")
+                        # For xm, the same choice among candidates the training loss
+                        # makes, not a score of candidates the optimizer never saw.
+                        score = imitation_score(policy, memory, cells, labels, objective, xm)
                         validation_losses.extend((-score).float().cpu().tolist())
             log.write(
                 json.dumps(

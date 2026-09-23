@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import re
 import threading
 from collections import deque
@@ -34,6 +35,7 @@ from hoi4_arena.models import (
     rdmreg,
     reprelu,
     temporal_jaccard,
+    xm_loss,
 )
 from hoi4_arena.recording import split_for_session
 from hoi4_arena.vision import ScreenRules, add_template
@@ -2139,3 +2141,31 @@ def test_control_cli_needs_a_mod_to_launch():
 
     with pytest.raises(ValueError, match="--mod"):
         control("launch")
+
+
+def test_xm_smooth_is_the_mixture_likelihood_and_hard_its_best_candidate():
+    torch.manual_seed(0)
+    actor = ActionHead(memory_dim=16, cell_dim=8, latents=3)
+    memory, cells = torch.randn(4, 16), torch.randn(4, GRID, 8)
+    actions = torch.zeros(4, SLOTS, 3, dtype=torch.long)
+    logps = torch.stack(
+        [actor(memory, cells, actions, noise=z.expand(4, -1))[1] for z in actor.latents]
+    )
+    smooth = xm_loss(actor, memory, cells, actions, form="smooth")
+    torch.testing.assert_close(smooth, -(logps.logsumexp(0) - math.log(3)))
+    hard = xm_loss(actor, memory, cells, actions)
+    torch.testing.assert_close(hard, -logps.max(0).values)
+    # The smooth form trains every latent; the hard one only the winners.
+    smooth.sum().backward()
+    assert (actor.latents.grad.abs().sum(-1) > 0).all()
+    assert hard.le(smooth).all() and (smooth - hard).max() <= math.log(3) + 1e-5
+
+
+def test_act_noise_draws_among_learned_latents_and_pins_the_first():
+    from hoi4_arena.runner import act_noise
+
+    latents = torch.arange(6.0).view(3, 2)
+    assert torch.equal(act_noise("xm", 2, True, "cpu", latents), latents[:1])
+    draws = {tuple(act_noise("xm", 2, False, "cpu", latents)[0].tolist()) for _ in range(40)}
+    assert draws == {tuple(row.tolist()) for row in latents}
+    assert torch.equal(act_noise("bc", 2, False, "cpu", latents), torch.zeros(1, 2))

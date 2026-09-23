@@ -236,9 +236,12 @@ class ActionHead(nn.Module):
     Categorical's exactly, and a test pins it bit-for-bit.
     """
 
-    def __init__(self, memory_dim=512, noise_dim=16, cell_dim=CELL_DIM):
+    def __init__(self, memory_dim=512, noise_dim=16, cell_dim=CELL_DIM, latents=0):
         super().__init__()
         self.noise_dim = noise_dim
+        # Learned latents for XM to choose among, in place of Gaussian noise (xm_loss).
+        if latents:
+            self.latents = nn.Parameter(torch.randn(latents, noise_dim))
         self.init = nn.Linear(memory_dim + noise_dim, 256)
         self.embedding = nn.Embedding(len(VOCAB), 64)
         self.xy = nn.Linear(2, 64)
@@ -325,7 +328,7 @@ class Policy(nn.Module):
     surroundings through the fovea, and one place of its own choosing through attention.
     """
 
-    def __init__(self, encoder, memory_dim=512):
+    def __init__(self, encoder, memory_dim=512, latents=0):
         super().__init__()
         self.encoder = encoder
         self.details = DetailEncoder()
@@ -339,7 +342,7 @@ class Policy(nn.Module):
         # Summary token, mean cell, fovea, attention readout, previous action, speed.
         self.fusion = nn.Linear(encoder.dim + 3 * CELL_DIM + 64 + 32, memory_dim)
         self.memory = nn.GRUCell(memory_dim, memory_dim)
-        self.actor = ActionHead(memory_dim)
+        self.actor = ActionHead(memory_dim, latents=latents)
         self.value = nn.Linear(memory_dim, 1)
         self.memory_dim = memory_dim
 
@@ -627,17 +630,41 @@ class PredictiveAuxiliary(nn.Module):
         return loss
 
 
-def xm_loss(actor, memories, cells, actions, candidates=5):
-    """XM-inspired best-of-K conditional BC, not a reproduction of continuous XM.
+def xm_loss(actor, memories, cells, actions, candidates=5, form="hard"):
+    """Explorative Modeling for the action head (Gladstone, Ji and Du, 2026, arXiv 2607.27372).
 
-    Select candidate noise without a graph, re-evaluate its exact categorical likelihood.
-    At RL time retain sampled noise in the rollout; fixed prior cancels in PPO ratios.
+    Forward XM: explore K latents, train on the one whose actions best match the
+    demonstration. The head's start state is conditioned on the latent, so different
+    latents can specialise to different ways of acting from one state instead of
+    averaging them. The latents are Gaussian draws, or, when the head has learned
+    `latents`, each of those (as the paper's discrete XMDLM does), and then K is their
+    number. `form`:
+
+    - "hard", the paper's min over candidates: the best is chosen without a graph and
+      re-evaluated with one, the paper's memory-saving mode.
+    - "smooth", -log mean_k p(a | z_k): every candidate gets gradients, and it is exactly
+      maximum likelihood of the K-candidate mixture; it differs from "hard" by at most
+      log K.
+
+    Returns the per-sample loss. The paper found autoregressive models, like this head,
+    the hardest to improve: they are less limited by expressivity. It recommends
+    sweeping K over 1, 2, 3, 5, then 8 and 12.
     """
-    noises = torch.randn(
-        candidates, memories.shape[0], actor.noise_dim, device=memories.device, dtype=memories.dtype
-    )
+    b = memories.shape[0]
+    rows = torch.arange(b, device=memories.device)
+    latents = getattr(actor, "latents", None)
+    if latents is not None:
+        noises = latents.to(memories.dtype)[:, None].expand(-1, b, -1)
+    else:
+        noises = torch.randn(
+            candidates, b, actor.noise_dim, device=memories.device, dtype=memories.dtype
+        )
+    if form == "smooth":
+        logps = torch.stack([actor(memories, cells, actions, noise=z)[1] for z in noises])
+        return -(logps.logsumexp(0) - math.log(len(noises)))
+    if form != "hard":
+        raise ValueError(form)
     with torch.no_grad():
         losses = torch.stack([-actor(memories, cells, actions, noise=z)[1] for z in noises])
         best = losses.argmin(0)
-    selected = noises[best, torch.arange(memories.shape[0], device=memories.device)]
-    return -actor(memories, cells, actions, noise=selected)[1]
+    return -actor(memories, cells, actions, noise=noises[best, rows])[1]
