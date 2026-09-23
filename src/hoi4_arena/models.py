@@ -408,27 +408,84 @@ def fuse(module, summary, cells, centre, previous, speed, hidden, dtype=None):
     return F.gelu(module.fusion(merged))
 
 
+def sinusoid(steps, dim, device=None):
+    """The fixed sine and cosine positions (Vaswani et al., 2017, arXiv 1706.03762)."""
+    position = torch.arange(steps, device=device, dtype=torch.float32)[:, None]
+    rate = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(10000.0) / dim)
+    )
+    table = torch.zeros(steps, dim, device=device)
+    table[:, 0::2] = torch.sin(position * rate)
+    table[:, 1::2] = torch.cos(position * rate[: dim // 2])
+    return table
+
+
+class WindowAttention(nn.Module):
+    """Full two-way attention over a window of decisions, in place of the two-way GRU.
+
+    The inverse dynamics model is non-causal and local: each label may use every decision
+    in its window, before and after, and a window is 16 to 64 decisions, where full
+    attention costs nothing next to reading the frames. VPT's IDM put a non-causal
+    transformer over its window (Baker et al., 2022, arXiv 2206.11795), and D2E's
+    Generalist-IDM (arXiv 2510.05684) likewise conditions each action on the context
+    before and after it. A recurrence has to carry a neighbour's evidence through every
+    step between; attention reads it directly.
+
+    Pre-norm layers, 8 heads at the memory's width, dropout 0.1. Positions are the fixed
+    sinusoids, not a learned table, so any window length is covered (`--sequence` 16, 32
+    or 64) and nothing in the checkpoint depends on the length it was trained at.
+    """
+
+    def __init__(self, dim=512, layers=2, heads=8, dropout=0.1):
+        super().__init__()
+        layer = nn.TransformerEncoderLayer(
+            dim,
+            heads,
+            4 * dim,
+            dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.layers = nn.TransformerEncoder(
+            layer, layers, norm=nn.LayerNorm(dim), enable_nested_tensor=False
+        )
+
+    def forward(self, x):
+        """(B, T, dim) in, (B, T, dim) out; no mask, so every step sees every other."""
+        steps, dim = x.shape[1:]
+        return self.layers(x + sinusoid(steps, dim, x.device).to(x.dtype))
+
+
 class InverseDynamics(nn.Module):
     """Labels the inputs behind a stretch of video, seeing what came after each decision.
 
     The policy has to act on the past alone. The inverse dynamics model does not: it is
     shown each decision's clip shifted into the future, so the last frames already show
     what the input did, and the views of the frame one interval later, where a moved
-    pointer has arrived. A two-way recurrence then runs over the window, so each decision
-    also knows its neighbours. That makes it a much easier problem than acting, and the
-    point: trained on recordings whose inputs are known, it labels video whose inputs are
-    not (Baker et al., 2022, Video PreTraining), and the labelled video trains the policy.
+    pointer has arrived. A two-way `context` then runs over the window, so each decision
+    also knows its neighbours: a two-way GRU ("gru", the first model's) or full attention
+    ("transformer", WindowAttention, with `layers` layers). That makes it a much easier
+    problem than acting, and the point: trained on recordings whose inputs are known, it
+    labels video whose inputs are not (Baker et al., 2022, Video PreTraining), and the
+    labelled video trains the policy.
 
     It reuses the policy's reader and action head, so its labels are in the same lattice,
     and its cells come from the later frame, where the pointer ends up.
     """
 
-    def __init__(self, encoder, memory_dim=512):
+    def __init__(self, encoder, memory_dim=512, context="gru", layers=2):
         super().__init__()
         self.trunk = Policy(encoder, memory_dim)
-        # The trunk's own recurrence and value are not used; the two-way recurrence is.
+        # The trunk's own recurrence and value are not used; the two-way context is.
         self.trunk.memory = self.trunk.value = None
-        self.context = nn.GRU(memory_dim, memory_dim // 2, batch_first=True, bidirectional=True)
+        if context == "gru":
+            self.context = nn.GRU(memory_dim, memory_dim // 2, batch_first=True, bidirectional=True)
+        elif context == "transformer":
+            self.context = WindowAttention(memory_dim, layers)
+        else:
+            raise ValueError(context)
+        self.context_kind = context
         self.memory_dim = memory_dim
 
     @property
@@ -457,7 +514,11 @@ class InverseDynamics(nn.Module):
                 seen, _, cell = self.trunk.observe(*inputs)
             merged.append(seen)
             cells.append(cell)
-        context, _ = self.context(torch.stack(merged, 1))
+        merged = torch.stack(merged, 1)
+        if self.context_kind == "gru":
+            context, _ = self.context(merged)
+        else:
+            context = self.context(merged)
         return context, torch.stack(cells, 1)
 
 

@@ -152,6 +152,19 @@ def main():
         help="Learn this many latents to explore instead of drawing Gaussian noise "
         "(the paper's discrete XM); 0 keeps the noise.",
     )
+    train.add_argument(
+        "--idm-min-logp",
+        type=float,
+        help="Drop inverse-dynamics labels whose log-likelihood (summed over the slots, 0 "
+        "is certain) is below this; a window holding one is not trained on.",
+    )
+    train.add_argument(
+        "--idm-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight of an inverse-dynamics label against a recorded one, in (0, 1]: "
+        "inferred labels are noisier, and hurt precise control most (D2E, 2510.05684).",
+    )
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--sequence", type=int, default=8)
     train.add_argument("--burn-in", type=int, default=2)
@@ -175,7 +188,23 @@ def main():
     idm.add_argument("--variant", choices=["large", "tiny", "screen"], default="large")
     idm.add_argument("--epochs", type=int, default=1)
     idm.add_argument("--batch-size", type=int, default=2)
-    idm.add_argument("--sequence", type=int, default=16)
+    idm.add_argument(
+        "--sequence",
+        type=int,
+        default=16,
+        help="Decisions per window: 16, 32 or 64. At speed 5 an input's effect can show "
+        "late, so a longer window lets a label read it from its neighbours' frames.",
+    )
+    idm.add_argument(
+        "--context",
+        choices=["gru", "transformer"],
+        default="gru",
+        help="What runs over the window: a two-way GRU, or full two-way attention (as "
+        "VPT's IDM, 2206.11795).",
+    )
+    idm.add_argument(
+        "--context-layers", type=int, default=2, help="Layers of the transformer context."
+    )
     idm.add_argument("--seed", type=int, default=42)
     idm.add_argument(
         "--no-checkpoint",

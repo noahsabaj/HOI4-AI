@@ -495,7 +495,9 @@ In order:
    The rule for switching is written down before the runs.
 4. **Upgrade the inverse dynamics model**: a two-way transformer over 32–64 decisions
    in place of the two-way GRU, compared with Generalist-IDM-1B fine-tuned on the same
-   recordings, and its labels weighted by confidence. Then measure whether labelled
+   recordings, and its labels weighted by confidence. The options are in place, not yet
+   run: `train-idm --context transformer` with `--sequence` 16, 32 or 64, and
+   `train-bc --idm-min-logp` and `--idm-weight`. Then measure whether labelled
    video (`label`, `--sources idm`) improves the arena policy at all, since the AI
    games already give clean labels without limit.
 5. **Offline reinforcement learning** on the recordings: pre-train the critic on the

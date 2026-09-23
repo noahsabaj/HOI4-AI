@@ -75,7 +75,18 @@ def train_idm(
     seed=42,
     sources=LABELLED,
     recompute=True,
+    context="gru",
+    context_layers=2,
 ):
+    """Train the inverse dynamics model on recordings whose inputs are known.
+
+    `context` is what runs over the window: "gru", the two-way GRU, or "transformer",
+    full two-way attention (models.WindowAttention) with `context_layers` layers.
+    `sequence` is the window, in decisions: 16 (3.2 s), 32 or 64. A longer one lets a
+    label read further from its decision. That matters at speed 5, where the simulation
+    does not sleep and the screen can answer an input late, after the 0.8 s the shifted
+    clip covers; a neighbour's frames may then be where its effect shows.
+    """
     torch.manual_seed(seed)
     output = Path(output)
     if (output / "epoch-0000.pt").exists():
@@ -92,7 +103,9 @@ def train_idm(
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
-    model = InverseDynamics(build_encoder(model_path, variant)).to(device)
+    model = InverseDynamics(
+        build_encoder(model_path, variant), context=context, layers=context_layers
+    ).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=1e-4)
     config = {
@@ -100,6 +113,8 @@ def train_idm(
         "variant": variant,
         "seed": seed,
         "sequence": sequence,
+        "context": context,
+        "context_layers": context_layers,
         "clip_shift": CLIP_SHIFT,
         "detail_shift": DETAIL_SHIFT,
         "model_path": str(Path(model_path).resolve()),
@@ -167,20 +182,26 @@ def load_idm(checkpoint, model_path=None, device="cuda"):
     if config.get("kind") != "idm":
         raise ValueError("Not an inverse dynamics checkpoint")
     encoder = build_encoder(model_path or config["model_path"], config["variant"])
-    model = InverseDynamics(encoder)
+    # A checkpoint from before the option has no "context": it is the two-way GRU.
+    model = InverseDynamics(
+        encoder, context=config.get("context", "gru"), layers=config.get("context_layers", 2)
+    )
     model.load_state_dict(saved["policy"])
     return model.to(device).eval(), config, metadata["sha256"]
 
 
-def label_recording(checkpoint, recording, *, model_path=None, window=16, device=None):
+def label_recording(checkpoint, recording, *, model_path=None, window=None, device=None):
     """Write the model's inputs for every decision of `recording` to labels-idm.npz.
 
     Each label is the most likely input, slot by slot, with its log-likelihood kept as a
-    confidence. Decisions the model could not see the frames after are marked invalid.
+    confidence (`train-bc --idm-min-logp` and `--idm-weight` use it). Decisions the model
+    could not see the frames after are marked invalid. The window defaults to the one the
+    model trained on, so a label sees as far around it as the model learned to.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     recording = Path(recording)
     model, config, digest = load_idm(checkpoint, model_path, device)
+    window = window or config.get("sequence", 16)
     manifest = json.loads((recording / "manifest.json").read_text())
     labels = session_labels(
         recording,
