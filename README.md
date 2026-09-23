@@ -83,6 +83,18 @@ Each training step reads its whole window's frames before running the memory ove
 
 What the policy sees of each decision: the last eight global views (448x256, the video encoder's clip), the four screen quadrants at 576x320 (so 10 px text survives at about 6 px), and a 224 px native fovea centred on the pointer. The first two are 16:9, like the screen; view sizes are (height, width) in Python and [width, height] on the worker's wire. It places the pointer by picking one of 32x32 screen cells, scored against what each cell shows, then a position inside it. `views` resizes with an exact area average in float32, and the worker does the same in Rust, bit for bit.
 
+Where the policy wants to point is a heat map: hot on what it wants to click, cold everywhere else. `heatmap` draws it over a recording's frames, with the demonstrated move marked, and reports how far the hottest point lies from the demonstrated one and how often that point falls in the hottest 1% of the screen. Two training options follow GUI-Actor (arXiv 2506.03143), which points with an attention map over the screen instead of writing coordinates:
+
+- `--pointer-sigma S` scores each demonstrated move against a Gaussian blob S lattice units wide (1 unit is about 1.9 px across and 1.1 px down at 1920x1080), over the cells it covers and the positions inside each, instead of its one exact point. A click anywhere on a button is right, so one 3 px off should not be scored as wrong as one across the screen.
+- `--look-before-click` lets the policy press a button only where its pointer already was when the decision began, so it clicks only what its fovea has seen. Decisions that press after a move are left out of training. The recorders now wait 0.25 to 0.45 s between moving onto something and pressing it, so their games follow the rule.
+
+Both are off by default until measured against exact targets.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe heatmap artifacts/bc/epoch-0000.pt data/raw/session-001 artifacts/heatmaps --count 24
+.venv\Scripts\hoi4-arena.exe train-bc data/raw artifacts/bc-soft --pointer-sigma 4 --look-before-click
+```
+
 Other demonstrations:
 
 - `--sources ai` also trains on the AI games' scripted camera and popup clicks, which `record-ai` stores with each game.

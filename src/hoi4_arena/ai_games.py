@@ -65,6 +65,10 @@ CENTRED = 0.03
 # Camera zoom in mouse-wheel notches in from fully out, measured at 1080p (see camera).
 # Unit counters show from 9; past 22 the map is terrain; 26 is the closest.
 VIEW_NEAR, VIEW_FAR, ZOOM_TERRAIN, ZOOM_MAX = 9, 20, 22, 26
+# Seconds between moving onto something and pressing it: longer than one 200 ms decision,
+# so a recorded click is always pressed where the pointer already was, as a player sees
+# the button light up before clicking it.
+LOOK = (0.25, 0.45)
 
 
 def say(station, *parts):
@@ -474,7 +478,11 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
         at = popups.due()
         if at:
             press = [{"kind": "button", "button": 0, "down": d} for d in (True, False)]
-            do([{"kind": "move", "x": at[0], "y": at[1]}, *press])
+            do([{"kind": "move", "x": at[0], "y": at[1]}])
+            # Look, then click: the press comes a decision or more after the move, so the
+            # fovea has seen the button first (models.ActionHead `look`).
+            stop.wait(rng.uniform(*LOOK))
+            do(press)
 
     def wheel(notches, at):
         nonlocal zoom

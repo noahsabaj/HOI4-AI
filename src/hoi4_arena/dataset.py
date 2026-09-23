@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from .actions import PERIOD, SLOTS, encode_interval
+from .actions import PERIOD, SLOTS, VOCAB, encode_interval
 from .learning import GAMMA
 
 # How many past global views one decision looks at. Eight frames is what fits the
@@ -231,6 +231,18 @@ def batch_to_device(batch, device, clips=True):
     return out
 
 
+PRESS_KINDS = [i for i, e in enumerate(VOCAB) if e and e["kind"] == "button" and e["down"]]
+
+
+def presses_after_move(actions):
+    """Per decision, whether a button is pressed in a slot after a move."""
+    kinds = actions[..., 0]
+    moved = np.cumsum(kinds == 1, axis=-1) > 0
+    # A slot's press counts only if a move came in an earlier slot.
+    before = np.concatenate([np.zeros_like(moved[..., :1]), moved[..., :-1]], axis=-1)
+    return (np.isin(kinds, PRESS_KINDS) & before).any(-1)
+
+
 def session_labels(
     source,
     *,
@@ -240,6 +252,7 @@ def session_labels(
     idm_min_logp=None,
     idm_weight=1.0,
     advantage=False,
+    look_before_click=False,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -306,6 +319,12 @@ def session_labels(
         except ValueError as error:
             valid[i] = False
             excluded.append({"decision": i, "reason": str(error)})
+    if look_before_click:
+        # A policy that looks before it clicks (models.ActionHead `look`) cannot press
+        # after a move in the same decision, so such a decision cannot be its label.
+        for i in np.flatnonzero(valid & presses_after_move(actions)):
+            valid[i] = False
+            excluded.append({"decision": int(i), "reason": "press after a move"})
     label_source = manifest["source"]
     weight = np.ones(len(decisions), dtype=np.float32)
     if inferred:
@@ -539,6 +558,7 @@ class VideoSessions(IterableDataset):
         idm_weight=1.0,
         clips=True,
         advantage=False,
+        look_before_click=False,
     ):
         self.length, self.burn_in, self.clips = length, burn_in, clips
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
@@ -560,6 +580,7 @@ class VideoSessions(IterableDataset):
                     idm_min_logp=idm_min_logp,
                     idm_weight=idm_weight,
                     advantage=advantage,
+                    look_before_click=look_before_click,
                 )
             )
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)

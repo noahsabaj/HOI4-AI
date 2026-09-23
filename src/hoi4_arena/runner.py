@@ -84,7 +84,11 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     config = saved["config"]
     encoder = build_encoder(model_path or config["model_path"], config["variant"])
-    policy = Policy(encoder, latents=config.get("xm_latents", 0))
+    policy = Policy(
+        encoder,
+        latents=config.get("xm_latents", 0),
+        look=config.get("look_before_click", False),
+    )
     policy.load_state_dict(saved["policy"])
     # Both collection and PPO come through here, so the frozen weights are halved in
     # both and the likelihood stays the same function on either side of a rollout.
