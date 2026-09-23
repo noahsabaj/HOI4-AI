@@ -75,6 +75,15 @@ def main():
     ai.add_argument("--hz", type=float, default=5)
     ai.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
     ai.add_argument("--cap-minutes", type=float, default=45)
+    ai.add_argument(
+        "--speeds",
+        type=int,
+        nargs="+",
+        choices=[4, 5],
+        default=[4, 5],
+        help="Game speeds taken in turn, each for both countries. Speed 5 finishes more "
+        "games an hour; speed 4 looks like normal play.",
+    )
     ai.add_argument("--peer", help="The second PC's pairing file, to record there too.")
     ai.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
     check = sub.add_parser(

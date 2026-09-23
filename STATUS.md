@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 164 Python tests and 24 Rust tests (2 need a live desktop and are
+Automated checks: 165 Python tests and 24 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -344,6 +344,10 @@ updates by itself, but only between connections, never mid-match. See the README
   `players`, so the next games show which of the two decides it.
 - The pause mark blinks, so the start check looks for it over 10 s rather than in one
   frame.
+- **Games alternate between speed 4 and 5** (`--speeds`), each speed played as both
+  countries in turn. Frames come at 5 a second either way, so speed 5 adds games an hour,
+  not frames: more winners for the win predictor, in footage that runs faster than normal
+  play and at a rate the CPU sets. Each manifest records its speed.
 
 ## Open work
 

@@ -1,7 +1,7 @@
 """Record AI-vs-AI games on an arena map, one after another, until a time budget runs out.
 
 Each game launches HOI4 with the arena, starts as Blue or Red in turn, hands both countries to
-the AI with the `observe` console command, sets speed 4, and records native frames while the
+the AI with the `observe` console command, sets speed 4 or 5, and records native frames while the
 camera watches the front, zooms in and out and clears popups the way a player would. The arena mod reports itself in the game's
 log, so a game ends when the log names a surrender and its winner, or at the cap, and a
 game whose weekly report stops has a stuck clock.
@@ -305,8 +305,8 @@ def pick_country(desk, country):
     return True
 
 
-def start_game(desk, rules, failure_shot, country="BLU"):
-    """From the main menu to an AI-vs-AI game running at speed 4, started as `country`.
+def start_game(desk, rules, failure_shot, country="BLU", speed=4):
+    """From the main menu to an AI-vs-AI game running at `speed` (4 or 5), as `country`.
 
     Which country the game starts as is varied because only one side ever won while the
     recorder always started as Blue; the arena logs the country each human started as.
@@ -347,6 +347,9 @@ def start_game(desk, rules, failure_shot, country="BLU"):
     if not rules.matches("speed", rgb) or rules.matches("paused", rgb):
         Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
         raise RuntimeError("game is not running at speed 4")
+    if speed == 5:
+        # Checked at 4, where the rule was calibrated, then one more.
+        click(desk, *SPEED_UP)
 
 
 def front_points(rgb):
@@ -493,14 +496,14 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None):
             pass
 
 
-def play(desk, root, popups, settings, station, country="BLU"):
+def play(desk, root, popups, settings, station, country="BLU", speed=4):
     stop = threading.Event()
     inputs = Logged(desk)
     mover = threading.Thread(target=camera, args=(inputs, stop, station, popups), daemon=True)
     outcome, reason = "timeout", None
     first = desk.capture()
     hz = settings["hz"]
-    rec = Recorder(root, first, game_speed=4, source="ai", hz=hz, codec=settings["codec"])
+    rec = Recorder(root, first, game_speed=speed, source="ai", hz=hz, codec=settings["codec"])
     arena = ArenaLog(desk, silence=WEEK_SILENCE)
     start = deadline = next_poll = time.monotonic()
     late, ending = 0, None
@@ -559,16 +562,24 @@ def play(desk, root, popups, settings, station, country="BLU"):
     return outcome, reason, rec.manifest
 
 
+def game_plan(station, index, speeds):
+    """The country and speed of a station's `index`-th game.
+
+    The country alternates, the two PCs out of step so both sides are covered at once, and
+    each speed is played as both countries in turn, so side and speed are not confounded.
+    """
+    countries = ("BLU", "RED") if station == "here" else ("RED", "BLU")
+    return countries[index % 2], speeds[index // 2 % len(speeds)]
+
+
 def run_station(station, out_root, rules, templates, settings, end):
     results = []
-    # Alternate the starting country, the two PCs out of step so both are covered at once.
-    countries = ("BLU", "RED") if station.name == "here" else ("RED", "BLU")
     # A game needs about 3 minutes to launch and most end within 10; do not start one
     # that cannot plausibly finish.
     while time.monotonic() + 12 * 60 < end:
         name = time.strftime(f"ai-{station.name}-%Y%m%d-%H%M%S")
-        country = countries[len(results) % 2]
-        entry = {"game": name, "station": station.name, "started_as": country}
+        country, speed = game_plan(station.name, len(results), settings["speeds"])
+        entry = {"game": name, "station": station.name, "started_as": country, "speed": speed}
         try:
             station.quit()
             station.launch(settings["mod"])
@@ -576,10 +587,16 @@ def run_station(station, out_root, rules, templates, settings, end):
             with station.connect() as desk:
                 if not focus(desk):
                     raise RuntimeError("could not bring the game window to the front")
-                start_game(desk, rules, out_root / f"{name}-start-failed.png", country)
-                say(station.name, "recording", name, "as", country)
+                start_game(desk, rules, out_root / f"{name}-start-failed.png", country, speed)
+                say(station.name, "recording", name, "as", country, "at speed", speed)
                 outcome, reason, manifest = play(
-                    desk, out_root / name, Popups(templates), settings, station.name, country
+                    desk,
+                    out_root / name,
+                    Popups(templates),
+                    settings,
+                    station.name,
+                    country,
+                    speed,
                 )
         except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
             say(station.name, "start failed:", error)
@@ -627,6 +644,7 @@ def record_ai_games(
     hz=5,
     codec="x264",
     cap_minutes=45,
+    speeds=(4, 5),
     peer=None,
     peer_only=False,
 ):
@@ -635,7 +653,15 @@ def record_ai_games(
     out_root.mkdir(parents=True, exist_ok=True)
     screen_rules = ScreenRules(rules)
     templates = [np.asarray(Image.open(path).convert("RGB")) for path in ok_button]
-    settings = {"mod": mod, "hz": hz, "codec": codec, "cap_minutes": cap_minutes}
+    if not speeds or any(speed not in (4, 5) for speed in speeds):
+        raise ValueError("speeds are 4 or 5")
+    settings = {
+        "mod": mod,
+        "hz": hz,
+        "codec": codec,
+        "cap_minutes": cap_minutes,
+        "speeds": list(speeds),
+    }
     stations = [] if peer_only else [Station("here")]
     if peer:
         deploy = pwsh(
