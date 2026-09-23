@@ -84,7 +84,7 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     config = saved["config"]
     encoder = build_encoder(model_path or config["model_path"], config["variant"])
-    policy = Policy(encoder)
+    policy = Policy(encoder, latents=config.get("xm_latents", 0))
     policy.load_state_dict(saved["policy"])
     # Both collection and PPO come through here, so the frozen weights are halved in
     # both and the likelihood stays the same function on either side of a rollout.
@@ -94,15 +94,22 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
     return halve_frozen(policy).to(device), config, metadata["sha256"]
 
 
-def act_noise(objective, width, deterministic, device):
+def act_noise(objective, width, deterministic, device, latents=None):
     """The latent an actor conditions on for one decision.
 
     ActionHead conditions its entire start state on this vector, so an xm checkpoint that
     keeps drawing a fresh latent stays stochastic no matter what the categorical heads do.
     A deterministic actor must therefore pin the latent to the prior mean as well; taking
     the argmax alone would leave exactly the sampling variance the flag exists to remove.
+    With learned `latents` the prior is uniform over them: a draw picks one, and a
+    deterministic actor always takes the first, since their mean is none of them.
     """
-    if deterministic or objective != "xm":
+    if objective != "xm":
+        return torch.zeros(1, width, device=device)
+    if latents is not None:
+        pick = 0 if deterministic else int(torch.randint(len(latents), ()))
+        return latents[pick : pick + 1].detach().float().to(device)
+    if deterministic:
         return torch.zeros(1, width, device=device)
     return torch.randn(1, width, device=device)
 
@@ -246,6 +253,7 @@ class Actor:
                 self.policy.actor.noise_dim,
                 self.deterministic,
                 device,
+                getattr(self.policy.actor, "latents", None),
             )
             action, logp, entropy = self.policy.actor(
                 self.hidden, cells, noise=noise, deterministic=self.deterministic

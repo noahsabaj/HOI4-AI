@@ -126,6 +126,27 @@ def main():
         "--projections", type=int, default=256, help="RDMReg's random projections (LpWM: 1024+)."
     )
     train.add_argument("--objective", choices=["bc", "xm"], default="bc")
+    train.add_argument(
+        "--xm-candidates",
+        type=int,
+        default=5,
+        help="Latents explored per decision for --objective xm (the paper sweeps 1, 2, 3, "
+        "5, 8, 12).",
+    )
+    train.add_argument(
+        "--xm-form",
+        choices=["hard", "smooth"],
+        default="hard",
+        help="hard trains the best candidate only; smooth, -log of the candidates' mean "
+        "likelihood, trains them all.",
+    )
+    train.add_argument(
+        "--xm-latents",
+        type=int,
+        default=0,
+        help="Learn this many latents to explore instead of drawing Gaussian noise "
+        "(the paper's discrete XM); 0 keeps the noise.",
+    )
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--sequence", type=int, default=8)
     train.add_argument("--burn-in", type=int, default=2)
