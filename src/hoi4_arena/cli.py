@@ -91,6 +91,19 @@ def main():
     )
     ai.add_argument("--peer", help="The second PC's pairing file, to record there too.")
     ai.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
+    ai.add_argument(
+        "--player",
+        choices=["observe", "scripted"],
+        default="observe",
+        help="observe: the game's AI plays both countries. scripted: the scripted player "
+        "fights the recorder's country through the interface, with a random strategy each "
+        "game, against the AI (needs an arena v3 or later for its daily state reports).",
+    )
+    rate = sub.add_parser(
+        "win-rate",
+        help="The scripted player's record against the game's AI, from record-ai results",
+    )
+    rate.add_argument("results", nargs="+", help="results-*.json files written by record-ai")
     check = sub.add_parser(
         "check-session",
         help="Check that a recording can train, and count its decisions. Training reads "
@@ -103,7 +116,7 @@ def main():
     train.add_argument(
         "--sources",
         nargs="+",
-        choices=["human", "ai", "idm"],
+        choices=["human", "ai", "scripted", "idm"],
         default=["human"],
         help="Whose inputs are demonstrations: the player's, the AI games' scripted "
         "camera and popup clicks, and inputs the inverse dynamics model labelled.",
@@ -215,12 +228,29 @@ def main():
         "critic and write how much each input improved the position, for train-bc "
         "--advantage (offline.py)",
     )
-    weigh.add_argument("checkpoint", help="A policy whose critic was trained (train-critic)")
+    weigh.add_argument(
+        "checkpoint",
+        nargs="?",
+        help="A policy whose critic was trained (train-critic); not needed with --state-value",
+    )
     weigh.add_argument("recording")
     weigh.add_argument("--model")
     weigh.add_argument("--n-step", type=int, default=25, help="Decisions looked ahead (5 s)")
     weigh.add_argument("--beta", type=float, default=0.05, help="Weight temperature")
     weigh.add_argument("--max-weight", type=float, default=20.0)
+    weigh.add_argument(
+        "--state-value",
+        help="A win predictor over the arena's logged state (train-state-value), used "
+        "instead of the checkpoint's screen critic",
+    )
+    fit = sub.add_parser(
+        "train-state-value",
+        help="Fit a win predictor on the arena's daily state reports (v3 arenas), for "
+        "advantage --state-value; CPU, seconds",
+    )
+    fit.add_argument("output", help="Where to write the model, e.g. artifacts/state-value.pt")
+    fit.add_argument("recordings", nargs="+", help="Recorded games; others are skipped")
+    fit.add_argument("--epochs", type=int, default=300)
     idm = sub.add_parser(
         "train-idm",
         help="Train the inverse dynamics model: inputs inferred from video, trained on "
@@ -269,7 +299,9 @@ def main():
         help="Keep perception's trainable activations instead of recomputing them: faster, but a "
         "batch of 2 no longer fits 8 GB.",
     )
-    idm.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["human", "ai"])
+    idm.add_argument(
+        "--sources", nargs="+", choices=["human", "ai", "scripted"], default=["human", "ai"]
+    )
     idm.add_argument(
         "--workers",
         type=int,
@@ -293,7 +325,7 @@ def main():
     cache.add_argument("checkpoint")
     cache.add_argument("output")
     cache.add_argument("--model")
-    cache.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["ai"])
+    cache.add_argument("--sources", nargs="+", choices=["human", "ai", "scripted"], default=["ai"])
     memory = sub.add_parser(
         "train-memory",
         help="Train the memory and action head on cached features, and score it on "
@@ -592,6 +624,11 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
+    elif command == "win-rate":
+        from .scripted import win_rate
+
+        games = [g for path in args["results"] for g in json.loads(Path(path).read_text())]
+        result = win_rate(games)
     elif command == "check-session":
         from .dataset import sequence_starts, session_labels
 
@@ -619,7 +656,12 @@ def _dispatch(command, args):
             n_step=args["n_step"],
             beta=args["beta"],
             max_weight=args["max_weight"],
+            state_value=args["state_value"],
         )
+    elif command == "train-state-value":
+        from .state_value import train_state_value
+
+        result = train_state_value(args["recordings"], args["output"], epochs=args["epochs"])
     elif command == "train-idm":
         from .idm import train_idm
 

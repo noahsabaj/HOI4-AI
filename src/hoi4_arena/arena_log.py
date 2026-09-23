@@ -6,14 +6,19 @@ The mod logs, without changing any rule (see mapgen's on_actions):
     start  12:00, 1 January, 1936
     player BLU
     week  1:00, 4 January, 1936 BLU states 8 owned 8 divisions 8 surrender 0
+    day  1:00, 4 January, 1936 BLU states 8 owned 8 divisions 8 surrender 0 strength 1
+        casualties 0 manpower 9.5 deployed 102 rifles 8.6 needed 8.6 at 1=1 2=0 ... 16=0
     control RED from BLU West 3 12:00, 9 March, 1936
     capitulated RED winner BLU 12:00, 2 June, 1936
     peace RED BLU 12:00, 3 June, 1936
 
 The worker's game_log request returns these lines with the "ARENA " prefix removed, on
 either PC. They are exact where the screen is not: a surrender names both sides, and the
-weekly counts do not depend on where the camera is. They are for scoring only. The agent
-never sees them, and a vanilla lobby has no mod, so its outcome still comes from the screen.
+weekly counts do not depend on where the camera is. They are for scoring and for training
+only (arenas since v3 log each side's state every day: divisions per state, the game's
+estimate of its army's strength against the enemy's, casualties, manpower and rifles). The
+agent never sees them, and a vanilla lobby has no mod, so its outcome still comes from the
+screen.
 """
 
 from __future__ import annotations
@@ -32,6 +37,13 @@ PATTERNS = {
         rf"^week\s+{DATE} (?P<tag>[A-Z]{{3}}) states (?P<states>\d+) owned (?P<owned>\d+)"
         r" divisions (?P<divisions>\d+) surrender (?P<surrender>[\d.]+)$"
     ),
+    "day": re.compile(
+        rf"^day\s+{DATE} (?P<tag>[A-Z]{{3}}) states (?P<states>\d+) owned (?P<owned>\d+)"
+        r" divisions (?P<divisions>\d+) surrender (?P<surrender>[\d.]+)"
+        r" strength (?P<strength>[\d.]+) casualties (?P<casualties>[\d.]+)"
+        r" manpower (?P<manpower>[\d.]+) deployed (?P<deployed>[\d.]+)"
+        r" rifles (?P<rifles>[\d.]+) needed (?P<needed>[\d.]+) at(?P<at>(?: \d+=[\d.]+)*)$"
+    ),
     "control": re.compile(
         rf"^control (?P<tag>[A-Z]{{3}}) from (?P<previous>[A-Z]{{3}}) (?P<state>.+?)\s+{DATE}$"
     ),
@@ -41,6 +53,7 @@ PATTERNS = {
     "peace": re.compile(rf"^peace (?P<tag>[A-Z]{{3}}) (?P<other>[A-Z]{{3}})\s+{DATE}$"),
 }
 NUMBERS = {"states", "owned", "divisions"}
+REALS = {"surrender", "strength", "casualties", "manpower", "deployed", "rifles", "needed"}
 ENEMY = {"BLU": "RED", "RED": "BLU"}
 # How much a state held counts against a whole surrender, in the potential below. A side
 # surrenders at a progress of 1.0 (BASE_SURRENDER_LEVEL), and the arena has 8 states a side,
@@ -61,8 +74,12 @@ def parse(line):
             event = {"kind": kind, **match.groupdict()}
             for key in NUMBERS & event.keys():
                 event[key] = int(event[key])
-            if "surrender" in event:
-                event["surrender"] = float(event["surrender"])
+            for key in REALS & event.keys():
+                event[key] = float(event[key])
+            if "at" in event:
+                # Divisions in each state, by state id.
+                pairs = (item.split("=") for item in event["at"].split())
+                event["at"] = {int(state): round(float(count)) for state, count in pairs}
             return event
     return None
 
@@ -96,6 +113,8 @@ class ArenaLog:
         self.offset = 0
         self.lines = []
         self.weeks = {}
+        # The latest daily report of each side (arenas since v3).
+        self.days = {}
         # The first report of each side: what it owned before any fighting.
         self.first_weeks = {}
         self.winner = self.loser = self.surrendered = None
@@ -122,6 +141,8 @@ class ArenaLog:
                 self.first_weeks.setdefault(event["tag"], event)
                 self.weeks[event["tag"]] = event
                 self.last_week = self.clock()
+            elif event["kind"] == "day":
+                self.days[event["tag"]] = event
             elif event["kind"] == "capitulated" and self.winner is None:
                 self.winner, self.loser = event["winner"], event["loser"]
                 self.surrendered = event["date"]
