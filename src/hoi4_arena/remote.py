@@ -96,6 +96,12 @@ class RemoteDesktop(Desktop):
             pass
 
     def worker_log(self) -> list[str]:
+        # A failed request asks for the log to explain itself (Desktop._detail), and a
+        # failed log request would ask again: on a worker that stopped answering, that
+        # recursed every 2 s for as long as anyone waited. Ask once.
+        if getattr(self, "_asking_for_log", False):
+            return list(self.diagnostics)
+        self._asking_for_log = True
         try:
             reply = self.request("status", timeout=2)
             lines = reply.get("log") or []
@@ -103,6 +109,8 @@ class RemoteDesktop(Desktop):
                 return [str(line) for line in lines]
         except (DesktopError, OSError, ValueError) as error:
             log.warning("remote worker log unavailable: %s", error)
+        finally:
+            self._asking_for_log = False
         return list(self.diagnostics)
 
     def close(self):

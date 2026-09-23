@@ -298,6 +298,21 @@ def main():
     control.add_argument(
         "--window", default="1920x1080", help="Client size of the windowed game to launch"
     )
+    job = sub.add_parser(
+        "job",
+        help="Run compute on the second PC's GPU: set up its Python environment, run a "
+        "training command there, stop one, or list them (scripts/Run-Job.ps1)",
+    )
+    job.add_argument("action", choices=["start", "stop", "status"])
+    job.add_argument("--peer", required=True, help="The second PC's peer.json")
+    job.add_argument("--id", dest="job_id", help="A name for the job: letters, digits, _ and -")
+    job.add_argument("--kind", choices=["setup", "run", "script"], default="run")
+    job.add_argument(
+        "args",
+        nargs="*",
+        help="For run, the hoi4-arena command and its arguments; for script, the script "
+        "and its arguments. Paths are inside the second PC's compute folder. Put -- first.",
+    )
     template = sub.add_parser("template")
     template.add_argument("screenshot")
     template.add_argument("rules")
@@ -582,6 +597,11 @@ def _dispatch(command, args):
                 result = {k: v for k, v in desktop.attached.items() if k != "payload"}
     elif command == "control":
         print(control(**args))
+    elif command == "job":
+        from .remote import RemoteDesktop
+
+        with RemoteDesktop(args["peer"], attach=False) as desktop:
+            print(desktop.job(args["action"], args["job_id"], args["kind"], args["args"]))
     elif command == "template":
         from .vision import add_template
 
