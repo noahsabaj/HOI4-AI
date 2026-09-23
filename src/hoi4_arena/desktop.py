@@ -319,6 +319,17 @@ class Desktop:
         reply = self.request("game_log", offset=int(offset))
         return reply["lines"], reply["offset"]
 
+    def pointer(self):
+        """The pointer's current image as RGBA, and its hotspot as (x, y).
+
+        The worker draws this image into every frame it captures; saved, it is the
+        template `video_import` looks for in video that never recorded the pointer.
+        """
+        reply = self.request("pointer")
+        w, h = reply["width"], reply["height"]
+        bgra = np.frombuffer(bytes(reply["payload"]), np.uint8).reshape(h, w, 4)
+        return bgra[:, :, [2, 1, 0, 3]].copy(), tuple(reply["hotspot"])
+
     def _control(self, op: str, timeout: float, **kwargs) -> str:
         """Run one of the worker's fixed Game-Control.ps1 actions and return its output.
 

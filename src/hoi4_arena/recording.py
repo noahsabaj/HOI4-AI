@@ -83,6 +83,9 @@ class Recorder:
             "nominal_fps": hz,
             "codec": codec,
             "fovea": FOVEA_SIZE,
+            # Whether the worker drew the pointer into the frames, as a player sees it.
+            # Recordings from before it did have no pointer in the pixels.
+            "pointer_drawn": bool(first.meta.get("pointer_drawn")),
             # The operator sets this for the whole session. The match loop leaves it alone.
             **recorded_speed(game_speed),
             "complete": False,
