@@ -40,6 +40,11 @@ def main():
     record.add_argument("output")
     record.add_argument("--seconds", type=float, default=1200)
     record.add_argument("--hz", type=float, default=10)
+    record.add_argument(
+        "--peer",
+        help="Record the second PC instead (its pairing file): you play there, its worker "
+        "captures the screen and your inputs, and the video is written here. Use --hz 5.",
+    )
     record.add_argument("--split", choices=["train", "validation", "test"])
     record.add_argument(
         "--codec",
