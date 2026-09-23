@@ -527,10 +527,13 @@ def reprelu(value):
     return value.relu().detach() + soft - soft.detach()
 
 
-def rdmreg(z, sparse: bool, projections=256):
+def rdmreg(z, sparse: bool, projections=256, shift=0.0):
     """LpWM distribution matching: sample axis 0, separate time axis, shared projections.
 
-    Lower projection count is a hardware adaptation, shared by both experimental arms.
+    Lower projection count is a hardware adaptation, shared by both experimental arms
+    (LpWM used 1024 to 8192). The sparse target is ReLU(Laplace(shift, 1/sqrt 2)), the
+    rectified generalized Gaussian with p = 1; a negative `shift` (LpWM swept 0, -1, -2)
+    moves mass below zero, so more coordinates are exactly zero.
     """
     if z.shape[0] < 2:
         raise ValueError("RDMReg needs at least two independent sequences in the batch")
@@ -538,7 +541,7 @@ def rdmreg(z, sparse: bool, projections=256):
     directions = F.normalize(torch.randn(z.shape[-1], projections, device=z.device), dim=0)
     if sparse:
         target = (
-            torch.distributions.Laplace(z.new_tensor(0), z.new_tensor(2**-0.5))
+            torch.distributions.Laplace(z.new_tensor(float(shift)), z.new_tensor(2**-0.5))
             .sample(z.shape)
             .relu()
         )
@@ -549,14 +552,46 @@ def rdmreg(z, sparse: bool, projections=256):
     return (actual - reference).square().mean()
 
 
-class PredictiveAuxiliary(nn.Module):
-    """Training-only action-conditioned prediction; dense/sparse arms share capacity."""
+def temporal_jaccard(z, valid, eps=1e-6):
+    """LpWM's temporal Jaccard loss (Kuang et al., 2026, arXiv 2608.22764, eq. 8).
 
-    def __init__(self, memory_dim=512, feature_dim=1024, latent_dim=384, mode="sparse"):
+    One minus the soft Jaccard index, sum(min) / sum(max), of consecutive non-negative
+    codes, averaged over pairs of valid steps. RDMReg shapes each step's codes alone, so
+    without this the support follows whatever changes fastest; in LpWM that was the arm's
+    motion, and here it would be the camera. With it, the support changed with contact
+    instead (correlation with cube motion 0.21 to 0.80), at no cost in success.
+    """
+    a, b = z[:, :-1].float(), z[:, 1:].float()
+    overlap = torch.minimum(a, b).sum(-1) / (torch.maximum(a, b).sum(-1) + eps)
+    pairs = (valid[:, 1:] & valid[:, :-1]).float()
+    return ((1 - overlap) * pairs).sum() / pairs.sum().clamp_min(1)
+
+
+class PredictiveAuxiliary(nn.Module):
+    """Training-only action-conditioned prediction; dense/sparse arms share capacity.
+
+    `shift`, `temporal_jaccard` and `projections` are LpWM's options for the sparse arm
+    (rdmreg, temporal_jaccard); their defaults keep the objective as it was.
+    """
+
+    def __init__(
+        self,
+        memory_dim=512,
+        feature_dim=1024,
+        latent_dim=384,
+        mode="sparse",
+        *,
+        shift=0.0,
+        temporal_jaccard=0.0,
+        projections=256,
+    ):
         super().__init__()
         if mode not in {"none", "dense", "sparse"}:
             raise ValueError(mode)
+        if (shift or temporal_jaccard) and mode != "sparse":
+            raise ValueError("the target shift and temporal Jaccard apply to sparse codes only")
         self.mode = mode
+        self.shift, self.jaccard, self.projections = shift, temporal_jaccard, projections
         self.project = nn.Linear(feature_dim, latent_dim)
         self.context = nn.Linear(memory_dim, latent_dim)
         self.action = nn.Linear(SLOTS * 3, latent_dim)
@@ -581,8 +616,15 @@ class PredictiveAuxiliary(nn.Module):
         prediction_loss = (error * mask).sum() / mask.sum().clamp_min(1)
         # Only regularize temporal positions with a fully valid independent batch.
         regular = z[:, valid.all(0)]
-        reg = rdmreg(regular, self.mode == "sparse") if regular.shape[1] else z.sum() * 0
-        return prediction_loss + 0.5 * reg
+        reg = (
+            rdmreg(regular, self.mode == "sparse", self.projections, self.shift)
+            if regular.shape[1]
+            else z.sum() * 0
+        )
+        loss = prediction_loss + 0.5 * reg
+        if self.jaccard:
+            loss = loss + self.jaccard * temporal_jaccard(z, valid)
+        return loss
 
 
 def xm_loss(actor, memories, cells, actions, candidates=5):

@@ -104,7 +104,7 @@ Memory on long windows: `train-bc` trains on 16 decisions (3.2 s) at a time, bec
 `--variant large` keeps the LeVJEPA video encoder (`--model models/levjepa-large`), and `distill` trains its compact student. `scripts/probe_encoders.py` reruns the comparison on any two recordings.
 Repeat BC with `--auxiliary dense` and `--auxiliary sparse`, holding seed, demonstrations, encoder initialization and other settings fixed. Compare `--objective xm --auxiliary none` separately. This is a discrete, noise-conditioned best-of-five **XM-inspired adaptation**, not a faithful reproduction of a continuous-action XM method.
 
-Dense and sparse predictive objectives use separate projection modules. Sparse training uses RepReLU and a rectified-Laplace RDM regularizer inspired by LpWM; 256 projections are a hardware adaptation. Neither auxiliary runs at deployment. These mechanisms have gradient tests, not demonstrated HOI4 learning gains.
+Dense and sparse predictive objectives use separate projection modules. Sparse training uses RepReLU and a rectified-Laplace RDM regularizer inspired by LpWM; 256 projections are a hardware adaptation (`--projections`). LpWM's paper (arXiv 2608.22764) adds two options, both off by default: `--sparsity-shift` moves the target's mean below zero for sparser codes, and `--temporal-jaccard` penalizes codes whose support changes between steps, which in LpWM made the support follow contact rather than the arm's motion (here, the game rather than the camera). Neither auxiliary runs at deployment. These mechanisms have gradient tests, not demonstrated HOI4 learning gains.
 
 ## Arena and self-play
 
