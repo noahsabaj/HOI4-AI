@@ -419,6 +419,51 @@ updates by itself, but only between connections, never mid-match. See the README
   slow to watch, so the runs since 2026-09-23 12:44 use `--speeds 5`: a game takes about
   three minutes.
 
+## What the 2026 literature changes (2026-09-23)
+
+The plan above followed Video PreTraining (2022) for its labelling step and AlphaStar
+(2019) for its reinforcement learning. Both were checked against the work of 2024–2026:
+arXiv, GitHub and researchers' posts on X, each claim traced to its primary source.
+No published agent plays grand strategy, 4X or RTS well from pixels: every strategy
+result reads the game's state through an API or text (Compiled Agency 2609.18996,
+CivBench 2609.02459, StarWM 2602.14857). So nothing here can be copied whole, and
+each change below is a flag measured against what it replaces.
+
+- **Kept: labelling video with an inverse dynamics model.** It is still the only route
+  shown to recover precise mouse and keyboard input, and it now runs at scale:
+  Standard Intelligence's FDM-1 (2026) labelled 11M hours of screen recordings with an
+  IDM trained on 40k, and D2E's Generalist-IDM-1B (2510.05684) labels PC games'
+  keyboard and mouse, including games it never saw. Latent action models (Genie, LAPA
+  2410.11758, villa-X 2507.23682) have never been tested on clicks or keys, and they
+  absorb change the agent did not cause (2605.20223), which in HOI4 is most of the
+  screen: the clock, the AI's units, the map.
+- **Changed: memory is trained on long windows.** A decision is 200 ms, so the 16-step
+  windows the policy trained on were 3.2 s: nothing longer could be learned. Cutting
+  gradients at even 100 steps costs measurably (Memoroids, 2402.09900). The newest
+  sequence layers, Mamba-3 (2603.15569) and Gated DeltaNet-2 (2605.22791), have been
+  compared only as language models; as an RL agent's memory, GRUs and LSTMs still match
+  newer cells (2601.15086, POPGym Arcade 2503.01450). So the window comes first, then a
+  measured comparison of the cells, with GDN-2 written from the MIT-licensed
+  flash-linear-attention reference or our own (NVlabs' repository is non-commercial).
+- **Changed: reinforcement learning uses every game.** On-policy PPO with a league
+  assumes millions of cheap games; this arena gives tens a day. Every 2025–26 method
+  that improves a policy from minutes to hours of real play is offline or off-policy on
+  top of a pretrained one: AlphaStar Unplugged (2308.03526) beat its imitation agent
+  90% of the time from replays alone; RECAP (π*0.6, 2511.14759) trains a critic on
+  outcomes and the policy on each action's advantage; EXPO-FT (2609.18207) went from
+  42% to 97% with 10 minutes of online data. Games can also start from mid-game saves
+  (DAGS, 2605.14379). PPO, PACT and InfoPPO stay, as flags to compare.
+- **Not now: training inside a world model of the screen.** Dreamer 4 (2509.24527)
+  found Minecraft diamonds from offline data alone, but on 256–1024 TPUs, with 9.6 s of
+  context; MIRA (2607.05352) needs a B200. On an 8 GB card a pixel model of HOI4 would
+  run no faster than the game, and no strategy policy has been trained in one. A small
+  model of the game's numbers, stepping once per game-day, is a later pilot.
+- **Not now: large vision-language agents** (Lumine 2511.08892, Game-TARS 2510.23691,
+  SIMA 2 2512.04797, UI-TARS-2 2509.02544). They are 7–230B parameters, too slow for
+  an 8 GB card in real time, and most are closed. What they teach is kept for later:
+  emitting short chunks of actions, and thinking only now and then, which a paused
+  game allows.
+
 ## Open work
 
 In order:
@@ -440,15 +485,30 @@ In order:
    `desync` gets calibrated whenever one happens.
 2. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
    speed used. This is the only source of a player's inputs.
-3. **Train the inverse dynamics model** on those and the AI games' inputs, then label
-   video that has no inputs (`label`) and train on it (`--sources idm`).
-4. Train the behaviour-cloning baseline, pre-train its critic on the AI games' winners
-   (`train-critic`), then recurrent PPO self-play with a league, scored from the arena
-   log, with the PACT critic (lambda = 1, a BCE value head trained after the actor on
-   importance-weighted returns). PACT's gains were measured on language models, so its
-   pieces are flags (`--gae-lambda`, `--critic`) to compare once self-play runs, as
-   are InfoPPO's information clock and adaptive clip (`--clock`, `--clip`).
-5. Run a two-PC match between agents, and check reset and recovery when something goes
+3. **Train memory on long windows.** Freeze a behaviour-cloned policy's perception,
+   cache what it reads from every decision of the recordings, and train the memory,
+   the action head and the value on windows of 128–512 decisions instead of 16. Then
+   compare the cells on those cached features, same budget, five seeds: no memory, the
+   GRU at 16 and at 256 decisions, Gated DeltaNet-2 and Mamba-3 at 256. They are
+   scored on held-out imitation loss, on the win prediction, and on probes of what the
+   memory holds (where the pointer was, how long since the camera last zoomed out).
+   The rule for switching is written down before the runs.
+4. **Upgrade the inverse dynamics model**: a two-way transformer over 32–64 decisions
+   in place of the two-way GRU, compared with Generalist-IDM-1B fine-tuned on the same
+   recordings, and its labels weighted by confidence. Then measure whether labelled
+   video (`label`, `--sources idm`) improves the arena policy at all, since the AI
+   games already give clean labels without limit.
+5. **Offline reinforcement learning** on the recordings: pre-train the critic on the
+   AI games' winners (`train-critic`), then train the policy on each action's advantage
+   (RECAP, AlphaStar Unplugged), judged against the behaviour-cloned baseline.
+6. **Off-policy fine-tuning in live games**, scored from the arena log, started from
+   mid-game saves, against a small pool: the game's AI at several difficulties and a
+   few frozen snapshots, rather than a full league. Recurrent PPO with the PACT critic
+   (`--gae-lambda`, `--critic`) and InfoPPO's clock and clip (`--clock`, `--clip`)
+   remain, as the baseline to compare against.
+7. Run a two-PC match between agents, and check reset and recovery when something goes
    wrong. (A two-PC match driven by hand, from this PC, works.)
-6. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
-7. Test the same interface in an unmodified private multiplayer lobby.
+8. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
+9. Test the same interface in an unmodified private multiplayer lobby.
+10. Later pilots: short action chunks, a planner that thinks while the game is paused,
+    and a small world model of the game's numbers.
