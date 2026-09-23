@@ -174,8 +174,22 @@ def main():
         "--no-checkpoint",
         dest="recompute",
         action="store_false",
-        help="Keep every step's activations instead of recomputing them: faster, but a "
+        help="Keep perception's trainable activations instead of recomputing them: faster, but a "
         "batch of 2 no longer fits 8 GB.",
+    )
+    train.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Background processes that decode the video and cut training windows while "
+        "the GPU trains; 0 does it on the training thread.",
+    )
+    train.add_argument(
+        "--chunk",
+        type=int,
+        default=4,
+        help="Frames the vision tower reads at once. Larger is faster until the backward "
+        "pass's recomputation no longer fits the card.",
     )
     idm = sub.add_parser(
         "train-idm",
@@ -210,10 +224,24 @@ def main():
         "--no-checkpoint",
         dest="recompute",
         action="store_false",
-        help="Keep every step's activations instead of recomputing them: faster, but a "
+        help="Keep perception's trainable activations instead of recomputing them: faster, but a "
         "batch of 2 no longer fits 8 GB.",
     )
     idm.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["human", "ai"])
+    idm.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Background processes that decode the video and cut training windows while "
+        "the GPU trains; 0 does it on the training thread.",
+    )
+    idm.add_argument(
+        "--chunk",
+        type=int,
+        default=4,
+        help="Frames the vision tower reads at once. Larger is faster until the backward "
+        "pass's recomputation no longer fits the card.",
+    )
     cache = sub.add_parser(
         "cache-features",
         help="Cache what a behaviour-cloned policy's frozen perception reads at every "
@@ -440,7 +468,7 @@ def main():
         "--no-checkpoint",
         dest="recompute",
         action="store_false",
-        help="Keep every step's activations instead of recomputing them: faster, but a "
+        help="Keep perception's trainable activations instead of recomputing them: faster, but a "
         "batch of 2 no longer fits 8 GB.",
     )
     critic.add_argument(

@@ -10,7 +10,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from .actions import PERIOD, SLOTS, encode_interval
 from .learning import GAMMA
@@ -62,7 +62,7 @@ STD = (0.229, 0.224, 0.225)
 class Views(NamedTuple):
     """One frame as the policy sees it. All uint8, channels last."""
 
-    global_view: torch.Tensor  # (*VIEW_SIZE, 3)
+    global_view: torch.Tensor | None  # (*VIEW_SIZE, 3); None when not asked for
     quadrants: torch.Tensor  # (4, *DETAIL_SIZE, 3)
     fovea: torch.Tensor  # (FOVEA_SIZE, FOVEA_SIZE, 3)
 
@@ -170,6 +170,8 @@ def views(rgb, size=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE, device="cpu
     Accumulation stays in float32. Half precision would cost about 90 MiB of peak
     allocation, but it rounds a handful of output pixels differently, and any divergence
     here is exactly what the worker must not have. CPU and CUDA float32 agree exactly.
+
+    `size` None skips the global view, for training an encoder that reads no clip.
     """
     x, y = parse_cursor(cursor)
     # A decoded frame arrives in a read-only buffer. Torch will not share one, so copy
@@ -193,8 +195,8 @@ def views(rgb, size=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE, device="cpu
         quads = _area(torch.cat(boxes), detail)
     else:
         quads = torch.cat([_area(box, detail) for box in boxes])
-    whole = _area(source, size)
-    return Views(whole[0].permute(1, 2, 0), quads.permute(0, 2, 3, 1), centre)
+    whole = None if size is None else _area(source, size)[0].permute(1, 2, 0)
+    return Views(whole, quads.permute(0, 2, 3, 1), centre)
 
 
 def normalize(array):
@@ -204,17 +206,24 @@ def normalize(array):
     return (x - x.new_tensor(MEAN)) / x.new_tensor(STD)
 
 
-def batch_to_device(batch, device):
+def batch_to_device(batch, device, clips=True):
     """A collated training batch on `device`, with pixels normalized there.
 
     Pixels travel as uint8 and are normalized on the device: a float copy is four times
     the bytes to move, and the quadrants alone are 2.4 MB per decision in uint8.
+
+    Without `clips`, or when the windows were cut without them, the batch has none. An
+    encoder that reads no clip (models.reads_clip) is spared 52 MB of uint8 a batch of
+    two, 210 MB once normalized.
     """
     out = {}
     for key, value in batch.items():
+        if key == "clips" and not clips:
+            continue
         out[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
-    # (B, n, T, H, W, 3) -> (B, n, 3, T, H, W): the encoder takes channels first.
-    out["clips"] = normalize(out["clips"]).permute(0, 1, 5, 2, 3, 4)
+    if "clips" in out:
+        # (B, n, T, H, W, 3) -> (B, n, 3, T, H, W): the encoder takes channels first.
+        out["clips"] = normalize(out["clips"]).permute(0, 1, 5, 2, 3, 4)
     out["quadrants"] = normalize(out["quadrants"]).permute(0, 1, 2, 5, 3, 4)
     out["fovea"] = normalize(out["fovea"]).permute(0, 1, 4, 2, 3)
     return out
@@ -372,10 +381,15 @@ def cover_starts(labels, length):
 
 
 class _Stream:
-    """One recording decoded front to back, yielding its windows as they fill."""
+    """One recording decoded front to back, yielding its windows as they fill.
 
-    def __init__(self, labels, length, burn_in, device, starts=None):
+    Without `clips` no global view is made or kept, and a frame no decision reads the
+    details of is decoded and dropped without computing any view of it.
+    """
+
+    def __init__(self, labels, length, burn_in, device, starts=None, clips=True):
         self.labels, self.length, self.burn_in, self.device = labels, length, burn_in, device
+        self.clips = clips
         manifest = labels["manifest"]
         self.w, self.h = manifest["width"], manifest["height"]
         self.starts = (
@@ -405,9 +419,6 @@ class _Stream:
         labels = self.labels
         n = self.length + self.burn_in
         steps = range(start, start + n)
-        clips = torch.stack(
-            [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]
-        )
         quads = torch.stack([self.details[d][0] for d in steps])
         fovea = torch.stack([self.details[d][1] for d in steps])
         actions = torch.from_numpy(labels["actions"][start : start + n].copy())
@@ -415,8 +426,7 @@ class _Stream:
         previous[1:] = actions[:-1]
         if start:
             previous[0] = torch.from_numpy(labels["actions"][start - 1].copy())
-        return {
-            "clips": clips,
+        window = {
             "quadrants": quads,
             "fovea": fovea,
             "actions": actions,
@@ -427,6 +437,11 @@ class _Stream:
             "outcome": torch.from_numpy(labels["outcome"][start : start + n].copy()),
             "start": start,
         }
+        if self.clips:
+            window["clips"] = torch.stack(
+                [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]
+            )
+        return window
 
     def advance(self):
         """Decode one frame. Returns the windows it completed, or None when none are left.
@@ -446,15 +461,19 @@ class _Stream:
         self.index += 1
         first = self.starts[0]
         needed = [int(d) for d in np.flatnonzero(labels["frame_ids"] == i) if d >= first]
+        # No window can complete before the first pending one's clip begins.
         if i < int(labels["clip_ids"][first].min()) and not needed:
             return []
-        frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
-        seen = views(frame, device=self.device, cursor=labels["cursors"][i])
-        self.globals[i] = seen.global_view.cpu()
-        if needed:
-            quads, fovea = seen.quadrants.cpu(), seen.fovea.cpu()
-            for d in needed:
-                self.details[d] = (quads, fovea)
+        if needed or self.clips:
+            frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
+            size = VIEW_SIZE if self.clips else None
+            seen = views(frame, size, device=self.device, cursor=labels["cursors"][i])
+            if self.clips:
+                self.globals[i] = seen.global_view.cpu()
+            if needed:
+                quads, fovea = seen.quadrants.cpu(), seen.fovea.cpu()
+                for d in needed:
+                    self.details[d] = (quads, fovea)
         done = []
         n = self.length + self.burn_in
         while self.starts and labels["last_frame"][self.starts[0] + n - 1] <= i:
@@ -481,6 +500,13 @@ class VideoSessions(IterableDataset):
     `idm_min_logp` and `idm_weight` pass to session_labels. Since a window is trained only
     when all its decisions are valid, one inferred label below the threshold drops the
     window that holds it.
+
+    `device` is where the views are computed. On the CPU they are the same bytes as on
+    CUDA (see `views`), and that is what lets a DataLoader's worker processes prepare
+    windows while the GPU trains (`window_loader`). Each worker then plays its own share
+    of the recordings, so every window is read exactly once, with its own share of the
+    streams and of the shuffle buffer. `clips` False cuts windows without the global
+    clips, for an encoder that does not read them (models.reads_clip).
     """
 
     def __init__(
@@ -499,8 +525,9 @@ class VideoSessions(IterableDataset):
         detail_shift=0,
         idm_min_logp=None,
         idm_weight=1.0,
+        clips=True,
     ):
-        self.length, self.burn_in = length, burn_in
+        self.length, self.burn_in, self.clips = length, burn_in, clips
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sessions = []
@@ -534,11 +561,23 @@ class VideoSessions(IterableDataset):
         self.epoch += 1
         order = list(self.sessions)
         rng.shuffle(order)
+        streams, shuffle = self.streams, self.shuffle
+        worker = get_worker_info()
+        if worker is not None and worker.num_workers > 1:
+            # Every worker shuffles the same order and takes every n-th recording of it.
+            share = worker.num_workers
+            order = order[worker.id :: share]
+            rng = random.Random(f"{self.seed}:{self.epoch - 1}:{worker.id}")
+            streams, shuffle = -(-streams // share), -(-shuffle // share)
         active, buffer = [], []
         try:
             while order or active:
-                while order and len(active) < self.streams:
-                    active.append(_Stream(order.pop(), self.length, self.burn_in, self.device))
+                while order and len(active) < streams:
+                    active.append(
+                        _Stream(
+                            order.pop(), self.length, self.burn_in, self.device, clips=self.clips
+                        )
+                    )
                 for stream in list(active):
                     done = stream.advance()
                     if done is None:
@@ -546,10 +585,27 @@ class VideoSessions(IterableDataset):
                         active.remove(stream)
                         continue
                     buffer.extend(done)
-                    while len(buffer) > self.shuffle:
+                    while len(buffer) > shuffle:
                         yield buffer.pop(rng.randrange(len(buffer)))
             rng.shuffle(buffer)
             yield from buffer
         finally:
             for stream in active:
                 stream.close()
+
+
+def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=False):
+    """Batches of VideoSessions' windows, prepared by `workers` background processes.
+
+    Measured on this PC (2026-09-23): decoding 1080p x264 4:4:4 takes 5.9 ms a frame and
+    the views of one 14.8 ms on the CPU, for about 34 frames a training step, all of it
+    on the training thread when `workers` is 0. The dataset must then compute its views
+    on the CPU. Batches are pinned for the card, so their copy to it does not wait.
+    """
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        num_workers=workers,
+        pin_memory=bool(workers) and torch.device(device).type == "cuda",
+    )

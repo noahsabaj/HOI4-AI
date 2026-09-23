@@ -38,7 +38,7 @@ from torch.utils.data import default_collate
 from .actions import SLOTS
 from .dataset import _Stream, batch_to_device, cover_starts, session_labels
 from .memory import build_memory, detach, reset, state_size
-from .models import CELL_DIM, CELLS, SPEEDS, ActionHead, fuse
+from .models import CELL_DIM, CELLS, SPEEDS, ActionHead, fuse, reads_clip
 
 # How far back the pointer probes look, in decisions.
 POINTER_LAGS = (5, 25, 100)
@@ -125,16 +125,19 @@ def cache_features(data, checkpoint, output, *, model_path=None, sources=("ai",)
         cells = np.lib.format.open_memmap(
             target / "cells.npy", "w+", np.float16, (count, CELLS * CELLS, CELL_DIM)
         )
-        stream = _Stream(labels, window, 0, device, starts=starts)
+        stream = _Stream(labels, window, 0, device, starts=starts, clips=reads_clip(policy.encoder))
         began = time.monotonic()
         try:
             while (done := stream.advance()) is not None:
                 for piece in done:
                     start = piece.pop("start")
                     batch = batch_to_device(default_collate([piece]), device)
+                    clips = batch.get("clips")
                     with torch.autocast(**autocast):
                         seen = policy.perceive(
-                            batch["clips"][0], batch["quadrants"][0], batch["fovea"][0]
+                            None if clips is None else clips[0],
+                            batch["quadrants"][0],
+                            batch["fovea"][0],
                         )
                     s, c, f = (x.float().cpu().numpy().astype(np.float16) for x in seen)
                     summary[start : start + window] = s

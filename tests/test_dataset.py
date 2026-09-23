@@ -338,3 +338,78 @@ def test_record_with_a_peer_focuses_its_game_and_records_it_here(tmp_path, monke
         ["BLU"],
         "RED",
     )
+
+
+def _key(window):
+    """A window's identity: its recording, by the speed each was given, and its start."""
+    return int(window["speed"].flatten()[0]), int(window["start"])
+
+
+@needs_ffmpeg
+def test_windows_for_an_encoder_that_reads_no_clip_carry_none_and_fewer_views(
+    tmp_path, monkeypatch
+):
+    """The Qwen3.5 tower reads no clip: no global view is computed, kept or moved."""
+    import hoi4_arena.dataset as dataset
+
+    _recording(tmp_path / "slow", [8, 6], game_speed=2)
+    _recording(tmp_path / "fast", [8, 6], game_speed=4)
+    calls = []
+
+    def counted(rgb, size=VIEW_SIZE, *args, **kwargs):
+        calls.append(size)
+        return views(rgb, size, *args, **kwargs)
+
+    monkeypatch.setattr(dataset, "views", counted)
+    common = {"length": 2, "burn_in": 1, "device": "cpu", "shuffle": 0}
+    full = {_key(w): w for w in VideoSessions(tmp_path, **common)}
+    viewed = len(calls)
+    calls.clear()
+    bare = {_key(w): w for w in VideoSessions(tmp_path, clips=False, **common)}
+    assert full.keys() == bare.keys() and len(bare) == 8
+    # Only the frames whose details a decision reads: half of a 10 Hz recording's.
+    assert set(calls) == {None} and len(calls) < viewed
+    for key, window in bare.items():
+        assert "clips" not in window and "clips" in full[key]
+        for name in ("quadrants", "fovea", "actions", "previous", "valid", "speed"):
+            assert torch.equal(window[name], full[key][name])
+    collate = torch.utils.data.default_collate
+    for batch in (
+        batch_to_device(collate(list(bare.values())[:2]), "cpu"),
+        batch_to_device(collate(list(full.values())[:2]), "cpu", clips=False),
+    ):
+        assert "clips" not in batch
+        assert batch["quadrants"].shape == (2, 3, QUADRANTS, 3, *DETAIL_SIZE)
+    assert views(np.zeros((16, 16, 3), np.uint8), None, cursor=(1, 1)).global_view is None
+
+
+@needs_ffmpeg
+def test_each_worker_reads_its_own_recordings_and_every_window_once(tmp_path, monkeypatch):
+    from collections import Counter
+    from types import SimpleNamespace
+
+    import hoi4_arena.dataset as dataset
+
+    for speed in (2, 3, 4, 5):
+        _recording(tmp_path / f"speed-{speed}", [8, 6], game_speed=speed)
+    sessions = VideoSessions(tmp_path, length=2, burn_in=1, device="cpu", clips=False)
+    every = Counter(_key(w) for w in sessions)
+    assert len(every) == len(sessions) == 16 and set(every.values()) == {1}
+    for workers in (2, 3, 4):
+        seen, recordings = Counter(), []
+        for worker in range(workers):
+            info = SimpleNamespace(id=worker, num_workers=workers)
+            monkeypatch.setattr(dataset, "get_worker_info", lambda info=info: info)
+            sessions.epoch = 7
+            keys = [_key(w) for w in sessions]
+            sessions.epoch = 7
+            assert [_key(w) for w in sessions] == keys, "a worker's shuffle is seeded"
+            seen.update(keys)
+            recordings.append({speed for speed, _ in keys})
+        assert seen == every
+        # A worker plays whole recordings, never a share of one.
+        assert sum(len(r) for r in recordings) == len(set().union(*recordings)) == 4
+    monkeypatch.undo()
+    # Real worker processes, which on Windows start fresh and are sent the dataset.
+    loader = dataset.window_loader(sessions, 1, workers=2)
+    assert Counter(_key(w) for w in loader) == every
