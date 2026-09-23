@@ -23,6 +23,7 @@ dependencies = [
     "lz4>=4",
     "cryptography>=46",
     "opencv-python-headless>=4.10",
+    "timm>=1.0.30",
 ]
 
 [project.optional-dependencies]

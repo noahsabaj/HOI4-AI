@@ -65,7 +65,7 @@ def train_idm(
     model_path,
     output,
     *,
-    variant="large",
+    variant="screen",
     epochs=1,
     batch_size=2,
     sequence=16,

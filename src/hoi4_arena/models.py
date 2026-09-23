@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -68,42 +69,46 @@ class VideoEncoder(nn.Module):
 
 
 class ScreenEncoder(nn.Module):
-    """An image encoder trained on web images with text, reading the screen in detail.
+    """The vision tower of Qwen3.5-0.8B, reading the four detail quadrants as one screen.
 
-    LeVJEPA learned from natural video. A HOI4 screen is interface: panels, icons and
-    small text. SigLIP 2 (Tschannen et al., 2025) was trained on image-text pairs that
-    include rendered text and documents, and its NaFlex variant takes any grid of
-    patches. This reads the four detail quadrants tiled back into one screen, at `size`
-    square, rather than the 224 px global clip, and returns the same summary and patch
-    grid as VideoEncoder. It sees one frame; the policy's memory carries time.
+    Chosen on 2026-09-23 from every vision encoder released in 2026 that we could find,
+    by probing each, frozen, on real frames of our recorded games. Characters of 10-12 px
+    were drawn onto the game's own pixels and a linear read-out had to name them (chance
+    2.8%). At 896 px this tower named 58.4% and found the pointer in 93%; the best
+    general-purpose encoders managed 9-17% (LingBot-Vision, EUPE, TIPSv2), an OCR
+    specialist 46-49% more slowly (MonkeyOCRv2-B), and Gemma 4's tower 4.4%. It was
+    trained with a vision-language model on documents, screenshots and GUIs, which is the
+    difference. 37 ms at 896 px on the 4060 Ti in bfloat16, against 63.5 for LeVJEPA.
 
-    At the default 896 px the quadrants' pixels go in unscaled, 56 x 56 patches. Measured
-    on the 4060 Ti at batch one in bfloat16 (random weights of the real size, 2026-09-23):
-    31.4 ms, against 63.5 ms for LeVJEPA's eight-frame clip; 16.2 ms at 672 and 8.2 at 448.
-
-    Weights are google/siglip2-base-patch16-naflex, kept locally like the video encoder:
-    nothing is fetched at run time.
+    It sees one frame, the quadrants tiled back into a `size` square; the policy's memory
+    carries time. Returns the patch grid's mean as the summary, and the grid. Weights are
+    timm's `qwen3_vit_88m_enc.qwen3_5_0_8b` (Apache-2.0), kept locally: `model_path` is
+    the folder holding its `model.safetensors`, and nothing is fetched at run time.
     """
 
-    def __init__(self, model_path=None, *, config=None, size=896, train_last=2):
-        super().__init__()
-        from transformers import Siglip2VisionModel
+    ARCH = "qwen3_vit_88m_enc"
 
-        if config is not None:
-            self.model = Siglip2VisionModel(config)
+    def __init__(self, model_path=None, *, size=896, train_last=2, pretrained=True):
+        super().__init__()
+        import timm
+
+        if pretrained:
+            weights = Path(model_path)
+            weights = weights / "model.safetensors" if weights.is_dir() else weights
+            if not weights.is_file():
+                raise FileNotFoundError(f"No screen encoder weights at {weights}")
+            self.model = timm.create_model(
+                self.ARCH, pretrained=True, pretrained_cfg_overlay={"file": str(weights)}
+            )
         else:
-            self.model = Siglip2VisionModel.from_pretrained(str(model_path), local_files_only=True)
-        config = self.model.config
-        self.dim, self.patch, self.size = config.hidden_size, config.patch_size, size
-        self.variant = "screen"
+            self.model = timm.create_model(self.ARCH, pretrained=False)
+        self.dim, self.size, self.variant = self.model.embed_dim, size, "screen"
         if train_last >= 0:
             self.model.requires_grad_(False)
-            if train_last:
-                for layer in self.model.encoder.layers[-train_last:]:
-                    layer.requires_grad_(True)
-                self.model.post_layernorm.requires_grad_(True)
-                self.model.head.requires_grad_(True)
-        # The views arrive normalized with ImageNet statistics; SigLIP expects [-1, 1].
+            for block in list(self.model.blocks)[len(self.model.blocks) - train_last :]:
+                block.requires_grad_(True)
+        # The views arrive normalized with ImageNet statistics; this tower expects mean
+        # 0.5 and std 0.5 per channel, that is [-1, 1].
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406])[:, None, None], False)
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225])[:, None, None], False)
 
@@ -113,21 +118,13 @@ class ScreenEncoder(nn.Module):
         screen = torch.cat([top, bottom], -2)
         screen = F.interpolate(screen.float(), (self.size, self.size), mode="area")
         screen = ((screen * self.std + self.mean) - 0.5) / 0.5
-        b, side = screen.shape[0], self.size // self.patch
-        # NaFlex takes flattened patches, row-major, each channels-last within the patch.
-        patches = screen.unfold(2, self.patch, self.patch).unfold(3, self.patch, self.patch)
-        patches = patches.permute(0, 2, 3, 4, 5, 1).reshape(b, side * side, -1)
-        output = self.model(
-            pixel_values=patches.to(self.model.dtype),
-            pixel_attention_mask=torch.ones(b, side * side, dtype=torch.long, device=screen.device),
-            spatial_shapes=torch.tensor([[side, side]] * b, device=screen.device),
-        )
-        grid = output.last_hidden_state.transpose(1, 2).reshape(b, self.dim, side, side)
-        return output.pooler_output, grid
+        grid = self.model.forward_features(screen.to(self.model.patch_embed.proj.weight.dtype))
+        grid = grid.permute(0, 3, 1, 2)  # (B, h, w, C) to (B, C, h, w)
+        return grid.mean((-2, -1)), grid
 
 
 def build_encoder(model_path, variant="large", **kwargs):
-    """The encoder a checkpoint names: "large" or "tiny" LeVJEPA, or "screen" SigLIP 2."""
+    """The encoder a checkpoint names: "large" or "tiny" LeVJEPA, or "screen" (Qwen3.5 tower)."""
     if variant == "screen":
         return ScreenEncoder(model_path, **kwargs)
     return VideoEncoder(model_path, variant=variant, **kwargs)
