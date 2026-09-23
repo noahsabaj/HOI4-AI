@@ -277,6 +277,26 @@ def main():
         "returns under the updated policy. joint: the usual single PPO loss.",
     )
     ppo.add_argument("--critic-epochs", type=int, default=1)
+    ppo.add_argument(
+        "--clock",
+        choices=["ticks", "information"],
+        default="ticks",
+        help="information: discount over the collecting policy's entropy per step "
+        "(InfoPPO), so confident waiting costs no horizon. ticks: over wall time.",
+    )
+    ppo.add_argument(
+        "--clip",
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help="adaptive: InfoPPO's per-step ratio bounds, wider where the policy was unsure.",
+    )
+    ppo.add_argument(
+        "--info-clip",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        help="The adaptive clip's epsilons. Default 10 20, the paper's.",
+    )
     critic = sub.add_parser(
         "train-critic",
         help="Pre-train a policy checkpoint's critic on recorded AI games, whose winners are known",

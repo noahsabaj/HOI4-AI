@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 159 Python tests and 24 Rust tests (2 need a live desktop and are
+Automated checks: 163 Python tests and 24 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -365,7 +365,8 @@ In order:
    (`train-critic`), then recurrent PPO self-play with a league, scored from the arena
    log, with the PACT critic (lambda = 1, a BCE value head trained after the actor on
    importance-weighted returns). PACT's gains were measured on language models, so its
-   pieces are flags (`--gae-lambda`, `--critic`) to compare once self-play runs.
+   pieces are flags (`--gae-lambda`, `--critic`) to compare once self-play runs, as
+   are InfoPPO's information clock and adaptive clip (`--clock`, `--clip`).
 5. Run a two-PC match between agents, and check reset and recovery when something goes
    wrong. (A two-PC match driven by hand, from this PC, works.)
 6. Complete 20 unattended matches and 50 side-swapped evaluation pairs.

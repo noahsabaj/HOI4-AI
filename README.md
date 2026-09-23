@@ -128,6 +128,8 @@ Set `"downscale": false` in the pair config to make the worker send native frame
 
 The critic follows PACT (Fu et al., 2026, arXiv:2609.26355). GAE uses lambda = 1 (`--gae-lambda`): a match is thousands of decisions scored mostly at its end, and below 1 every intermediate value error leaks into the advantages. The value head predicts the return scaled into [0, 1] and trains with binary cross-entropy. By default (`--critic pact`) PPO updates the actor first, then trains the value head alone on the stored steps replayed under the updated policy, each return weighted by that step's likelihood ratio (ratios outside [0, 6] left out), so the critic estimates the policy just trained rather than the one before it. `--critic joint` is the usual single loss. Before self-play, `train-critic` pre-trains the value head of a behaviour-cloned checkpoint on recorded AI games, whose winners are known, and reports how often it names the winner.
 
+Two options follow InfoPPO (Zeng et al., 2026, arXiv:2609.24380), which measures each step by the collecting policy's entropy there. Every stored step keeps that entropy. `--clock information` discounts over it instead of over ticks, so the many ticks a policy confidently spends waiting cost no horizon and a match is discounted over its decisions. `--clip adaptive` replaces PPO's fixed [0.8, 1.2] with per-step bounds that widen with the entropy, logarithmically (`--info-clip`, default the paper's 10 and 20), so a confident step barely moves and an unsure one may move further. Both are off by default: the paper measured them on language models.
+
 ```powershell
 .venv\Scripts\hoi4-arena.exe train-critic artifacts/ai-games-1080p artifacts/bc-none/epoch-0000.pt artifacts/bc-critic.pt
 ```
