@@ -22,6 +22,14 @@ def main():
         help="Allow TF32 float32 matmuls. Measured worth nothing here and not free; "
         "see models.configure_precision.",
     )
+    parser.add_argument(
+        "--gpu-memory",
+        type=float,
+        default=0.9,
+        help="Fail with out-of-memory past this fraction of the GPU, rather than let Windows "
+        "spill into system memory and run many times slower (models.limit_gpu_memory). "
+        "The rest is left for the game and the desktop.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     bench = sub.add_parser("benchmark")
     bench.add_argument("--model", default="models/levjepa-large")
@@ -299,10 +307,12 @@ def main():
     )
     traceback = args.pop("traceback")
     tf32 = args.pop("tf32")
+    gpu_memory = args.pop("gpu_memory")
     try:
-        from .models import configure_precision
+        from .models import configure_precision, limit_gpu_memory
 
         configure_precision(tf32)
+        limit_gpu_memory(gpu_memory)
         result = _dispatch(command, args)
     except KeyboardInterrupt:
         logging.getLogger(__name__).error("interrupted")

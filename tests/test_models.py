@@ -309,3 +309,23 @@ def test_recomputing_steps_gives_the_same_loss_and_gradients():
             torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
         )
     assert torch.allclose(grads[0], grads[1], atol=1e-6)
+
+
+def test_the_gpu_memory_cap_is_a_fraction_and_optional():
+    from hoi4_arena.models import limit_gpu_memory
+
+    assert limit_gpu_memory(None) is None
+    if not torch.cuda.is_available():
+        assert limit_gpu_memory(0.9) is None
+        return
+    with pytest.raises(ValueError, match="fraction"):
+        limit_gpu_memory(1.5)
+    total = torch.cuda.get_device_properties(0).total_memory / 2**20
+    try:
+        cap = limit_gpu_memory(0.5)
+        assert abs(cap - total / 2) < 2
+        # Past the cap the allocator refuses instead of letting the driver spill.
+        with pytest.raises(torch.OutOfMemoryError):
+            torch.empty(int(total * 0.6 * 2**20), dtype=torch.uint8, device="cuda")
+    finally:
+        limit_gpu_memory(1.0)

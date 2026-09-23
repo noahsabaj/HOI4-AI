@@ -435,6 +435,23 @@ class InverseDynamics(nn.Module):
         return context, torch.stack(cells, 1)
 
 
+def limit_gpu_memory(fraction: float | None):
+    """Cap this process's GPU allocations at `fraction` of the card, so running out fails.
+
+    On Windows the driver's default lets a CUDA process that fills the card spill into
+    system memory instead of failing: measured on 2026-09-23, a training step that
+    reached 7 GB of the 8 GB 4060 Ti took 34.6 s instead of about 2.6. The caching
+    allocator refuses anything past the cap with an out-of-memory error, which is the
+    failure that should happen. None leaves the card uncapped. Returns the cap in MiB.
+    """
+    if fraction is None or not torch.cuda.is_available():
+        return None
+    if not 0 < fraction <= 1:
+        raise ValueError("the GPU memory fraction must be in (0, 1]")
+    torch.cuda.set_per_process_memory_fraction(fraction)
+    return int(torch.cuda.get_device_properties(0).total_memory * fraction / 2**20)
+
+
 def configure_precision(tf32: bool = False):
     """Say out loud what float32 matmuls are allowed to do, instead of inheriting it.
 
