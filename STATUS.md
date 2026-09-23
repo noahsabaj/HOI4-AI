@@ -205,8 +205,9 @@ Things to know:
 ## Second PC
 
 The second PC runs the worker from one shared folder. From this PC,
-`scripts/Deploy-Peer.ps1` builds and copies the worker, `Start-Worker.ps1` and the
-pairing files there, skipping unchanged files. On the second PC, `Start-Worker.ps1
+`scripts/Deploy-Peer.ps1` builds and copies the worker, its scripts and the pairing
+files there, skipping unchanged files. `hoi4-arena control` launches, closes and
+inspects HOI4 there through the worker. On the second PC, `Start-Worker.ps1
 -Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
 updates by itself, but only between connections, never mid-match. See the README.
 
@@ -241,14 +242,14 @@ In order:
 
 1. **Record AI-vs-AI games in bulk** on the arena with `hoi4-arena record-ai`,
    on both PCs at once with `--peer artifacts/pairing/peer.json`. The second PC's games
-   are launched and closed through its worker (`launch.txt`, and `quit` to close) and
+   are launched and closed through its worker (the `launch` and `quit` operations) and
    its frames are recorded here: a full 1080p frame takes about 86 ms over the network,
    so 5 Hz fits. Both monitors must stay switched on (brightness can be zero): a
    monitor switched off disconnects on DisplayPort, Windows shrinks the desktop to
    1024x768, and the capture breaks, which the recorder now reports. On the second PC
    the Discord overlay is off: after a force-closed game it hung every later launch at
    startup. Games are now closed politely first, and a hung launch restarts Discord
-   (`-Launch restart-discord`) and retries once. `-Launch report` lists the second
+   (`restart_discord`) and retries once. `report` lists the second
    PC's windows, busy processes and log ends. `desync` gets calibrated whenever one
    happens. The AI games have
    no actions, so they can't teach clicks, but they need no human time and are enough

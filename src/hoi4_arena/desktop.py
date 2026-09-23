@@ -29,6 +29,16 @@ def worker_executable() -> str:
     return str(Path("target/release/hoi4-desktop-worker.exe").resolve())
 
 
+def local_control_args() -> list[str]:
+    """Worker arguments that point its control operations at this repo.
+
+    The worker looks for Game-Control.ps1 and the arena mods beside itself, which is the
+    second PC's layout. Here the script is in scripts/ and the mods in artifacts/mods/.
+    """
+    root = Path(__file__).resolve().parents[2]
+    return ["--scripts", str(root / "scripts"), "--mods", str(root / "artifacts" / "mods")]
+
+
 class DesktopError(RuntimeError):
     pass
 
@@ -46,8 +56,20 @@ class Frame:
 
 
 class Desktop:
-    def __init__(self, command: list[str] | None = None):
-        command = command or [worker_executable()]
+    def __init__(
+        self,
+        command: list[str] | None = None,
+        *,
+        worker_args: list[str] | tuple[str, ...] = (),
+        attach: bool = True,
+    ):
+        """Start a local worker and, by default, attach it to the running game.
+
+        `attach=False` is for the control operations (launch, quit, report,
+        restart_discord), which need no game: with none running, attach fails.
+        `worker_args` go on the worker's command line, such as `local_control_args()`.
+        """
+        command = [*(command or [worker_executable()]), *worker_args]
         # The worker's only diagnostic channel is stderr. Capture it instead of letting it
         # escape to an inherited console, so failures land beside the run's other evidence.
         self.process = subprocess.Popen(
@@ -62,11 +84,13 @@ class Desktop:
         self.reader_error = None
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._drain, daemon=True).start()
-        try:
-            self.attached = self.request("attach")
-        except Exception:
-            self._shutdown()
-            raise
+        self.attached = None
+        if attach:
+            try:
+                self.attached = self.request("attach")
+            except Exception:
+                self._shutdown()
+                raise
 
     def _read(self):
         try:
@@ -279,6 +303,40 @@ class Desktop:
         """
         reply = self.request("game_log", offset=int(offset))
         return reply["lines"], reply["offset"]
+
+    def _control(self, op: str, timeout: float, **kwargs) -> str:
+        """Run one of the worker's fixed Game-Control.ps1 actions and return its output.
+
+        The worker refuses these while input is armed, and runs one at a time. A refusal
+        or a failed script is a nonzero exit, raised here with the script's own words.
+        """
+        reply = self.request(op, timeout=timeout, **kwargs)
+        output = reply.get("output", "")
+        if reply.get("exit") != 0:
+            raise DesktopError(f"{op} exited {reply.get('exit')}: {output}")
+        return output
+
+    def launch(self, mod: str, window: str | None = "1920x1080", timeout: float = 600) -> str:
+        """Start HOI4 with the arena mod in that folder of the worker's mods directory.
+
+        `mod` is a folder name, not a path. `window` is the client size of a windowed
+        game, or None for the player's own display mode. Refused if HOI4 is running. A
+        game that never logged far enough to load is not a failure here: the output says
+        "Timed out waiting for the game log", and the caller decides what to do.
+        """
+        return self._control("launch", timeout, mod=mod, window=window)
+
+    def quit(self, timeout: float = 120) -> str:
+        """Close HOI4, politely first, and return once it is gone."""
+        return self._control("quit", timeout)
+
+    def report(self, timeout: float = 60) -> str:
+        """The game's processes, the visible windows and the ends of the game and Steam logs."""
+        return self._control("report", timeout)
+
+    def restart_discord(self, timeout: float = 60) -> str:
+        """Restart Discord, whose overlay once hung every launch after a force-closed game."""
+        return self._control("restart_discord", timeout)
 
     def close(self):
         # Record rather than raise: close() runs from __exit__, where raising would

@@ -106,6 +106,16 @@ def main():
     capture = sub.add_parser("capture")
     capture.add_argument("output")
     capture.add_argument("--peer")
+    control = sub.add_parser(
+        "control",
+        help="Launch, close or inspect HOI4 through the worker, here or on the second PC",
+    )
+    control.add_argument("action", choices=["launch", "quit", "report", "restart-discord"])
+    control.add_argument("--peer", help="The second PC's peer.json; this PC if omitted")
+    control.add_argument("--mod", help="Arena mod folder name to launch, as deployed")
+    control.add_argument(
+        "--window", default="1920x1080", help="Client size of the windowed game to launch"
+    )
     template = sub.add_parser("template")
     template.add_argument("screenshot")
     template.add_argument("rules")
@@ -218,6 +228,27 @@ def _report(problems):
         raise ValueError(f"{len(problems)} references the game cannot resolve")
 
 
+def control(action, peer=None, mod=None, window="1920x1080"):
+    """One control operation through a worker that is not attached to any game.
+
+    On the second PC the worker finds its script and mods beside itself; here they are
+    this repo's scripts/ and artifacts/mods/.
+    """
+    from .desktop import Desktop, local_control_args
+    from .remote import RemoteDesktop
+
+    if action == "launch" and not mod:
+        raise ValueError("launch needs --mod, the arena's folder name")
+    with (
+        RemoteDesktop(peer, attach=False)
+        if peer
+        else Desktop(worker_args=local_control_args(), attach=False)
+    ) as desktop:
+        if action == "launch":
+            return desktop.launch(mod, window=window)
+        return getattr(desktop, action.replace("-", "_"))()
+
+
 def _dispatch(command, args):
     result = None
     if command == "benchmark":
@@ -264,6 +295,8 @@ def _dispatch(command, args):
                 result = {k: v for k, v in frame.meta.items() if k != "events"}
             else:
                 result = {k: v for k, v in desktop.attached.items() if k != "payload"}
+    elif command == "control":
+        print(control(**args))
     elif command == "template":
         from .vision import add_template
 

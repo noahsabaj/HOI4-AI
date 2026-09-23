@@ -2179,3 +2179,59 @@ def test_approximate_kl_is_zero_when_the_policy_has_not_moved():
     logp = torch.tensor([-0.2, -1.5])
     assert float(approximate_kl(logp, logp)) == pytest.approx(0.0)
     assert float(approximate_kl(logp, logp - 1)) > 0
+
+
+# A stand-in worker for the control operations: the same line protocol, a game that is not
+# running (attach fails, as the real worker's does with no HOI4 window), and a reply built
+# from the request so the test can see what arrived.
+FAKE_WORKER = r"""
+import json, sys
+for line in sys.stdin:
+    cmd = json.loads(line)
+    op = cmd["op"]
+    if op == "attach":
+        reply = {"error": "expected_one_hoi4_window_found_0"}
+    elif op == "release":
+        reply = {"armed": False}
+    elif op == "launch":
+        output = f"Arena load test PID 1 {cmd['mod']} {cmd['window']} {sys.argv[1:]}"
+        reply = {"output": output, "exit": 0}
+    elif op == "quit":
+        reply = {"output": "refused: something", "exit": 1}
+    else:
+        reply = {"output": op, "exit": 0}
+    reply["id"] = cmd["id"]
+    reply["bytes"] = 0
+    sys.stdout.write(json.dumps(reply) + "\n")
+    sys.stdout.flush()
+"""
+
+
+def test_control_operations_need_no_game_and_raise_on_a_nonzero_exit(tmp_path):
+    import sys
+
+    from hoi4_arena.desktop import Desktop
+
+    worker = tmp_path / "worker.py"
+    worker.write_text(FAKE_WORKER)
+    command = [sys.executable, str(worker)]
+    with pytest.raises(DesktopError, match="hoi4_window"):
+        Desktop(command)
+    with Desktop(command, worker_args=["--mods", "D:/mods"], attach=False) as desktop:
+        assert desktop.attached is None
+        launched = desktop.launch("small-arena-v1")
+        assert "small-arena-v1 1920x1080" in launched
+        assert "'--mods', 'D:/mods'" in launched, "worker_args reach the worker"
+        assert desktop.launch("a", window=None).startswith("Arena load test PID 1 a None")
+        assert desktop.report() == "report"
+        assert desktop.restart_discord() == "restart_discord"
+        with pytest.raises(DesktopError, match="quit exited 1: refused: something"):
+            desktop.quit()
+    assert desktop.close_error is None
+
+
+def test_control_cli_needs_a_mod_to_launch():
+    from hoi4_arena.cli import control
+
+    with pytest.raises(ValueError, match="--mod"):
+        control("launch")

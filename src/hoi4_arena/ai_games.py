@@ -31,7 +31,7 @@ import numpy as np
 from PIL import Image
 
 from .arena_log import ArenaLog
-from .desktop import Desktop, DesktopError
+from .desktop import Desktop, DesktopError, local_control_args
 from .recording import Recorder
 from .remote import RemoteDesktop
 from .vision import ScreenRules, country_pixels, find_template
@@ -103,68 +103,43 @@ class Popups:
 
 
 class Station:
-    """This PC, or the second PC through its worker bridge and shared folder."""
+    """This PC, or the second PC, driven through its worker.
+
+    Launching and closing the game are worker operations (Game-Control.ps1), on either
+    PC, over a connection that does not attach to a game, since there may be none yet.
+    The second PC's bridge takes one connection at a time, so each operation's
+    connection is closed before the recording one opens. Arena mods are named by folder:
+    they live in artifacts/mods here and in the deployed mods folder there.
+    """
 
     def __init__(self, name, peer=None):
         self.name, self.peer = name, peer
-        if peer:
-            host = json.loads(Path(peer).read_text())["host"]
-            self.share = Path(rf"\\{host}\HOI4Worker")
 
-    def connect(self):
-        return RemoteDesktop(self.peer) if self.peer else Desktop()
-
-    def _request(self, line, timeout=240):
-        # The second PC's idle bridge notices launch.txt, runs it, and writes the outcome.
-        # It only does so between connections, so none may be open while this waits.
-        result = self.share / "launch-result.txt"
-        result.unlink(missing_ok=True)
-        (self.share / "launch.txt").write_text(line)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            time.sleep(2)
-            try:
-                text = result.read_text(errors="replace").strip()
-            except OSError:
-                continue
-            if text.endswith("end of request"):
-                return text.removesuffix("end of request").strip()
-        raise RuntimeError(f"second PC did not answer '{line}' within {timeout} s")
+    def connect(self, attach=True):
+        if self.peer:
+            return RemoteDesktop(self.peer, attach=attach)
+        return Desktop(worker_args=local_control_args(), attach=attach)
 
     def quit(self):
-        if self.peer:
-            self._request("quit")
-        else:
-            # Asked to close first, as on the second PC: a game killed outright left the
-            # next one there hanging at startup.
-            pwsh(
-                "-Command",
-                "Get-Process hoi4 -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }; "
-                "$end = (Get-Date).AddSeconds(30); "
-                "while ((Get-Process hoi4 -ErrorAction SilentlyContinue) -and (Get-Date) -lt $end) { Start-Sleep 1 }; "
-                "Get-Process hoi4 -ErrorAction SilentlyContinue | Stop-Process -Force; "
-                "while (Get-Process hoi4 -ErrorAction SilentlyContinue) { Start-Sleep 1 }",
-            )  # fmt: skip
+        with self.connect(attach=False) as desk:
+            desk.quit()
         # Let the previous launch's watcher put the player's display settings back first.
         time.sleep(5)
 
     def launch(self, mod):
-        if self.peer:
-            out = self._request(f"{Path(mod).name} {WINDOW}")
+        name = Path(mod).name
+        with self.connect(attach=False) as desk:
+            out = desk.launch(name, window=WINDOW)
             if "Timed out waiting for the game log" in out:
                 # A game that never gets far enough to log has hung at startup; a stuck
                 # Discord overlay did that once. Restart Discord and try once more.
                 say(self.name, "launch hung; restarting Discord and retrying")
-                self._request("restart-discord")
-                self.quit()
-                out = self._request(f"{Path(mod).name} {WINDOW}")
-            if "Arena load test PID" not in out or "Timed out" in out:
-                raise RuntimeError(f"second PC did not launch: {out}")
-        else:
-            run = pwsh(
-                "-File", str(SCRIPTS / "Test-ArenaLoad.ps1"), "-Mod", str(mod), "-Window", WINDOW
-            )
-            out = run.stdout.strip() + run.stderr.strip()[-200:]
+                desk.restart_discord()
+                desk.quit()
+                time.sleep(5)
+                out = desk.launch(name, window=WINDOW)
+        if "Arena load test PID" not in out or "Timed out" in out:
+            raise RuntimeError(f"{self.name} did not launch: {out}")
         say(self.name, "launch:", out.replace("\n", " | "))
 
 
