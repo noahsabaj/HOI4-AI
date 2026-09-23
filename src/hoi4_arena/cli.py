@@ -165,6 +165,12 @@ def main():
         help="Loss weight of an inverse-dynamics label against a recorded one, in (0, 1]: "
         "inferred labels are noisier, and hurt precise control most (D2E, 2510.05684).",
     )
+    train.add_argument(
+        "--advantage",
+        action="store_true",
+        help="Count each decision of a weighed player's recording by its advantage "
+        "(hoi4-arena advantage): advantage-weighted imitation, offline RL",
+    )
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument(
         "--save-every",
@@ -203,6 +209,18 @@ def main():
         help="Frames the vision tower reads at once. Larger is faster until the backward "
         "pass's recomputation no longer fits the card.",
     )
+    weigh = sub.add_parser(
+        "advantage",
+        help="Offline RL: value every decision of a player's recording with a trained "
+        "critic and write how much each input improved the position, for train-bc "
+        "--advantage (offline.py)",
+    )
+    weigh.add_argument("checkpoint", help="A policy whose critic was trained (train-critic)")
+    weigh.add_argument("recording")
+    weigh.add_argument("--model")
+    weigh.add_argument("--n-step", type=int, default=25, help="Decisions looked ahead (5 s)")
+    weigh.add_argument("--beta", type=float, default=0.05, help="Weight temperature")
+    weigh.add_argument("--max-weight", type=float, default=20.0)
     idm = sub.add_parser(
         "train-idm",
         help="Train the inverse dynamics model: inputs inferred from video, trained on "
@@ -591,6 +609,17 @@ def _dispatch(command, args):
 
         args["sources"] = tuple(args["sources"])
         result = train_bc(args.pop("data"), args.pop("model"), args.pop("output"), **args)
+    elif command == "advantage":
+        from .offline import advantage_labels
+
+        result = advantage_labels(
+            args["checkpoint"],
+            args["recording"],
+            model_path=args["model"],
+            n_step=args["n_step"],
+            beta=args["beta"],
+            max_weight=args["max_weight"],
+        )
     elif command == "train-idm":
         from .idm import train_idm
 

@@ -129,6 +129,7 @@ def train_bc(
     xm_latents=0,
     idm_min_logp=None,
     idm_weight=1.0,
+    advantage=False,
     workers=2,
     chunk=CHUNK,
     save_every=600.0,
@@ -172,6 +173,7 @@ def train_bc(
         "clips": reads_clip(encoder),
         "idm_min_logp": idm_min_logp,
         "idm_weight": idm_weight,
+        "advantage": advantage,
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
@@ -216,6 +218,7 @@ def train_bc(
         "sources": list(sources),
         "idm_min_logp": idm_min_logp,
         "idm_weight": idm_weight,
+        "advantage": advantage,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

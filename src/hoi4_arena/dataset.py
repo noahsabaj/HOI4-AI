@@ -55,6 +55,8 @@ QUADRANTS = 4
 GAME_SPEED_SECONDS = (2.0, 0.5, 0.2, 0.1, 0.0)
 # Where `hoi4-arena label` writes the inverse dynamics model's labels in a recording.
 IDM_LABELS = "labels-idm.npz"
+# Where `hoi4-arena advantage` writes a player's recording's weights (offline.py).
+ADVANTAGE_LABELS = "labels-advantage.npz"
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
@@ -237,6 +239,7 @@ def session_labels(
     detail_shift=0,
     idm_min_logp=None,
     idm_weight=1.0,
+    advantage=False,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -317,6 +320,15 @@ def session_labels(
             valid &= ~unsure
         weight[:] = idm_weight
         label_source = "idm"
+    # Offline RL (offline.py): with `advantage`, a player's recording that has been
+    # weighed counts each decision by its advantage; one that has not counts as before.
+    if advantage and (source / ADVANTAGE_LABELS).exists():
+        stored = np.load(source / ADVANTAGE_LABELS)
+        if not np.array_equal(stored["decisions"], decisions):
+            raise ValueError(
+                "Advantage weights were made on a different decision grid; weigh again"
+            )
+        weight = weight * stored["weight"]
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the
@@ -526,6 +538,7 @@ class VideoSessions(IterableDataset):
         idm_min_logp=None,
         idm_weight=1.0,
         clips=True,
+        advantage=False,
     ):
         self.length, self.burn_in, self.clips = length, burn_in, clips
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
@@ -546,6 +559,7 @@ class VideoSessions(IterableDataset):
                     detail_shift=detail_shift,
                     idm_min_logp=idm_min_logp,
                     idm_weight=idm_weight,
+                    advantage=advantage,
                 )
             )
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)
