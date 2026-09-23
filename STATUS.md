@@ -266,6 +266,63 @@ test frames (a rerun of the Qwen row gave 85.6%). Larger towers (C-RADIOv4, the 
 Qwen3.5-2B tower, Qwen4-Exp, which is also gated) cost 120–160 ms at 896 px. UltraViT,
 TuringViT and LiAuto-MindViT have no public weights yet.
 
+## LeVJEPA, a second look (2026-09-23)
+
+LeVJEPA had been set aside on speed alone: it never took the text or pointer probe, it
+read 224 px squares (12 px text becomes 2 px), and it re-encoded all 8 frames every tick.
+Its paper (Kuhn et al., 2026, arXiv:2608.27395) says why each of those undersold it: it
+reads any frame size through 3D rotary positions, it attends block-causally so earlier
+frames need no re-encoding, and its frozen features are meant for a nonlinear probe.
+So it was probed again (`scripts/probe_video_encoders.py`) on two games recorded with the
+new camera: 16:9 frames from 448 to 1152 wide, 1, 4 or 8 frames of context, three depths,
+each read out by a linear layer and by a small MLP, against the Qwen tower on the same
+frames. A new task, camera motion, asks what the camera did in the last 200 ms, from the
+recorder's own inputs (still, pan, zoom in, zoom out; balanced accuracy, chance 25%). An
+encoder that reads one frame gets the last four side by side. Best of depth and read-out:
+
+| Encoder | Input | Reads text | Finds pointer | Camera motion |
+|---|---|---|---|---|
+| Qwen tower | 1152x640 | **58.0%** | 95.0% | 54.4% |
+| Qwen tower | 896 square | 56.5% | 96.2% | 50.8% |
+| Qwen tower | 896x496 | 33.7% | 98.1% | 50.5% |
+| LeVJEPA, 1 frame | 1152x640 | 18.0% | 85.6% | 47.2% |
+| LeVJEPA, 1 frame | 896x496 | 13.6% | 92.5% | 46.7% |
+| LeVJEPA, 4 frames | 640x352 | 7.3% | 93.1% | 62.3% |
+| LeVJEPA, 4 frames | 448x256 | 4.5% | 90.6% | **64.6%** |
+| LeVJEPA, 8 frames | 448x256 | 4.6% | 93.1% | 59.1% |
+| LeVJEPA, 8 frames (the old setup) | 224 square | 3.4% | 87.5% | not run |
+
+- **Text: the Qwen tower, by far.** At the same resolution it reads three times as many
+  characters (58.0% against 18.0% at 1152x640, 33.7% against 13.6% at 896x496).
+  LeVJEPA learned from natural video, the tower from documents and screens.
+- **Motion: LeVJEPA, with frames in sequence.** Four frames in order beat the tower's four
+  side by side, 64.6% against 54.4%. One LeVJEPA frame is no better than the tower, so
+  the gain is its video context, as its paper would predict. Four frames did better than
+  eight here.
+- **Pointer:** about equal.
+- **Speed.** Streaming LeVJEPA frame by frame, with each layer's keys and values cached
+  (`scripts/stream_levjepa.py`), matches the whole-clip pass (1.7e-5 in float32). Idle
+  GPU, bfloat16, one frame per tick:
+
+| | Per tick |
+|---|---|
+| Qwen tower 1152x640 / 896 square / 896x496 | 32 / 36 / 17 ms |
+| LeVJEPA streamed, eager, 448x256 / 640x352 / 896x496 | 91 / 109 / 288 ms |
+| LeVJEPA, one frame as a CUDA graph plus the cached frames' attention, same sizes | about 20 / 42 / 115 ms |
+
+  Eager LeVJEPA is dominated by Python overhead (the released code rebuilds its rotary
+  tables in every layer), which a CUDA graph removes. The tower gains nothing from one.
+
+**Verdict.** The live policy keeps the Qwen tower: reading the screen's numbers needs
+resolution, and LeVJEPA reads text poorly even at 1152 px while costing more there. LeVJEPA
+is the better encoder where motion is the task and time is not: the inverse dynamics
+model, which runs offline and exists to tell which input caused each change between
+frames. At 448x256 with four frames it would also fit beside the tower in a tick, for a
+policy that wants both. Two side results: the tower reads 16:9 at 1152x640 better than the
+896 square it is fed now, for less time (it is fed quadrants tiled into a square, which
+squashes the screen); and the LpWM paper (Kuang et al., 2026, arXiv:2608.22764) is about
+sparse latents for learned world models, not an encoder, so it had nothing to probe.
+
 ## Performance
 
 All on an RTX 4060 Ti with the game at 3840×2160.
@@ -344,10 +401,15 @@ updates by itself, but only between connections, never mid-match. See the README
   `players`, so the next games show which of the two decides it.
 - The pause mark blinks, so the start check looks for it over 10 s rather than in one
   frame.
+- **Picking Red** clicks Red's land on the picker and checks the selected flag; twice on
+  the second PC it had clicked before the picker's map was drawn, and once here it clicked
+  the drawn pointer, whose glove reads as red. The log's `player` line is the truth.
 - **Games alternate between speed 4 and 5** (`--speeds`), each speed played as both
   countries in turn. Frames come at 5 a second either way, so speed 5 adds games an hour,
   not frames: more winners for the win predictor, in footage that runs faster than normal
-  play and at a rate the CPU sets. Each manifest records its speed.
+  play and at a rate the CPU sets. Each manifest records its speed. Speed 4 proved too
+  slow to watch, so the runs since 2026-09-23 12:44 use `--speeds 5`: a game takes about
+  three minutes.
 
 ## Open work
 

@@ -56,21 +56,33 @@ def test_the_arena_offset_points_from_the_screen_centre_to_the_arena_centre():
     assert arena_offset(chrome) is None
 
 
-def test_picking_a_country_clicks_inside_its_land(monkeypatch):
+def test_picking_a_country_clicks_its_land_until_its_flag_shows(monkeypatch):
     frame = np.zeros((1080, 1920, 3), np.uint8)
     frame[:] = SEA
     frame[300:700, 700:1152] = BLUE_LAND
     frame[300:700, 1152:1604] = RED_LAND
+    x0, y0, x1, y1 = ai_games.PICKER_FLAG
+    frame[y0:y1, x0:x1] = (40, 60, 200)  # Blue, the default, is selected.
     clicks = []
+
+    def click(desk, x, y):
+        clicks.append((x, y))
+        if 1152 <= x * 1920 < 1604:
+            frame[y0:y1, x0:x1] = (200, 40, 40)
+
     monkeypatch.setattr(ai_games, "screen", lambda desk: frame)
-    monkeypatch.setattr(ai_games, "click", lambda desk, x, y: clicks.append((x, y)))
+    monkeypatch.setattr(ai_games, "click", click)
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ai_games, "act", lambda desk, events, pause=0.15: None)
+    assert ai_games.picked(frame) == "BLU"
+    assert pick_country(None, "BLU") and not clicks, "already selected"
     assert pick_country(None, "RED")
     x, y = clicks[-1]
     assert 1152 <= x * 1920 < 1604 and 300 <= y * 1080 < 700
-    assert pick_country(None, "BLU")
-    assert 700 <= clicks[-1][0] * 1920 < 1152
-    frame[:] = SEA
-    assert not pick_country(None, "RED")
+    assert ai_games.picked(frame) == "RED"
+    # No Blue land and Blue not selected: the pick never takes.
+    frame[300:700, 700:1152] = SEA
+    assert not pick_country(None, "BLU")
 
 
 def test_the_front_is_where_blue_land_meets_red():
