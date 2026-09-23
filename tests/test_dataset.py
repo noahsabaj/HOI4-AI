@@ -37,7 +37,7 @@ def one_box_at_a_time(rgb, size=VIEW_SIZE, detail=DETAIL_SIZE, device="cpu"):
     h, w = source.shape[-2:]
 
     def area(box, s):
-        scaled = F.interpolate(box.float(), (s, s), mode="area")
+        scaled = F.interpolate(box.float(), s, mode="area")
         return scaled.round().clamp(0, 255).to(torch.uint8)[0].permute(1, 2, 0)
 
     boxes = [source[..., y : y + bh, x : x + bw] for y, x, bh, bw in quadrants(h, w)]
@@ -55,7 +55,7 @@ def test_batched_view_resize_is_identical_to_resizing_one_box_at_a_time(shape):
     seen = views(frame, cursor=(0, 0))
     assert torch.equal(seen.global_view, expected_global)
     assert torch.equal(seen.quadrants, expected_quadrants)
-    assert seen.quadrants.shape == (QUADRANTS, DETAIL_SIZE, DETAIL_SIZE, 3)
+    assert seen.quadrants.shape == (QUADRANTS, *DETAIL_SIZE, 3)
     assert torch.equal(seen.fovea, torch.from_numpy(cursor_crop(frame, 0, 0, FOVEA_SIZE)))
 
 
@@ -201,8 +201,8 @@ def test_training_windows_read_only_past_frames_and_carry_the_speed(tmp_path):
     assert {int(w["speed"][0]) for w in windows} == {2, 4}, "two speeds train together"
     for window in windows:
         clips = window["clips"]
-        assert clips.shape == (3, CLIP_FRAMES, VIEW_SIZE, VIEW_SIZE, 3)
-        assert window["quadrants"].shape == (3, QUADRANTS, DETAIL_SIZE, DETAIL_SIZE, 3)
+        assert clips.shape == (3, CLIP_FRAMES, *VIEW_SIZE, 3)
+        assert window["quadrants"].shape == (3, QUADRANTS, *DETAIL_SIZE, 3)
         assert window["fovea"].shape == (3, FOVEA_SIZE, FOVEA_SIZE, 3)
         # Frame i reads i. Each clip ends on its decision's frame and never reaches past it.
         latest = clips[:, -1, 0, 0, 0]
@@ -211,8 +211,8 @@ def test_training_windows_read_only_past_frames_and_carry_the_speed(tmp_path):
         assert torch.equal(window["fovea"][:, FOVEA_SIZE // 2, FOVEA_SIZE // 2, 0], latest)
         assert (torch.diff(latest.int()) == 2).all(), "one decision every two 10 Hz frames"
     batch = batch_to_device(torch.utils.data.default_collate(windows[:2]), "cpu")
-    assert batch["clips"].shape == (2, 3, 3, CLIP_FRAMES, VIEW_SIZE, VIEW_SIZE)
-    assert batch["quadrants"].shape == (2, 3, QUADRANTS, 3, DETAIL_SIZE, DETAIL_SIZE)
+    assert batch["clips"].shape == (2, 3, 3, CLIP_FRAMES, *VIEW_SIZE)
+    assert batch["quadrants"].shape == (2, 3, QUADRANTS, 3, *DETAIL_SIZE)
     assert batch["fovea"].shape == (2, 3, 3, FOVEA_SIZE, FOVEA_SIZE)
 
 

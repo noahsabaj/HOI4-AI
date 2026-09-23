@@ -868,6 +868,15 @@ _DOWNSCALE_GOLDEN = [
             133,
         ],
     ),
+    # 16:9 to a non-square output, (height, width): the views are 16:9 since 2026-09-23.
+    (
+        16,
+        9,
+        (3, 5),
+        [116, 167, 123, 169, 124, 109, 127, 114, 116, 165, 127, 137, 154, 106, 105, 140, 103]
+        + [161, 138, 116, 110, 129, 153, 119, 140, 150, 109, 105, 139, 110, 135, 121, 158, 104]
+        + [145, 126, 175, 144, 131, 141, 144, 105, 131, 142, 133],
+    ),
 ]
 
 
@@ -888,10 +897,12 @@ def test_worker_downscale_matches_training_resize():
     """
     import torch.nn.functional as F
 
+    from hoi4_arena.dataset import hw
+
     for w, h, size, expected in _DOWNSCALE_GOLDEN:
         rgb = _lcg(w * h * 4).reshape(h, w, 4)[:, :, [2, 1, 0]].astype(np.float32)
         t = torch.as_tensor(rgb).permute(2, 0, 1)[None]
-        out = F.interpolate(t, (size, size), mode="area").round().clamp(0, 255).to(torch.uint8)
+        out = F.interpolate(t, hw(size), mode="area").round().clamp(0, 255).to(torch.uint8)
         got = out[0].permute(1, 2, 0).numpy().ravel().tolist()
         assert got == expected, f"{w}x{h}->{size} drifted from the worker's golden vector"
 
@@ -950,8 +961,9 @@ def test_capture_splits_a_downscaled_worker_payload():
 
     from hoi4_arena.desktop import Desktop
 
-    size, detail, fovea, regions = 4, 6, 2, [[1, 2, 3, 2], [0, 0, 2, 2]]
-    views_block = _lcg((size * size + 4 * detail * detail + fovea * fovea) * 3)
+    # Sizes are (height, width), sent to the worker as [width, height].
+    size, detail, fovea, regions = (4, 6), (6, 5), 2, [[1, 2, 3, 2], [0, 0, 2, 2]]
+    views_block = _lcg((4 * 6 + 4 * 6 * 5 + fovea * fovea) * 3)
     crop_blocks = [_lcg(3 * 2 * 4), _lcg(2 * 2 * 4)]
     payload = bytes(views_block) + b"".join(bytes(c) for c in crop_blocks)
 
@@ -964,8 +976,8 @@ def test_capture_splits_a_downscaled_worker_payload():
             "overflow": False,
             "stopped": False,
             "full_bytes": 0,
-            "view_size": size,
-            "detail_size": detail,
+            "view_size": [6, 4],
+            "detail_size": [5, 6],
             "fovea_size": fovea,
             "views_bytes": len(views_block),
             "region_bytes": [len(c) for c in crop_blocks],
@@ -976,11 +988,12 @@ def test_capture_splits_a_downscaled_worker_payload():
     frame = desktop.capture(views=size, detail=detail, fovea=fovea, regions=regions)
     assert frame.rgb is None, "a views-only capture must not carry the full frame"
     g, quads, centre = frame.views
-    assert g.shape == (size, size, 3) and quads.shape == (4, detail, detail, 3)
+    assert g.shape == (4, 6, 3) and quads.shape == (4, 6, 5, 3)
     assert centre.shape == (fovea, fovea, 3)
-    assert np.array_equal(g.ravel(), views_block[: size * size * 3])
+    assert np.array_equal(g.ravel(), views_block[: 4 * 6 * 3])
     assert np.array_equal(centre.ravel(), views_block[-fovea * fovea * 3 :])
-    assert desktop.request.call_args.kwargs["detail"] == detail
+    assert desktop.request.call_args.kwargs["views"] == [6, 4]
+    assert desktop.request.call_args.kwargs["detail"] == [5, 6]
     assert frame.meta["cursor"] == [1, 2]
     assert [c.shape for c in frame.crops] == [(2, 3, 3), (2, 2, 3)]
     # Crops arrive BGRA and must be swizzled to RGB like the full frame is.
@@ -1002,8 +1015,8 @@ def test_capture_rejects_a_payload_that_contradicts_its_header():
             "overflow": False,
             "stopped": False,
             "full_bytes": 0,
-            "view_size": 2,
-            "detail_size": 2,
+            "view_size": [2, 2],
+            "detail_size": [2, 2],
             "fovea_size": 2,
             "views_bytes": 6 * 2 * 2 * 3,
             "region_bytes": [],
@@ -1458,7 +1471,7 @@ def test_capture_rejects_a_frame_that_did_not_record_the_cursor():
 
 
 def test_capture_rejects_a_worker_that_sends_one_size_for_every_view():
-    """The old layout: five views at one size and the cursor crop, and no detail size."""
+    """Old layouts: one size for every view, or square sizes as plain numbers."""
     size = 2
     n = 6 * size * size * 3
     reply = {
@@ -1474,9 +1487,12 @@ def test_capture_rejects_a_worker_that_sends_one_size_for_every_view():
         "region_bytes": [],
         "cursor": [0, 0],
     }
-    with pytest.raises(DesktopError, match="detail and fovea sizes"):
+    with pytest.raises(DesktopError, match=r"\[width, height\]"):
         _stub_desktop(reply).capture(views=size, detail=4, fovea=size)
     reply.update(detail_size=size, fovea_size=size)
+    with pytest.raises(DesktopError, match=r"\[width, height\]"):
+        _stub_desktop(reply).capture(views=size, detail=4, fovea=size)
+    reply.update(view_size=[size, size], detail_size=[size, size])
     with pytest.raises(DesktopError, match="sizes other than requested"):
         _stub_desktop(reply).capture(views=size, detail=4, fovea=size)
 

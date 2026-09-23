@@ -26,8 +26,9 @@ from .vision import ScreenRules
 log = logging.getLogger(__name__)
 
 # Which views a rollout stored. 1: global view and five 224 px tiles. 2: global view, four
-# 448 px quadrants and a 224 px fovea, and the game speed.
-OBSERVATION = 2
+# 448 px quadrants and a 224 px fovea, and the game speed. 3: the same views at 16:9, a
+# 448x256 global view and 576x320 quadrants.
+OBSERVATION = 3
 
 
 def seed_everything(seed, *, salt=None):
