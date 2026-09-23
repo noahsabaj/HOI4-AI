@@ -383,6 +383,9 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
                     # West is Blue and east is Red unless the pair says otherwise.
                     # The territory reward is that country's own share.
                     country=spec.get("country", "BLU" if side == "left" else "RED"),
+                    # The arena mod reports every match in game.log, so that is what
+                    # scores it. A vanilla lobby has no mod and sets "screen".
+                    reward=config.get("reward", "log"),
                 )
             )
         for env in environments:

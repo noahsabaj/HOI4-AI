@@ -166,6 +166,22 @@ def country_pixels(crop):
     return blue, red
 
 
+def find_template(rgb, template, threshold):
+    """Where `template` sits anywhere in `rgb`, as the centre in screen fractions, or None.
+
+    The best normalised squared difference must be below `threshold`: 0 is an exact copy.
+    A fixed-rect rule reads one known place with ScreenRules; this searches the whole
+    frame, for things such as a popup's Ok button that can open anywhere.
+    """
+    import cv2
+
+    score, _, (x, y), _ = cv2.minMaxLoc(cv2.matchTemplate(rgb, template, cv2.TM_SQDIFF_NORMED))
+    if score >= threshold:
+        return None
+    h, w = template.shape[:2]
+    return (x + w / 2) / rgb.shape[1], (y + h / 2) / rgb.shape[0]
+
+
 def land_span(crop):
     """The width in pixels of the country-coloured land in a crop, or None if none."""
     blue, red = country_pixels(crop)
