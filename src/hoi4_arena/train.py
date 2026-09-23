@@ -7,52 +7,77 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .dataset import VideoSessions, batch_to_device
+from .dataset import VideoSessions, batch_to_device, window_loader
 from .learning import save_checkpoint
-from .models import Policy, PredictiveAuxiliary, VideoEncoder, build_encoder, xm_loss
+from .models import (
+    CHUNK,
+    Policy,
+    PredictiveAuxiliary,
+    VideoEncoder,
+    build_encoder,
+    reads_clip,
+    xm_loss,
+)
 
 
-def unroll(policy, batch, burn_in=2, training=True, checkpoint=False):
+def unroll(policy, batch, burn_in=2, training=True, checkpoint=False, chunk=CHUNK):
     """Run the policy over a batch of windows. Burn-in steps only warm the memory.
 
     Returns the scored steps' memories, values, summary features and cells, each with
     the time axis second.
 
-    `checkpoint` keeps only each step's inputs and outputs for the backward pass and
-    recomputes the rest (torch.utils.checkpoint), trading one more forward pass per step
-    for the activations of every step's trainable encoder blocks and detail reader.
+    What the screen shows does not depend on the memory, so the window's frames are
+    perceived first, `chunk` frames at a time (Policy.perceive_window), and only the
+    memory then runs step by step. The encoder's frozen blocks run once, without a graph.
+    Burn-in frames are read with no graph at all, and the memory they warm is detached,
+    as when each step ran whole.
+
+    `checkpoint` keeps only the inputs of the trainable part of perception (the
+    encoder's last blocks, the detail and fovea readers) and recomputes it in the
+    backward pass, chunk by chunk. Before, each step was recomputed whole, the frozen
+    blocks included, which on the Qwen3.5 tower was most of a 3.2 s step.
     """
-    hidden = None
-    memories, values, features, cells = [], [], [], []
-    for t in range(batch["clips"].shape[1]):
-        scored = training and t >= burn_in
-        inputs = (
-            batch["clips"][:, t],
-            batch["quadrants"][:, t],
-            batch["fovea"][:, t],
-            batch["previous"][:, t],
-            batch["speed"][:, t],
-            hidden,
-        )
-        with torch.set_grad_enabled(scored):
-            if scored and checkpoint:
-                hidden, value, feature, cell = torch.utils.checkpoint.checkpoint(
-                    policy, *inputs, use_reentrant=False
+    clips = batch.get("clips")
+    steps = batch["quadrants"].shape[1]
+    dtype = batch["quadrants"].dtype
+    seen = []
+    for part, grad in ((slice(0, burn_in), False), (slice(burn_in, steps), training)):
+        if part.start >= part.stop:
+            continue
+        with torch.set_grad_enabled(grad):
+            seen.append(
+                policy.perceive_window(
+                    None if clips is None else clips[:, part],
+                    batch["quadrants"][:, part],
+                    batch["fovea"][:, part],
+                    checkpoint=checkpoint,
+                    chunk=chunk,
                 )
-            else:
-                hidden, value, feature, cell = policy(*inputs)
+            )
+    summary, cells, centre = (torch.cat(x, 1) for x in zip(*seen))
+    hidden = batch["quadrants"].new_zeros(summary.shape[0], policy.memory_dim)
+    memories, values = [], []
+    for t in range(steps):
+        with torch.set_grad_enabled(training and t >= burn_in):
+            hidden, value = policy.recall(
+                summary[:, t],
+                cells[:, t],
+                centre[:, t],
+                batch["previous"][:, t],
+                batch["speed"][:, t],
+                hidden,
+                dtype,
+            )
         if t < burn_in:
             hidden = hidden.detach()
         else:
             memories.append(hidden)
             values.append(value)
-            features.append(feature)
-            cells.append(cell)
     return (
         torch.stack(memories, 1),
         torch.stack(values, 1),
-        torch.stack(features, 1),
-        torch.stack(cells, 1),
+        summary[:, burn_in:],
+        cells[:, burn_in:],
     )
 
 
@@ -104,6 +129,8 @@ def train_bc(
     xm_latents=0,
     idm_min_logp=None,
     idm_weight=1.0,
+    workers=2,
+    chunk=CHUNK,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -113,11 +140,18 @@ def train_bc(
     the ones it was least sure of and `idm_weight` (0 < W <= 1) scales the rest's loss
     against a recorded label's (dataset.session_labels says why).
 
-    `recompute` recomputes each step in the backward pass instead of keeping its
-    activations. Measured on the 4060 Ti with LeVJEPA, windows of 8 steps after 2 of
-    burn-in (2026-09-23): batch 1 took 1.0 s and 4.3 GB, checkpointed 1.6 s and 2.1 GB;
-    batch 2 checkpointed took 1.3 s a window and 2.5 GB, and without it 34.6 s a step,
-    because at 7 GB Windows moved GPU memory into system memory instead of failing.
+    `recompute` recomputes the trainable part of perception in the backward pass instead
+    of keeping its activations (see `unroll`; `chunk` is how many frames it reads at
+    once). Measured on the 4060 Ti with LeVJEPA, windows of 8 steps after 2 of burn-in
+    (2026-09-23), when each whole step was recomputed: batch 1 took 1.0 s and 4.3 GB,
+    checkpointed 1.6 s and 2.1 GB; batch 2 checkpointed took 1.3 s a window and 2.5 GB,
+    and without it 34.6 s a step, because at 7 GB Windows moved GPU memory into system
+    memory instead of failing.
+
+    `workers` background processes decode the video and cut the windows while the GPU
+    trains (see `window_loader`); 0 does it on this thread, the views on the GPU, in
+    exactly the order training has always seen. Clips are read only for an encoder that
+    reads them: the default Qwen3.5 tower reads the quadrants alone.
     """
     if not 0 < idm_weight <= 1:
         raise ValueError("idm_weight must be in (0, 1]")
@@ -126,22 +160,25 @@ def train_bc(
     if (output / "epoch-0000.pt").exists():
         raise FileExistsError("Checkpoints are immutable")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    encoder = build_encoder(model_path, variant)
     common = {
         "length": sequence,
         "burn_in": burn_in,
         "sources": sources,
         "seed": seed,
-        "device": device,
+        "device": device if not workers else "cpu",
+        "clips": reads_clip(encoder),
         "idm_min_logp": idm_min_logp,
         "idm_weight": idm_weight,
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
     # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
-    loader = DataLoader(dataset, batch_size=batch_size, drop_last=auxiliary != "none")
+    loader = window_loader(
+        dataset, batch_size, workers=workers, device=device, drop_last=auxiliary != "none"
+    )
     if len(dataset) < (2 if auxiliary != "none" else 1):
         raise ValueError("Need at least two sequences for independent-batch regularization")
-    encoder = build_encoder(model_path, variant)
     if variant == "tiny":
         if not student:
             raise ValueError("Distill a student before training a compact policy")
@@ -184,12 +221,14 @@ def train_bc(
         for epoch in range(epochs):
             policy.train()
             aux.train()
+            # Workers iterate copies of the dataset, so its epoch is set here, not counted.
+            dataset.epoch = epoch
             for step, batch in enumerate(loader):
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
                     memory, _, features, cells = unroll(
-                        policy, batch, burn_in, checkpoint=recompute
+                        policy, batch, burn_in, checkpoint=recompute, chunk=chunk
                     )
                     actions = batch["actions"][:, burn_in:]
                     score = imitation_score(policy, memory, cells, actions, objective, xm)
@@ -213,10 +252,12 @@ def train_bc(
             policy.eval()
             validation_losses = []
             with torch.no_grad():
-                for batch in DataLoader(validation, batch_size=batch_size):
+                for batch in window_loader(validation, batch_size, workers=workers, device=device):
                     batch = batch_to_device(batch, device)
                     with torch.autocast(**autocast):
-                        memory, _, _, cells = unroll(policy, batch, burn_in, training=False)
+                        memory, _, _, cells = unroll(
+                            policy, batch, burn_in, training=False, chunk=chunk
+                        )
                         labels = batch["actions"][:, burn_in:]
                         # For xm, the same choice among candidates the training loss
                         # makes, not a score of candidates the optimizer never saw.
@@ -286,7 +327,13 @@ def train_critic(
         policy.value.requires_grad_(True)
     params = [p for p in policy.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=1e-4)
-    common = {"length": sequence, "burn_in": burn_in, "sources": ("ai",), "seed": seed}
+    common = {
+        "length": sequence,
+        "burn_in": burn_in,
+        "sources": ("ai",),
+        "seed": seed,
+        "clips": reads_clip(policy.encoder),
+    }
     dataset = VideoSessions(data, device=device, **common)
     try:
         validation = VideoSessions(data, split="validation", device=device, **common)

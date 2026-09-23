@@ -21,6 +21,38 @@ assert CELLS * CELLS == GRID
 CELL_DIM = 256
 # Game speeds 1 to 5, and 0 for a recording that predates the field.
 SPEEDS = 6
+# Frames the vision tower reads in one call when training reads a whole window at once
+# (Policy.perceive_window). With recomputation on, the backward pass rebuilds one chunk's
+# trainable activations at a time, so this bounds that peak: four frames is twice what a
+# step of batch 2 held before the window was read in one piece.
+CHUNK = 4
+
+
+def frozen_depth(blocks, stem):
+    """How many leading blocks carry no gradient, or None when the stem itself trains.
+
+    Read from requires_grad at call time rather than from `train_last`, because callers
+    change it afterwards: train-critic freezes the whole policy but its value head, and
+    then the whole tower runs without a graph.
+    """
+    if any(p.requires_grad for p in stem):
+        return None
+    depth = 0
+    for block in blocks:
+        if any(p.requires_grad for p in block.parameters()):
+            break
+        depth += 1
+    return depth
+
+
+def reads_clip(encoder):
+    """Whether an encoder reads the global clip. The Qwen3.5 tower reads only the quadrants,
+    so for it the clips need not be built, normalized or moved at all."""
+    return getattr(encoder, "reads_clip", True)
+
+
+class _Captured(Exception):
+    """Raised by a pre-hook to stop a forward pass at the first block that trains."""
 
 
 class VideoEncoder(nn.Module):
@@ -35,7 +67,12 @@ class VideoEncoder(nn.Module):
     told the camera's motion apart best from four 448x256 frames in sequence (64.6%, where
     eight gave 59.1% and the Qwen3.5 tower's four side by side 54.4%), so that is the
     default, and why the inverse dynamics model uses it.
+
+    Training reads it in two parts (`frozen`, then `tail`), so the blocks that do not
+    train run once without a graph instead of again in the backward pass.
     """
+
+    reads_clip = True
 
     def __init__(self, model_path, variant="large", train_last=2, frames=4):
         super().__init__()
@@ -66,12 +103,57 @@ class VideoEncoder(nn.Module):
         """`quadrants` is ignored: this encoder reads the global clip."""
         # All input frames are <= current observation time. No token dropping for control.
         clip = clip[:, :, -self.frames :]
-        tokens = self.model(pixel_values=clip).last_hidden_state
+        return self._read(self.model(pixel_values=clip).last_hidden_state, clip)
+
+    def _read(self, tokens, clip):
         h, w = clip.shape[-2] // self.patch, clip.shape[-1] // self.patch
         # Patches are ordered time-major after the summary token, so the last h*w tokens
         # are the newest frame.
         grid = tokens[:, -h * w :].transpose(1, 2).reshape(tokens.shape[0], self.dim, h, w)
         return tokens[:, 0], grid
+
+    @torch.no_grad()
+    def frozen(self, clip, quadrants=None):
+        """The encoder up to its first block that trains, run without a graph.
+
+        LeVJEPA's forward is one piece of reviewed remote code, so rather than rewrite its
+        tokenizer, positions and block-causal mask here, it is run as it is and stopped at
+        that block: a pre-hook records the tokens and keyword arguments the block was
+        about to receive. `tail` continues from them. When the stem trains (the "tiny"
+        student) the whole forward is left to `tail`.
+        """
+        clip = clip[:, :, -self.frames :]
+        vit = self.model.encoder
+        stem = [p for n, p in vit.named_parameters() if not n.startswith(("blocks.", "norm."))]
+        depth = frozen_depth(vit.blocks, stem)
+        if depth is None or getattr(vit, "out_layers", None) is not None:
+            return clip, None, None
+        target = vit.blocks[depth] if depth < len(vit.blocks) else vit.norm
+        captured = {}
+
+        def stop(module, args, kwargs):
+            captured["inputs"] = args, kwargs
+            raise _Captured
+
+        handle = target.register_forward_pre_hook(stop, with_kwargs=True)
+        try:
+            self.model(pixel_values=clip)
+        except _Captured:
+            pass
+        finally:
+            handle.remove()
+        return clip, captured["inputs"], depth
+
+    def tail(self, state):
+        """The rest of `frozen`'s forward, with a graph for the blocks that train."""
+        clip, inputs, depth = state
+        if inputs is None:
+            return self(clip)
+        vit = self.model.encoder
+        (x, *rest), kwargs = inputs
+        for block in vit.blocks[depth:]:
+            x = block(x, *rest, **kwargs)
+        return self._read(vit.norm(x), clip)
 
 
 class ScreenEncoder(nn.Module):
@@ -94,6 +176,7 @@ class ScreenEncoder(nn.Module):
     """
 
     ARCH = "qwen3_vit_88m_enc"
+    reads_clip = False
 
     def __init__(self, model_path=None, *, size=(640, 1152), train_last=2, pretrained=True):
         super().__init__()
@@ -121,15 +204,51 @@ class ScreenEncoder(nn.Module):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225])[:, None, None], False)
 
     def forward(self, clip, quadrants):
+        """`clip` is ignored: this encoder reads the quadrants."""
+        return self._read(self.model.forward_features(self._screen(quadrants)))
+
+    def _screen(self, quadrants):
         top = torch.cat([quadrants[:, 0], quadrants[:, 1]], -1)
         bottom = torch.cat([quadrants[:, 2], quadrants[:, 3]], -1)
         screen = torch.cat([top, bottom], -2)
         if tuple(screen.shape[-2:]) != self.size:
             screen = F.interpolate(screen.float(), self.size, mode="area")
         screen = ((screen.float() * self.std + self.mean) - 0.5) / 0.5
-        grid = self.model.forward_features(screen.to(self.model.patch_embed.proj.weight.dtype))
+        return screen.to(self.model.patch_embed.proj.weight.dtype)
+
+    @staticmethod
+    def _read(grid):
         grid = grid.permute(0, 3, 1, 2)  # (B, h, w, C) to (B, C, h, w)
         return grid.mean((-2, -1)), grid
+
+    @torch.no_grad()
+    def frozen(self, clip, quadrants):
+        """The tower up to its first block that trains, run without a graph.
+
+        With the default two trainable blocks, ten of the twelve run here, once. Before,
+        each training step was recomputed whole in the backward pass, frozen blocks and
+        all. The steps are timm's forward_features, split in two (`tail` is the rest).
+        """
+        model = self.model
+        screen = self._screen(quadrants)
+        depth = frozen_depth(model.blocks, [model.pos_embed, *model.patch_embed.parameters()])
+        if depth is None:
+            return screen, None, None, None
+        x = model.patch_embed(screen)
+        hw = tuple(x.shape[1:3])
+        x, rope = model._pos_embed(x)
+        for block in model.blocks[:depth]:
+            x = block(x, rope=rope)
+        return x, rope, hw, depth
+
+    def tail(self, state):
+        """The rest of `frozen`'s forward, with a graph for the blocks that train."""
+        x, rope, hw, depth = state
+        if depth is None:
+            return self._read(self.model.forward_features(x))
+        for block in self.model.blocks[depth:]:
+            x = block(x, rope=rope)
+        return self._read(x.reshape(x.shape[0], *hw, -1))
 
 
 def build_encoder(model_path, variant="large", **kwargs):
@@ -362,14 +481,28 @@ class Policy(nn.Module):
         loss) and the cells (for the action head). The value is a logit of the scaled
         return: `learning.value_estimate` turns it into a return, and it is trained with
         binary cross-entropy (`learning.critic_loss`).
+
+        `clip` may be None for an encoder that does not read it (`reads_clip`). The fused
+        inputs are joined in the quadrants' dtype, which is the clip's: both arrive
+        normalized in float32.
         """
         if hidden is None:
-            hidden = clip.new_zeros(clip.shape[0], self.memory_dim)
+            hidden = quadrants.new_zeros(quadrants.shape[0], self.memory_dim)
         if reset is not None:
             hidden = hidden * (~reset.bool()).to(hidden.dtype)[:, None]
-        merged, summary, cells = self.observe(clip, quadrants, fovea, previous, speed, hidden)
-        hidden = self.memory(merged, hidden)
-        return hidden, self.value(hidden).squeeze(-1), summary, cells
+        summary, cells, centre = self.perceive(clip, quadrants, fovea)
+        hidden, value = self.recall(
+            summary, cells, centre, previous, speed, hidden, quadrants.dtype
+        )
+        return hidden, value, summary, cells
+
+    def recall(self, summary, cells, centre, previous, speed, hidden, dtype):
+        """The memory's step: one decision's perception taken in. Returns the new memory
+        and the value logit."""
+        hidden = self.memory(
+            fuse(self, summary, cells, centre, previous, speed, hidden, dtype), hidden
+        )
+        return hidden, self.value(hidden).squeeze(-1)
 
     def observe(self, clip, quadrants, fovea, previous, speed, hidden):
         """What one decision sees, fused into one vector, before the memory takes it in.
@@ -378,12 +511,50 @@ class Policy(nn.Module):
         token and the cells.
         """
         summary, cells, centre = self.perceive(clip, quadrants, fovea)
-        merged = fuse(self, summary, cells, centre, previous, speed, hidden, clip.dtype)
+        merged = fuse(self, summary, cells, centre, previous, speed, hidden, quadrants.dtype)
         return merged, summary, cells
 
     def perceive(self, clip, quadrants, fovea):
         """What the screen shows, before any memory: the summary, the cells, the fovea."""
         summary, grid = self.encoder(clip, quadrants)
+        return summary, self.cells(grid, quadrants), self.foveal(fovea).mean((-2, -1))
+
+    def perceive_window(self, clips, quadrants, fovea, *, checkpoint=False, chunk=CHUNK):
+        """`perceive` over a window of decisions: (B, T, ...) views in, (B, T, ...) out.
+
+        Perception does not depend on the memory, so a window's frames need not wait for
+        the recurrence: they go through `chunk` frames at a time. The encoder's frozen
+        blocks run first, once and without a graph (the encoders' `frozen`); only what
+        trains after them (`tail`, the cells and the fovea's reader) builds one. With
+        `checkpoint` (and gradients on) that trainable part keeps just its inputs and is
+        recomputed chunk by chunk in the backward pass, which is what lets a batch of 2
+        fit 8 GB. The frozen blocks are never recomputed. A chunk never spans two windows,
+        so it is a view of the batch, not a copy the recomputation would have to keep.
+        `clips` may be None for an encoder that does not read them.
+        """
+        split = getattr(self.encoder, "frozen", None)
+        windows = []
+        for i in range(quadrants.shape[0]):
+            parts = []
+            for start in range(0, quadrants.shape[1], chunk):
+                span = slice(start, start + chunk)
+                clip = None if clips is None else clips[i, span]
+                quads, centre = quadrants[i, span], fovea[i, span]
+                state = split(clip, quads) if split else (clip, quads)
+                if checkpoint and torch.is_grad_enabled():
+                    parts.append(
+                        torch.utils.checkpoint.checkpoint(
+                            self._perceive_tail, state, quads, centre, use_reentrant=False
+                        )
+                    )
+                else:
+                    parts.append(self._perceive_tail(state, quads, centre))
+            windows.append([torch.cat(x) for x in zip(*parts)])
+        return tuple(torch.stack(x) for x in zip(*windows))
+
+    def _perceive_tail(self, state, quadrants, fovea):
+        tail = getattr(self.encoder, "tail", None)
+        summary, grid = tail(state) if tail else self.encoder(*state)
         return summary, self.cells(grid, quadrants), self.foveal(fovea).mean((-2, -1))
 
 
@@ -492,34 +663,38 @@ class InverseDynamics(nn.Module):
     def actor(self):
         return self.trunk.actor
 
-    def forward(self, clips, quadrants, fovea, speed, checkpoint=False):
+    def forward(self, clips, quadrants, fovea, speed, checkpoint=False, chunk=CHUNK):
         """A window of decisions: (B, T, ...) views in, per-decision context and cells out.
 
         The previous action is not an input: it is what a neighbouring decision is being
-        asked to label. Each decision is read on its own; with `checkpoint` (and gradients
-        on) its activations are recomputed in the backward pass rather than kept, which a
-        16-step window needs on an 8 GB card (see train.train_bc).
+        asked to label. Each decision is read on its own, with an empty memory steering
+        its attention readout, so the whole window is read at once (Policy.perceive_window,
+        which also says what `checkpoint` and `chunk` do; a 16-step window needs the
+        recomputation on an 8 GB card). `clips` may be None for an encoder that does not
+        read them.
         """
-        b, steps = clips.shape[:2]
-        previous = clips.new_zeros(b, SLOTS, 3, dtype=torch.long)
-        hidden = clips.new_zeros(b, self.memory_dim)
-        merged, cells = [], []
-        for t in range(steps):
-            inputs = (clips[:, t], quadrants[:, t], fovea[:, t], previous, speed[:, t], hidden)
-            if checkpoint and torch.is_grad_enabled():
-                seen, _, cell = torch.utils.checkpoint.checkpoint(
-                    self.trunk.observe, *inputs, use_reentrant=False
-                )
-            else:
-                seen, _, cell = self.trunk.observe(*inputs)
-            merged.append(seen)
-            cells.append(cell)
-        merged = torch.stack(merged, 1)
+        b, steps = quadrants.shape[:2]
+        summary, cells, centre = self.trunk.perceive_window(
+            clips, quadrants, fovea, checkpoint=checkpoint, chunk=chunk
+        )
+        previous = quadrants.new_zeros(b * steps, SLOTS, 3, dtype=torch.long)
+        hidden = quadrants.new_zeros(b * steps, self.memory_dim)
+        merged = fuse(
+            self.trunk,
+            summary.flatten(0, 1),
+            cells.flatten(0, 1),
+            centre.flatten(0, 1),
+            previous,
+            speed.flatten(0, 1),
+            hidden,
+            quadrants.dtype,
+        )
+        merged = merged.unflatten(0, (b, steps))
         if self.context_kind == "gru":
             context, _ = self.context(merged)
         else:
             context = self.context(merged)
-        return context, torch.stack(cells, 1)
+        return context, cells
 
 
 def limit_gpu_memory(fraction: float | None):

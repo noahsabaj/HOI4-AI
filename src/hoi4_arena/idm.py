@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import default_collate
 
 from .actions import SLOTS
 from .dataset import (
@@ -23,9 +23,10 @@ from .dataset import (
     batch_to_device,
     cover_starts,
     session_labels,
+    window_loader,
 )
 from .learning import file_hash, save_checkpoint
-from .models import InverseDynamics, build_encoder
+from .models import CHUNK, InverseDynamics, build_encoder, reads_clip
 
 # How far ahead the model looks, in decision intervals. The clip ends four intervals
 # (0.8 s) after the decision, so it spans 0.6 s before it and the effect after; the
@@ -37,9 +38,14 @@ DETAIL_SHIFT = 1
 LABELLED = ("human", "ai")
 
 
-def _score(model, batch, labels=None, deterministic=True, checkpoint=False):
+def _score(model, batch, labels=None, deterministic=True, checkpoint=False, chunk=CHUNK):
     context, cells = model(
-        batch["clips"], batch["quadrants"], batch["fovea"], batch["speed"], checkpoint=checkpoint
+        batch.get("clips"),
+        batch["quadrants"],
+        batch["fovea"],
+        batch["speed"],
+        checkpoint=checkpoint,
+        chunk=chunk,
     )
     flat = context.flatten(0, 1), cells.flatten(0, 1)
     if labels is None:
@@ -77,6 +83,8 @@ def train_idm(
     recompute=True,
     context="gru",
     context_layers=2,
+    workers=2,
+    chunk=CHUNK,
 ):
     """Train the inverse dynamics model on recordings whose inputs are known.
 
@@ -85,27 +93,28 @@ def train_idm(
     `sequence` is the window, in decisions: 16 (3.2 s), 32 or 64. A longer one lets a
     label read further from its decision. That matters at speed 5, where the simulation
     does not sleep and the screen can answer an input late, after the 0.8 s the shifted
-    clip covers; a neighbour's frames may then be where its effect shows.
+    clip covers; a neighbour's frames may then be where its effect shows. `recompute`,
+    `workers` and `chunk` are train_bc's.
     """
     torch.manual_seed(seed)
     output = Path(output)
     if (output / "epoch-0000.pt").exists():
         raise FileExistsError("Checkpoints are immutable")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    encoder = build_encoder(model_path, variant)
     common = {
         "length": sequence,
         "burn_in": 0,
         "sources": sources,
         "seed": seed,
-        "device": device,
+        "device": device if not workers else "cpu",
         "clip_shift": CLIP_SHIFT,
         "detail_shift": DETAIL_SHIFT,
+        "clips": reads_clip(encoder),
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
-    model = InverseDynamics(
-        build_encoder(model_path, variant), context=context, layers=context_layers
-    ).to(device)
+    model = InverseDynamics(encoder, context=context, layers=context_layers).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=1e-4)
     config = {
@@ -125,11 +134,15 @@ def train_idm(
     with (output / "metrics.jsonl").open("a") as log:
         for epoch in range(epochs):
             model.train()
-            for step, batch in enumerate(DataLoader(dataset, batch_size=batch_size)):
+            dataset.epoch = epoch  # Workers iterate copies of the dataset.
+            loader = window_loader(dataset, batch_size, workers=workers, device=device)
+            for step, batch in enumerate(loader):
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
-                    logp = _score(model, batch, batch["actions"], checkpoint=recompute)[1]
+                    logp = _score(
+                        model, batch, batch["actions"], checkpoint=recompute, chunk=chunk
+                    )[1]
                     loss = -logp.mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training objective")
@@ -141,11 +154,12 @@ def train_idm(
             model.eval()
             nll, kinds, errors = [], [], []
             with torch.no_grad():
-                for batch in DataLoader(validation, batch_size=batch_size):
+                for batch in window_loader(validation, batch_size, workers=workers, device=device):
                     batch = batch_to_device(batch, device)
                     with torch.autocast(**autocast):
-                        nll.extend((-_score(model, batch, batch["actions"])[1]).float().tolist())
-                        predicted = _score(model, batch)[0]
+                        scored = _score(model, batch, batch["actions"], chunk=chunk)
+                        nll.extend((-scored[1]).float().tolist())
+                        predicted = _score(model, batch, chunk=chunk)[0]
                     kind, error = label_accuracy(predicted, batch["actions"].flatten(0, 1))
                     kinds.append(kind)
                     if error is not None:
@@ -212,7 +226,8 @@ def label_recording(checkpoint, recording, *, model_path=None, window=None, devi
     count = len(labels["decisions"])
     actions = np.zeros((count, SLOTS, 3), np.int64)
     logp = np.full(count, -np.inf, np.float32)
-    stream = _Stream(labels, window, 0, device, starts=cover_starts(labels, window))
+    clips = reads_clip(model.trunk.encoder)
+    stream = _Stream(labels, window, 0, device, starts=cover_starts(labels, window), clips=clips)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
     try:
         while (done := stream.advance()) is not None:
