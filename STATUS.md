@@ -19,8 +19,8 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 165 Python tests and 24 Rust tests (2 need a live desktop and are
-skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
+Automated checks: about 220 Python tests and 26 Rust tests (2 need a live desktop and
+are skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
 was played to a surrender on 2026-09-22, driven from this PC.
@@ -333,161 +333,154 @@ sparse latents for learned world models, not an encoder, so it had nothing to pr
 
 ## Performance
 
-All on an RTX 4060 Ti with the game at 3840×2160.
+Re-measured on 2026-09-23 with the Qwen3.5 tower and the 16:9 views, on the second PC's
+idle RTX 4060 Ti (the same card as this PC), without a game running
+(`scripts/time_policy.py`, `train-bc` on four fixed games):
 
 | | Result |
 |---|---|
-| One actor, whole tick with a live game | 135.0 ms p50, 148.7 ms p95. **Fits the 200 ms tick** |
-| Two actors on one GPU (self-play on one PC) | 243.6 ms p50, 279.9 ms p95 of GPU per tick. **Does not fit** |
-| Two compact-encoder actors, 8 frames | 85.6 ms p50, 103.6 ms p95. Fits, but the compact encoder is untrained |
-| Capture, Desktop Duplication vs GDI blit | 16.2 ms vs 67.1 ms on the same loaded screen |
-| Encoder forward, 16 vs 8 frames | 131.5 ms vs 64.9 ms. Fewer than 8 frames gains nothing |
-| Worker, five downscaled views | 8.3 ms |
+| One actor's decision step | 38.6 ms p50 with the compiled action head (63.5 ms eager) |
+| Two actors, batched into one pass | 78.5 ms p50 (102.4 ms eager). **Fits the 200 ms tick** |
+| Vision tower alone, one frame | 33.5 ms eager, 33.0 ms as a CUDA graph (compute-bound; not worth it) |
+| A behaviour-cloning step (batch 2, 10 decisions) | 1.47 s, from 2.0 s before #54 (1.36×) |
+| An inverse-dynamics step (LeVJEPA-Large, 4 frames, 32 decisions) | about 9 s, the GPU 81–98% busy |
 
-What made the difference: removing hidden GPU syncs in `torch.distributions` argument
-checks, capturing the action head as a CUDA graph (26× faster), Desktop Duplication
-instead of the blit, and storing frozen weights in bfloat16 (640 MiB instead of 1170).
+The compiled action head needs Triton; `triton-windows` 3.6 is locked since #53. Before,
+it had been installed by hand on this PC only, and elsewhere the head silently ran
+eagerly. The newest Triton, 3.8, was no faster and not bit-exact with the eager head, so
+3.6 stays until PyTorch moves.
 
-Tried and not taken: `channels_last` (slower), TF32 (no gain, available as `--tf32`),
-resizing on the GPU (would mean sending 33 MB frames), compiling the encoder (changes
-stored log-probabilities, which PPO compares against).
+Earlier, all on an RTX 4060 Ti with the game at 3840×2160 and the LeVJEPA encoder:
 
-Things to know:
-
-- A fresh Desktop Duplication has no image until the screen changes, so the worker
-  uses the blit for that one tick instead of giving up on duplication.
-- The fused action head is not bit-identical across CPUs; matmul order differs.
-- Clips use one frame per decision (200 ms apart, 8 frames = 1.6 s), the same live and
-  in training.
-- After any change to the Rust worker, rebuild and redeploy it. `Desktop.capture` raises
-  if a worker returns the wrong views.
-
-## Second PC
-
-The second PC runs the worker from one shared folder. From this PC,
-`scripts/Deploy-Peer.ps1` builds and copies the worker, its scripts and the pairing
-files there, skipping unchanged files. `hoi4-arena control` launches, closes and
-inspects HOI4 there through the worker. On the second PC, `Start-Worker.ps1
--Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
-updates by itself, but only between connections, never mid-match. See the README.
-
-## Recording AI games
-
-`hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.
-
-- **The arena reports itself in game.log.** The mod logs, without changing any rule,
-  `ARENA` lines at the start (who declared the war, each human's country), every week (states held, divisions, surrender progress per
-  country), when a state changes hands, on a surrender (loser and winner) and after the
-  peace deal. The worker's `game_log` request returns only these lines, on either PC.
-  A game ends on the surrender line, so no pixels are read to call it. Surrender
-  progress runs from 0 to 1 (1 is a surrender). `owned` counts states a side both owns
-  and controls, so it falls as land is occupied.
-- **Popups are clicked, not disabled.** An agent must learn to clear them in a vanilla
-  game, so the recorder clicks each popup's Ok button 1 to 4 s after it opens, found
-  anywhere on screen with OpenCV template matching. A popup was open in 44% of sampled
-  frames of the last game without this, and in 2% of both games with it.
-- **The camera watches the front with the unit counters in view.** HOI4 hides the
-  counters beyond a camera distance of 900. Measured at 1080p in mouse-wheel notches in
-  from fully out: at 0 the arena fills the middle half of the screen, the counters appear
-  from 9, about a third of the arena shows at 18, the map turns to terrain past 22, and 26
-  is the closest. The first recordings sat almost fully zoomed out, so the counters were
-  never on screen. Now the camera stays between 9 and 20 notches, zooming in and out and
-  panning, mostly towards where Blue's land meets Red's. Every 20 to 60 seconds it zooms
-  fully out for a few seconds, recentres by what it sees (pans alone drifted, because pan
-  speed changes with zoom), and closes in on a new point, mostly on the front. Games
-  recorded before 2026-09-23 noon are the zoomed-out kind.
-- **The default arena is 12x8 provinces a side** (`arena-12x8-v2`, 8 states a side).
-  The first two games on it (2026-09-23, one on each PC) both ended in a surrender read
-  from the log, after 24.8 and 31.5 minutes at speed 4.
-- **Red won all of the first six AI games on it**, where a fair map does that 1.6% of
-  the time. The map is a true mirror (terrain, coast, rivers, supply, victory points and
-  starting divisions all match under a half turn) and the fronts moved both ways for
-  months, but in v1 Blue always declared the war and the recorder always started as
-  Blue. In v2 a coin flip picks who declares, logged as `declare`, and the log names
-  each human's starting country (`player`); the recorder alternates Blue and Red, the
-  two PCs out of step. Each game's manifest records `started_as`, `declarer` and
-  `players`, so the next games show which of the two decides it.
-- The pause mark blinks, so the start check looks for it over 10 s rather than in one
-  frame.
-- **Picking Red** clicks Red's land on the picker and checks the selected flag; twice on
-  the second PC it had clicked before the picker's map was drawn, and once here it clicked
-  the drawn pointer, whose glove reads as red. The log's `player` line is the truth.
-- **Games alternate between speed 4 and 5** (`--speeds`), each speed played as both
-  countries in turn. Frames come at 5 a second either way, so speed 5 adds games an hour,
-  not frames: more winners for the win predictor, in footage that runs faster than normal
-  play and at a rate the CPU sets. Each manifest records its speed. Speed 4 proved too
-  slow to watch, so the runs since 2026-09-23 12:44 use `--speeds 5`: a game takes about
-  three minutes.
-
-## What the 2026 literature changes (2026-09-23)
-
-The plan above followed Video PreTraining (2022) for its labelling step and AlphaStar
-(2019) for its reinforcement learning. Both were checked against the work of 2024–2026:
-arXiv, GitHub and researchers' posts on X, each claim traced to its primary source.
-No published agent plays grand strategy, 4X or RTS well from pixels: every strategy
-result reads the game's state through an API or text (Compiled Agency 2609.18996,
-CivBench 2609.02459, StarWM 2602.14857). So nothing here can be copied whole, and
-each change below is a flag measured against what it replaces.
-
-- **Kept: labelling video with an inverse dynamics model.** It is still the only route
-  shown to recover precise mouse and keyboard input, and it now runs at scale:
-  Standard Intelligence's FDM-1 (2026) labelled 11M hours of screen recordings with an
-  IDM trained on 40k, and D2E's Generalist-IDM-1B (2510.05684) labels PC games'
-  keyboard and mouse, including games it never saw. Latent action models (Genie, LAPA
-  2410.11758, villa-X 2507.23682) have never been tested on clicks or keys, and they
-  absorb change the agent did not cause (2605.20223), which in HOI4 is most of the
-  screen: the clock, the AI's units, the map.
-- **Changed: memory is trained on long windows.** A decision is 200 ms, so the 16-step
-  windows the policy trained on were 3.2 s: nothing longer could be learned. Cutting
-  gradients at even 100 steps costs measurably (Memoroids, 2402.09900). The newest
-  sequence layers, Mamba-3 (2603.15569) and Gated DeltaNet-2 (2605.22791), have been
-  compared only as language models; as an RL agent's memory, GRUs and LSTMs still match
-  newer cells (2601.15086, POPGym Arcade 2503.01450). So the window comes first, then a
-  measured comparison of the cells, with GDN-2 written from the MIT-licensed
-  flash-linear-attention reference or our own (NVlabs' repository is non-commercial).
-- **Changed: reinforcement learning uses every game.** On-policy PPO with a league
-  assumes millions of cheap games; this arena gives tens a day. Every 2025–26 method
-  that improves a policy from minutes to hours of real play is offline or off-policy on
-  top of a pretrained one: AlphaStar Unplugged (2308.03526) beat its imitation agent
-  90% of the time from replays alone; RECAP (π*0.6, 2511.14759) trains a critic on
-  outcomes and the policy on each action's advantage; EXPO-FT (2609.18207) went from
-  42% to 97% with 10 minutes of online data. Games can also start from mid-game saves
-  (DAGS, 2605.14379). PPO, PACT and InfoPPO stay, as flags to compare.
-- **Not now: training inside a world model of the screen.** Dreamer 4 (2509.24527)
-  found Minecraft diamonds from offline data alone, but on 256–1024 TPUs, with 9.6 s of
-  context; MIRA (2607.05352) needs a B200. On an 8 GB card a pixel model of HOI4 would
-  run no faster than the game, and no strategy policy has been trained in one. A small
-  model of the game's numbers, stepping once per game-day, is a later pilot.
-- **Not now: large vision-language agents** (Lumine 2511.08892, Game-TARS 2510.23691,
-  SIMA 2 2512.04797, UI-TARS-2 2509.02544). They are 7–230B parameters, too slow for
-  an 8 GB card in real time, and most are closed. What they teach is kept for later:
-  emitting short chunks of actions, and thinking only now and then, which a paused
-  game allows.
-
-## Open work
-
-In order:
-
-1. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
-   with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
-   closed through its worker (`launch`, `quit`) and its frames recorded here: a full
-   1080p frame takes about 86 ms over the network, so 5 Hz fits. Both monitors must stay
-   switched on (brightness can be zero): a monitor switched off disconnects on
-   DisplayPort, Windows shrinks the desktop to 1024x768, and the capture breaks, which
-   the recorder reports. On the second PC the Discord overlay is off: after a
-   force-closed game it hung every later launch. Games are closed politely first, and a
-   hung launch restarts Discord (`restart_discord`) and retries once. `report` lists the
-   second PC's windows, busy processes and log ends. The games carry the scripted
-   camera's inputs as labels, so they teach camera control and popup clearing, and
-   serve the encoder, predicting who wins, and a first opponent. On the 12x8 arena the
-   first two games took 24.8 and 31.5 minutes, so a match limit of 1800 s is too short
-   there; the recorder's cap is 45 minutes. Recordings are 1080p x264 (CRF 18, 4:4:4).
-   `desync` gets calibrated whenever one happens.
-2. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
-   speed used. This is the only source of a player's inputs.
-3. **Train memory on long windows.** Freeze a behaviour-cloned policy's perception,
-   cache what it reads from every decision of the recordings, and train the memory,
-   the action head and the value on windows of 128–512 decisions instead of 16. Then
+| | Result |
+|---|---|
+| One actor, whole tick with a live game | 135.0 ms p50, 148.7 ms p95. **Fits the 200 ms tick** | | Two actors on one GPU (self-play on one PC) | 243.6 ms
+   p50, 279.9 ms p95 of GPU per tick. **Does not fit** | | Two compact-encoder actors, 8
+   frames | 85.6 ms p50, 103.6 ms p95. Fits, but the compact encoder is untrained | |
+   Capture, Desktop Duplication vs GDI blit | 16.2 ms vs 67.1 ms on the same loaded
+   screen | | Encoder forward, 16 vs 8 frames | 131.5 ms vs 64.9 ms. Fewer than 8 frames
+   gains nothing | | Worker, five downscaled views | 8.3 ms |  What made the difference:
+   removing hidden GPU syncs in `torch.distributions` argument checks, capturing the
+   action head as a CUDA graph (26× faster), Desktop Duplication instead of the blit,
+   and storing frozen weights in bfloat16 (640 MiB instead of 1170).  Tried and not
+   taken: `channels_last` (slower), TF32 (no gain, available as `--tf32`), resizing on
+   the GPU (would mean sending 33 MB frames), compiling the encoder (changes stored
+   log-probabilities, which PPO compares against).  Things to know:  - A fresh Desktop
+   Duplication has no image until the screen changes, so the worker uses the blit for
+   that one tick instead of giving up on duplication. - The fused action head is not
+   bit-identical across CPUs; matmul order differs. - Clips use one frame per decision
+   (200 ms apart, 8 frames = 1.6 s), the same live and in training. - After any change
+   to the Rust worker, rebuild and redeploy it. `Desktop.capture` raises if a worker
+   returns the wrong views.  ## Second PC  The second PC runs the worker from one shared
+   folder. From this PC, `scripts/Deploy-Peer.ps1` builds and copies the worker, its
+   scripts and the pairing files there, skipping unchanged files. `hoi4-arena control`
+   launches, closes and inspects HOI4 there through the worker. On the second PC,
+   `Start-Worker.ps1 -Install` (PowerShell 7.5+) starts the worker at every logon. After
+   that it applies updates by itself, but only between connections, never mid-match. See
+   the README.  ## Recording AI games  `hoi4-arena record-ai` (`hoi4_arena.ai_games`)
+   plays AI-vs-AI games in observer mode and records them.  - **The arena reports itself
+   in game.log.** The mod logs, without changing any rule, `ARENA` lines at the start
+   (who declared the war, each human's country), every week (states held, divisions,
+   surrender progress per country), when a state changes hands, on a surrender (loser
+   and winner) and after the peace deal. The worker's `game_log` request returns only
+   these lines, on either PC. A game ends on the surrender line, so no pixels are read
+   to call it. Surrender progress runs from 0 to 1 (1 is a surrender). `owned` counts
+   states a side both owns and controls, so it falls as land is occupied. - **Popups are
+   clicked, not disabled.** An agent must learn to clear them in a vanilla game, so the
+   recorder clicks each popup's Ok button 1 to 4 s after it opens, found anywhere on
+   screen with OpenCV template matching. A popup was open in 44% of sampled frames of
+   the last game without this, and in 2% of both games with it. - **The camera watches
+   the front with the unit counters in view.** HOI4 hides the counters beyond a camera
+   distance of 900. Measured at 1080p in mouse-wheel notches in from fully out: at 0 the
+   arena fills the middle half of the screen, the counters appear from 9, about a third
+   of the arena shows at 18, the map turns to terrain past 22, and 26 is the closest.
+   The first recordings sat almost fully zoomed out, so the counters were never on
+   screen. Now the camera stays between 9 and 20 notches, zooming in and out and
+   panning, mostly towards where Blue's land meets Red's. Every 20 to 60 seconds it
+   zooms fully out for a few seconds, recentres by what it sees (pans alone drifted,
+   because pan speed changes with zoom), and closes in on a new point, mostly on the
+   front. Games recorded before 2026-09-23 noon are the zoomed-out kind. - **The default
+   arena is 12x8 provinces a side** (`arena-12x8-v2`, 8 states a side). The first two
+   games on it (2026-09-23, one on each PC) both ended in a surrender read from the log,
+   after 24.8 and 31.5 minutes at speed 4. - **Red won all of the first six AI games on
+   it**, where a fair map does that 1.6% of the time. The map is a true mirror (terrain,
+   coast, rivers, supply, victory points and starting divisions all match under a half
+   turn) and the fronts moved both ways for months, but in v1 Blue always declared the
+   war and the recorder always started as Blue. In v2 a coin flip picks who declares,
+   logged as `declare`, and the log names each human's starting country (`player`); the
+   recorder alternates Blue and Red, the two PCs out of step. Each game's manifest
+   records `started_as`, `declarer` and `players`, so the next games show which of the
+   two decides it. - The pause mark blinks, so the start check looks for it over 10 s
+   rather than in one frame. - **Picking Red** clicks Red's land on the picker and
+   checks the selected flag; twice on the second PC it had clicked before the picker's
+   map was drawn, and once here it clicked the drawn pointer, whose glove reads as red.
+   The log's `player` line is the truth. - **Games alternate between speed 4 and 5**
+   (`--speeds`), each speed played as both countries in turn. Frames come at 5 a second
+   either way, so speed 5 adds games an hour, not frames: more winners for the win
+   predictor, in footage that runs faster than normal play and at a rate the CPU sets.
+   Each manifest records its speed. Speed 4 proved too slow to watch, so the runs since
+   2026-09-23 12:44 use `--speeds 5`: a game takes about three minutes.  ## What the
+   2026 literature changes (2026-09-23)  The plan above followed Video PreTraining
+   (2022) for its labelling step and AlphaStar (2019) for its reinforcement learning.
+   Both were checked against the work of 2024–2026: arXiv, GitHub and researchers' posts
+   on X, each claim traced to its primary source. No published agent plays grand
+   strategy, 4X or RTS well from pixels: every strategy result reads the game's state
+   through an API or text (Compiled Agency 2609.18996, CivBench 2609.02459, StarWM
+   2602.14857). So nothing here can be copied whole, and each change below is a flag
+   measured against what it replaces.  - **Kept: labelling video with an inverse
+   dynamics model.** It is still the only route shown to recover precise mouse and
+   keyboard input, and it now runs at scale: Standard Intelligence's FDM-1 (2026)
+   labelled 11M hours of screen recordings with an IDM trained on 40k, and D2E's
+   Generalist-IDM-1B (2510.05684) labels PC games' keyboard and mouse, including games
+   it never saw. Latent action models (Genie, LAPA 2410.11758, villa-X 2507.23682) have
+   never been tested on clicks or keys, and they absorb change the agent did not cause
+   (2605.20223), which in HOI4 is most of the screen: the clock, the AI's units, the
+   map. - **Changed: memory is trained on long windows.** A decision is 200 ms, so the
+   16-step windows the policy trained on were 3.2 s: nothing longer could be learned.
+   Cutting gradients at even 100 steps costs measurably (Memoroids, 2402.09900). The
+   newest sequence layers, Mamba-3 (2603.15569) and Gated DeltaNet-2 (2605.22791), have
+   been compared only as language models; as an RL agent's memory, GRUs and LSTMs still
+   match newer cells (2601.15086, POPGym Arcade 2503.01450). So the window comes first,
+   then a measured comparison of the cells, with GDN-2 written from the MIT-licensed
+   flash-linear-attention reference or our own (NVlabs' repository is non-commercial). -
+   **Changed: reinforcement learning uses every game.** On-policy PPO with a league
+   assumes millions of cheap games; this arena gives tens a day. Every 2025–26 method
+   that improves a policy from minutes to hours of real play is offline or off-policy on
+   top of a pretrained one: AlphaStar Unplugged (2308.03526) beat its imitation agent
+   90% of the time from replays alone; RECAP (π*0.6, 2511.14759) trains a critic on
+   outcomes and the policy on each action's advantage; EXPO-FT (2609.18207) went from
+   42% to 97% with 10 minutes of online data. Games can also start from mid-game saves
+   (DAGS, 2605.14379). PPO, PACT and InfoPPO stay, as flags to compare. - **Not now:
+   training inside a world model of the screen.** Dreamer 4 (2509.24527) found Minecraft
+   diamonds from offline data alone, but on 256–1024 TPUs, with 9.6 s of context; MIRA
+   (2607.05352) needs a B200. On an 8 GB card a pixel model of HOI4 would run no faster
+   than the game, and no strategy policy has been trained in one. A small model of the
+   game's numbers, stepping once per game-day, is a later pilot. - **Not now: large
+   vision-language agents** (Lumine 2511.08892, Game-TARS 2510.23691, SIMA 2 2512.04797,
+   UI-TARS-2 2509.02544). They are 7–230B parameters, too slow for an 8 GB card in real
+   time, and most are closed. What they teach is kept for later: emitting short chunks
+   of actions, and thinking only now and then, which a paused game allows.  ## Open work
+   In order:  1. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both
+   PCs at once with `--peer artifacts/pairing/peer.json`. The second PC's games are
+   launched and closed through its worker (`launch`, `quit`) and its frames recorded
+   here: a full 1080p frame takes about 86 ms over the network, so 5 Hz fits. Both
+   monitors must stay switched on (brightness can be zero): a monitor switched off
+   disconnects on DisplayPort, Windows shrinks the desktop to 1024x768, and the capture
+   breaks, which the recorder reports. On the second PC the Discord overlay is off:
+   after a force-closed game it hung every later launch. Games are closed politely
+   first, and a hung launch restarts Discord (`restart_discord`) and retries once.
+   `report` lists the second PC's windows, busy processes and log ends. The games carry
+   the scripted camera's inputs as labels, so they teach camera control and popup
+   clearing, and serve the encoder, predicting who wins, and a first opponent. On the
+   12x8 arena the first two games took 24.8 and 31.5 minutes, so a match limit of 1800 s
+   is too short there; the recorder's cap is 45 minutes. Recordings are 1080p x264 (CRF
+   18, 4:4:4). `desync` gets calibrated whenever one happens. 2. **Record 1–4 hours of
+   human play** on the arena, with `--game-speed` set to the speed used. This is the
+   only source of a player's inputs. 3. **Train memory on long windows.** Freeze a
+   behaviour-cloned policy's perception, cache what it reads from every decision of the
+   recordings, and train the memory, the action head and the value on windows of 128–512
+   decisions instead of 1
+6. Then
    compare the cells on those cached features, same budget, five seeds: no memory, the
    GRU at 16 and at 256 decisions, Gated DeltaNet-2 and Mamba-3 at 256. They are
    scored on held-out imitation loss, on the win prediction, and on probes of what the
@@ -495,19 +488,24 @@ In order:
    The rule for switching is written down before the runs.
 4. **Upgrade the inverse dynamics model**: a two-way transformer over 32–64 decisions
    in place of the two-way GRU, compared with Generalist-IDM-1B fine-tuned on the same
-   recordings, and its labels weighted by confidence. The options are in place, not yet
-   run: `train-idm --context transformer` with `--sequence` 16, 32 or 64, and
-   `train-bc --idm-min-logp` and `--idm-weight`. Then measure whether labelled
-   video (`label`, `--sources idm`) improves the arena policy at all, since the AI
-   games already give clean labels without limit.
+   recordings, and its labels weighted by confidence. The options are in place
+   (`train-idm --context transformer` with `--sequence` 16, 32 or 64, and
+   `train-bc --idm-min-logp` and `--idm-weight`), and the first runs, GRU then
+   transformer, started on the second PC's GPU on 2026-09-23. Then measure whether
+   labelled video (`label`, `--sources idm`) improves the arena policy at all, since the
+   AI games already give clean labels without limit.
 5. **Offline reinforcement learning** on the recordings: pre-train the critic on the
    AI games' winners (`train-critic`), then train the policy on each action's advantage
-   (RECAP, AlphaStar Unplugged), judged against the behaviour-cloned baseline.
+   (RECAP, AlphaStar Unplugged), judged against the behaviour-cloned baseline. `hoi4-arena advantage` and
+   `train-bc --advantage` do this (#56) for a player's own recordings; AI games are
+   refused, since their recorded inputs, the camera's, did not decide who won.
 6. **Off-policy fine-tuning in live games**, scored from the arena log, started from
-   mid-game saves, against a small pool: the game's AI at several difficulties and a
-   few frozen snapshots, rather than a full league. Recurrent PPO with the PACT critic
+   mid-game saves, against a small pool: the game's AI at several difficulties and a few
+   frozen snapshots, rather than a full league. Recurrent PPO with the PACT critic
    (`--gae-lambda`, `--critic`) and InfoPPO's clock and clip (`--clock`, `--clip`)
-   remain, as the baseline to compare against.
+   remain, as the baseline to compare against. Starting from a save works: `control
+   launch --save <name>` (#52) went straight to the saved moment on the second PC, from
+   a save the console's `savegame` wrote mid-game.
 7. Run a two-PC match between agents, and check reset and recovery when something goes
    wrong. (A two-PC match driven by hand, from this PC, works.)
 8. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
