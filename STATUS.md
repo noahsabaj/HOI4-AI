@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 163 Python tests and 24 Rust tests (2 need a live desktop and are
+Automated checks: 164 Python tests and 24 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -321,9 +321,16 @@ updates by itself, but only between connections, never mid-match. See the README
   game, so the recorder clicks each popup's Ok button 1 to 4 s after it opens, found
   anywhere on screen with OpenCV template matching. A popup was open in 44% of sampled
   frames of the last game without this, and in 2% of both games with it.
-- **The camera comes back to the whole arena** every one to two and a half minutes: it
-  zooms fully out and pans until the land is centred, steered by what it sees. Pans
-  alone drifted, because pan speed changes with zoom.
+- **The camera watches the front with the unit counters in view.** HOI4 hides the
+  counters beyond a camera distance of 900. Measured at 1080p in mouse-wheel notches in
+  from fully out: at 0 the arena fills the middle half of the screen, the counters appear
+  from 9, about a third of the arena shows at 18, the map turns to terrain past 22, and 26
+  is the closest. The first recordings sat almost fully zoomed out, so the counters were
+  never on screen. Now the camera stays between 9 and 20 notches, zooming in and out and
+  panning, mostly towards where Blue's land meets Red's. Every 20 to 60 seconds it zooms
+  fully out for a few seconds, recentres by what it sees (pans alone drifted, because pan
+  speed changes with zoom), and closes in on a new point, mostly on the front. Games
+  recorded before 2026-09-23 noon are the zoomed-out kind.
 - **The default arena is 12x8 provinces a side** (`arena-12x8-v2`, 8 states a side).
   The first two games on it (2026-09-23, one on each PC) both ended in a surrender read
   from the log, after 24.8 and 31.5 minutes at speed 4.

@@ -1,8 +1,8 @@
 """Record AI-vs-AI games on an arena map, one after another, until a time budget runs out.
 
-Each game launches HOI4 with the arena, starts as Blue, hands both countries to the AI with
-the `observe` console command, sets speed 4, and records native frames while the camera
-moves and clears popups the way a player would. The arena mod reports itself in the game's
+Each game launches HOI4 with the arena, starts as Blue or Red in turn, hands both countries to
+the AI with the `observe` console command, sets speed 4, and records native frames while the
+camera watches the front, zooms in and out and clears popups the way a player would. The arena mod reports itself in the game's
 log, so a game ends when the log names a surrender and its winner, or at the cap, and a
 game whose weekly report stops has a stuck clock.
 
@@ -10,8 +10,9 @@ With a peer, the second PC records its own games at the same time, driven over i
 connection; its frames are recorded here. The second PC's worker must be running and the
 arena deployed to it (Deploy-Peer.ps1 -Mod), which this does itself.
 
-The recordings carry no actions, so they cannot teach clicks. They are for the encoder, for
-predicting who wins, and for measuring how often a match ends inside the time limit.
+The recordings carry the camera's own inputs as labels, but none of the AI's orders. They are
+for the encoder, for predicting who wins, for camera control and clearing popups, and for
+measuring how often a match ends inside the time limit.
 
 It takes over the screen of each PC it uses. Anything else that takes focus stops input to
 the game until the recorder brings it back.
@@ -56,6 +57,9 @@ GRAVE, ENTER = 0xC0, 0x0D
 MAP_TOP, MAP_BOTTOM = 80, 120
 # Close enough to the middle, as a fraction of the screen.
 CENTRED = 0.03
+# Camera zoom in mouse-wheel notches in from fully out, measured at 1080p (see camera).
+# Unit counters show from 9; past 22 the map is terrain; 26 is the closest.
+VIEW_NEAR, VIEW_FAR, ZOOM_TERRAIN, ZOOM_MAX = 9, 20, 22, 26
 
 
 def say(station, *parts):
@@ -265,7 +269,10 @@ def recentre(desk, tries=10):
     and undoes whatever drift the camera built up. True if the arena ended up centred.
     """
     act(
-        desk, [{"kind": "move", "x": 0.5, "y": 0.5}] + [{"kind": "wheel", "delta": -120}] * 14, 0.05
+        desk,
+        [{"kind": "move", "x": 0.5, "y": 0.5}]
+        + [{"kind": "wheel", "delta": -120}] * (ZOOM_MAX + 4),
+        0.03,
     )
     keys = {(0, 1): 0x27, (0, -1): 0x25, (1, 1): 0x28, (1, -1): 0x26}
     for _ in range(tries):
@@ -342,19 +349,52 @@ def start_game(desk, rules, failure_shot, country="BLU"):
         raise RuntimeError("game is not running at speed 4")
 
 
-def camera(desk, stop, station, popups, recentre_every=(60, 150)):
-    """Look around like a player, clear popups, and come back to the whole arena.
+def front_points(rgb):
+    """Where Blue's land meets Red's, as (x, y) screen fractions: the front line.
 
-    Every pan is undone by the opposite pan of the same length, and every zoom-in by a
-    zoom-out at the same pointer position, but that still drifted: two 32-minute games
-    both ended zoomed in on one side, because pan speed changes with zoom. So every
-    minute or two the camera zooms fully out and recentres on what it sees, which is also
-    the view the territory reward reads. It shares the recorder's connection: the second
-    PC's bridge accepts only one.
+    Occupied land takes its occupier's colour, so this follows the fighting, not the
+    starting border. Empty when the two do not touch on screen.
     """
-    rng = random.Random()
-    opposite = {0x25: 0x27, 0x27: 0x25, 0x26: 0x28, 0x28: 0x26}
-    next_recentre = time.monotonic() + rng.uniform(*recentre_every)
+    import cv2
+
+    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+    blue, red = country_pixels(rgb[top:bottom])
+    if blue is None or not blue.any() or not red.any():
+        return []
+    near_blue = cv2.dilate(blue.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    ys, xs = np.nonzero(near_blue & red)
+    return [(x / rgb.shape[1], (y + top) / rgb.shape[0]) for y, x in zip(ys, xs, strict=True)]
+
+
+def land_points(rgb):
+    """Any land on screen, as (x, y) screen fractions."""
+    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+    blue, red = country_pixels(rgb[top:bottom])
+    if blue is None:
+        return []
+    ys, xs = np.nonzero(blue | red)
+    return [(x / rgb.shape[1], (y + top) / rgb.shape[0]) for y, x in zip(ys, xs, strict=True)]
+
+
+def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None):
+    """Watch the war like a player: close in on the front, look around, step back.
+
+    Measured at 1080p on 2026-09-23, in wheel notches in from fully out: the whole arena
+    fills the middle half of the screen at 0, unit counters appear from 9 (the game hides
+    them beyond a camera distance of 900), about a third of the arena shows at 18, the map
+    turns to terrain past about 22, and 26 is as close as it goes. So the camera spends
+    its time between VIEW_NEAR and VIEW_FAR, where the counters are, zooming in and out
+    and panning, and every 20 to 60 seconds zooms fully out for a few seconds to see the
+    whole map, recentres, and picks somewhere new to look: mostly a point on the front,
+    where Blue's land meets Red's, sometimes anywhere on the land. Zooming is toward the
+    pointer, as in the game, so it closes in on what it points at. Fully zoomed out the
+    counters vanish, which is also a view players use, but only in passing. It shares
+    the recorder's connection: the second PC's bridge accepts only one.
+    """
+    rng = rng or random.Random()
+    arrows = [0x25, 0x26, 0x27, 0x28]
+    zoom = 0
+    next_overview = time.monotonic()
 
     def do(events, pause=0.08):
         # The worker disarms after 750 ms without input, so arm for each burst.
@@ -369,39 +409,76 @@ def camera(desk, stop, station, popups, recentre_every=(60, 150)):
             press = [{"kind": "button", "button": 0, "down": d} for d in (True, False)]
             do([{"kind": "move", "x": at[0], "y": at[1]}, *press])
 
-    def linger():
-        # Point around while away, like a player reading the map.
-        for _ in range(rng.randint(1, 3)):
-            if stop.wait(rng.uniform(0.6, 1.8)):
+    def wheel(notches, at):
+        nonlocal zoom
+        step = 120 if notches > 0 else -120
+        notches = max(-zoom, min(ZOOM_MAX - zoom, notches))
+        do(
+            [{"kind": "move", "x": at[0], "y": at[1]}]
+            + [{"kind": "wheel", "delta": step}] * abs(notches),
+            rng.uniform(0.04, 0.12),
+        )
+        zoom += notches
+
+    def linger(low=0.6, high=1.8, times=(1, 3)):
+        # Point around while looking, like a player reading the map.
+        for _ in range(rng.randint(*times)):
+            if stop.wait(rng.uniform(low, high)):
                 return
             clear_popup()
-            x, y = rng.uniform(0.1, 0.9), rng.uniform(0.15, 0.85)
-            do([{"kind": "move", "x": x, "y": y}])
+            do([{"kind": "move", "x": rng.uniform(0.1, 0.9), "y": rng.uniform(0.15, 0.85)}])
+
+    def interest(rgb):
+        """Somewhere worth looking on screen: mostly the front, else any land."""
+        points = front_points(rgb) if rng.random() < 0.75 else []
+        points = points or land_points(rgb)
+        return rng.choice(points) if points else None
+
+    def pan():
+        # Towards something worth looking at, most of the time; a player does not scroll
+        # out over the sea for long. Otherwise anywhere.
+        target = interest(screen(desk)) if rng.random() < 0.7 else None
+        if target is None:
+            hold(desk, rng.choice(arrows), rng.uniform(0.1, 0.4))
+            return
+        dx, dy = target[0] - 0.5, target[1] - 0.5
+        if abs(dx) >= abs(dy):
+            key, offset = (0x27 if dx > 0 else 0x25), dx
+        else:
+            key, offset = (0x28 if dy > 0 else 0x26), dy
+        hold(desk, key, min(0.4, max(0.08, abs(offset) * 0.8)))
+
+    def overview():
+        nonlocal zoom
+        recentre(desk)
+        zoom = 0
+        linger(1.0, 2.5, (1, 2))
+        wheel(rng.randint(VIEW_NEAR + 1, VIEW_FAR), interest(screen(desk)) or (0.5, 0.5))
 
     try:
         while not stop.wait(rng.uniform(0.8, 2.5)):
             try:
                 clear_popup()
+                if time.monotonic() >= next_overview:
+                    overview()
+                    next_overview = time.monotonic() + rng.uniform(*overview_every)
+                    continue
                 roll = rng.random()
-                if time.monotonic() >= next_recentre:
-                    recentre(desk)
-                    next_recentre = time.monotonic() + rng.uniform(*recentre_every)
-                    linger()
-                elif roll < 0.35:
-                    vk = rng.choice(list(opposite))
-                    seconds = rng.uniform(0.08, 0.25)
-                    hold(desk, vk, seconds)
-                    linger()
-                    hold(desk, opposite[vk], seconds)
-                elif roll < 0.65:
-                    x, y = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
-                    notches = rng.randint(1, 4)
-                    at = {"kind": "move", "x": x, "y": y}
-                    do([at] + [{"kind": "wheel", "delta": 120}] * notches)
-                    linger()
-                    do([at] + [{"kind": "wheel", "delta": -120}] * notches)
-                else:
-                    linger()
+                here = (rng.uniform(0.25, 0.75), rng.uniform(0.3, 0.7))
+                if 0.35 <= roll < 0.8 and rng.random() < 0.5:
+                    here = interest(screen(desk)) or here
+                if roll < 0.35:
+                    pan()
+                elif roll < 0.55:
+                    wheel(rng.randint(1, 4), here)
+                elif roll < 0.75:
+                    wheel(-rng.randint(1, 4), here)
+                elif roll < 0.8:
+                    wheel(ZOOM_TERRAIN - zoom + rng.randint(0, 2), here)  # A close look.
+                linger()
+                if zoom < VIEW_NEAR or zoom > VIEW_FAR + 2:
+                    # Drifted out of the counters' range: come back into it.
+                    wheel(rng.randint(VIEW_NEAR + 1, VIEW_FAR) - zoom, here)
             except DesktopError as error:
                 say(station, "camera:", error)
                 try:
