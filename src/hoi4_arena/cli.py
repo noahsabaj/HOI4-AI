@@ -64,7 +64,7 @@ def main():
     )
     ai.add_argument("output")
     ai.add_argument("--minutes", type=float, required=True, help="Total time budget.")
-    ai.add_argument("--mod", default="artifacts/mods/arena-12x8-v1")
+    ai.add_argument("--mod", default="artifacts/mods/arena-12x8-v2")
     ai.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     ai.add_argument(
         "--ok-button",

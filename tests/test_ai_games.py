@@ -3,7 +3,8 @@ import random
 import numpy as np
 import pytest
 
-from hoi4_arena.ai_games import MAP_BOTTOM, MAP_TOP, OK_MATCH, Popups, arena_offset
+from hoi4_arena import ai_games
+from hoi4_arena.ai_games import MAP_BOTTOM, MAP_TOP, OK_MATCH, Popups, arena_offset, pick_country
 from hoi4_arena.vision import find_template
 
 # Land tints measured at 1080p (vision.country_pixels) and the sea around them.
@@ -53,3 +54,20 @@ def test_the_arena_offset_points_from_the_screen_centre_to_the_arena_centre():
     chrome[: MAP_TOP - 1] = BLUE_LAND
     chrome[1080 - MAP_BOTTOM + 1 :] = RED_LAND
     assert arena_offset(chrome) is None
+
+
+def test_picking_a_country_clicks_inside_its_land(monkeypatch):
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = SEA
+    frame[300:700, 700:1152] = BLUE_LAND
+    frame[300:700, 1152:1604] = RED_LAND
+    clicks = []
+    monkeypatch.setattr(ai_games, "screen", lambda desk: frame)
+    monkeypatch.setattr(ai_games, "click", lambda desk, x, y: clicks.append((x, y)))
+    assert pick_country(None, "RED")
+    x, y = clicks[-1]
+    assert 1152 <= x * 1920 < 1604 and 300 <= y * 1080 < 700
+    assert pick_country(None, "BLU")
+    assert 700 <= clicks[-1][0] * 1920 < 1152
+    frame[:] = SEA
+    assert not pick_country(None, "RED")

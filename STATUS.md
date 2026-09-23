@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 157 Python tests and 24 Rust tests (2 need a live desktop and are
+Automated checks: 159 Python tests and 24 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -311,7 +311,7 @@ updates by itself, but only between connections, never mid-match. See the README
 `hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.
 
 - **The arena reports itself in game.log.** The mod logs, without changing any rule,
-  `ARENA` lines at the start, every week (states held, divisions, surrender progress per
+  `ARENA` lines at the start (who declared the war, each human's country), every week (states held, divisions, surrender progress per
   country), when a state changes hands, on a surrender (loser and winner) and after the
   peace deal. The worker's `game_log` request returns only these lines, on either PC.
   A game ends on the surrender line, so no pixels are read to call it. Surrender
@@ -324,10 +324,17 @@ updates by itself, but only between connections, never mid-match. See the README
 - **The camera comes back to the whole arena** every one to two and a half minutes: it
   zooms fully out and pans until the land is centred, steered by what it sees. Pans
   alone drifted, because pan speed changes with zoom.
-- **The default arena is 12x8 provinces a side** (`arena-12x8-v1`, 8 states a side).
+- **The default arena is 12x8 provinces a side** (`arena-12x8-v2`, 8 states a side).
   The first two games on it (2026-09-23, one on each PC) both ended in a surrender read
-  from the log, after 24.8 and 31.5 minutes at speed 4. Red won both, in July and
-  December 1937.
+  from the log, after 24.8 and 31.5 minutes at speed 4.
+- **Red won all of the first six AI games on it**, where a fair map does that 1.6% of
+  the time. The map is a true mirror (terrain, coast, rivers, supply, victory points and
+  starting divisions all match under a half turn) and the fronts moved both ways for
+  months, but in v1 Blue always declared the war and the recorder always started as
+  Blue. In v2 a coin flip picks who declares, logged as `declare`, and the log names
+  each human's starting country (`player`); the recorder alternates Blue and Red, the
+  two PCs out of step. Each game's manifest records `started_as`, `declarer` and
+  `players`, so the next games show which of the two decides it.
 - The pause mark blinks, so the start check looks for it over 10 s rather than in one
   frame.
 

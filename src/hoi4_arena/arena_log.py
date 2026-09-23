@@ -2,7 +2,9 @@
 
 The mod logs, without changing any rule (see mapgen's on_actions):
 
+    declare RED
     start  12:00, 1 January, 1936
+    player BLU
     week  1:00, 4 January, 1936 BLU states 8 owned 8 divisions 8 surrender 0
     control RED from BLU West 3 12:00, 9 March, 1936
     capitulated RED winner BLU 12:00, 2 June, 1936
@@ -24,6 +26,8 @@ import time
 DATE = r"(?P<date>\d{1,2}:\d{2}, \d{1,2} \w+, \d{4})"
 PATTERNS = {
     "start": re.compile(rf"^start\s+{DATE}$"),
+    "declare": re.compile(r"^declare (?P<tag>[A-Z]{3})$"),
+    "player": re.compile(r"^player (?P<tag>[A-Z]{3})$"),
     "week": re.compile(
         rf"^week\s+{DATE} (?P<tag>[A-Z]{{3}}) states (?P<states>\d+) owned (?P<owned>\d+)"
         r" divisions (?P<divisions>\d+) surrender (?P<surrender>[\d.]+)$"
@@ -95,6 +99,8 @@ class ArenaLog:
         # The first report of each side: what it owned before any fighting.
         self.first_weeks = {}
         self.winner = self.loser = self.surrendered = None
+        # Who declared the war (arenas since v2) and the countries humans started as.
+        self.declarer, self.players = None, []
         # A weekly report missing for this long means the game clock has stopped. None
         # turns the check off: at speed 2 a week takes 84 s, longer than the screen's own
         # clock check allows.
@@ -119,6 +125,10 @@ class ArenaLog:
             elif event["kind"] == "capitulated" and self.winner is None:
                 self.winner, self.loser = event["winner"], event["loser"]
                 self.surrendered = event["date"]
+            elif event["kind"] == "declare":
+                self.declarer = event["tag"]
+            elif event["kind"] == "player":
+                self.players.append(event["tag"])
         if self.silence is not None and self.clock() - self.last_week > self.silence:
             raise RuntimeError(f"the game clock stopped: no weekly report for {self.silence} s")
         return events

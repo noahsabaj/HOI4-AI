@@ -176,6 +176,13 @@ def test_a_small_country_keeps_every_province_arena_sized(tmp_path):
     for hook in ("on_capitulation", "on_weekly", "on_state_control_changed"):
         assert hook in on_actions
     assert on_actions.count('log = "') == on_actions.count('log = "ARENA ')
+    # A coin flip picks who declares the war, and the side and each human player are logged.
+    for tag, enemy in (("BLU", "RED"), ("RED", "BLU")):
+        assert f"{tag} = {{ declare_war_on = {{ target = {enemy} " in on_actions
+        assert f'log = "ARENA declare {tag}"' in on_actions
+    assert "random_list = { 50 = {" in on_actions
+    assert on_actions.count("{") == on_actions.count("}")
+    assert 'log = "ARENA player [THIS.GetTag]"' in on_actions
     bitmap = np.asarray(Image.open(output / "map/provinces.bmp"))
     packed = (
         bitmap[:, :, 0].astype(np.uint32) << 16
