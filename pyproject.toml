@@ -9,7 +9,21 @@ description = "Screen-only HOI4 imitation learning and self-play research"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE.md", "third_party/licenses/*.txt"]
 requires-python = ">=3.12,<3.14"
-dependencies = ["numpy>=2", "pillow>=11", "gymnasium>=1", "torch>=2.7", "transformers>=5,<6", "huggingface-hub>=1", "einops>=0.8", "safetensors>=0.5", "psutil>=7", "scipy>=1.15", "lz4>=4", "cryptography>=46"]
+dependencies = [
+    "numpy>=2",
+    "pillow>=11",
+    "gymnasium>=1",
+    "torch>=2.7",
+    "transformers>=5,<6",
+    "huggingface-hub>=1",
+    "einops>=0.8",
+    "safetensors>=0.5",
+    "psutil>=7",
+    "scipy>=1.15",
+    "lz4>=4",
+    "cryptography>=46",
+    "opencv-python-headless>=4.10",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.11"]

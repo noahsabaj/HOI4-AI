@@ -2,9 +2,9 @@
 
 Each game launches HOI4 with the arena, starts as Blue, hands both countries to the AI with
 the `observe` console command, sets speed 4, and records native frames while the camera
-moves the way a player's would. A game ends when the capitulation popup ("<country>
-equipment seized") appears, or at the cap. The popup names the country that capitulated
-with its flag on the left, so the winner is the other one.
+moves and clears popups the way a player would. The arena mod reports itself in the game's
+log, so a game ends when the log names a surrender and its winner, or at the cap, and a
+game whose weekly report stops has a stuck clock.
 
 With --peer, the second PC records its own games at the same time, driven over its worker
 connection; its frames are recorded here. The second PC's worker must be running and the
@@ -28,22 +28,25 @@ import threading
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
 from hoi4_arena.desktop import Desktop, DesktopError
 from hoi4_arena.recording import Recorder
 from hoi4_arena.remote import RemoteDesktop
-from hoi4_arena.vision import ScreenRules
+from hoi4_arena.vision import ScreenRules, country_pixels
 
 SCRIPTS = Path(__file__).resolve().parent
 # The game runs in a 1920x1080 window (Test-ArenaLoad -Window), and these are fractions of
 # it, measured on 2026-09-22.
 WINDOW = "1920x1080"
-# The capitulation popup at 1920x1080: the tank artwork at the left of its title bar, which
-# is the same whichever side lost, and the flag of the country that capitulated.
-POPUP_ART = (744, 390, 86, 65)
-LOSER_FLAG = (764, 475, 24, 12)
+# A popup's Ok button, matched anywhere on screen: TM_SQDIFF_NORMED measured below 0.001
+# on the research and peace popups and above 0.07 everywhere else in two recorded games.
+OK_MATCH = 0.05
+# At speed 4 a game week is about 17 s, so a minute and a half without the mod's weekly
+# report means the clock has stopped.
+WEEK_SILENCE = 90
 SINGLE_PLAYER, NEW_GAME = (0.5, 290 / 1080), (0.5, 420 / 1080)
 SELECT_COUNTRY, START = (1043 / 1920, 875 / 1080), (1777 / 1920, 1038 / 1080)
 SPEED_UP = (1789 / 1920, 20 / 1080)
@@ -59,21 +62,42 @@ def pwsh(*args, timeout=300):
     return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
 
-def crop(rgb, rect):
-    x, y, w, h = rect
-    return rgb[y : y + h, x : x + w].astype(np.float32)
+class Popups:
+    """Finds popups' Ok buttons in the recorded frames and hands them to the camera.
 
+    A popup left open covered the map in 45% of the frames of two recorded games. A
+    player clears them, and an agent must learn to, so the camera clicks Ok the way a
+    player would: after a short, varying pause to read it.
+    """
 
-def capitulation_winner(rgb, template):
-    """BLU or RED once the capitulation popup is up, otherwise None."""
-    if float(np.abs(crop(rgb, POPUP_ART) - template).mean()) > 12:
+    def __init__(self, templates, rng=None):
+        self.templates = templates
+        self.rng = rng or random.Random()
+        self.lock = threading.Lock()
+        self.pending = None
+
+    def look(self, rgb):
+        with self.lock:
+            if self.pending is not None:
+                return
+        for template in self.templates:
+            score, _, (x, y), _ = cv2.minMaxLoc(
+                cv2.matchTemplate(rgb, template, cv2.TM_SQDIFF_NORMED)
+            )
+            if score < OK_MATCH:
+                h, w = template.shape[:2]
+                at = ((x + w / 2) / rgb.shape[1], (y + h / 2) / rgb.shape[0])
+                with self.lock:
+                    self.pending = (at, time.monotonic() + self.rng.uniform(1, 4))
+                return
+
+    def due(self):
+        """The Ok button to click now, if one has waited its reading time."""
+        with self.lock:
+            if self.pending and time.monotonic() >= self.pending[1]:
+                at, self.pending = self.pending[0], None
+                return at
         return None
-    r, g, b = crop(rgb, LOSER_FLAG).mean(axis=(0, 1))
-    if r > b + 60:
-        return "BLU"  # Red capitulated.
-    if b > r + 60:
-        return "RED"
-    return "unknown"
 
 
 class Station:
@@ -204,6 +228,47 @@ def screen(desk, tries=5):
     return rgb
 
 
+def hold(desk, vk, seconds):
+    desk.arm(setup=True)
+    desk.apply([{"kind": "key", "vk": vk, "down": True}])
+    try:
+        time.sleep(seconds)
+    finally:
+        desk.apply([{"kind": "key", "vk": vk, "down": False}])
+
+
+def recentre(desk, tries=10):
+    """Zoom fully out and pan until the arena sits in the middle of the screen.
+
+    Steered by what is on screen, not by a fixed recipe, so it works for any arena size
+    and undoes whatever drift the camera built up. True if the arena ended up centred.
+    """
+    act(
+        desk, [{"kind": "move", "x": 0.5, "y": 0.5}] + [{"kind": "wheel", "delta": -120}] * 14, 0.05
+    )
+    keys = {(0, 1): 0x27, (0, -1): 0x25, (1, 1): 0x28, (1, -1): 0x26}
+    for _ in range(tries):
+        time.sleep(0.5)
+        rgb = screen(desk)
+        # Leave out the top bar and the bottom panels, whose chrome is not the map.
+        top, bottom = 80, rgb.shape[0] - 120
+        blue, red = country_pixels(rgb[top:bottom])
+        if blue is None or not (blue | red).any():
+            return False
+        ys, xs = np.nonzero(blue | red)
+        centre = ((ys.min() + ys.max()) / 2 + top, (xs.min() + xs.max()) / 2)
+        offsets = [centre[0] / rgb.shape[0] - 0.5, centre[1] / rgb.shape[1] - 0.5]
+        if max(abs(o) for o in offsets) < 0.03:
+            return True
+        # Pan along whichever axis is further out: right/left for x, down/up for y.
+        axis = 0 if abs(offsets[1]) >= abs(offsets[0]) else 1
+        offset = offsets[1] if axis == 0 else offsets[0]
+        focus(desk, tries=1)
+        hold(desk, keys[(axis, 1 if offset > 0 else -1)], min(0.4, max(0.03, abs(offset))))
+        desk.release()
+    return False
+
+
 def start_game(desk, rules, failure_shot):
     """From the main menu to an AI-vs-AI game running at speed 4."""
     click(desk, *SINGLE_PLAYER)
@@ -214,17 +279,19 @@ def start_game(desk, rules, failure_shot):
     time.sleep(40)
     click(desk, *START)
     time.sleep(20)
-    rgb = screen(desk)
     # A new game starts paused. The pause mark is the same on both PCs; the alert row that
-    # "healthy" reads is not, as each PC shows different alerts.
-    if not rules.matches("paused", rgb):
+    # "healthy" reads is not, as each PC shows different alerts. The mark blinks, so one
+    # frame can catch it faded: look for it over a few seconds.
+    for _ in range(40):
+        rgb = screen(desk)
+        if rules.matches("paused", rgb):
+            break
+        time.sleep(0.25)
+    else:
         Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
         raise RuntimeError("game did not reach the map")
     console(desk, "observe")
-    act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}] + [{"kind": "wheel", "delta": -120}] * 14, 0.1)
-    # The framing the hand-centred runs used: right for 0.5 s, then left for 0.28 s.
-    act(desk, tap(0x27), pause=0.5)
-    act(desk, tap(0x25), pause=0.28)
+    recentre(desk)
     for _ in range(3):
         click(desk, *SPEED_UP)  # The on-screen + button: speed 1 to 4.
     act(desk, [{"kind": "move", "x": 0.5, "y": 0.75}])
@@ -236,16 +303,19 @@ def start_game(desk, rules, failure_shot):
         raise RuntimeError("game is not running at speed 4")
 
 
-def camera(desk, stop, station):
-    """Look around like a player, always coming back to the start view.
+def camera(desk, stop, station, popups, recentre_every=(60, 150)):
+    """Look around like a player, clear popups, and come back to the whole arena.
 
     Every pan is undone by the opposite pan of the same length, and every zoom-in by a
-    zoom-out at the same pointer position. A random walk drifted off the arena onto open
-    sea within minutes, because pan speed changes with zoom. It shares the recorder's
-    connection: the second PC's bridge accepts only one.
+    zoom-out at the same pointer position, but that still drifted: two 32-minute games
+    both ended zoomed in on one side, because pan speed changes with zoom. So every
+    minute or two the camera zooms fully out and recentres on what it sees, which is also
+    the view the territory reward reads. It shares the recorder's connection: the second
+    PC's bridge accepts only one.
     """
     rng = random.Random()
     opposite = {0x25: 0x27, 0x27: 0x25, 0x26: 0x28, 0x28: 0x26}
+    next_recentre = time.monotonic() + rng.uniform(*recentre_every)
 
     def do(events, pause=0.08):
         # The worker disarms after 750 ms without input, so arm for each burst.
@@ -254,32 +324,36 @@ def camera(desk, stop, station):
             desk.apply([event])
             time.sleep(pause)
 
-    def hold(vk, seconds):
-        desk.arm(setup=True)
-        desk.apply([{"kind": "key", "vk": vk, "down": True}])
-        try:
-            time.sleep(seconds)
-        finally:
-            desk.apply([{"kind": "key", "vk": vk, "down": False}])
+    def clear_popup():
+        at = popups.due()
+        if at:
+            press = [{"kind": "button", "button": 0, "down": d} for d in (True, False)]
+            do([{"kind": "move", "x": at[0], "y": at[1]}, *press])
 
     def linger():
         # Point around while away, like a player reading the map.
         for _ in range(rng.randint(1, 3)):
             if stop.wait(rng.uniform(0.6, 1.8)):
                 return
+            clear_popup()
             x, y = rng.uniform(0.1, 0.9), rng.uniform(0.15, 0.85)
             do([{"kind": "move", "x": x, "y": y}])
 
     try:
         while not stop.wait(rng.uniform(0.8, 2.5)):
             try:
+                clear_popup()
                 roll = rng.random()
-                if roll < 0.35:
+                if time.monotonic() >= next_recentre:
+                    recentre(desk)
+                    next_recentre = time.monotonic() + rng.uniform(*recentre_every)
+                    linger()
+                elif roll < 0.35:
                     vk = rng.choice(list(opposite))
                     seconds = rng.uniform(0.08, 0.25)
-                    hold(vk, seconds)
+                    hold(desk, vk, seconds)
                     linger()
-                    hold(opposite[vk], seconds)
+                    hold(desk, opposite[vk], seconds)
                 elif roll < 0.65:
                     x, y = rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)
                     notches = rng.randint(1, 4)
@@ -303,14 +377,37 @@ def camera(desk, stop, station):
             pass
 
 
-def play(desk, root, template, args, station):
+class ArenaLog:
+    """The arena mod's game.log lines for one game: its surrender and its heartbeat."""
+
+    def __init__(self, desk):
+        self.desk, self.offset, self.lines = desk, 0, []
+        self.winner = self.surrendered = None
+        self.last_week = time.monotonic()
+
+    def poll(self):
+        lines, self.offset = self.desk.game_log(self.offset)
+        for line in lines:
+            self.lines.append(line)
+            words = line.split()
+            if words[0] == "week":
+                self.last_week = time.monotonic()
+            elif words[0] == "capitulated" and self.winner is None:
+                # "capitulated RED winner BLU <date>"
+                self.winner, self.surrendered = words[3], " ".join(words[4:])
+        if time.monotonic() - self.last_week > WEEK_SILENCE:
+            raise RuntimeError(f"the game clock stopped: no weekly report for {WEEK_SILENCE} s")
+
+
+def play(desk, root, popups, args, station):
     stop = threading.Event()
-    mover = threading.Thread(target=camera, args=(desk, stop, station), daemon=True)
+    mover = threading.Thread(target=camera, args=(desk, stop, station, popups), daemon=True)
     outcome, reason = "timeout", None
     first = desk.capture()
     rec = Recorder(root, first, game_speed=4, source="ai", hz=args.hz, codec=args.codec)
-    start = deadline = time.monotonic()
-    late = seen = 0
+    log = ArenaLog(desk)
+    start = deadline = next_poll = time.monotonic()
+    late, ending = 0, None
     try:
         rec.append(first)
         mover.start()
@@ -322,14 +419,21 @@ def play(desk, root, template, args, station):
                 focus(desk, tries=1)
                 continue
             rec.append(frame)
-            if time.monotonic() - deadline > 1:
+            now = time.monotonic()
+            if now - deadline > 1:
                 late += 1
-                deadline = time.monotonic()
-            winner = capitulation_winner(frame.rgb, template)
-            seen = seen + 1 if winner else 0
-            if seen >= 2:
-                outcome = winner
-                Image.fromarray(frame.rgb).save(Path(root) / "capitulation.png")
+                deadline = now
+            if rec.manifest["frames"] % int(args.hz) == 0:
+                popups.look(frame.rgb)  # About once a second; a search costs ~70 ms.
+            if now >= next_poll:
+                next_poll = now + 2
+                log.poll()
+                if log.winner and ending is None:
+                    # Keep a few seconds of the surrender on screen, then stop.
+                    ending = now + 5
+                    Image.fromarray(frame.rgb).save(Path(root) / "capitulation.png")
+            if ending is not None and now >= ending:
+                outcome = log.winner
                 break
             if rec.manifest["frames"] % (60 * int(args.hz)) == 0:
                 say(station, f"{rec.manifest['frames'] // int(args.hz) // 60} min recorded")
@@ -338,19 +442,21 @@ def play(desk, root, template, args, station):
     finally:
         stop.set()
         mover.join(timeout=10)
+        (Path(root) / "arena-log.txt").write_text("\n".join(log.lines) + "\n")
         rec.manifest.update(
             winner=outcome,
+            surrendered=log.surrendered,
             seconds=round(time.monotonic() - start),
             late_ticks=late,
             arena=Path(args.mod).name,
-            driver="observe + scripted camera",
+            driver="observe + scripted camera + popup clicks",
             station=station,
         )
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
 
 
-def run_station(station, out_root, rules, template, args, end):
+def run_station(station, out_root, rules, templates, args, end):
     results = []
     # A game needs about 3 minutes to launch and most end within 10; do not start one
     # that cannot plausibly finish.
@@ -367,7 +473,7 @@ def run_station(station, out_root, rules, template, args, end):
                 start_game(desk, rules, out_root / f"{name}-start-failed.png")
                 say(station.name, "recording", name)
                 outcome, reason, manifest = play(
-                    desk, out_root / name, template, args, station.name
+                    desk, out_root / name, Popups(templates), args, station.name
                 )
         except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
             say(station.name, "start failed:", error)
@@ -406,12 +512,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("output")
     parser.add_argument("--minutes", type=float, required=True, help="Total time budget.")
-    parser.add_argument("--mod", default="artifacts/mods/small-arena-v1")
+    parser.add_argument("--mod", default="artifacts/mods/arena-12x8-v1")
     parser.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     parser.add_argument(
-        "--popup",
-        default="artifacts/screens-1080p/capitulation-popup.png",
-        help="A 1920x1080 capture of the capitulation popup, to cut its artwork from.",
+        "--ok-button",
+        nargs="+",
+        default=["artifacts/screens-1080p/ok-button.png"],
+        help="1920x1080 crops of popup Ok buttons, clicked wherever they appear.",
     )
     parser.add_argument("--hz", type=float, default=5)
     parser.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
@@ -422,7 +529,7 @@ def main():
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
     rules = ScreenRules(args.rules)
-    template = crop(np.asarray(Image.open(args.popup).convert("RGB")), POPUP_ART)
+    templates = [np.asarray(Image.open(path).convert("RGB")) for path in args.ok_button]
     stations = [] if args.peer_only else [Station("here")]
     if args.peer:
         deploy = pwsh(
@@ -434,7 +541,7 @@ def main():
         stations.append(Station("peer", args.peer))
     end = time.monotonic() + args.minutes * 60
     threads = [
-        threading.Thread(target=run_station, args=(s, out_root, rules, template, args, end))
+        threading.Thread(target=run_station, args=(s, out_root, rules, templates, args, end))
         for s in stations
     ]
     for thread in threads:

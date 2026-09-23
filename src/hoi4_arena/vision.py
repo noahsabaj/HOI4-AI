@@ -146,7 +146,7 @@ def country_pixels(crop):
     the arena is one piece, because the two countries share a border, and clouds drift
     over the sea as separate patches.
     """
-    from scipy import ndimage
+    import cv2
 
     pixels = np.asarray(crop, dtype=np.int32)
     if pixels.size == 0 or pixels.ndim != 3:
@@ -154,7 +154,10 @@ def country_pixels(crop):
     r, b = pixels[..., 0], pixels[..., 2]
     land = pixels.sum(-1) > 250
     blue, red = land & (b - r > 10), land & (r - b > 15)
-    labels, count = ndimage.label(blue | red)
+    # Four-neighbour connectivity, as scipy's label used by default; OpenCV's labelling
+    # measured about twice as fast. Label 0 is the background in both.
+    count, labels = cv2.connectedComponents((blue | red).astype(np.uint8), connectivity=4)
+    count -= 1
     if count > 1:
         sizes = np.bincount(labels.ravel())
         sizes[0] = 0

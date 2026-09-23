@@ -739,9 +739,26 @@ def generate(
         'BLU = { history = "ARENA_BLU_HISTORY" ideology = neutrality } '
         'RED = { history = "ARENA_RED_HISTORY" ideology = neutrality } } }',
     )
+    # Besides the war, the arena reports itself in game.log, which changes no rule: each
+    # line starts "ARENA " so the worker's game_log request can pick them out. A surrender
+    # names both sides, so a match ends without reading pixels, and the weekly counts
+    # give an exact territory figure. Checked on 2026-09-22: the dynamic variables
+    # resolve in log strings, and a state changing hands logs its name.
     write(
         "common/on_actions/arena.txt",
-        "on_actions = { on_startup = { effect = { BLU = { declare_war_on = { target = RED type = annex_everything } } } } }",
+        "on_actions = {\n"
+        "\ton_startup = { effect = { BLU = { declare_war_on = { target = RED type = annex_everything } }"
+        ' log = "ARENA start [GetDateText]" } }\n'
+        '\ton_weekly = { effect = { log = "ARENA week [GetDateText] [ROOT.GetTag] states'
+        " [?num_controlled_states] owned [?num_owned_controlled_states] divisions"
+        ' [?num_divisions] surrender [?surrender_progress]" } }\n'
+        '\ton_capitulation = { effect = { log = "ARENA capitulated [ROOT.GetTag] winner'
+        ' [FROM.GetTag] [GetDateText]" } }\n'
+        '\ton_state_control_changed = { effect = { log = "ARENA control [ROOT.GetTag] from'
+        ' [FROM.GetTag] [FROM.FROM.GetName] [GetDateText]" } }\n'
+        '\ton_peaceconference_ended = { effect = { log = "ARENA peace [ROOT.GetTag]'
+        ' [FROM.GetTag] [GetDateText]" } }\n'
+        "}",
     )
     # Without an adjective and an ideology-qualified name every string the game builds
     # from the tag renders a raw key, starting with the name of the war.

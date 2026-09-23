@@ -160,6 +160,21 @@ pub fn cursor_crop_bgra(
     out
 }
 
+/// The arena mod's lines among complete lines of game.log text, without the engine's
+/// timestamp prefix, and how many bytes were consumed. A trailing partial line is left
+/// for the next read.
+fn arena_lines(bytes: &[u8]) -> (Vec<String>, usize) {
+    let used = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let lines = String::from_utf8_lossy(&bytes[..used])
+        .lines()
+        .filter_map(|line| {
+            line.split_once("]: ARENA ")
+                .map(|(_, rest)| rest.trim().to_string())
+        })
+        .collect();
+    (lines, used)
+}
+
 fn valid_event(e: &Event, setup: bool) -> bool {
     match *e {
         Event::Move { x, y } => {
@@ -719,6 +734,47 @@ mod platform {
     }
     /// Arm, release, apply, and status. These stay off the capture thread so a blit
     /// cannot bunch the 25 ms slots up behind it.
+    /// HOI4's game.log under the user's Documents folder, which may be redirected.
+    fn game_log_path() -> Result<std::path::PathBuf, String> {
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+        unsafe {
+            let mut path = null_mut();
+            if SHGetKnownFolderPath(&FOLDERID_Documents, 0, null_mut(), &mut path) != 0 {
+                return Err("documents_folder_unknown".into());
+            }
+            let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+            let documents = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+            CoTaskMemFree(path as _);
+            Ok(std::path::Path::new(&documents)
+                .join("Paradox Interactive")
+                .join("Hearts of Iron IV")
+                .join("logs")
+                .join("game.log"))
+        }
+    }
+
+    /// New arena lines after `offset`, and the offset to ask from next time. A log
+    /// shorter than the offset belongs to a newer game and is read from the start.
+    fn read_arena_log(offset: u64) -> Result<(Vec<String>, u64), String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = game_log_path()?;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => return Ok((vec![], 0)),
+        };
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let start = if offset > len { 0 } else { offset };
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(1 << 20)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let (lines, used) = arena_lines(&bytes);
+        Ok((lines, start + used as u64))
+    }
+
     fn fast_op(
         shared: &Arc<Mutex<InputState>>,
         cmd: &serde_json::Value,
@@ -802,6 +858,17 @@ mod platform {
                 *last = Instant::now();
                 Ok((
                     serde_json::json!({"applied": events.len(), "t_ns": ns()}),
+                    vec![],
+                ))
+            }
+            // The arena mod's own lines from HOI4's game.log: surrenders, peace, states
+            // changing hands and a weekly count per country. Read-only, one fixed file,
+            // and only lines the mod wrote, so it exposes nothing else on the machine.
+            "game_log" => {
+                let offset = cmd["offset"].as_u64().unwrap_or(0);
+                let (lines, offset) = read_arena_log(offset)?;
+                Ok((
+                    serde_json::json!({"lines": lines, "offset": offset}),
                     vec![],
                 ))
             }
@@ -1268,6 +1335,15 @@ mod tests {
                 "vk {vk:#x} is part of the demonstration vocabulary"
             );
         }
+    }
+    #[test]
+    fn arena_lines_skip_other_and_partial_lines() {
+        let text =
+            b"[1][x][effectbase.cpp:1783]: ARENA week  1:00, 4 January, 1936 BLU states 4\r\n\
+[2][x][other.cpp:9]: something else\r\n[3][x][effectbase.cpp:1783]: ARENA capitu";
+        let (lines, used) = arena_lines(text);
+        assert_eq!(lines, vec!["week  1:00, 4 January, 1936 BLU states 4"]);
+        assert_eq!(&text[used..], b"[3][x][effectbase.cpp:1783]: ARENA capitu");
     }
     #[test]
     fn setup_can_open_the_console() {

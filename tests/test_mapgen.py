@@ -170,6 +170,12 @@ def test_a_small_country_keeps_every_province_arena_sized(tmp_path):
     descriptor = (output / "descriptor.mod").read_text()
     assert 'replace_path = "events"' in descriptor
     assert 'replace_path = "common/on_actions"' in descriptor
+    # The arena reports its surrenders and weekly counts in game.log, for the worker's
+    # game_log request, and every line it writes starts with the prefix that finds them.
+    on_actions = (output / "common/on_actions/arena.txt").read_text()
+    for hook in ("on_capitulation", "on_weekly", "on_state_control_changed"):
+        assert hook in on_actions
+    assert on_actions.count('log = "') == on_actions.count('log = "ARENA ')
     bitmap = np.asarray(Image.open(output / "map/provinces.bmp"))
     packed = (
         bitmap[:, :, 0].astype(np.uint32) << 16
