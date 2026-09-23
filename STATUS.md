@@ -354,15 +354,12 @@ In order:
    speed used. This is the only source of a player's inputs.
 3. **Train the inverse dynamics model** on those and the AI games' inputs, then label
    video that has no inputs (`label`) and train on it (`--sources idm`).
-4. **Pick the encoder.** Download the SigLIP 2 weights and compare `--variant screen`
-   against LeVJEPA, or distil the compact LeVJEPA student. Either is how two actors fit
-   one GPU; the other way is one GPU per side.
-5. Train the behaviour-cloning baseline, pre-train its critic on the AI games' winners
+4. Train the behaviour-cloning baseline, pre-train its critic on the AI games' winners
    (`train-critic`), then recurrent PPO self-play with a league, scored from the arena
    log, with the PACT critic (lambda = 1, a BCE value head trained after the actor on
    importance-weighted returns). PACT's gains were measured on language models, so its
    pieces are flags (`--gae-lambda`, `--critic`) to compare once self-play runs.
-6. Run a two-PC match between agents, and check reset and recovery when something goes
+5. Run a two-PC match between agents, and check reset and recovery when something goes
    wrong. (A two-PC match driven by hand, from this PC, works.)
-7. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
-8. Test the same interface in an unmodified private multiplayer lobby.
+6. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
+7. Test the same interface in an unmodified private multiplayer lobby.
