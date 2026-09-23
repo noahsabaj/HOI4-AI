@@ -753,6 +753,23 @@ def generate(
         f' log = "ARENA declare {tag}" }}'
         for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
     )
+    # Every day each side also reports what a player can only estimate from the screen:
+    # its divisions in every state, the game's own estimate of its army's strength
+    # against the enemy's, casualties, manpower, and the rifles its divisions hold against
+    # what they need. Training may read it (a win predictor that sees the true state,
+    # perception checked against what is really on the map); the agent never does, and a
+    # vanilla lobby has no mod. At speed 5 a day passes in about 0.4 s.
+    ids = sorted(states)
+    daily = (
+        "".join(f" set_temp_variable = {{ arena_d{s} = num_armies_in_state@{s} }}" for s in ids)
+        + " set_temp_variable = { arena_rifles = num_equipment_in_armies_k@infantry_equipment }"
+        " set_temp_variable = { arena_needed = num_target_equipment_in_armies_k@infantry_equipment }"
+        ' log = "ARENA day [GetDateText] [ROOT.GetTag] states [?num_controlled_states] owned'
+        " [?num_owned_controlled_states] divisions [?num_divisions] surrender"
+        " [?surrender_progress] strength [?enemies_strength_ratio] casualties [?casualties_k]"
+        " manpower [?manpower_k] deployed [?deployed_army_manpower_k] rifles [?arena_rifles]"
+        " needed [?arena_needed] at" + "".join(f" {s}=[?arena_d{s}]" for s in ids) + '"'
+    )
     write(
         "common/on_actions/arena.txt",
         "on_actions = {\n"
@@ -762,7 +779,8 @@ def generate(
         '\ton_weekly = { effect = { log = "ARENA week [GetDateText] [ROOT.GetTag] states'
         " [?num_controlled_states] owned [?num_owned_controlled_states] divisions"
         ' [?num_divisions] surrender [?surrender_progress]" } }\n'
-        '\ton_capitulation = { effect = { log = "ARENA capitulated [ROOT.GetTag] winner'
+        + "".join(f"\ton_daily_{tag} = {{ effect = {{{daily} }} }}\n" for tag in ("BLU", "RED"))
+        + '\ton_capitulation = { effect = { log = "ARENA capitulated [ROOT.GetTag] winner'
         ' [FROM.GetTag] [GetDateText]" } }\n'
         '\ton_state_control_changed = { effect = { log = "ARENA control [ROOT.GetTag] from'
         ' [FROM.GetTag] [FROM.FROM.GetName] [GetDateText]" } }\n'

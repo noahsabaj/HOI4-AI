@@ -125,18 +125,34 @@ def advantage_labels(
     beta=0.05,
     max_weight=20.0,
     device=None,
+    state_value=None,
 ):
-    """Write `labels-advantage.npz` beside a player's recording: values, advantages, weights."""
-    from .runner import load_policy
+    """Write `labels-advantage.npz` beside a player's recording: values, advantages, weights.
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    With `state_value` (a model from train-state-value) the values come from the arena's
+    logged state instead of `checkpoint`'s screen critic: exact where the screen is not,
+    and with no GPU. Only recordings of v3 arenas or later have that log.
+    """
+    if checkpoint is None and state_value is None:
+        raise ValueError("advantage needs a policy with a trained critic, or --state-value")
     recording = Path(recording)
     manifest = json.loads((recording / "manifest.json").read_text())
     side = player_side(manifest)
     labels = session_labels(recording, sources=(manifest["source"],))
-    policy, config, digest = load_policy(checkpoint, model_path, device)
-    policy.eval()
-    values = value_recording(policy, labels, device)
+    if state_value is not None:
+        from .learning import file_hash
+        from .state_value import frame_values, load_state_value
+
+        frames = frame_values(load_state_value(state_value), recording, manifest["frames"])
+        values = frames[labels["frame_ids"]]
+        digest = file_hash(state_value)
+    else:
+        from .runner import load_policy
+
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        policy, config, digest = load_policy(checkpoint, model_path, device)
+        policy.eval()
+        values = value_recording(policy, labels, device)
     count = len(values)
     advantage, weight = advantage_weights(
         values,

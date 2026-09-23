@@ -14,6 +14,9 @@ The recordings carry the camera's own inputs as labels, but none of the AI's ord
 for the encoder, for predicting who wins, for camera control and clearing popups, and for
 measuring how often a match ends inside the time limit.
 
+With `player="scripted"` the recorder's country is not handed to the AI: the scripted player
+(scripted.py) fights it through the interface, and its orders are recorded as labels too.
+
 It takes over the screen of each PC it uses. Anything else that takes focus stops input to
 the game until the recorder brings it back.
 """
@@ -354,11 +357,30 @@ def pick_country(desk, country, tries=5):
     return picked(screen(desk)) == country
 
 
-def start_game(desk, rules, failure_shot, country="BLU", speed=4):
+def run_at(desk, rules, speed, failure_shot=None):
+    """Unpause a game paused at speed 1 and run it at `speed`, 4 or 5."""
+    for _ in range(3):
+        click(desk, *SPEED_UP)  # The on-screen + button: speed 1 to 4.
+    act(desk, [{"kind": "move", "x": 0.5, "y": 0.75}])
+    act(desk, tap(0x20))  # Unpause
+    time.sleep(2)
+    rgb = screen(desk)
+    if not rules.matches("speed", rgb) or rules.matches("paused", rgb):
+        if failure_shot:
+            Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
+        raise RuntimeError("game is not running at speed 4")
+    if speed == 5:
+        # Checked at 4, where the rule was calibrated, then one more.
+        click(desk, *SPEED_UP)
+
+
+def start_game(desk, rules, failure_shot, country="BLU", speed=4, observe=True):
     """From the main menu to an AI-vs-AI game running at `speed` (4 or 5), as `country`.
 
     Which country the game starts as is varied because only one side ever won while the
     recorder always started as Blue; the arena logs the country each human started as.
+    Without `observe` the game is left paused at its start, as `country`, for the scripted
+    player (scripted.Planner) to set up and run while it is recorded.
     """
     click(desk, *SINGLE_PLAYER)
     time.sleep(8)
@@ -383,20 +405,11 @@ def start_game(desk, rules, failure_shot, country="BLU", speed=4):
     else:
         Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
         raise RuntimeError("game did not reach the map")
+    if not observe:
+        return
     console(desk, "observe")
     recentre(desk)
-    for _ in range(3):
-        click(desk, *SPEED_UP)  # The on-screen + button: speed 1 to 4.
-    act(desk, [{"kind": "move", "x": 0.5, "y": 0.75}])
-    act(desk, tap(0x20))  # Unpause
-    time.sleep(2)
-    rgb = screen(desk)
-    if not rules.matches("speed", rgb) or rules.matches("paused", rgb):
-        Image.fromarray(rgb).resize((960, 540)).save(failure_shot)
-        raise RuntimeError("game is not running at speed 4")
-    if speed == 5:
-        # Checked at 4, where the rule was calibrated, then one more.
-        click(desk, *SPEED_UP)
+    run_at(desk, rules, speed, failure_shot)
 
 
 def front_points(rgb):
@@ -426,7 +439,7 @@ def land_points(rgb):
     return [(x / rgb.shape[1], (y + top) / rgb.shape[0]) for y, x in zip(ys, xs, strict=True)]
 
 
-def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None):
+def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, planner=None):
     """Watch the war like a player: close in on the front, look around, step back.
 
     Measured at 1080p on 2026-09-23, in wheel notches in from fully out: the whole arena
@@ -440,6 +453,10 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None):
     pointer, as in the game, so it closes in on what it points at. Fully zoomed out the
     counters vanish, which is also a view players use, but only in passing. It shares
     the recorder's connection: the second PC's bridge accepts only one.
+
+    With a scripted player's `planner`, the planner first sets the paused game up and
+    starts it, then gives its later orders between the camera's moves. A setup that fails
+    is left in `planner.error`, which ends the game; a later order that fails is retried.
     """
     rng = rng or random.Random()
     arrows = [0x25, 0x26, 0x27, 0x28]
@@ -506,9 +523,30 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None):
         wheel(rng.randint(VIEW_NEAR + 1, VIEW_FAR), interest(screen(desk)) or (0.5, 0.5))
 
     try:
+        if planner is not None:
+            try:
+                planner.setup(desk)
+            except Exception as error:  # noqa: BLE001 - play() ends the game with it.
+                planner.error = error
+                return
+            # Setup left the camera fully zoomed out over the arena.
+            zoom, next_overview = 0, time.monotonic() + rng.uniform(*overview_every)
         while not stop.wait(rng.uniform(0.8, 2.5)):
             try:
                 clear_popup()
+                if planner is not None and planner.due():
+                    try:
+                        moved = planner.step(desk)
+                    except RuntimeError as error:
+                        say(station, "planner:", error)
+                        moved = True
+                    if moved:
+                        zoom = 0
+                        wheel(
+                            rng.randint(VIEW_NEAR + 1, VIEW_FAR),
+                            interest(screen(desk)) or (0.5, 0.5),
+                        )
+                    continue
                 if time.monotonic() >= next_overview:
                     overview()
                     next_overview = time.monotonic() + rng.uniform(*overview_every)
@@ -543,17 +581,37 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None):
             pass
 
 
-def play(desk, root, popups, settings, station, country="BLU", speed=4):
+def play(desk, root, popups, settings, station, country="BLU", speed=4, player=None):
+    """Record one game to its end. With `player` (a plan, templates and screen rules), the
+    scripted player fights it from its paused start; without, the game's AI plays both."""
+    from .scripted import Planner
+
     stop = threading.Event()
     inputs = Logged(desk)
-    mover = threading.Thread(target=camera, args=(inputs, stop, station, popups), daemon=True)
     outcome, reason = "timeout", None
     first = desk.capture()
     hz = settings["hz"]
-    rec = Recorder(root, first, game_speed=speed, source="ai", hz=hz, codec=settings["codec"])
-    arena = ArenaLog(desk, silence=WEEK_SILENCE)
+    source = "scripted" if player else "ai"
+    rec = Recorder(root, first, game_speed=speed, source=source, hz=hz, codec=settings["codec"])
+    planner = None
+    if player:
+        planner = Planner(
+            country, player["plan"], player["templates"], player["rules"], speed,
+            frame=lambda: rec.manifest["frames"],
+        )  # fmt: skip
+    mover = threading.Thread(
+        target=camera,
+        args=(inputs, stop, station, popups),
+        kwargs={"planner": planner},
+        daemon=True,
+    )
+    # A scripted game starts paused, and no weekly report comes until it runs.
+    arena = ArenaLog(desk, silence=None if planner else WEEK_SILENCE)
     start = deadline = next_poll = time.monotonic()
     late, ending = 0, None
+    # Each mod line with the number of frames recorded when it was read, which aligns the
+    # arena's daily reports (v3) with the video: at speed 5 a day passes in about 0.4 s.
+    stamped = []
     try:
         rec.append(first)
         mover.start()
@@ -566,14 +624,22 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4):
                 continue
             rec.append(frame, scripted_events=inputs.take())
             now = time.monotonic()
+            if planner is not None:
+                if planner.error is not None:
+                    raise RuntimeError(f"the scripted player's setup failed: {planner.error}")
+                if planner.running and arena.silence is None:
+                    arena.silence, arena.last_week = WEEK_SILENCE, arena.clock()
             if now - deadline > 1:
                 late += 1
                 deadline = now
             if rec.manifest["frames"] % int(hz) == 0:
                 popups.look(frame.rgb)  # About once a second; a search costs ~70 ms.
             if now >= next_poll:
-                next_poll = now + 2
+                next_poll = now + 1
+                seen = len(arena.lines)
                 arena.poll()
+                frames = rec.manifest["frames"]
+                stamped.extend({"frame": frames, "line": line} for line in arena.lines[seen:])
                 if arena.winner and ending is None:
                     # Keep a few seconds of the surrender on screen, then stop.
                     ending = now + 5
@@ -589,6 +655,8 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4):
         stop.set()
         mover.join(timeout=10)
         (Path(root) / "arena-log.txt").write_text("\n".join(arena.lines) + "\n")
+        with (Path(root) / "arena-log.jsonl").open("w") as out:
+            out.writelines(json.dumps(entry) + "\n" for entry in stamped)
         rec.manifest.update(
             winner=outcome,
             surrendered=arena.surrendered,
@@ -600,11 +668,18 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4):
             seconds=round(time.monotonic() - start),
             late_ticks=late,
             arena=Path(settings["mod"]).name,
-            driver="observe + scripted camera + popup clicks",
-            # frames.jsonl carries the camera's inputs as scripted_events.
+            driver=(
+                "scripted player + scripted camera + popup clicks"
+                if planner
+                else "observe + scripted camera + popup clicks"
+            ),
+            # frames.jsonl carries the camera's inputs, and the scripted player's orders,
+            # as scripted_events.
             labels="scripted_events",
             station=station,
         )
+        if planner:
+            rec.manifest.update(plan=player["plan"], orders=planner.orders)
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
 
@@ -620,13 +695,22 @@ def game_plan(station, index, speeds):
 
 
 def run_station(station, out_root, rules, templates, settings, end):
+    from .scripted import choose_plan
+
     results = []
+    scripted = settings.get("player") == "scripted"
+    rng = random.Random()
     # A game needs about 3 minutes to launch and most end within 10; do not start one
     # that cannot plausibly finish.
     while time.monotonic() + 12 * 60 < end:
-        name = time.strftime(f"ai-{station.name}-%Y%m%d-%H%M%S")
+        kind = "scripted" if scripted else "ai"
+        name = time.strftime(f"{kind}-{station.name}-%Y%m%d-%H%M%S")
         country, speed = game_plan(station.name, len(results), settings["speeds"])
         entry = {"game": name, "station": station.name, "started_as": country, "speed": speed}
+        player = None
+        if scripted:
+            player = {"plan": choose_plan(rng), "templates": settings["buttons"], "rules": rules}
+            entry["plan"] = player["plan"]
         try:
             station.quit()
             station.launch(settings["mod"])
@@ -634,7 +718,10 @@ def run_station(station, out_root, rules, templates, settings, end):
             with station.connect() as desk:
                 if not focus(desk):
                     raise RuntimeError("could not bring the game window to the front")
-                start_game(desk, rules, out_root / f"{name}-start-failed.png", country, speed)
+                start_game(
+                    desk, rules, out_root / f"{name}-start-failed.png", country, speed,
+                    observe=not scripted,
+                )  # fmt: skip
                 say(station.name, "recording", name, "as", country, "at speed", speed)
                 outcome, reason, manifest = play(
                     desk,
@@ -644,6 +731,7 @@ def run_station(station, out_root, rules, templates, settings, end):
                     station.name,
                     country,
                     speed,
+                    player,
                 )
         except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
             say(station.name, "start failed:", error)
@@ -694,20 +782,31 @@ def record_ai_games(
     speeds=(4, 5),
     peer=None,
     peer_only=False,
+    player="observe",
 ):
-    """Record on this PC, the second PC, or both at once, until `minutes` run out."""
+    """Record on this PC, the second PC, or both at once, until `minutes` run out.
+
+    `player` "observe" hands both countries to the game's AI; "scripted" has the scripted
+    player (scripted.py) fight the recorder's country against the AI.
+    """
+    from .scripted import TEMPLATES, load_templates
+
     out_root = Path(output)
     out_root.mkdir(parents=True, exist_ok=True)
     screen_rules = ScreenRules(rules)
     templates = [np.asarray(Image.open(path).convert("RGB")) for path in ok_button]
     if not speeds or any(speed not in (4, 5) for speed in speeds):
         raise ValueError("speeds are 4 or 5")
+    if player not in ("observe", "scripted"):
+        raise ValueError("player is observe or scripted")
     settings = {
         "mod": mod,
         "hz": hz,
         "codec": codec,
         "cap_minutes": cap_minutes,
         "speeds": list(speeds),
+        "player": player,
+        "buttons": load_templates(TEMPLATES) if player == "scripted" else None,
     }
     stations = [] if peer_only else [Station("here")]
     if peer:

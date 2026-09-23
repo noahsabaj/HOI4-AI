@@ -101,6 +101,17 @@ Offline reinforcement learning, before any live self-play: `advantage` has a tra
 .venv\Scripts\hoi4-arena.exe train-bc data/human artifacts/bc-awr --advantage
 ```
 
+A scripted player makes games whose recorded inputs do decide who wins, without anyone at the keyboard. `record-ai --player scripted` has it fight the recorder's country against the game's AI through the real interface. While the game is still paused it forms the divisions into an army (shift+click on the "Unassigned divisions" alert, then the green + in the army bar). It draws a front line on the border (Z, then a click) and an offensive into enemy land (X, then a right-drag). Then it runs the game and activates the plan (the arrow above the army card). Each game draws its strategy at random: a near or deep offensive, or none; a wait of 0 to 60 s before activating; and sometimes a new offensive every 40 to 120 s. Its inputs are stored as labels, like the camera's, and the manifest lists every order with the frame it was given at and the enemy state it aimed at. `win-rate` reads the results files and reports its record against the AI, overall, by side and by strategy, with 95% intervals. It is the first baseline a learned agent must beat. Its games train with `--sources scripted`.
+
+Arenas since v3 (`arena-12x8-v3`) also report each side's true state every day in game.log: divisions in each state, the game's estimate of its army's strength against the enemy's, casualties, manpower, and rifles held against rifles needed. Recordings keep every mod line with the frame it was read at (`arena-log.jsonl`). `train-state-value` fits a small win predictor on that state, on the CPU in seconds. `advantage --state-value` then values each decision from the state rather than from the screen. Training may read the state; the agent never does, and a vanilla lobby has no mod.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe record-ai artifacts/scripted-games --minutes 240 --player scripted --mod artifacts/mods/arena-12x8-v3 --speeds 5 --peer artifacts/pairing/peer.json --peer-only
+.venv\Scripts\hoi4-arena.exe win-rate artifacts/scripted-games/results-peer-20260923.json
+.venv\Scripts\hoi4-arena.exe train-state-value artifacts/state-value.pt artifacts/scripted-games/scripted-peer-20260923-185544
+.venv\Scripts\hoi4-arena.exe advantage --state-value artifacts/state-value.pt artifacts/scripted-games/scripted-peer-20260923-185544
+```
+
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
 
 ```powershell

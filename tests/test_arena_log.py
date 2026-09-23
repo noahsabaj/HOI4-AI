@@ -32,6 +32,26 @@ def test_every_kind_of_mod_line_parses_including_the_padded_hour():
     assert parse("supply BLU 3") is None
 
 
+# Copied from a live game.log of the v3 arena on 2026-09-23. Blue's report comes at 24:00.
+DAY = (
+    "day  24:00, 4 January, 1936 BLU states 8 owned 8 divisions 8 surrender 0 strength 1"
+    " casualties 0.078 manpower 0 deployed 14.938 rifles 4.77499 needed 4.79999 at 1=0 2=0"
+    " 3=0 4=0 5=0 6=0 7=4 8=4 9=0 10=0 11=0 12=0 13=0 14=0 15=0 16=0"
+)
+
+
+def test_the_daily_report_parses_with_the_divisions_in_every_state():
+    day = parse(DAY)
+    assert (day["kind"], day["tag"], day["date"]) == ("day", "BLU", "24:00, 4 January, 1936")
+    assert (day["states"], day["owned"], day["divisions"]) == (8, 8, 8)
+    assert (day["casualties"], day["rifles"], day["needed"]) == (0.078, 4.77499, 4.79999)
+    assert day["strength"] == 1.0 and day["deployed"] == 14.938
+    assert day["at"] == {**{s: 0 for s in range(1, 17)}, 7: 4, 8: 4}
+    log = ArenaLog(_log([DAY]))
+    log.poll()
+    assert log.days["BLU"]["at"][7] == 4
+
+
 def _log(*batches):
     desktop = Mock()
     desktop.game_log.side_effect = [(list(batch), 100 * (i + 1)) for i, batch in enumerate(batches)]

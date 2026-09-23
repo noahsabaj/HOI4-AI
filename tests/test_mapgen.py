@@ -183,6 +183,14 @@ def test_a_small_country_keeps_every_province_arena_sized(tmp_path):
     assert "random_list = { 50 = {" in on_actions
     assert on_actions.count("{") == on_actions.count("}")
     assert 'log = "ARENA player [THIS.GetTag]"' in on_actions
+    # Since v3 each side also reports its state every day, with its divisions in each state.
+    for tag in ("BLU", "RED"):
+        assert f"on_daily_{tag} = {{ effect = {{" in on_actions
+    daily = on_actions.split("on_daily_BLU", 1)[1].splitlines()[0]
+    assert "ARENA day [GetDateText] [ROOT.GetTag]" in daily
+    for state in range(1, 2 * report["states_per_country"] + 1):
+        assert f"arena_d{state} = num_armies_in_state@{state} }}" in daily
+        assert f" {state}=[?arena_d{state}]" in daily
     bitmap = np.asarray(Image.open(output / "map/provinces.bmp"))
     packed = (
         bitmap[:, :, 0].astype(np.uint32) << 16
