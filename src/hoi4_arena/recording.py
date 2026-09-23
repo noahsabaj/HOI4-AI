@@ -36,12 +36,38 @@ def split_for_session(session_id: str):
     return "train" if bucket < 80 else "validation" if bucket < 90 else "test"
 
 
+# Encoder arguments by name. ffv1 is lossless. x264 at CRF 18 in full-resolution colour
+# (4:4:4, so thin coloured text keeps its edges) measured about 48 dB PSNR against ffv1
+# on a 1080p arena clip, and about a hundredth of the size.
+CODECS = {
+    "ffv1": [
+        "-c:v", "ffv1", "-level", "3",
+        # Sliced so the encode spreads over cores. With four threads and no slices, a
+        # busy 4K map encoded at about 16 fps offline and could not hold 5 Hz beside a
+        # running game; sixteen slices measured about 70 fps.
+        "-slices", "16", "-threads", str(min(16, os.cpu_count() or 4)),
+    ],
+    "x264": ["-c:v", "libx264", "-preset", "faster", "-crf", "18", "-pix_fmt", "yuv444p"],
+}  # fmt: skip
+
+
 class Recorder:
-    """Lossless native RGB frames; explicit frame index -> capture time, not nominal FPS."""
+    """Native RGB frames; explicit frame index -> capture time, not nominal FPS."""
 
     def __init__(
-        self, root, first, *, game_speed, source="human", hz=15, session_id=None, split=None
+        self,
+        root,
+        first,
+        *,
+        game_speed,
+        source="human",
+        hz=15,
+        session_id=None,
+        split=None,
+        codec="ffv1",
     ):
+        if codec not in CODECS:
+            raise ValueError(f"codec must be one of {sorted(CODECS)}")
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=False)
         self.id = session_id or str(uuid.uuid4())
@@ -55,6 +81,7 @@ class Recorder:
             "height": pixels.shape[0],
             "video_source": "full_frame" if first.rgb is not None else "global_view",
             "nominal_fps": hz,
+            "codec": codec,
             "cursor_crop": VIEW_SIZE,
             # The operator sets this for the whole session. The match loop leaves it alone.
             **recorded_speed(game_speed),
@@ -65,7 +92,7 @@ class Recorder:
         self.events = (self.root / "frames.jsonl").open("w", encoding="utf8")
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            raise RuntimeError("FFmpeg is required for lossless recordings")
+            raise RuntimeError("FFmpeg is required for recordings")
         self.log = (self.root / "ffmpeg.log").open("wb")
         self.encoder = subprocess.Popen(
             [
@@ -84,17 +111,7 @@ class Recorder:
                 "-i",
                 "pipe:0",
                 "-an",
-                "-c:v",
-                "ffv1",
-                "-level",
-                "3",
-                # Sliced so the encode spreads over cores. With four threads and no
-                # slices, a busy 4K map encoded at about 16 fps offline and could not hold
-                # 5 Hz beside a running game; sixteen slices measured about 70 fps.
-                "-slices",
-                "16",
-                "-threads",
-                str(min(16, os.cpu_count() or 4)),
+                *CODECS[codec],
                 str(self.root / "screen.mkv"),
             ],
             stdin=subprocess.PIPE,
@@ -138,7 +155,7 @@ class Recorder:
         self._manifest()
 
 
-def record(root, seconds, hz=15, command=None, split=None, game_speed=None):
+def record(root, seconds, hz=15, command=None, split=None, game_speed=None, codec="ffv1"):
     """Write the manifest whatever happens, then fail loudly if the session is unusable.
 
     `game_speed` is the speed the operator set for the whole session. It is checked
@@ -150,7 +167,7 @@ def record(root, seconds, hz=15, command=None, split=None, game_speed=None):
     speed = recorded_speed(game_speed)["game_speed"]
     with Desktop(command) as desktop:
         first = desktop.capture()
-        recorder = Recorder(root, first, hz=hz, split=split, game_speed=speed)
+        recorder = Recorder(root, first, hz=hz, split=split, game_speed=speed, codec=codec)
         start = time.monotonic()
         deadline = start
         reason = None

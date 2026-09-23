@@ -30,9 +30,13 @@ from hoi4_arena.recording import Recorder
 from hoi4_arena.vision import ScreenRules
 
 SCRIPTS = Path(__file__).resolve().parent
-# Where the treaty popup's title sits at 3840x2160, and the row holding the winner's colour.
-TREATY_RECT = (1700, 842, 210, 36)
-WINNER_ROW = (1650, 955, 400, 20)
+# The game runs in a 1920x1080 window (Test-ArenaLoad -Window), and these are fractions of
+# it. Where the treaty popup's title and winner's colour sit comes from the command line,
+# measured on a capture of the popup.
+WINDOW = "1920x1080"
+SINGLE_PLAYER, NEW_GAME = (0.5, 290 / 1080), (0.5, 420 / 1080)
+SELECT_COUNTRY, START = (1043 / 1920, 875 / 1080), (1777 / 1920, 1038 / 1080)
+SPEED_UP = (1789 / 1920, 20 / 1080)
 
 
 def say(*parts):
@@ -80,11 +84,11 @@ def crop(rgb, rect):
     return rgb[y : y + h, x : x + w].astype(np.float32)
 
 
-def treaty_winner(rgb, template):
+def treaty_winner(rgb, template, treaty_rect, winner_row):
     """BLU or RED once the peace summary popup is up, otherwise None."""
-    if float(np.abs(crop(rgb, TREATY_RECT) - template).mean()) > 12:
+    if template is None or float(np.abs(crop(rgb, treaty_rect) - template).mean()) > 12:
         return None
-    row = crop(rgb, WINNER_ROW).astype(int)
+    row = crop(rgb, winner_row).astype(int)
     r, g, b = row[..., 0], row[..., 1], row[..., 2]
     blue = int(((b - r > 100) & (b > 150) & (g < 150)).sum())
     red = int(((r > 150) & (g < 90) & (b < 90)).sum())
@@ -97,20 +101,22 @@ def kill_game():
         "Get-Process hoi4 -ErrorAction SilentlyContinue | Stop-Process -Force; "
         "while (Get-Process hoi4 -ErrorAction SilentlyContinue) { Start-Sleep 1 }",
     )
+    # Let the previous launch's watcher put the player's display settings back first.
+    time.sleep(5)
 
 
 def start_game(mod, rules, failure_shot):
     kill_game()
-    out = pwsh("-File", str(SCRIPTS / "Test-ArenaLoad.ps1"), "-Mod", str(mod))
+    out = pwsh("-File", str(SCRIPTS / "Test-ArenaLoad.ps1"), "-Mod", str(mod), "-Window", WINDOW)
     say("launch:", out.stdout.strip().replace("\n", " | "), out.stderr.strip()[-200:])
     time.sleep(25)
-    click(0.5, 0.325)  # Single Player
-    time.sleep(5)
-    click(0.5, 0.415)  # New Game
+    click(*SINGLE_PLAYER)
+    time.sleep(8)
+    click(*NEW_GAME)
     time.sleep(40)
-    click(0.535, 0.732)  # Select Country (Blue is preselected)
+    click(*SELECT_COUNTRY)  # Blue is preselected.
     time.sleep(40)
-    click(0.944, 0.970)  # Start
+    click(*START)
     time.sleep(20)
     rgb = shot()
     if not rules.matches("healthy", rgb):
@@ -122,7 +128,7 @@ def start_game(mod, rules, failure_shot):
     act([{"kind": "key", "vk": 0x27, "down": d} for d in (True, False)], pause=0.5)
     act([{"kind": "key", "vk": 0x25, "down": d} for d in (True, False)], pause=0.28)
     for _ in range(3):
-        click(0.948, 0.0145)  # The on-screen + button: speed 1 to 4.
+        click(*SPEED_UP)  # The on-screen + button: speed 1 to 4.
     act([{"kind": "move", "x": 0.5, "y": 0.75}])
     key(0x20)  # Unpause
     time.sleep(2)
@@ -198,7 +204,7 @@ def play(root, template, args):
     outcome, reason, seen = "timeout", None, 0
     with Desktop() as desk:
         first = desk.capture()
-        rec = Recorder(root, first, game_speed=4, source="ai", hz=args.hz)
+        rec = Recorder(root, first, game_speed=4, source="ai", hz=args.hz, codec=args.codec)
         start = deadline = time.monotonic()
         late = 0
         try:
@@ -215,7 +221,7 @@ def play(root, template, args):
                 if time.monotonic() - deadline > 1:
                     late += 1
                     deadline = time.monotonic()
-                winner = treaty_winner(frame.rgb, template)
+                winner = treaty_winner(frame.rgb, template, args.treaty_rect, args.winner_row)
                 seen = seen + 1 if winner else 0
                 if seen >= 2:
                     outcome = winner
@@ -244,19 +250,26 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--minutes", type=float, required=True, help="Total time budget.")
     parser.add_argument("--mod", default="artifacts/mods/small-arena-v1")
-    parser.add_argument("--rules", default="artifacts/calibration-live/rules.json")
+    parser.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     parser.add_argument(
         "--treaty",
-        default="artifacts/match-end-screens-2026-09-22/observer-peace-summary-popup.png",
-        help="A 3840x2160 capture of the peace summary popup, to cut its title from.",
+        help="A 1920x1080 capture of the peace summary popup, to cut its title from. "
+        "Without it every game runs to the cap.",
     )
+    parser.add_argument("--treaty-rect", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
+    parser.add_argument("--winner-row", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
     parser.add_argument("--hz", type=float, default=5)
+    parser.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
     parser.add_argument("--cap-minutes", type=float, default=32)
     args = parser.parse_args()
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
     rules = ScreenRules(args.rules)
-    template = crop(np.asarray(Image.open(args.treaty).convert("RGB")), TREATY_RECT)
+    template = None
+    if args.treaty:
+        if not (args.treaty_rect and args.winner_row):
+            parser.error("--treaty needs --treaty-rect and --winner-row")
+        template = crop(np.asarray(Image.open(args.treaty).convert("RGB")), args.treaty_rect)
     end = time.monotonic() + args.minutes * 60
     results = []
     # A game needs about 3 minutes to launch and most end within 10; do not start one

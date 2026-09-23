@@ -250,13 +250,16 @@ class ArenaEnv(gym.Env):
                     raise DesktopError("game_clock_stalled")
             now = time.monotonic()
             reward = {"win": 1.0, "loss": -1.0}.get(outcome, 0.0)
-            # The change in Blue's share of the political minimap. The main view is not
-            # a score: the match vocabulary can scroll it. An uncalibrated crop adds
-            # nothing, and a crop with neither country colour does not invent a swing.
+            # The change in the acting country's share of the arena, read from the main
+            # view only when it shows the whole arena at the calibrated zoom. The camera
+            # moves, so any other frame is not a reading: it adds nothing and the last
+            # reading stands. An uncalibrated crop adds nothing either.
             territory_reward = 0.0
             territory = "uncalibrated"
             if self.rules.minimap_rect is not None:
-                territory = occupation_balance(screen.minimap_pixels(), self.colour)
+                territory = occupation_balance(
+                    screen.minimap_pixels(), self.colour, span=self.rules.minimap_span
+                )
                 if territory is not None and self.territory is not None:
                     territory_reward = territory - self.territory
                 if territory is not None:

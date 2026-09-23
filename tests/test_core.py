@@ -1895,6 +1895,27 @@ def test_occupation_balance_counts_country_colours_and_ignores_chrome():
     assert occupation_balance(np.zeros((4, 4, 3), np.uint8)) is None
 
 
+def test_occupation_reads_the_faint_map_tint_and_only_a_whole_arena():
+    """Measured 1080p colours: land is a faint tint, sea is dark, lit cloud is bluish."""
+    from hoi4_arena.vision import RED, land_span, occupation_balance
+
+    sea, blue, red, cloud = (33, 43, 61), (120, 134, 145), (168, 145, 131), (89, 93, 108)
+    crop = np.full((40, 100, 3), sea, np.uint8)
+    crop[10:30, 20:50] = blue
+    crop[10:30, 50:70] = red
+    # A cloud bright enough to pass for Blue, but not touching the arena.
+    crop[2:6, 85:99] = (140, 150, 170)
+    crop[32:36, 0:10] = cloud
+    assert land_span(crop) == 50
+    assert occupation_balance(crop) == pytest.approx(0.6)
+    assert occupation_balance(crop, RED) == pytest.approx(0.4)
+    # The calibrated whole-arena width counts; a zoomed-in view, wider or narrower, does not.
+    assert occupation_balance(crop, span=50) == pytest.approx(0.6)
+    assert occupation_balance(crop, span=100) is None
+    assert occupation_balance(crop, span=30) is None
+    assert occupation_balance(np.full((8, 8, 3), sea, np.uint8)) is None
+
+
 def test_territory_reward_follows_the_minimap_crop(tmp_path):
     """A shift from red to blue inside the crop pays. The same shift outside does not."""
     from unittest.mock import Mock

@@ -71,6 +71,30 @@ HOI4 has no "game over" screen. What each side actually sees when the other surr
 
 ## Screen calibration
 
+**The arena now runs in a 1920×1080 window** (`Test-ArenaLoad.ps1 -Window 1920x1080`),
+so the game renders at 1080p and captures and recordings are that size too. HOI4 is not
+DPI aware: on this 150%-scaled 4K monitor Windows stretched a 1920×1080 window to
+2880×1620, so the launch marks only that process DPI aware. The script also switches
+the game to windowed and puts the player's own display settings back after the game
+exits (HOI4 writes them back on exit, so restoring them sooner is undone).
+
+Calibrated at 1920×1080 in `artifacts/calibration-1080p/rules.json`: `ready`, `paused`,
+`healthy`, `speed`, `clock_rect` and the territory crop. On a running game `healthy`
+and `speed` read 0 and `ready` 35 or more; on the start frame `speed` reads 43.
+`win`, `loss` and `disconnect` exist only at 4K so far and need recapturing at 1080p
+(a two-player match). The layout differs from 4K, so no 4K rect carries over.
+
+**Territory reward.** HOI4 has no minimap, so the reward reads the main view, but only
+when the camera shows the whole arena at full zoom-out: the arena is then 469 px wide
+at 1080p (`minimap_span`), and any frame whose land is not within 15% of that width is
+not a reading. The map draws the country colours faintly (Blue's land about
+(120, 134, 145), Red's (168, 145, 131)), so land is told apart by tint, not by the
+written colours, and only the largest connected patch counts, which drops lit cloud.
+At the start Blue reads 52% and Red 48%.
+
+The 4K calibration below (`artifacts/calibration-live/rules.json`) is kept for
+reference.
+
 Calibrated at 3840×2160 in `artifacts/calibration-live/rules.json`: `healthy`, `paused`,
 `clock_rect`, `speed` (the speed-4 bars at `[3416, 52, 186, 9]`), `win` (the "Make your
 Demands" text at `[1810, 140, 215, 30]`) and `loss` (the "Defeated" title at
@@ -78,8 +102,7 @@ Demands" text at `[1810, 140, 215, 30]`) and `loss` (the "Defeated" title at
 and `ready` (the clock reading "12:00, 1 Jan, 1936" at the start of a game, max 23).
 Each matches only its own screen: the nearest other captured screen is 21 away for
 `win`, 33 for `loss`, 26 for `disconnect` and 29 for `ready`. **Still needed before a
-match can run:** `desync`, which can't be produced on demand, and a `minimap_rect` for
-the territory reward, which needs a design decision because HOI4 has no minimap.
+match can run:** `desync`, which can't be produced on demand.
 
 - The start clock drifts by up to 19 between captures of the same paused frame (the
   pause hatching moves), so `ready` needs a looser threshold than the other rules.
@@ -169,14 +192,15 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Finish calibration**: `desync`, and decide how the territory reward reads the map
-   (a fixed-camera crop, or an overlay only the reward sees). All other screens are done.
+1. **Finish calibration at 1080p**: recapture `win`, `loss` and `disconnect` in a
+   two-player match, and `desync` whenever one happens.
 2. **Record AI-vs-AI games** on the arena with `scripts/record_ai_games.py`. They have
    no actions, so they can't teach clicks, but they need no human time and are enough
    for the encoder (step 4), for learning to predict who wins, and as a first opponent.
-   Three recorded so far (Red, Red, Blue; 7 to 15 minutes each). Every armed game so far,
-   five of five, ended inside 1800 s. At native 4K a game is 7 to 19 GB, so pick a
-   smaller storage format before recording many.
+   Three recorded at 4K so far (Red, Red, Blue; 7 to 15 minutes each). Every armed game
+   so far, five of five, ended inside 1800 s. Recordings are now 1080p x264 (CRF 18,
+   4:4:4): about 48 dB against lossless and about a hundredth of the size; the 4K
+   lossless games were 7 to 19 GB each.
 3. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
    speed actually used. This is the only source of real actions. Recordings need the
    cursor position, which the worker now sends.

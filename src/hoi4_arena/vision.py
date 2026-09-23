@@ -98,8 +98,23 @@ def set_clock_rect(screenshot, rules, rect):
 
 
 def set_minimap_rect(screenshot, rules, rect):
-    """Calibrate the political minimap. The territory reward reads nothing else."""
-    return _set_rect(screenshot, rules, rect, "minimap_rect", "Minimap", "minimap calibration")
+    """Calibrate the map area the territory reward reads.
+
+    HOI4 has no minimap, so this is the part of the main view where the whole arena sits
+    when the camera is zoomed all the way out. The screenshot should show exactly that:
+    the width of the land in it is stored as `minimap_span`, and the reward is read only
+    from frames whose land spans the same width, so a zoomed-in view that shows part of
+    the arena never counts as a change of territory.
+    """
+    result = _set_rect(screenshot, rules, rect, "minimap_rect", "Minimap", "minimap calibration")
+    path, image, spec = _open_spec(screenshot, rules)
+    x, y, w, h = result["minimap_rect"]
+    span = land_span(np.asarray(image.convert("RGB"))[y : y + h, x : x + w])
+    if span:
+        spec["minimap_span"] = span
+        path.write_text(json.dumps(spec, indent=2))
+    result["minimap_span"] = span
+    return result
 
 
 def _set_rect(screenshot, rules, rect, key, label, replacement):
@@ -113,34 +128,72 @@ def _set_rect(screenshot, rules, rect, key, label, replacement):
     return {key: checked, "calibration": str(path)}
 
 
-# The colours the map generator writes for the two countries. The minimap shades them,
-# so a match is a distance rather than an exact pixel, and chrome farther than this
-# from both is ignored.
+# The colours the map generator writes for the two countries.
 BLUE = (40, 100, 220)
 RED = (220, 60, 60)
 
 
-def occupation_balance(crop, colour=BLUE, tolerance=48.0):
+def country_pixels(crop):
+    """Masks of the pixels that read as Blue's and as Red's land.
+
+    The map draws country colour faintly over terrain, so the land is nowhere near the
+    written colours: measured at 1080p, Blue's land is about (120, 134, 145) and Red's
+    (168, 145, 131). What survives is the tint. Land is brighter than the sea (about
+    (33, 43, 61)), bluish land is Blue's and reddish land is Red's, and grey interface
+    chrome, which is neither, is ignored. Occupied land takes its occupier's colour.
+
+    Lit cloud reads as bluish land too, so only the largest connected patch counts:
+    the arena is one piece, because the two countries share a border, and clouds drift
+    over the sea as separate patches.
+    """
+    from scipy import ndimage
+
+    pixels = np.asarray(crop, dtype=np.int32)
+    if pixels.size == 0 or pixels.ndim != 3:
+        return None, None
+    r, b = pixels[..., 0], pixels[..., 2]
+    land = pixels.sum(-1) > 250
+    blue, red = land & (b - r > 10), land & (r - b > 15)
+    labels, count = ndimage.label(blue | red)
+    if count > 1:
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        arena = labels == int(sizes.argmax())
+        blue, red = blue & arena, red & arena
+    return blue, red
+
+
+def land_span(crop):
+    """The width in pixels of the country-coloured land in a crop, or None if none."""
+    blue, red = country_pixels(crop)
+    if blue is None:
+        return None
+    columns = np.flatnonzero((blue | red).any(axis=0))
+    return int(columns[-1] - columns[0] + 1) if columns.size else None
+
+
+def occupation_balance(crop, colour=BLUE, span=None, span_tolerance=0.15):
     """`colour`'s share of the pixels that read as one of the two countries.
 
-    The default colour is Blue, which is what the original calls measured. A match
-    passes the acting country's colour: Red's reward is Red's share, so the two
-    sides move in opposite directions when the front moves. None means the crop
-    contained neither country. The caller must not turn that into a swing.
+    A match passes the acting country's colour: Red's reward is Red's share, so the two
+    sides move in opposite directions when the front moves. None means the crop is not a
+    reading: it contained neither country, or, when `span` is given, its land was not
+    that wide, so the camera was not showing the whole arena at the calibrated zoom. The
+    caller must not turn None into a swing.
     """
-    pixels = np.asarray(crop, dtype=np.float32)
-    if pixels.size == 0 or pixels.ndim != 3:
-        return None
     chosen = tuple(int(v) for v in colour)
     if chosen not in (BLUE, RED):
         raise ValueError("occupation colour must be the blue or red country colour")
-    to_blue = np.linalg.norm(pixels - np.array(BLUE, dtype=np.float32), axis=-1)
-    to_red = np.linalg.norm(pixels - np.array(RED, dtype=np.float32), axis=-1)
-    is_blue = (to_blue <= tolerance) & (to_blue <= to_red)
-    is_red = (to_red <= tolerance) & (to_red < to_blue)
+    is_blue, is_red = country_pixels(crop)
+    if is_blue is None:
+        return None
     total = int(is_blue.sum() + is_red.sum())
     if total == 0:
         return None
+    if span:
+        width = land_span(crop)
+        if width is None or abs(width / span - 1) > span_tolerance:
+            return None
     owned = is_blue if chosen == BLUE else is_red
     return float(owned.sum() / total)
 
@@ -152,6 +205,7 @@ class ScreenRules:
         self.width, self.height = spec["resolution"]
         self.clock_rect = self._stored_rect(spec.get("clock_rect"), "clock_rect")
         self.minimap_rect = self._stored_rect(spec.get("minimap_rect"), "minimap_rect")
+        self.minimap_span = spec.get("minimap_span")
         self.rules = spec["rules"]
         self.templates = {}
         for name, rule in self.rules.items():
