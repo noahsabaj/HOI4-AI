@@ -1,4 +1,4 @@
-# Status — 2026-09-22
+# Status — 2026-09-23
 
 The pipeline runs end to end in pieces, but there is no trained agent yet and no match
 between two agents has been played. This file lists what has actually been measured.
@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 125 Python tests and 16 Rust tests (2 need a live desktop and are
+Automated checks: 127 Python tests and 16 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -201,6 +201,31 @@ The second PC runs the worker from one shared folder. From this PC,
 pairing files there, skipping unchanged files. On the second PC, `Start-Worker.ps1
 -Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
 updates by itself, but only between connections, never mid-match. See the README.
+
+## Recording AI games
+
+`scripts/record_ai_games.py` plays AI-vs-AI games in observer mode and records them.
+
+- **The arena reports itself in game.log.** The mod logs, without changing any rule,
+  `ARENA` lines at the start, every week (states held, divisions, surrender progress per
+  country), when a state changes hands, on a surrender (loser and winner) and after the
+  peace deal. The worker's `game_log` request returns only these lines, on either PC.
+  A game ends on the surrender line, so no pixels are read to call it. Surrender
+  progress runs from 0 to 1 (1 is a surrender). `owned` counts states a side both owns
+  and controls, so it falls as land is occupied.
+- **Popups are clicked, not disabled.** An agent must learn to clear them in a vanilla
+  game, so the recorder clicks each popup's Ok button 1 to 4 s after it opens, found
+  anywhere on screen with OpenCV template matching. A popup was open in 44% of sampled
+  frames of the last game without this, and in 2% of both games with it.
+- **The camera comes back to the whole arena** every one to two and a half minutes: it
+  zooms fully out and pans until the land is centred, steered by what it sees. Pans
+  alone drifted, because pan speed changes with zoom.
+- **The default arena is 12x8 provinces a side** (`arena-12x8-v1`, 8 states a side).
+  The first two games on it (2026-09-23, one on each PC) both ended in a surrender read
+  from the log, after 24.8 and 31.5 minutes at speed 4. Red won both, in July and
+  December 1937.
+- The pause mark blinks, so the start check looks for it over 10 s rather than in one
+  frame.
 
 ## Open work
 

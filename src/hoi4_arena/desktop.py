@@ -270,6 +270,16 @@ class Desktop:
         """
         return bool(self.request("focus")["foreground"])
 
+    def game_log(self, offset=0):
+        """The arena mod's new game.log lines after `offset`, and the offset to pass next.
+
+        The mod logs each surrender, peace deal and state changing hands, and a weekly
+        count per country, so a match's outcome needs no pixels. Works the same on the
+        second PC, through its worker.
+        """
+        reply = self.request("game_log", offset=int(offset))
+        return reply["lines"], reply["offset"]
+
     def close(self):
         # Record rather than raise: close() runs from __exit__, where raising would
         # replace whatever exception is already propagating. Callers that treat a failed
