@@ -33,6 +33,7 @@ from hoi4_arena.models import (
     halve_frozen,
     rdmreg,
     reprelu,
+    temporal_jaccard,
 )
 from hoi4_arena.recording import split_for_session
 from hoi4_arena.vision import ScreenRules, add_template
@@ -178,6 +179,45 @@ def test_auxiliary_propagates_to_memory_features_and_predictor(mode):
     assert torch.isfinite(loss) and loss > 0
     assert memories.grad.abs().sum() > 0 and features.grad.abs().sum() > 0
     assert aux.predictor[0].weight.grad.abs().sum() > 0
+
+
+def test_temporal_jaccard_counts_support_that_changes_between_steps():
+    z = torch.tensor([[[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 2.0, 2.0]]])
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    # The first pair shares its support, the second shares none: (0 + 1) / 2.
+    assert temporal_jaccard(z, valid).item() == pytest.approx(0.5, abs=1e-5)
+    # A pair with an invalid step does not count.
+    assert temporal_jaccard(z, torch.tensor([[True, True, False]])).item() == pytest.approx(
+        0.0, abs=1e-5
+    )
+
+
+def test_a_negative_shift_makes_the_sparse_target_sparser():
+    """Codes drawn from the shifted target match it better than they match the unshifted one."""
+    torch.manual_seed(0)
+    laplace = torch.distributions.Laplace(torch.tensor(-2.0), torch.tensor(2**-0.5))
+    sparse = laplace.sample((512, 1, 32)).relu()
+    assert (sparse == 0).float().mean() > 0.9
+    assert rdmreg(sparse, True, shift=-2.0) < rdmreg(sparse, True, shift=0.0)
+
+
+def test_lpwm_options_reach_the_loss_and_are_refused_for_dense_codes():
+    torch.manual_seed(0)
+    args = (
+        torch.randn(2, 3, 16),
+        torch.randn(2, 3, 8),
+        torch.zeros(2, 3, SLOTS, 3, dtype=torch.long),
+        torch.ones(2, 3, dtype=torch.bool),
+    )
+    plain = PredictiveAuxiliary(memory_dim=16, feature_dim=8, latent_dim=12)
+    jaccard = PredictiveAuxiliary(memory_dim=16, feature_dim=8, latent_dim=12, temporal_jaccard=1.0)
+    jaccard.load_state_dict(plain.state_dict())
+    torch.manual_seed(1)
+    base = plain(*args)
+    torch.manual_seed(1)
+    assert jaccard(*args) > base
+    with pytest.raises(ValueError, match="sparse"):
+        PredictiveAuxiliary(mode="dense", temporal_jaccard=0.1)
 
 
 def test_rdm_needs_independent_batch_samples():

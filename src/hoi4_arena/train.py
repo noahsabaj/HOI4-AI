@@ -82,6 +82,9 @@ def train_bc(
     seed=42,
     sources=("human",),
     recompute=True,
+    sparsity_shift=0.0,
+    temporal_jaccard=0.0,
+    projections=256,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -123,12 +126,21 @@ def train_bc(
             torch.load(student, map_location="cpu", weights_only=True)["encoder"]
         )
     policy = Policy(encoder).to(device)
-    aux = PredictiveAuxiliary(feature_dim=encoder.dim, mode=auxiliary).to(device)
+    aux = PredictiveAuxiliary(
+        feature_dim=encoder.dim,
+        mode=auxiliary,
+        shift=sparsity_shift,
+        temporal_jaccard=temporal_jaccard,
+        projections=projections,
+    ).to(device)
     params = [p for p in [*policy.parameters(), *aux.parameters()] if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=1e-4)
     config = {
         "variant": variant,
         "auxiliary": auxiliary,
+        "sparsity_shift": sparsity_shift,
+        "temporal_jaccard": temporal_jaccard,
+        "projections": projections,
         "objective": objective,
         "seed": seed,
         "sequence": sequence,

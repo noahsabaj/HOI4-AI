@@ -108,6 +108,23 @@ def main():
     train.add_argument("--variant", choices=["large", "tiny", "screen"], default="screen")
     train.add_argument("--student")
     train.add_argument("--auxiliary", choices=["none", "dense", "sparse"], default="none")
+    train.add_argument(
+        "--sparsity-shift",
+        type=float,
+        default=0.0,
+        help="LpWM's target mean for --auxiliary sparse: below 0, sparser codes (it swept "
+        "0, -1, -2).",
+    )
+    train.add_argument(
+        "--temporal-jaccard",
+        type=float,
+        default=0.0,
+        help="Weight of LpWM's temporal Jaccard loss on the sparse codes, so their support "
+        "changes with the game rather than the camera (LpWM used 0.005 to 0.1).",
+    )
+    train.add_argument(
+        "--projections", type=int, default=256, help="RDMReg's random projections (LpWM: 1024+)."
+    )
     train.add_argument("--objective", choices=["bc", "xm"], default="bc")
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--sequence", type=int, default=8)
