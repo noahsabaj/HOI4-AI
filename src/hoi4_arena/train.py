@@ -12,25 +12,35 @@ from .learning import save_checkpoint
 from .models import Policy, PredictiveAuxiliary, VideoEncoder, build_encoder, xm_loss
 
 
-def unroll(policy, batch, burn_in=2, training=True):
+def unroll(policy, batch, burn_in=2, training=True, checkpoint=False):
     """Run the policy over a batch of windows. Burn-in steps only warm the memory.
 
     Returns the scored steps' memories, values, summary features and cells, each with
     the time axis second.
+
+    `checkpoint` keeps only each step's inputs and outputs for the backward pass and
+    recomputes the rest (torch.utils.checkpoint), trading one more forward pass per step
+    for the activations of every step's trainable encoder blocks and detail reader.
     """
     hidden = None
     memories, values, features, cells = [], [], [], []
     for t in range(batch["clips"].shape[1]):
-        context = torch.set_grad_enabled(training and t >= burn_in)
-        with context:
-            hidden, value, feature, cell = policy(
-                batch["clips"][:, t],
-                batch["quadrants"][:, t],
-                batch["fovea"][:, t],
-                batch["previous"][:, t],
-                batch["speed"][:, t],
-                hidden,
-            )
+        scored = training and t >= burn_in
+        inputs = (
+            batch["clips"][:, t],
+            batch["quadrants"][:, t],
+            batch["fovea"][:, t],
+            batch["previous"][:, t],
+            batch["speed"][:, t],
+            hidden,
+        )
+        with torch.set_grad_enabled(scored):
+            if scored and checkpoint:
+                hidden, value, feature, cell = torch.utils.checkpoint.checkpoint(
+                    policy, *inputs, use_reentrant=False
+                )
+            else:
+                hidden, value, feature, cell = policy(*inputs)
         if t < burn_in:
             hidden = hidden.detach()
         else:
@@ -71,11 +81,18 @@ def train_bc(
     burn_in=2,
     seed=42,
     sources=("human",),
+    recompute=True,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
     `sources` picks which recordings' inputs are demonstrations: "human" play, and "ai"
     games' scripted camera and popup clicks (see ai_games).
+
+    `recompute` recomputes each step in the backward pass instead of keeping its
+    activations. Measured on the 4060 Ti with LeVJEPA, windows of 8 steps after 2 of
+    burn-in (2026-09-23): batch 1 took 1.0 s and 4.3 GB, checkpointed 1.6 s and 2.1 GB;
+    batch 2 checkpointed took 1.3 s a window and 2.5 GB, and without it 34.6 s a step,
+    because at 7 GB Windows moved GPU memory into system memory instead of failing.
     """
     torch.manual_seed(seed)
     output = Path(output)
@@ -130,7 +147,9 @@ def train_bc(
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
-                    memory, _, features, cells = unroll(policy, batch, burn_in)
+                    memory, _, features, cells = unroll(
+                        policy, batch, burn_in, checkpoint=recompute
+                    )
                     actions = batch["actions"][:, burn_in:]
                     bc = -imitation_score(policy, memory, cells, actions, objective).mean()
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
@@ -212,6 +231,7 @@ def train_critic(
     burn_in=2,
     seed=42,
     trunk=False,
+    recompute=True,
 ):
     """Pre-train a policy's critic on recorded AI games, whose winners are known.
 
@@ -258,7 +278,7 @@ def train_critic(
                 continue
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(**autocast):
-                _, values, _, _ = unroll(policy, batch, burn_in)
+                _, values, _, _ = unroll(policy, batch, burn_in, checkpoint=recompute)
             loss = critic_loss(values[known], target[known]).mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite critic objective")

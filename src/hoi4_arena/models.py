@@ -409,25 +409,30 @@ class InverseDynamics(nn.Module):
     def actor(self):
         return self.trunk.actor
 
-    def forward(self, clips, quadrants, fovea, speed):
+    def forward(self, clips, quadrants, fovea, speed, checkpoint=False):
         """A window of decisions: (B, T, ...) views in, per-decision context and cells out.
 
         The previous action is not an input: it is what a neighbouring decision is being
-        asked to label.
+        asked to label. Each decision is read on its own; with `checkpoint` (and gradients
+        on) its activations are recomputed in the backward pass rather than kept, which a
+        16-step window needs on an 8 GB card (see train.train_bc).
         """
         b, steps = clips.shape[:2]
-        previous = clips.new_zeros(b * steps, SLOTS, 3, dtype=torch.long)
-        hidden = clips.new_zeros(b * steps, self.memory_dim)
-        merged, _, cells = self.trunk.observe(
-            clips.flatten(0, 1),
-            quadrants.flatten(0, 1),
-            fovea.flatten(0, 1),
-            previous,
-            speed.flatten(0, 1),
-            hidden,
-        )
-        context, _ = self.context(merged.reshape(b, steps, -1))
-        return context, cells.reshape(b, steps, *cells.shape[1:])
+        previous = clips.new_zeros(b, SLOTS, 3, dtype=torch.long)
+        hidden = clips.new_zeros(b, self.memory_dim)
+        merged, cells = [], []
+        for t in range(steps):
+            inputs = (clips[:, t], quadrants[:, t], fovea[:, t], previous, speed[:, t], hidden)
+            if checkpoint and torch.is_grad_enabled():
+                seen, _, cell = torch.utils.checkpoint.checkpoint(
+                    self.trunk.observe, *inputs, use_reentrant=False
+                )
+            else:
+                seen, _, cell = self.trunk.observe(*inputs)
+            merged.append(seen)
+            cells.append(cell)
+        context, _ = self.context(torch.stack(merged, 1))
+        return context, torch.stack(cells, 1)
 
 
 def configure_precision(tf32: bool = False):

@@ -37,8 +37,10 @@ DETAIL_SHIFT = 1
 LABELLED = ("human", "ai")
 
 
-def _score(model, batch, labels=None, deterministic=True):
-    context, cells = model(batch["clips"], batch["quadrants"], batch["fovea"], batch["speed"])
+def _score(model, batch, labels=None, deterministic=True, checkpoint=False):
+    context, cells = model(
+        batch["clips"], batch["quadrants"], batch["fovea"], batch["speed"], checkpoint=checkpoint
+    )
     flat = context.flatten(0, 1), cells.flatten(0, 1)
     if labels is None:
         return model.actor(*flat, deterministic=deterministic)
@@ -69,6 +71,7 @@ def train_idm(
     sequence=16,
     seed=42,
     sources=LABELLED,
+    recompute=True,
 ):
     torch.manual_seed(seed)
     output = Path(output)
@@ -108,7 +111,7 @@ def train_idm(
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
-                    logp = _score(model, batch, batch["actions"])[1]
+                    logp = _score(model, batch, batch["actions"], checkpoint=recompute)[1]
                     loss = -logp.mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training objective")

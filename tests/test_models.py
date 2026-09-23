@@ -272,3 +272,40 @@ def test_the_policy_reads_every_view_and_the_speed(speed):
     action, logp, _ = policy.actor(hidden, cells)
     assert action.shape == (2, SLOTS, 3) and logp.shape == (2,)
     assert len(VOCAB) > 1
+
+
+def test_recomputing_steps_gives_the_same_loss_and_gradients():
+    """Checkpointing trades memory for a second forward pass; it must not change the math."""
+    from hoi4_arena.models import InverseDynamics
+    from hoi4_arena.train import unroll
+
+    torch.manual_seed(12)
+    batch = {
+        "clips": torch.randn(2, 3, 3, 8, 16, 16),
+        "quadrants": torch.randn(2, 3, QUADRANTS, 3, 32, 32),
+        "fovea": torch.randn(2, 3, 3, 16, 16),
+        "previous": torch.zeros(2, 3, SLOTS, 3, dtype=torch.long),
+        "speed": torch.full((2, 3), 4),
+    }
+    grads = []
+    for recompute in (False, True):
+        torch.manual_seed(13)
+        policy = Policy(_Encoder(), memory_dim=16)
+        memory, values, _, cells = unroll(policy, batch, burn_in=1, checkpoint=recompute)
+        (memory.sum() + values.sum() + cells.mean()).backward()
+        grads.append(
+            torch.cat([p.grad.flatten() for p in policy.parameters() if p.grad is not None])
+        )
+    assert torch.allclose(grads[0], grads[1], atol=1e-6)
+    grads = []
+    for recompute in (False, True):
+        torch.manual_seed(14)
+        model = InverseDynamics(_Encoder(), memory_dim=16)
+        context, cells = model(
+            batch["clips"], batch["quadrants"], batch["fovea"], batch["speed"], checkpoint=recompute
+        )
+        (context.sum() + cells.mean()).backward()
+        grads.append(
+            torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+        )
+    assert torch.allclose(grads[0], grads[1], atol=1e-6)
