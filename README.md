@@ -81,6 +81,12 @@ Other demonstrations:
 .venv\Scripts\hoi4-arena.exe train-bc data/raw artifacts/bc-idm --sources human idm
 ```
 
+Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe pointer artifacts/screens-1080p/pointer-menu.png
+.venv\Scripts\hoi4-arena.exe import-video clip.mp4 data/unlabelled/clip-001 --pointers artifacts/screens-1080p/pointer-*.png --game-speed 3
+```
 `--variant screen` swaps the LeVJEPA video encoder for SigLIP 2 (`google/siglip2-base-patch16-naflex`, kept in a local folder passed as `--model`), which reads the four quadrants as one 896 px screen. `distill` trains the compact LeVJEPA student from any recordings.
 Repeat BC with `--auxiliary dense` and `--auxiliary sparse`, holding seed, demonstrations, encoder initialization and other settings fixed. Compare `--objective xm --auxiliary none` separately. This is a discrete, noise-conditioned best-of-five **XM-inspired adaptation**, not a faithful reproduction of a continuous-action XM method.
 
