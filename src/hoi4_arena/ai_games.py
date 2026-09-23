@@ -506,7 +506,7 @@ def record_ai_games(
     ok_button=("artifacts/screens-1080p/ok-button.png",),
     hz=5,
     codec="x264",
-    cap_minutes=32,
+    cap_minutes=45,
     peer=None,
     peer_only=False,
 ):

@@ -66,7 +66,7 @@ def main():
     )
     ai.add_argument("--hz", type=float, default=5)
     ai.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
-    ai.add_argument("--cap-minutes", type=float, default=32)
+    ai.add_argument("--cap-minutes", type=float, default=45)
     ai.add_argument("--peer", help="The second PC's pairing file, to record there too.")
     ai.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
     prepare = sub.add_parser("prepare")
