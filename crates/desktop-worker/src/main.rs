@@ -566,7 +566,7 @@ mod platform {
         DeleteObject(icon.hbmMask);
         let (mask_w, mask_h, mask) = mask?;
         let (width, height, pixels) = match color {
-            Some((w, h, bgra)) if bgra.chunks_exact(4).any(|p| p[3] != 0) => {
+            Some((w, h, bgra)) if bgra.as_chunks::<4>().0.iter().any(|p| p[3] != 0) => {
                 (w, h, PointerPixels::Alpha(bgra))
             }
             Some((w, h, bgra)) => {
@@ -574,19 +574,33 @@ mod platform {
                     return None;
                 }
                 let and = mask
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .take(w * h)
                     .map(|p| p[0] != 0)
                     .collect();
-                let xor = bgra.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect();
+                let xor = bgra
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| [p[0], p[1], p[2]])
+                    .collect();
                 (w, h, PointerPixels::Mask { and, xor })
             }
             None => {
                 let h = mask_h / 2;
                 let split = mask_w * h * 4;
-                let and = mask[..split].chunks_exact(4).map(|p| p[0] != 0).collect();
+                let and = mask[..split]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| p[0] != 0)
+                    .collect();
                 let xor = mask[split..split * 2]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|p| [p[0], p[1], p[2]])
                     .collect();
                 (mask_w, h, PointerPixels::Mask { and, xor })
