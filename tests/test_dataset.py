@@ -271,3 +271,62 @@ def test_timestamps_that_go_backwards_still_refuse_the_recording(tmp_path):
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     with pytest.raises(ValueError, match="Nonmonotonic"):
         session_labels(tmp_path / "game")
+
+
+@needs_ffmpeg
+def test_record_with_a_peer_focuses_its_game_and_records_it_here(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from hoi4_arena import recording, remote
+
+    calls = []
+
+    class Peer:
+        def __init__(self, config):
+            calls.append(("connect", config))
+            self.seq = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            calls.append(("close",))
+
+        def focus(self):
+            calls.append(("focus",))
+            return True
+
+        def capture(self):
+            self.seq += 1
+            meta = {"t_ns": self.seq * 100_000_000, "cursor": [4, 4], "foreground": True}
+            meta["events"] = []
+            return SimpleNamespace(
+                rgb=np.full((16, 16, 3), self.seq, np.uint8),
+                views=None,
+                meta=meta,
+                received_ns=self.seq,
+            )
+
+        def request(self, op):
+            return {"events": []}
+
+        def game_log(self, offset):
+            lines = ["declare RED", "player BLU", "capitulated BLU winner RED 1:00, 30 May, 1937"]
+            if offset == 0:  # an earlier game of the same launch, already over
+                return ["player RED", "capitulated RED winner BLU 1:00, 2 June, 1936"], 2
+            return lines, offset + len(lines)
+
+        def worker_log(self):
+            return []
+
+    monkeypatch.setattr(remote, "RemoteDesktop", Peer)
+    recording.record(tmp_path / "rec", 0.5, hz=10, game_speed=5, codec="ffv1", peer="p.json")
+    manifest = json.loads((tmp_path / "rec" / "manifest.json").read_text())
+    assert manifest["complete"] and manifest["station"] == "peer" and manifest["frames"] >= 5
+    assert calls[0] == ("connect", "p.json") and calls[1] == ("focus",)
+    # Only this recording's game counts: its declarer, the player's country, the winner.
+    assert (manifest["declarer"], manifest["players"], manifest["winner"]) == (
+        "RED",
+        ["BLU"],
+        "RED",
+    )

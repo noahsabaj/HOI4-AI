@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .arena_log import ArenaLog
 from .dataset import FOVEA_SIZE, parse_cursor, recorded_speed
 from .desktop import Desktop
 
@@ -158,19 +159,46 @@ class Recorder:
         self._manifest()
 
 
-def record(root, seconds, hz=15, command=None, split=None, game_speed=None, codec="ffv1"):
+def record(
+    root, seconds, hz=15, command=None, split=None, game_speed=None, codec="ffv1", peer=None
+):
     """Write the manifest whatever happens, then fail loudly if the session is unusable.
 
     `game_speed` is the speed the operator set for the whole session. It is checked
-    before the worker starts.
+    before the worker starts. With `peer`, a pairing file, the game and the player are on
+    the second PC: its worker captures the screen and the player's own inputs there, both
+    on its clock, and the frames come here over the network to be encoded. A full 1080p
+    frame takes about 86 ms to arrive, so 5 Hz holds and 10 does not.
 
     An incomplete recording is rejected by training (session_labels), so exiting zero on a failed
     or interrupted run would hand the operator a session that can never be trained on.
     """
     speed = recorded_speed(game_speed)["game_speed"]
-    with Desktop(command) as desktop:
+    if peer:
+        from .remote import RemoteDesktop
+
+        desktop = RemoteDesktop(peer)
+    else:
+        desktop = Desktop(command)
+    with desktop:
+        # The worker captures only a game in front. Bring it there once, before the
+        # first frame: nobody may have clicked it yet, least of all on the second PC.
+        desktop.focus()
+        # The arena mod's log names who declared, which country the player took and who
+        # won, as it does for the AI games (arena_log). Lines from before this recording
+        # belong to earlier games of the same launch, so they are read now and dropped.
+        arena = ArenaLog(desktop)
+        try:
+            arena.poll()
+        except Exception as error:  # noqa: BLE001 - a vanilla game has no arena log.
+            log.warning("no arena log: %s", error)
+            arena = None
+        else:
+            arena.declarer, arena.players = None, []
+            arena.winner = arena.loser = arena.surrendered = None
         first = desktop.capture()
         recorder = Recorder(root, first, hz=hz, split=split, game_speed=speed, codec=codec)
+        recorder.manifest["station"] = "peer" if peer else "here"
         start = time.monotonic()
         deadline = start
         reason = None
@@ -194,6 +222,17 @@ def record(root, seconds, hz=15, command=None, split=None, game_speed=None, code
                 tail.pop("payload", None)
             except Exception as error:
                 reason = reason or f"Final input drain failed: {error}"
+            if arena is not None:
+                try:
+                    arena.poll()
+                    recorder.manifest.update(
+                        winner=arena.winner,
+                        surrendered=arena.surrendered,
+                        declarer=arena.declarer,
+                        players=arena.players,
+                    )
+                except Exception as error:  # noqa: BLE001 - the video is still good.
+                    log.warning("could not read the arena log: %s", error)
             try:
                 lines = desktop.worker_log()
                 if lines:
