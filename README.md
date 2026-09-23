@@ -93,6 +93,14 @@ The default image encoder (`--variant screen`) is the vision tower of Qwen3.5-0.
 .venv\Scripts\hf.exe download timm/qwen3_vit_88m_enc.qwen3_5_0_8b model.safetensors --local-dir models/qwen3-vit-88m
 ```
 
+Memory on long windows: `train-bc` trains on 16 decisions (3.2 s) at a time, because the vision tower runs at every step. `cache-features` freezes a trained policy's perception and stores what it reads at each decision (about 0.5 MB a decision), and `train-memory` then trains the memory and action head on that cache over whole games, with the memory carried from each game's start. It compares memory cells at the same budget: the GRU, Gated DeltaNet-2, Mamba-3 (both in plain PyTorch, checked against their reference implementations) and none. It scores each on held-out games, by imitation loss and by linear probes of what the memory holds that the screen does not show.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe cache-features data/ai artifacts/bc/epoch-0000.pt artifacts/features
+.venv\Scripts\hoi4-arena.exe train-memory artifacts/features artifacts/memory/gdn2-256 --memory gdn2 --window 256
+.venv\Scripts\hoi4-arena.exe train-memory artifacts/features artifacts/memory/gru-16 --window 16 --no-carry --burn-in 2
+```
+
 `--variant large` keeps the LeVJEPA video encoder (`--model models/levjepa-large`), and `distill` trains its compact student. `scripts/probe_encoders.py` reruns the comparison on any two recordings.
 Repeat BC with `--auxiliary dense` and `--auxiliary sparse`, holding seed, demonstrations, encoder initialization and other settings fixed. Compare `--objective xm --auxiliary none` separately. This is a discrete, noise-conditioned best-of-five **XM-inspired adaptation**, not a faithful reproduction of a continuous-action XM method.
 
