@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -187,6 +188,78 @@ def save_checkpoint(path, policy, config, *, auxiliary=None, optimizer=None, pro
         json.dumps({"sha256": digest, "config": config, "provenance": provenance}, indent=2)
     )
     return digest
+
+
+class Progress:
+    """A training run's position and state, saved as it goes so an interruption costs minutes.
+
+    On 2026-09-23 a session restart killed a behaviour-cloning run at step 2141 of about
+    2300, 72 minutes in, and nothing was kept: checkpoints were written only at the end of
+    an epoch. Now `progress.pt` in the run's folder holds the model, the optimizer, the
+    random state and where the run was, rewritten every `every` seconds of training and
+    after every epoch, and removed when the run finishes. Resuming loads it and skips the
+    batches already trained. The data comes back in the same order, because the windows
+    are shuffled by seed and epoch alone (VideoSessions), so the skipped batches are
+    exactly the ones trained before. They are still decoded to be skipped, which is the
+    cost of resuming: a few minutes, not the run.
+
+    The config must match the saved one, so a resume cannot quietly continue a different
+    run. `every` 0 saves only after each epoch.
+    """
+
+    def __init__(self, output, config, *, every=600.0, resume=False, clock=time.monotonic):
+        self.path = Path(output) / "progress.pt"
+        self.config, self.every, self.resume, self.clock = config, every, resume, clock
+        self.last = clock()
+        if not resume and self.path.exists():
+            raise FileExistsError(
+                f"A run in progress is saved in {self.path.parent}: resume it (--resume) "
+                "or train into another folder"
+            )
+        if resume and not self.path.exists():
+            raise FileNotFoundError(f"No run in progress to resume in {self.path.parent}")
+
+    def start(self, modules, optimizer):
+        """Where to begin, (epoch, batches to skip), with the saved state loaded if resuming."""
+        if not self.resume:
+            return 0, 0
+        saved = torch.load(self.path, map_location="cpu", weights_only=True)
+        if saved["config"] != self.config:
+            raise ValueError("The run saved here was made with other settings; it cannot resume")
+        for name, module in modules.items():
+            module.load_state_dict(saved["modules"][name])
+        optimizer.load_state_dict(saved["optimizer"])
+        torch.set_rng_state(saved["rng"]["torch"])
+        if torch.cuda.is_available() and saved["rng"]["cuda"] is not None:
+            torch.cuda.set_rng_state_all(saved["rng"]["cuda"])
+        return saved["epoch"], saved["step"]
+
+    def save(self, epoch, step, modules, optimizer):
+        """Write the state now: `step` batches of `epoch` are done."""
+        payload = {
+            "config": self.config,
+            "epoch": epoch,
+            "step": step,
+            "modules": {name: module.state_dict() for name, module in modules.items()},
+            "optimizer": optimizer.state_dict(),
+            "rng": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
+        }
+        # Written whole and renamed, so an interruption mid-write leaves the last one.
+        temp = self.path.with_suffix(".tmp")
+        torch.save(payload, temp)
+        temp.replace(self.path)
+        self.last = self.clock()
+
+    def tick(self, epoch, step, modules, optimizer):
+        """After each batch: save if `every` seconds have passed since the last save."""
+        if self.every and self.clock() - self.last >= self.every:
+            self.save(epoch, step, modules, optimizer)
+
+    def finish(self):
+        self.path.unlink(missing_ok=True)
 
 
 class League:

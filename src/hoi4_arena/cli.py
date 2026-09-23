@@ -166,6 +166,18 @@ def main():
         "inferred labels are noisier, and hurt precise control most (D2E, 2510.05684).",
     )
     train.add_argument("--epochs", type=int, default=1)
+    train.add_argument(
+        "--save-every",
+        type=float,
+        default=600.0,
+        help="Seconds of training between saves of the run in progress (progress.pt), so an "
+        "interruption costs minutes; 0 saves after each epoch only",
+    )
+    train.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue the run saved in the output folder, same settings, from where it stopped",
+    )
     train.add_argument("--sequence", type=int, default=8)
     train.add_argument("--burn-in", type=int, default=2)
     train.add_argument("--batch-size", type=int, default=2)
@@ -201,6 +213,18 @@ def main():
     idm.add_argument("--model", default="models/levjepa-large")
     idm.add_argument("--variant", choices=["large", "tiny", "screen"], default="large")
     idm.add_argument("--epochs", type=int, default=1)
+    idm.add_argument(
+        "--save-every",
+        type=float,
+        default=600.0,
+        help="Seconds of training between saves of the run in progress (progress.pt), so an "
+        "interruption costs minutes; 0 saves after each epoch only",
+    )
+    idm.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue the run saved in the output folder, same settings, from where it stopped",
+    )
     idm.add_argument("--batch-size", type=int, default=2)
     idm.add_argument(
         "--sequence",
