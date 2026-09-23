@@ -2,9 +2,9 @@
 
 Each game launches HOI4 with the arena, starts as Blue, hands both countries to the AI with
 the `observe` console command, sets speed 4, and records native frames while a second worker
-connection moves the camera the way a player would. A game ends when the peace summary
-popup ("Treaty of ...") appears, or at the cap. The winner is read from the colour square in
-that popup.
+connection moves the camera the way a player would. A game ends when the capitulation popup
+("<country> equipment seized") appears, or at the cap. The popup names the country that
+capitulated with its flag on the left, so the winner is the other one.
 
 The recordings carry no actions, so they cannot teach clicks. They are for the encoder, for
 predicting who wins, and for measuring how often a match ends inside the time limit.
@@ -31,9 +31,12 @@ from hoi4_arena.vision import ScreenRules
 
 SCRIPTS = Path(__file__).resolve().parent
 # The game runs in a 1920x1080 window (Test-ArenaLoad -Window), and these are fractions of
-# it. Where the treaty popup's title and winner's colour sit comes from the command line,
-# measured on a capture of the popup.
+# it, measured on 2026-09-22.
 WINDOW = "1920x1080"
+# The capitulation popup at 1920x1080: the tank artwork at the left of its title bar, which
+# is the same whichever side lost, and the flag of the country that capitulated.
+POPUP_ART = (744, 390, 86, 65)
+LOSER_FLAG = (764, 475, 24, 12)
 SINGLE_PLAYER, NEW_GAME = (0.5, 290 / 1080), (0.5, 420 / 1080)
 SELECT_COUNTRY, START = (1043 / 1920, 875 / 1080), (1777 / 1920, 1038 / 1080)
 SPEED_UP = (1789 / 1920, 20 / 1080)
@@ -84,15 +87,16 @@ def crop(rgb, rect):
     return rgb[y : y + h, x : x + w].astype(np.float32)
 
 
-def treaty_winner(rgb, template, treaty_rect, winner_row):
-    """BLU or RED once the peace summary popup is up, otherwise None."""
-    if template is None or float(np.abs(crop(rgb, treaty_rect) - template).mean()) > 12:
+def capitulation_winner(rgb, template):
+    """BLU or RED once the capitulation popup is up, otherwise None."""
+    if float(np.abs(crop(rgb, POPUP_ART) - template).mean()) > 12:
         return None
-    row = crop(rgb, winner_row).astype(int)
-    r, g, b = row[..., 0], row[..., 1], row[..., 2]
-    blue = int(((b - r > 100) & (b > 150) & (g < 150)).sum())
-    red = int(((r > 150) & (g < 90) & (b < 90)).sum())
-    return "BLU" if blue > red else "RED" if red > blue else "unknown"
+    r, g, b = crop(rgb, LOSER_FLAG).mean(axis=(0, 1))
+    if r > b + 60:
+        return "BLU"  # Red capitulated.
+    if b > r + 60:
+        return "RED"
+    return "unknown"
 
 
 def kill_game():
@@ -221,11 +225,11 @@ def play(root, template, args):
                 if time.monotonic() - deadline > 1:
                     late += 1
                     deadline = time.monotonic()
-                winner = treaty_winner(frame.rgb, template, args.treaty_rect, args.winner_row)
+                winner = capitulation_winner(frame.rgb, template)
                 seen = seen + 1 if winner else 0
                 if seen >= 2:
                     outcome = winner
-                    Image.fromarray(frame.rgb).save(Path(root) / "treaty.png")
+                    Image.fromarray(frame.rgb).save(Path(root) / "capitulation.png")
                     break
                 if rec.manifest["frames"] % (60 * int(args.hz)) == 0:
                     say(f"  {rec.manifest['frames'] // int(args.hz) // 60} min recorded")
@@ -252,12 +256,10 @@ def main():
     parser.add_argument("--mod", default="artifacts/mods/small-arena-v1")
     parser.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     parser.add_argument(
-        "--treaty",
-        help="A 1920x1080 capture of the peace summary popup, to cut its title from. "
-        "Without it every game runs to the cap.",
+        "--popup",
+        default="artifacts/screens-1080p/capitulation-popup.png",
+        help="A 1920x1080 capture of the capitulation popup, to cut its artwork from.",
     )
-    parser.add_argument("--treaty-rect", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
-    parser.add_argument("--winner-row", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
     parser.add_argument("--hz", type=float, default=5)
     parser.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
     parser.add_argument("--cap-minutes", type=float, default=32)
@@ -265,11 +267,7 @@ def main():
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
     rules = ScreenRules(args.rules)
-    template = None
-    if args.treaty:
-        if not (args.treaty_rect and args.winner_row):
-            parser.error("--treaty needs --treaty-rect and --winner-row")
-        template = crop(np.asarray(Image.open(args.treaty).convert("RGB")), args.treaty_rect)
+    template = crop(np.asarray(Image.open(args.popup).convert("RGB")), POPUP_ART)
     end = time.monotonic() + args.minutes * 60
     results = []
     # A game needs about 3 minutes to launch and most end within 10; do not start one

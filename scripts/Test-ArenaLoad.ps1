@@ -44,6 +44,16 @@ if ($Window) {
     $text=[Text.Encoding]::UTF8.GetString($originalDisplay)
     $text=$text -replace '("display_mode"=\{\s*value=)"[^"]*"','$1"windowed"'
     $text=$text -replace '("windowed_resolution"=\{\s*value=)"[^"]*"',"`$1`"$Window`""
+    # A settings file that never had a windowed size has no entry to replace; the game
+    # then opens its window at the desktop size. Add the entry to the Graphics block.
+    if ($text -notmatch '"windowed_resolution"') {
+        $entry="`t`"windowed_resolution`"={`n`t`tvalue=`"$Window`"`n`t`tversion=0`n`t}`n"
+        $text=$text -replace '("Graphics"=\{\r?\n)',"`$1$entry"
+    }
+    if ($text -notmatch '"display_mode"') {
+        $entry="`t`"display_mode`"={`n`t`tvalue=`"windowed`"`n`t`tversion=0`n`t}`n"
+        $text=$text -replace '("Graphics"=\{\r?\n)',"`$1$entry"
+    }
     [IO.File]::WriteAllText($display,$text)
 }
 $modPath=(Resolve-Path -LiteralPath $Mod).Path

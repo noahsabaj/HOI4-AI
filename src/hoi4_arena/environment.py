@@ -21,6 +21,15 @@ from .vision import (
 )
 
 COUNTRY_COLOUR = {"BLU": BLUE, "RED": RED}
+
+# How long a running, unpaused game may show the same clock before the match is called
+# off. The clock shows the hour, which advances every 0.1 s at speed 4 and every 2 s even
+# at speed 1, so a still clock means the game has stopped. In a two-player match that is
+# what a dropped connection looks like while both games keep running: the client's clock
+# freezes and its "Server Lost!" popup follows only 25 to 65 s later (measured
+# 2026-09-22), while the host keeps playing on. At 60 s this limit let that stretch run
+# on as live match time.
+CLOCK_STALL_SECONDS = 15
 TERMINAL_NAMES = {"win", "loss", "disconnect", "desync"}
 
 log = logging.getLogger(__name__)
@@ -246,7 +255,7 @@ class ArenaEnv(gym.Env):
                 if clock_advanced(clock, self.clock_pixels):
                     self.clock_changed = time.monotonic()
                     self.clock_pixels = clock.copy()
-                elif time.monotonic() - self.clock_changed > 60:
+                elif time.monotonic() - self.clock_changed > CLOCK_STALL_SECONDS:
                     raise DesktopError("game_clock_stalled")
             now = time.monotonic()
             reward = {"win": 1.0, "loss": -1.0}.get(outcome, 0.0)
