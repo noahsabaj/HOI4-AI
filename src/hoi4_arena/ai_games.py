@@ -55,6 +55,8 @@ SPEED_UP = (1789 / 1920, 20 / 1080)
 GRAVE, ENTER = 0xC0, 0x0D
 # The top bar and the bottom panels are chrome, not map.
 MAP_TOP, MAP_BOTTOM = 80, 120
+# The selected country's flag in the picker's top bar, 1080p pixels (x0, y0, x1, y1).
+PICKER_FLAG = (1480, 25, 1545, 60)
 # Close enough to the middle, as a fraction of the screen.
 CENTRED = 0.03
 # Camera zoom in mouse-wheel notches in from fully out, measured at 1080p (see camera).
@@ -230,10 +232,13 @@ def on_screen(frame):
 
 
 def screen(desk, tries=5):
-    """A full frame. The first capture on a new connection is sometimes all black."""
+    """A full frame. The first capture on a new connection is sometimes all black.
+
+    Black but for the pointer, too, since the worker draws it: judged by the mean.
+    """
     for _ in range(tries):
         rgb = on_screen(desk.capture(full=True)).rgb
-        if rgb.max() > 0:
+        if rgb.mean() > 1:
             break
         time.sleep(0.5)
     return rgb
@@ -291,18 +296,62 @@ def recentre(desk, tries=10):
     return False
 
 
-def pick_country(desk, country):
-    """On the country picker, click the middle of `country`'s land. False if none shows."""
-    rgb = screen(desk)
-    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
-    masks = dict(zip(("BLU", "RED"), country_pixels(rgb[top:bottom]), strict=True))
-    if masks[country] is None or not masks[country].any():
-        return False
-    ys, xs = np.nonzero(masks[country])
-    # The land pixel nearest the median, so the click is on the land whatever its shape.
-    k = np.argmin((ys - np.median(ys)) ** 2 + (xs - np.median(xs)) ** 2)
-    click(desk, xs[k] / rgb.shape[1], (ys[k] + top) / rgb.shape[0])
-    return True
+def picked(rgb):
+    """The country the picker shows as selected, by its flag in the top bar, or None."""
+    x0, y0, x1, y1 = PICKER_FLAG
+    r, _, b = rgb[y0:y1, x0:x1].reshape(-1, 3).mean(0)
+    return "RED" if r - b > 40 else "BLU" if b - r > 40 else None
+
+
+def own_land(crop, country):
+    """The largest patch of `country`'s land colour in `crop`, or None if there is little.
+
+    Not vision.country_pixels, which keeps the largest patch of either colour: on the
+    picker that is the selected country, and the other shows only as a sliver beside it,
+    cut off by the glowing border.
+    """
+    import cv2
+
+    pixels = np.asarray(crop, dtype=np.int32)
+    r, b = pixels[..., 0], pixels[..., 2]
+    land = pixels.sum(-1) > 250
+    mask = land & ((r - b > 15) if country == "RED" else (b - r > 10))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=4
+    )
+    if count < 2:
+        return None
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[largest, cv2.CC_STAT_AREA] < 2000:
+        return None
+    return labels == largest
+
+
+def pick_country(desk, country, tries=5):
+    """On the country picker, click the middle of `country`'s land until its flag shows.
+
+    The picker's map can still be black when the recorder gets there, and on the second
+    PC a click made then left Blue selected twice, so each click waits for the land and
+    is checked against the selected flag. False if the pick never took.
+    """
+    for _ in range(tries):
+        # The drawn pointer's glove reads as red land, and where little of Red shows it
+        # was the largest red patch: move it up onto the top bar, off the map, first.
+        act(desk, [{"kind": "move", "x": 0.3, "y": 0.015}])
+        rgb = screen(desk)
+        if picked(rgb) == country:
+            return True
+        top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+        land = own_land(rgb[top:bottom], country)
+        if land is None:
+            time.sleep(2)
+            continue
+        ys, xs = np.nonzero(land)
+        # The land pixel nearest the median, so the click is on the land whatever its shape.
+        k = np.argmin((ys - np.median(ys)) ** 2 + (xs - np.median(xs)) ** 2)
+        click(desk, xs[k] / rgb.shape[1], (ys[k] + top) / rgb.shape[0])
+        time.sleep(1.5)
+    return picked(screen(desk)) == country
 
 
 def start_game(desk, rules, failure_shot, country="BLU", speed=4):
@@ -317,12 +366,10 @@ def start_game(desk, rules, failure_shot, country="BLU", speed=4):
     time.sleep(40)
     click(desk, *SELECT_COUNTRY)  # Blue is preselected.
     time.sleep(40)
-    if country != "BLU":
-        # Clicking a country's land on the picker's map selects it.
-        if not pick_country(desk, country):
-            Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
-            raise RuntimeError(f"no {country} land on the country picker")
-        time.sleep(3)
+    # Clicking a country's land on the picker's map selects it; Blue is the default.
+    if not pick_country(desk, country):
+        Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
+        raise RuntimeError(f"could not pick {country} on the country picker")
     click(desk, *START)
     time.sleep(20)
     # A new game starts paused. The pause mark is the same on both PCs; the alert row that
