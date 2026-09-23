@@ -71,3 +71,17 @@ def test_picking_a_country_clicks_inside_its_land(monkeypatch):
     assert 700 <= clicks[-1][0] * 1920 < 1152
     frame[:] = SEA
     assert not pick_country(None, "RED")
+
+
+def test_the_front_is_where_blue_land_meets_red():
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = SEA
+    frame[300:700, 700:1152] = BLUE_LAND
+    frame[300:700, 1152:1604] = RED_LAND
+    xs = [x * 1920 for x, _ in ai_games.front_points(frame)]
+    ys = [y * 1080 for _, y in ai_games.front_points(frame)]
+    assert xs and min(xs) >= 1150 and max(xs) <= 1156
+    assert min(ys) >= 300 and max(ys) < 700
+    frame[300:700, 1152:1604] = SEA
+    assert ai_games.front_points(frame) == []
+    assert len(ai_games.land_points(frame)) == 400 * 452
