@@ -99,6 +99,17 @@ def main():
         "fights the recorder's country through the interface, with a random strategy each "
         "game, against the AI (needs an arena v3 or later for its daily state reports).",
     )
+    heat = sub.add_parser(
+        "heatmap",
+        help="Draw where a policy wants to point, as a heat map over a recording's frames, "
+        "with the demonstrated move marked",
+    )
+    heat.add_argument("checkpoint")
+    heat.add_argument("recording")
+    heat.add_argument("output", help="A folder for the images and heatmaps.json")
+    heat.add_argument("--decisions", type=int, nargs="+", help="Decision indices to draw")
+    heat.add_argument("--count", type=int, default=24, help="Else this many, spread over moves")
+    heat.add_argument("--model")
     rate = sub.add_parser(
         "win-rate",
         help="The scripted player's record against the game's AI, from record-ai results",
@@ -185,6 +196,21 @@ def main():
         "(hoi4-arena advantage): advantage-weighted imitation, offline RL",
     )
     train.add_argument("--epochs", type=int, default=1)
+    train.add_argument(
+        "--pointer-sigma",
+        type=float,
+        default=0.0,
+        help="Score each demonstrated pointer position against a Gaussian blob this wide, in "
+        "lattice units (1 is about 1.9 px across and 1.1 px down at 1920x1080), instead of "
+        "its one exact point: a click anywhere on a button is right. 0 keeps exact targets",
+    )
+    train.add_argument(
+        "--look-before-click",
+        action="store_true",
+        help="The policy may press a button only where its pointer already was when the "
+        "decision began, so it has seen what it clicks; decisions that press after a move "
+        "are left out of training",
+    )
     train.add_argument(
         "--save-every",
         type=float,
@@ -624,6 +650,17 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
+    elif command == "heatmap":
+        from .heatmap import draw_heatmaps
+
+        result = draw_heatmaps(
+            args["checkpoint"],
+            args["recording"],
+            args["output"],
+            decisions=args["decisions"],
+            count=args["count"],
+            model_path=args["model"],
+        )
     elif command == "win-rate":
         from .scripted import win_rate
 

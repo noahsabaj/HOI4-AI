@@ -36,7 +36,7 @@ import time
 
 import numpy as np
 
-from .ai_games import MAP_BOTTOM, MAP_TOP, act, recentre, run_at, screen, tap
+from .ai_games import LOOK, MAP_BOTTOM, MAP_TOP, act, recentre, run_at, screen, tap
 from .vision import country_pixels
 
 # The least normalised correlation (TM_CCOEFF_NORMED, 1 an exact copy) at which a button
@@ -138,12 +138,14 @@ class Planner:
         return (x + w / 2) / rgb.shape[1], (y + h / 2 + cut) / rgb.shape[0]
 
     def click(self, desk, at, button=0, shift=False):
+        """Move onto `at`, look (ai_games.LOOK), then press there."""
         press = [{"kind": "button", "button": button, "down": d} for d in (True, False)]
-        events = [{"kind": "move", "x": at[0], "y": at[1]}, *press]
+        act(desk, [{"kind": "move", "x": at[0], "y": at[1]}])
+        time.sleep(self.rng.uniform(*LOOK))
         if shift:
-            events = [{"kind": "key", "vk": SHIFT, "down": True}, *events]
-            events.append({"kind": "key", "vk": SHIFT, "down": False})
-        act(desk, events)
+            press = [{"kind": "key", "vk": SHIFT, "down": True}, *press]
+            press.append({"kind": "key", "vk": SHIFT, "down": False})
+        act(desk, press)
 
     def form_army(self, desk, tries=4):
         """Every unassigned division into one new army, which is left selected."""
@@ -185,30 +187,45 @@ class Planner:
             return rgb, None, None, None
         return rgb, blue, red, land_box(blue, red)
 
-    def draw_front(self, desk):
+    def draw_front(self, desk, tries=4):
+        """A front line along the whole border, checked: the plan's activate arrow shows.
+
+        The front line tool takes a click on the enemy's side of the border. On 2026-09-23
+        two games in three as Red drew no front and so had no plan to activate: the click
+        had gone to the player's own side, where the tool does nothing.
+        """
         rgb, blue, red, box = self.overview(desk)
         if box is None or not self.select_army(desk):
             raise RuntimeError("no arena or army to draw a front line with")
         front = self.front(blue, red)
         if not front:
             raise RuntimeError("the two countries do not touch on screen")
-        # The border's middle: the front line tool follows the whole border from there.
-        x, y = sorted(front, key=lambda p: p[1])[len(front) // 2]
-        act(desk, tap(FRONT_LINE))
-        self.click(desk, self.screen_point(rgb, x, y))
-        time.sleep(0.8)
-        self.order("front", at=self.box_point(box, x, y))
+        # The border's middle first: the tool follows the whole border from there.
+        middle = sorted(front, key=lambda p: p[1])[len(front) // 2]
+        for attempt in range(tries):
+            x, y = middle if attempt == 0 else self.rng.choice(front)
+            act(desk, tap(FRONT_LINE))
+            self.click(desk, self.screen_point(rgb, x, y))
+            time.sleep(0.8)
+            if self.find(screen(desk), "activate", top=0.8) is not None:
+                self.order("front", at=self.box_point(box, x, y), tries=attempt + 1)
+                return
+            self.select_army(desk)
+        raise RuntimeError("no front line took: the plan's activate arrow never showed")
 
     def front(self, blue, red):
-        """Crop pixels where the two countries meet, as (x, y).
+        """Crop pixels on the enemy's side of the border, as (x, y).
 
-        Not within a twentieth of the land's height of its top or bottom edge: the first
-        live game's offensive started from a stray "front" pixel on the top coast.
+        The enemy's land next to the player's: where the front line tool takes its click,
+        and where an offensive starts. Not within a twentieth of the land's height of its
+        top or bottom edge: the first live game's offensive started from a stray "front"
+        pixel on the top coast.
         """
         import cv2
 
-        near_blue = cv2.dilate(blue.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
-        ys, xs = np.nonzero(near_blue & red)
+        own, enemy = (blue, red) if self.country == "BLU" else (red, blue)
+        near_own = cv2.dilate(own.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+        ys, xs = np.nonzero(near_own & enemy)
         box = land_box(blue, red)
         if box is not None:
             margin = (box[2] - box[0]) / 20
@@ -256,12 +273,9 @@ class Planner:
             for i in range(1, 9)
         ]
         press = {"kind": "button", "button": 1}
-        act(
-            desk,
-            [{"kind": "move", "x": a[0], "y": a[1]}, {**press, "down": True}, *steps,
-             {**press, "down": False}],
-            pause=0.08,
-        )  # fmt: skip
+        act(desk, [{"kind": "move", "x": a[0], "y": a[1]}])
+        time.sleep(self.rng.uniform(*LOOK))
+        act(desk, [{**press, "down": True}, *steps, {**press, "down": False}], pause=0.08)
         time.sleep(0.8)
         u, v = self.box_point(box, *target)
         self.order(

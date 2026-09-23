@@ -81,16 +81,17 @@ def unroll(policy, batch, burn_in=2, training=True, checkpoint=False, chunk=CHUN
     )
 
 
-def imitation_score(policy, memory, cells, actions, objective, xm=None):
+def imitation_score(policy, memory, cells, actions, objective, xm=None, sigma=0.0):
     """Per-step log-likelihood of the demonstrated actions, flattened over time.
 
-    `xm` holds xm_loss's options (candidates, form) for the "xm" objective.
+    `xm` holds xm_loss's options (candidates, form) for the "xm" objective. `sigma` > 0
+    scores each demonstrated move against a blob that wide around it (ActionHead).
     """
     memory, cells, actions = memory.flatten(0, 1), cells.flatten(0, 1), actions.flatten(0, 1)
     if objective == "xm":
-        return -xm_loss(policy.actor, memory, cells, actions, **(xm or {}))
+        return -xm_loss(policy.actor, memory, cells, actions, **(xm or {}), sigma=sigma)
     if objective == "bc":
-        return policy.actor(memory, cells, actions)[1]
+        return policy.actor(memory, cells, actions, sigma=sigma)[1]
     raise ValueError(objective)
 
 
@@ -130,6 +131,8 @@ def train_bc(
     idm_min_logp=None,
     idm_weight=1.0,
     advantage=False,
+    pointer_sigma=0.0,
+    look_before_click=False,
     workers=2,
     chunk=CHUNK,
     save_every=600.0,
@@ -174,6 +177,7 @@ def train_bc(
         "idm_min_logp": idm_min_logp,
         "idm_weight": idm_weight,
         "advantage": advantage,
+        "look_before_click": look_before_click,
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
@@ -189,7 +193,7 @@ def train_bc(
         encoder.load_state_dict(
             torch.load(student, map_location="cpu", weights_only=True)["encoder"]
         )
-    policy = Policy(encoder, latents=xm_latents).to(device)
+    policy = Policy(encoder, latents=xm_latents, look=look_before_click).to(device)
     xm = {"candidates": xm_candidates, "form": xm_form}
     aux = PredictiveAuxiliary(
         feature_dim=encoder.dim,
@@ -219,6 +223,8 @@ def train_bc(
         "idm_min_logp": idm_min_logp,
         "idm_weight": idm_weight,
         "advantage": advantage,
+        "pointer_sigma": pointer_sigma,
+        "look_before_click": look_before_click,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)
@@ -241,7 +247,9 @@ def train_bc(
                         policy, batch, burn_in, checkpoint=recompute, chunk=chunk
                     )
                     actions = batch["actions"][:, burn_in:]
-                    score = imitation_score(policy, memory, cells, actions, objective, xm)
+                    score = imitation_score(
+                        policy, memory, cells, actions, objective, xm, sigma=pointer_sigma
+                    )
                     bc = imitation_loss(score, batch["weight"][:, burn_in:])
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
                     loss = bc + 0.1 * predictive

@@ -188,6 +188,11 @@ The policy was rebuilt so it can read the screen and point at what it sees:
   then one of 32x32 positions inside it: the same 1024x1024 lattice as before. A test
   trains the head to point at a marked cell placed at random, and it hits it over 90% of
   the time on screens it has not seen.
+  Since 2026-09-23 that distribution can be drawn as a heat map over any recording
+  (`heatmap`). Two options, off until measured: `--pointer-sigma` trains against a blob
+  around each demonstrated point rather than the point, and `--look-before-click`
+  presses only where the pointer already was, after the fovea has seen it (GUI-Actor,
+  arXiv 2506.03143, points the same way, with an attention map over the screen).
 - **Speed** is an input, so recordings at different speeds train together.
 - **Data** is read straight from the recordings' video; nothing is prepared, which at 448
   px would have been about 43 GB per hour. AI games now keep the scripted camera's

@@ -33,7 +33,10 @@ def test_the_front_is_where_the_two_countries_touch():
     blue[:, :10], red[:, 10:] = True, True
     planner = Planner("BLU", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
     front = planner.front(blue, red)
+    # On the enemy's side: Red's columns next to Blue's for Blue, Blue's for Red.
     assert front and {x for x, _ in front} <= {10, 11, 12}
+    red_front = Planner("RED", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    assert {x for x, _ in red_front.front(blue, red)} <= {7, 8, 9}
     assert planner.box_point((0, 0, 10, 20), 10, 5) == [0.5, 0.5]
 
 

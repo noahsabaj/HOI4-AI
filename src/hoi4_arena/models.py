@@ -337,6 +337,31 @@ def entropy(normalized, probabilities):
     return -(normalized.clamp(min=floor) * probabilities).sum(-1)
 
 
+# The kinds that press a mouse button down (actions.VOCAB), one per button.
+PRESSES = [i for i, e in enumerate(VOCAB) if e and e["kind"] == "button" and e["down"]]
+
+
+def pointer_blob(coordinate, sigma):
+    """A Gaussian blob of width `sigma` lattice units around `coordinate`, on one axis.
+
+    Returns the two cells nearest the point (its own, and the neighbour on the side it is
+    closer to), each cell's share of the blob, and the blob within each cell over its
+    CELLS positions, normalised. Two cells hold all but a sliver of it while `sigma` is
+    under about a quarter of a cell: the cell beyond the point's own lies at least half a
+    cell away. A neighbour clamped onto the point's own cell at the screen's edge counts
+    nothing.
+    """
+    own = torch.div(coordinate, CELLS, rounding_mode="floor").long()
+    side = torch.where(coordinate % CELLS < CELLS / 2, -1, 1)
+    near = torch.stack([own, (own + side).clamp(0, CELLS - 1)], 1)
+    positions = near[..., None].float() * CELLS + torch.arange(CELLS, device=near.device)
+    weight = torch.exp(-0.5 * ((positions - coordinate[:, None, None]) / sigma) ** 2)
+    counts = torch.stack([torch.ones_like(own), (near[:, 1] != own).long()], 1)
+    weight = weight * counts[..., None]
+    mass = weight.sum(-1)
+    return near, mass, weight / mass.clamp_min(1e-12)[..., None]
+
+
 class ActionHead(nn.Module):
     """Autoregressive event slots with an exact, replayable conditional likelihood.
 
@@ -353,11 +378,20 @@ class ActionHead(nn.Module):
     host-device synchronization, paid for every head of every slot -- including on the
     teacher-forcing path, which never samples anything. The arithmetic below reproduces
     Categorical's exactly, and a test pins it bit-for-bit.
+
+    With `look`, a button is pressed only where the pointer already was when the decision
+    began: after a move, a press waits for the next decision, whose fovea shows what the
+    pointer landed on. A player moves to a button, sees it light up, then clicks; so does
+    this, and a click is never made on something it has not looked at.
     """
 
-    def __init__(self, memory_dim=512, noise_dim=16, cell_dim=CELL_DIM, latents=0):
+    def __init__(self, memory_dim=512, noise_dim=16, cell_dim=CELL_DIM, latents=0, look=False):
         super().__init__()
         self.noise_dim = noise_dim
+        self.look = look
+        press = torch.zeros(len(VOCAB), dtype=torch.bool)
+        press[PRESSES] = True
+        self.register_buffer("press", press, persistent=False)
         # Learned latents for XM to choose among, in place of Gaussian noise (xm_loss).
         if latents:
             self.latents = nn.Parameter(torch.randn(latents, noise_dim))
@@ -373,12 +407,19 @@ class ActionHead(nn.Module):
         self.fine = nn.Sequential(nn.Linear(256 + cell_dim, 256), nn.GELU(), nn.Linear(256, GRID))
         self.scale = 1 / math.sqrt(cell_dim)
 
-    def forward(self, memory, cells, actions=None, noise=None, deterministic=False):
+    def forward(self, memory, cells, actions=None, noise=None, deterministic=False, sigma=0.0):
         """Sample (or score, given `actions`) the eight slots.
 
         `cells` is (B, GRID, cell_dim): the screen's CELLS x CELLS map, row-major, as
         Policy builds it. Returns the actions, their summed log-likelihood and the summed
         entropy.
+
+        `sigma` > 0, when scoring, scores each demonstrated move against a Gaussian blob
+        of that width in lattice units around it instead of its one exact point: the
+        cross-entropy with the blob, over the cells it covers and the positions inside
+        each (`soft_pointer`). A click anywhere on a button is right, and one 3 px off
+        the demonstrated pixel should not be scored as wrong as one across the screen.
+        The returned score is then that negative cross-entropy, not a likelihood.
 
         The entropy of a slot is the kind's, plus, weighted by the chance of a move, the
         cell's and the position's within one cell. That last term is exact only for the
@@ -393,12 +434,16 @@ class ActionHead(nn.Module):
         state = torch.tanh(self.init(torch.cat([memory, noise], -1)))
         previous = torch.zeros(b, 64, device=memory.device, dtype=memory.dtype)
         result, logps, entropies = [], [], []
+        moved = torch.zeros(b, dtype=torch.bool, device=memory.device)
         for slot in range(SLOTS):
             state = self.cell(previous, state)
             # The float casts are load-bearing, not incidental: run in bfloat16 this same
             # normalization lands about 0.05 away, which is a large number to put inside
             # a ratio of likelihoods.
-            kinds = categorical(self.kinds(state).float())
+            logits = self.kinds(state).float()
+            if self.look:
+                logits = logits.masked_fill(moved[:, None] & self.press, float("-inf"))
+            kinds = categorical(logits)
             where = torch.einsum("bnc,bc->bn", cells, self.query(state).to(cells.dtype))
             places = categorical(where.float() * self.scale + self.cell_bias.float())
             if actions is not None:
@@ -415,7 +460,12 @@ class ActionHead(nn.Module):
                 offset = fine.argmax(-1) if deterministic else gumbel_argmax(fine)
             kind_p, place_p, fine_p = kinds.softmax(-1), places.softmax(-1), fine.softmax(-1)
             move = (kind == 1).float()
-            lp = log_prob(kinds, kind) + move * (log_prob(places, place) + log_prob(fine, offset))
+            moved = moved | (kind == 1)
+            if actions is not None and sigma > 0:
+                pointer = -self.soft_pointer(state, cells, rows, x, y, places, sigma)
+            else:
+                pointer = log_prob(places, place) + log_prob(fine, offset)
+            lp = log_prob(kinds, kind) + move * pointer
             expected = entropy(kinds, kind_p) + kind_p[:, 1] * (
                 entropy(places, place_p) + entropy(fine, fine_p)
             )
@@ -436,6 +486,65 @@ class ActionHead(nn.Module):
             torch.stack(entropies, 1).sum(1),
         )
 
+    def soft_pointer(self, state, cells, rows, x, y, places, sigma):
+        """Cross-entropy of the pointer with a Gaussian blob around the target (x, y).
+
+        The blob is separable, so its share of each of the 2x2 cells nearest the target is
+        the product of the two axes' shares, and inside each cell it is the outer product
+        of the two axes' profiles. The fine head is run for all four cells, each scored
+        against its part of the blob and weighted by that cell's share.
+        """
+        cx, mx, fx = pointer_blob(x.float(), sigma)
+        cy, my, fy = pointer_blob(y.float(), sigma)
+        ids = (cy[:, :, None] * CELLS + cx[:, None, :]).flatten(1)
+        share = (my[:, :, None] * mx[:, None, :]).flatten(1)
+        share = share / share.sum(-1, keepdim=True).clamp_min(1e-12)
+        coarse = -(share * places.gather(-1, ids)).sum(-1)
+        chosen = cells[rows[:, None], ids].to(state.dtype)
+        wide = torch.cat([state[:, None].expand(-1, 4, -1), chosen], -1)
+        fine = categorical(self.fine(wide).float())
+        target = (fy[:, :, None, :, None] * fx[:, None, :, None, :]).flatten(3).flatten(1, 2)
+        return coarse + (share * -(target * fine).sum(-1)).sum(-1)
+
+    @torch.no_grad()
+    def pointer_map(self, memory, cells, actions, slot, noise=None, top=16):
+        """Where the head would put the pointer at `slot`, over the whole lattice.
+
+        The slots before `slot` are teacher-forced to `actions`. Returns the probability
+        of each kind there, and a (GRID, GRID) map (rows y, columns x) of where a move
+        would go: each cell's probability times the position inside it, run exactly for
+        the `top` most likely cells and spread evenly over the rest. For one sample.
+        """
+        b = memory.shape[0]
+        if noise is None:
+            noise = torch.zeros(b, self.noise_dim, device=memory.device, dtype=memory.dtype)
+        state = torch.tanh(self.init(torch.cat([memory, noise], -1)))
+        previous = torch.zeros(b, 64, device=memory.device, dtype=memory.dtype)
+        moved = torch.zeros(b, dtype=torch.bool, device=memory.device)
+        for step in range(slot + 1):
+            state = self.cell(previous, state)
+            if step == slot:
+                break
+            values = actions[:, step]
+            moved = moved | (values[:, 0] == 1)
+            previous = self.embedding(values[:, 0]) + self.xy(
+                values[:, 1:].to(memory.dtype) / (GRID - 1)
+            )
+        logits = self.kinds(state).float()
+        if self.look:
+            logits = logits.masked_fill(moved[:, None] & self.press, float("-inf"))
+        kind_p = logits.softmax(-1)[0]
+        where = torch.einsum("bnc,bc->bn", cells, self.query(state).to(cells.dtype))
+        place_p = (where.float() * self.scale + self.cell_bias.float()).softmax(-1)[0]
+        heat = (place_p / (CELLS * CELLS))[:, None].expand(-1, CELLS * CELLS).clone()
+        best = place_p.topk(top).indices
+        chosen = cells[0, best].to(state.dtype)
+        fine = self.fine(torch.cat([state.expand(top, -1), chosen], -1)).float().softmax(-1)
+        heat[best] = place_p[best, None] * fine
+        # (cell row, cell column, row inside, column inside) to lattice rows and columns.
+        grid = heat.view(CELLS, CELLS, CELLS, CELLS).permute(0, 2, 1, 3).reshape(GRID, GRID)
+        return kind_p, grid
+
 
 class Policy(nn.Module):
     """Global clip, quadrants and fovea in; a recurrent memory, a value and the cells out.
@@ -447,7 +556,7 @@ class Policy(nn.Module):
     surroundings through the fovea, and one place of its own choosing through attention.
     """
 
-    def __init__(self, encoder, memory_dim=512, latents=0):
+    def __init__(self, encoder, memory_dim=512, latents=0, look=False):
         super().__init__()
         self.encoder = encoder
         self.details = DetailEncoder()
@@ -461,7 +570,7 @@ class Policy(nn.Module):
         # Summary token, mean cell, fovea, attention readout, previous action, speed.
         self.fusion = nn.Linear(encoder.dim + 3 * CELL_DIM + 64 + 32, memory_dim)
         self.memory = nn.GRUCell(memory_dim, memory_dim)
-        self.actor = ActionHead(memory_dim, latents=latents)
+        self.actor = ActionHead(memory_dim, latents=latents, look=look)
         self.value = nn.Linear(memory_dim, 1)
         self.memory_dim = memory_dim
 
@@ -866,7 +975,7 @@ class PredictiveAuxiliary(nn.Module):
         return loss
 
 
-def xm_loss(actor, memories, cells, actions, candidates=5, form="hard"):
+def xm_loss(actor, memories, cells, actions, candidates=5, form="hard", sigma=0.0):
     """Explorative Modeling for the action head (Gladstone, Ji and Du, 2026, arXiv 2607.27372).
 
     Forward XM: explore K latents, train on the one whose actions best match the
@@ -896,11 +1005,15 @@ def xm_loss(actor, memories, cells, actions, candidates=5, form="hard"):
             candidates, b, actor.noise_dim, device=memories.device, dtype=memories.dtype
         )
     if form == "smooth":
-        logps = torch.stack([actor(memories, cells, actions, noise=z)[1] for z in noises])
+        logps = torch.stack(
+            [actor(memories, cells, actions, noise=z, sigma=sigma)[1] for z in noises]
+        )
         return -(logps.logsumexp(0) - math.log(len(noises)))
     if form != "hard":
         raise ValueError(form)
     with torch.no_grad():
-        losses = torch.stack([-actor(memories, cells, actions, noise=z)[1] for z in noises])
+        losses = torch.stack(
+            [-actor(memories, cells, actions, noise=z, sigma=sigma)[1] for z in noises]
+        )
         best = losses.argmin(0)
-    return -actor(memories, cells, actions, noise=noises[best, rows])[1]
+    return -actor(memories, cells, actions, noise=noises[best, rows], sigma=sigma)[1]
