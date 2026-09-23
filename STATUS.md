@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 135 Python tests and 16 Rust tests (2 need a live desktop and are
+Automated checks: 146 Python tests and 22 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -171,6 +171,43 @@ every rule below came from a crash dump or the stock files.
   puts all victory points on one border province; it showed that victory points alone do
   not cause a surrender.
 
+## The model and its data (2026-09-23)
+
+The policy was rebuilt so it can read the screen and point at what it sees:
+
+- **Views.** Eight 224 px global views (the video encoder's clip), the four quadrants at
+  448 px instead of 224, and a 224 px native fovea on the pointer. The worker's views of
+  a live 1080p frame matched `dataset.views` byte for byte, and a views-only capture took
+  21.5 ms (p50, this PC).
+- **Reader.** The video encoder's last-frame patch grid is kept, not only its summary
+  token. The quadrants go through a convolutional reader that keeps a stride-16 map
+  instead of pooling each tile to 2x2. Both are combined into a 32x32 map of the screen.
+- **Pointer.** A move picks one of the 32x32 cells, scored against each cell's features,
+  then one of 32x32 positions inside it: the same 1024x1024 lattice as before. A test
+  trains the head to point at a marked cell placed at random, and it hits it over 90% of
+  the time on screens it has not seen.
+- **Speed** is an input, so recordings at different speeds train together.
+- **Data** is read straight from the recordings' video; nothing is prepared, which at 448
+  px would have been about 43 GB per hour. AI games now keep the scripted camera's
+  inputs as labels.
+- **Inverse dynamics model** (`train-idm`, `label`): the same reader, shown each clip
+  shifted 0.8 s past the decision, labels the inputs behind video that has none.
+- **Screen encoder option** (`--variant screen`, SigLIP 2 base): reads the quadrants as one
+  896 px screen.
+
+Measured at batch one in bfloat16 on the 4060 Ti (random weights of the real sizes where
+no trained ones exist yet):
+
+| | Result |
+|---|---|
+| Whole policy step with LeVJEPA: encoder, reader, cells, memory, 8-slot head (eager) | 73.8 ms p50, 761 MiB peak |
+| LeVJEPA encoder alone, 8 frames | 63.5 ms |
+| Detail reader, four 448 px quadrants | 2.7 ms |
+| SigLIP 2 screen encoder at 448 / 672 / 896 px | 8.2 / 16.2 / 31.4 ms |
+
+At 31.4 ms the screen encoder costs half of LeVJEPA, so two actors on one GPU should fit
+with it; that is measured once it has weights.
+
 ## Performance
 
 All on an RTX 4060 Ti with the game at 3840×2160.
@@ -240,31 +277,31 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Record AI-vs-AI games in bulk** on the arena with `hoi4-arena record-ai`,
-   on both PCs at once with `--peer artifacts/pairing/peer.json`. The second PC's games
-   are launched and closed through its worker (the `launch` and `quit` operations) and
-   its frames are recorded here: a full 1080p frame takes about 86 ms over the network,
-   so 5 Hz fits. Both monitors must stay switched on (brightness can be zero): a
-   monitor switched off disconnects on DisplayPort, Windows shrinks the desktop to
-   1024x768, and the capture breaks, which the recorder now reports. On the second PC
-   the Discord overlay is off: after a force-closed game it hung every later launch at
-   startup. Games are now closed politely first, and a hung launch restarts Discord
-   (`restart_discord`) and retries once. `report` lists the second
-   PC's windows, busy processes and log ends. `desync` gets calibrated whenever one
-   happens. The AI games have
-   no actions, so they can't teach clicks, but they need no human time and are enough
-   for the encoder (step 3), for learning to predict who wins, and as a first opponent.
-   Three recorded at 4K so far (Red, Red, Blue; 7 to 15 minutes each). Every armed game
-   so far, five of five, ended inside 1800 s. Recordings are now 1080p x264 (CRF 18,
-   4:4:4): about 48 dB against lossless and about a hundredth of the size; the 4K
-   lossless games were 7 to 19 GB each.
+1. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
+   with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
+   closed through its worker (`launch`, `quit`) and its frames recorded here: a full
+   1080p frame takes about 86 ms over the network, so 5 Hz fits. Both monitors must stay
+   switched on (brightness can be zero): a monitor switched off disconnects on
+   DisplayPort, Windows shrinks the desktop to 1024x768, and the capture breaks, which
+   the recorder reports. On the second PC the Discord overlay is off: after a
+   force-closed game it hung every later launch. Games are closed politely first, and a
+   hung launch restarts Discord (`restart_discord`) and retries once. `report` lists the
+   second PC's windows, busy processes and log ends. The games carry the scripted
+   camera's inputs as labels, so they teach camera control and popup clearing, and
+   serve the encoder, predicting who wins, and a first opponent. On the 12x8 arena the
+   first two games took 24.8 and 31.5 minutes, so a match limit of 1800 s is too short
+   there; the recorder's cap is 45 minutes. Recordings are 1080p x264 (CRF 18, 4:4:4).
+   `desync` gets calibrated whenever one happens.
 2. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
-   speed actually used. This is the only source of real actions. Recordings need the
-   cursor position, which the worker now sends.
-3. **Distil the compact encoder** from the AI games and human recordings. It is the only
-   measured way to fit two actors in one tick on one GPU; the other is one GPU per side.
-4. Train the behaviour-cloning baseline, then recurrent PPO self-play with a league.
-5. Run a two-PC match between agents, and check reset and recovery when something goes
+   speed used. This is the only source of a player's inputs.
+3. **Train the inverse dynamics model** on those and the AI games' inputs, then label
+   video that has no inputs (`label`) and train on it (`--sources idm`).
+4. **Pick the encoder.** Download the SigLIP 2 weights and compare `--variant screen`
+   against LeVJEPA, or distil the compact LeVJEPA student. Either is how two actors fit
+   one GPU; the other way is one GPU per side.
+5. Train the behaviour-cloning baseline, then recurrent PPO self-play with a league,
+   scored from the arena log.
+6. Run a two-PC match between agents, and check reset and recovery when something goes
    wrong. (A two-PC match driven by hand, from this PC, works.)
-6. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
-7. Test the same interface in an unmodified private multiplayer lobby.
+7. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
+8. Test the same interface in an unmodified private multiplayer lobby.

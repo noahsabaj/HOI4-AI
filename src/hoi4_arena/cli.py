@@ -69,14 +69,26 @@ def main():
     ai.add_argument("--cap-minutes", type=float, default=45)
     ai.add_argument("--peer", help="The second PC's pairing file, to record there too.")
     ai.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
-    prepare = sub.add_parser("prepare")
-    prepare.add_argument("source")
-    prepare.add_argument("output")
+    check = sub.add_parser(
+        "check-session",
+        help="Check that a recording can train, and count its decisions. Training reads "
+        "recordings directly; nothing is prepared.",
+    )
+    check.add_argument("source")
+    check.add_argument("--sources", nargs="+", default=["human", "ai"])
     train = sub.add_parser("train-bc")
-    train.add_argument("data")
+    train.add_argument("data", help="A folder of recordings, each with its own manifest.")
+    train.add_argument(
+        "--sources",
+        nargs="+",
+        choices=["human", "ai", "idm"],
+        default=["human"],
+        help="Whose inputs are demonstrations: the player's, the AI games' scripted "
+        "camera and popup clicks, and inputs the inverse dynamics model labelled.",
+    )
     train.add_argument("output")
     train.add_argument("--model", default="models/levjepa-large")
-    train.add_argument("--variant", choices=["large", "tiny"], default="large")
+    train.add_argument("--variant", choices=["large", "tiny", "screen"], default="large")
     train.add_argument("--student")
     train.add_argument("--auxiliary", choices=["none", "dense", "sparse"], default="none")
     train.add_argument("--objective", choices=["bc", "xm"], default="bc")
@@ -85,6 +97,26 @@ def main():
     train.add_argument("--burn-in", type=int, default=2)
     train.add_argument("--batch-size", type=int, default=2)
     train.add_argument("--seed", type=int, default=42)
+    idm = sub.add_parser(
+        "train-idm",
+        help="Train the inverse dynamics model: inputs inferred from video, trained on "
+        "recordings whose inputs are known",
+    )
+    idm.add_argument("data")
+    idm.add_argument("output")
+    idm.add_argument("--model", default="models/levjepa-large")
+    idm.add_argument("--variant", choices=["large", "tiny", "screen"], default="large")
+    idm.add_argument("--epochs", type=int, default=1)
+    idm.add_argument("--batch-size", type=int, default=2)
+    idm.add_argument("--sequence", type=int, default=16)
+    idm.add_argument("--seed", type=int, default=42)
+    idm.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["human", "ai"])
+    label = sub.add_parser(
+        "label", help="Label a recording's inputs with a trained inverse dynamics model"
+    )
+    label.add_argument("checkpoint")
+    label.add_argument("recordings", nargs="+")
+    label.add_argument("--model-path")
     distill = sub.add_parser("distill")
     distill.add_argument("data")
     distill.add_argument("output")
@@ -263,14 +295,35 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
-    elif command == "prepare":
-        from .dataset import prepare_session
+    elif command == "check-session":
+        from .dataset import sequence_starts, session_labels
 
-        result = prepare_session(args["source"], args["output"])
+        labels = session_labels(args["source"], sources=tuple(args["sources"]))
+        result = {
+            "decisions": len(labels["decisions"]),
+            "excluded": len(labels["excluded"]),
+            "windows": len(sequence_starts(labels["valid"], 8, 2)),
+            "split": labels["manifest"]["split"],
+            "source": labels["label_source"],
+            "game_speed": labels["speed"],
+        }
     elif command == "train-bc":
         from .train import train_bc
 
+        args["sources"] = tuple(args["sources"])
         result = train_bc(args.pop("data"), args.pop("model"), args.pop("output"), **args)
+    elif command == "train-idm":
+        from .idm import train_idm
+
+        args["sources"] = tuple(args["sources"])
+        result = train_idm(args.pop("data"), args.pop("model"), args.pop("output"), **args)
+    elif command == "label":
+        from .idm import label_recording
+
+        result = {
+            path: label_recording(args["checkpoint"], path, model_path=args["model_path"])
+            for path in args["recordings"]
+        }
     elif command == "distill":
         from .train import distill
 

@@ -6,19 +6,29 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from .dataset import Sessions, require_one_game_speed
+from .dataset import VideoSessions, batch_to_device
 from .learning import save_checkpoint
-from .models import Policy, PredictiveAuxiliary, VideoEncoder, xm_loss
+from .models import Policy, PredictiveAuxiliary, VideoEncoder, build_encoder, xm_loss
 
 
 def unroll(policy, batch, burn_in=2, training=True):
+    """Run the policy over a batch of windows. Burn-in steps only warm the memory.
+
+    Returns the scored steps' memories, values, summary features and cells, each with
+    the time axis second.
+    """
     hidden = None
-    memories, values, features = [], [], []
+    memories, values, features, cells = [], [], [], []
     for t in range(batch["clips"].shape[1]):
         context = torch.set_grad_enabled(training and t >= burn_in)
         with context:
-            hidden, value, feature = policy(
-                batch["clips"][:, t], batch["tiles"][:, t], batch["previous"][:, t], hidden
+            hidden, value, feature, cell = policy(
+                batch["clips"][:, t],
+                batch["quadrants"][:, t],
+                batch["fovea"][:, t],
+                batch["previous"][:, t],
+                batch["speed"][:, t],
+                hidden,
             )
         if t < burn_in:
             hidden = hidden.detach()
@@ -26,7 +36,23 @@ def unroll(policy, batch, burn_in=2, training=True):
             memories.append(hidden)
             values.append(value)
             features.append(feature)
-    return torch.stack(memories, 1), torch.stack(values, 1), torch.stack(features, 1)
+            cells.append(cell)
+    return (
+        torch.stack(memories, 1),
+        torch.stack(values, 1),
+        torch.stack(features, 1),
+        torch.stack(cells, 1),
+    )
+
+
+def imitation_score(policy, memory, cells, actions, objective):
+    """Per-step log-likelihood of the demonstrated actions, flattened over time."""
+    memory, cells, actions = memory.flatten(0, 1), cells.flatten(0, 1), actions.flatten(0, 1)
+    if objective == "xm":
+        return -xm_loss(policy.actor, memory, cells, actions)
+    if objective == "bc":
+        return policy.actor(memory, cells, actions)[1]
+    raise ValueError(objective)
 
 
 def train_bc(
@@ -43,20 +69,35 @@ def train_bc(
     sequence=8,
     burn_in=2,
     seed=42,
+    sources=("human",),
 ):
+    """Behaviour cloning on recordings, read straight from their video.
+
+    `sources` picks which recordings' inputs are demonstrations: "human" play, and "ai"
+    games' scripted camera and popup clicks (see ai_games).
+    """
     torch.manual_seed(seed)
     output = Path(output)
     if (output / "epoch-0000.pt").exists():
         raise FileExistsError("Checkpoints are immutable")
-    dataset = Sessions(data, length=sequence, burn_in=burn_in)
-    validation = Sessions(data, split="validation", length=sequence, burn_in=burn_in)
-    require_one_game_speed([dataset.game_speed, validation.game_speed])
-    # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=auxiliary != "none")
-    if len(loader) == 0:
-        raise ValueError("Need at least two sequences for independent-batch regularization")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    encoder = VideoEncoder(model_path, variant=variant)
+    dataset = VideoSessions(
+        data, length=sequence, burn_in=burn_in, sources=sources, seed=seed, device=device
+    )
+    validation = VideoSessions(
+        data,
+        split="validation",
+        length=sequence,
+        burn_in=burn_in,
+        sources=sources,
+        seed=seed,
+        device=device,
+    )
+    # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
+    loader = DataLoader(dataset, batch_size=batch_size, drop_last=auxiliary != "none")
+    if len(dataset) < (2 if auxiliary != "none" else 1):
+        raise ValueError("Need at least two sequences for independent-batch regularization")
+    encoder = build_encoder(model_path, variant)
     if variant == "tiny":
         if not student:
             raise ValueError("Distill a student before training a compact policy")
@@ -76,28 +117,21 @@ def train_bc(
         "burn_in": burn_in,
         "batch_size": batch_size,
         "model_path": str(Path(model_path).resolve()),
-        "game_speed": dataset.game_speed,
+        "sources": list(sources),
     }
     output.mkdir(parents=True, exist_ok=True)
+    autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
     with (output / "metrics.jsonl").open("a") as log:
         for epoch in range(epochs):
             policy.train()
             aux.train()
             for step, batch in enumerate(loader):
-                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+                batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(
-                    device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"
-                ):
-                    memory, _, features = unroll(policy, batch, burn_in)
+                with torch.autocast(**autocast):
+                    memory, _, features, cells = unroll(policy, batch, burn_in)
                     actions = batch["actions"][:, burn_in:]
-                    flat_memory, flat_actions = memory.flatten(0, 1), actions.flatten(0, 1)
-                    if objective == "xm":
-                        bc = xm_loss(policy.actor, flat_memory, flat_actions).mean()
-                    elif objective == "bc":
-                        bc = -policy.actor(flat_memory, flat_actions)[1].mean()
-                    else:
-                        raise ValueError(objective)
+                    bc = -imitation_score(policy, memory, cells, actions, objective).mean()
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
                     loss = bc + 0.1 * predictive
                 if not torch.isfinite(loss):
@@ -118,23 +152,22 @@ def train_bc(
             validation_losses = []
             with torch.no_grad():
                 for batch in DataLoader(validation, batch_size=batch_size):
-                    batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                    with torch.autocast(
-                        device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"
-                    ):
-                        memory, _, _ = unroll(policy, batch, burn_in, training=False)
-                        memory = memory.flatten(0, 1)
-                        labels = batch["actions"][:, burn_in:].flatten(0, 1)
+                    batch = batch_to_device(batch, device)
+                    with torch.autocast(**autocast):
+                        memory, _, _, cells = unroll(policy, batch, burn_in, training=False)
+                        labels = batch["actions"][:, burn_in:]
                         if objective == "xm":
                             # The same best-of-K choice the training loss makes, not a
                             # log-sum-exp of candidates the optimizer never saw.
+                            flat_memory, flat_cells = memory.flatten(0, 1), cells.flatten(0, 1)
                             scores = torch.stack(
                                 [
                                     policy.actor(
-                                        memory,
-                                        labels,
+                                        flat_memory,
+                                        flat_cells,
+                                        labels.flatten(0, 1),
                                         noise=torch.randn(
-                                            len(memory), policy.actor.noise_dim, device=device
+                                            len(flat_memory), policy.actor.noise_dim, device=device
                                         ),
                                     )[1]
                                     for _ in range(5)
@@ -142,7 +175,7 @@ def train_bc(
                             )
                             score = scores.max(0).values
                         else:
-                            score = policy.actor(memory, labels)[1]
+                            score = imitation_score(policy, memory, cells, labels, "bc")
                         validation_losses.extend((-score).float().cpu().tolist())
             log.write(
                 json.dumps(
@@ -166,27 +199,36 @@ def train_bc(
     return config
 
 
-def distill(data, model_path, output, epochs=1, seed=42):
-    """Offline teacher only; the deployed student remains a single direct policy encoder."""
+def distill(data, model_path, output, epochs=1, seed=42, sources=("human", "ai")):
+    """Offline teacher only; the deployed student remains a single direct policy encoder.
+
+    The student learns the teacher's summary token and its patch grid, since the policy
+    now reads both. AI games count here: distillation needs pixels, not actions.
+    """
     path = Path(output)
     if path.exists():
         raise FileExistsError(path)
     torch.manual_seed(seed)
-    dataset = Sessions(data, length=1, burn_in=0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dataset = VideoSessions(data, length=1, burn_in=0, sources=sources, seed=seed, device=device)
     teacher = VideoEncoder(model_path, train_last=0).to(device).eval()
     student = VideoEncoder(model_path, variant="tiny").to(device)
     projection = torch.nn.Linear(student.dim, teacher.dim).to(device)
     optimizer = torch.optim.AdamW([*student.parameters(), *projection.parameters()], lr=1e-4)
     for _ in range(epochs):
-        for batch in DataLoader(dataset, batch_size=2, shuffle=True):
-            clip = batch["clips"][:, 0].to(device)
+        for batch in DataLoader(dataset, batch_size=2):
+            clip = batch_to_device(batch, device)["clips"][:, 0]
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
                 with torch.no_grad():
-                    target = teacher(clip)
-                features = student(clip)
-                loss = torch.nn.functional.mse_loss(projection(features).float(), target.float())
+                    target, target_grid = teacher(clip)
+                summary, grid = student(clip)
+                loss = torch.nn.functional.mse_loss(
+                    projection(summary).float(), target.float()
+                ) + torch.nn.functional.mse_loss(
+                    projection(grid.flatten(2).transpose(1, 2)).float(),
+                    target_grid.flatten(2).transpose(1, 2).float(),
+                )
             loss.backward()
             optimizer.step()
     path.parent.mkdir(parents=True, exist_ok=True)
