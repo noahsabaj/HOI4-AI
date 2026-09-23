@@ -289,6 +289,16 @@ class Policy(nn.Module):
             hidden = clip.new_zeros(clip.shape[0], self.memory_dim)
         if reset is not None:
             hidden = hidden * (~reset.bool()).to(hidden.dtype)[:, None]
+        merged, summary, cells = self.observe(clip, quadrants, fovea, previous, speed, hidden)
+        hidden = self.memory(merged, hidden)
+        return hidden, self.value(hidden).squeeze(-1), summary, cells
+
+    def observe(self, clip, quadrants, fovea, previous, speed, hidden):
+        """What one decision sees, fused into one vector, before the memory takes it in.
+
+        `hidden` only steers the attention readout. Returns the fused vector, the summary
+        token and the cells.
+        """
         scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
         prior = self.previous_action((previous / scales).flatten(1).to(clip.dtype))
         summary, grid = self.encoder(clip)
@@ -300,8 +310,55 @@ class Policy(nn.Module):
         merged = torch.cat(
             [summary, cells.mean(1), centre, readout, prior, self.speed(speed)], -1
         ).to(clip.dtype)
-        hidden = self.memory(F.gelu(self.fusion(merged)), hidden)
-        return hidden, self.value(hidden).squeeze(-1), summary, cells
+        return F.gelu(self.fusion(merged)), summary, cells
+
+
+class InverseDynamics(nn.Module):
+    """Labels the inputs behind a stretch of video, seeing what came after each decision.
+
+    The policy has to act on the past alone. The inverse dynamics model does not: it is
+    shown each decision's clip shifted into the future, so the last frames already show
+    what the input did, and the views of the frame one interval later, where a moved
+    pointer has arrived. A two-way recurrence then runs over the window, so each decision
+    also knows its neighbours. That makes it a much easier problem than acting, and the
+    point: trained on recordings whose inputs are known, it labels video whose inputs are
+    not (Baker et al., 2022, Video PreTraining), and the labelled video trains the policy.
+
+    It reuses the policy's reader and action head, so its labels are in the same lattice,
+    and its cells come from the later frame, where the pointer ends up.
+    """
+
+    def __init__(self, encoder, memory_dim=512):
+        super().__init__()
+        self.trunk = Policy(encoder, memory_dim)
+        # The trunk's own recurrence and value are not used; the two-way recurrence is.
+        self.trunk.memory = self.trunk.value = None
+        self.context = nn.GRU(memory_dim, memory_dim // 2, batch_first=True, bidirectional=True)
+        self.memory_dim = memory_dim
+
+    @property
+    def actor(self):
+        return self.trunk.actor
+
+    def forward(self, clips, quadrants, fovea, speed):
+        """A window of decisions: (B, T, ...) views in, per-decision context and cells out.
+
+        The previous action is not an input: it is what a neighbouring decision is being
+        asked to label.
+        """
+        b, steps = clips.shape[:2]
+        previous = clips.new_zeros(b * steps, SLOTS, 3, dtype=torch.long)
+        hidden = clips.new_zeros(b * steps, self.memory_dim)
+        merged, _, cells = self.trunk.observe(
+            clips.flatten(0, 1),
+            quadrants.flatten(0, 1),
+            fovea.flatten(0, 1),
+            previous,
+            speed.flatten(0, 1),
+            hidden,
+        )
+        context, _ = self.context(merged.reshape(b, steps, -1))
+        return context, cells.reshape(b, steps, *cells.shape[1:])
 
 
 def configure_precision(tf32: bool = False):

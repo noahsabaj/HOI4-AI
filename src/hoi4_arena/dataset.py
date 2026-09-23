@@ -49,6 +49,8 @@ QUADRANTS = 4
 # and 16 at speed 4. The policy is told the speed (Policy's speed input), so one model can
 # learn from recordings made at different speeds.
 GAME_SPEED_SECONDS = (2.0, 0.5, 0.2, 0.1, 0.0)
+# Where `hoi4-arena label` writes the inverse dynamics model's labels in a recording.
+IDM_LABELS = "labels-idm.npz"
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
@@ -209,17 +211,26 @@ def batch_to_device(batch, device):
     return out
 
 
-def session_labels(source, *, sources=("human",)):
+def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
     Checked before any frame is decoded, so a recording that cannot train fails here
     rather than an hour into a run. `sources` are the manifest sources accepted: "human"
     recordings carry the player's own inputs; "ai" recordings carry the scripted camera's
     (see ai_games), which are real inputs but not a player's.
+
+    The shifts, in decision intervals, move each decision's clip and detail views later
+    than the decision itself. The policy uses none: it acts on the past. The inverse
+    dynamics model looks ahead, at frames that already show what the input did. A decision
+    whose shifted frames run past the end of the video is not valid for that reader.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
-    if not manifest.get("complete") or manifest.get("source") not in sources:
+    own = manifest.get("source") in sources
+    # A recording with no inputs of its own can be labelled by the inverse dynamics model
+    # (hoi4-arena label), and "idm" in `sources` accepts those labels.
+    inferred = not own and "idm" in sources and (source / IDM_LABELS).exists()
+    if not manifest.get("complete") or not (own or inferred):
         raise ValueError(f"Only complete recordings from {sorted(sources)} enter training")
     # Before any frame is decoded. A session with no recorded speed cannot grow one.
     speed = recorded_speed(manifest.get("game_speed"))
@@ -241,7 +252,8 @@ def session_labels(source, *, sources=("human",)):
     # a hardcoded 2.1 s was correct only while a clip spanned 2.0 s.
     lead_in = (CLIP_FRAMES + 1) * PERIOD_NS
     decisions = np.arange(times[0] + lead_in, times[-1] - PERIOD_NS, PERIOD_NS, dtype=np.int64)
-    frame_ids = np.searchsorted(times, decisions, side="right") - 1
+    frame_ids = np.searchsorted(times, decisions + detail_shift * PERIOD_NS, side="right") - 1
+    clip_ids = clip_frame_ids(times, decisions + clip_shift * PERIOD_NS)
     event_times = np.array([e["t_ns"] for e in events], dtype=np.int64)
     actions = np.zeros((len(decisions), SLOTS, 3), dtype=np.int64)
     valid = np.ones(len(decisions), dtype=bool)
@@ -253,6 +265,16 @@ def session_labels(source, *, sources=("human",)):
         except ValueError as error:
             valid[i] = False
             excluded.append({"decision": i, "reason": str(error)})
+    label_source = manifest["source"]
+    if inferred:
+        stored = np.load(source / IDM_LABELS)
+        if not np.array_equal(stored["decisions"], decisions):
+            raise ValueError("IDM labels were made on a different decision grid; label again")
+        actions, valid = stored["actions"].copy(), stored["valid"].copy()
+        label_source = "idm"
+    # Frames the reader needs that the video does not have.
+    readable = decisions + max(clip_shift, detail_shift) * PERIOD_NS <= times[-1]
+    valid &= readable
     return {
         "root": source,
         "manifest": manifest,
@@ -261,11 +283,14 @@ def session_labels(source, *, sources=("human",)):
         "cursors": cursors,
         "decisions": decisions,
         "frame_ids": frame_ids,
-        "clip_ids": clip_frame_ids(times, decisions),
+        "clip_ids": clip_ids,
+        # The last frame each decision reads, so a window is cut only once it is decoded.
+        "last_frame": np.maximum(clip_ids.max(-1), frame_ids),
+        "readable": readable,
         "actions": actions,
         "valid": valid,
         "excluded": excluded,
-        "label_source": manifest["source"],
+        "label_source": label_source,
     }
 
 
@@ -278,14 +303,33 @@ def sequence_starts(valid, length, burn_in):
     ]
 
 
-class _Stream:
-    """One recording decoded front to back, yielding its training windows as they fill."""
+def cover_starts(labels, length):
+    """Windows of `length` that cover every decision whose frames exist, for labelling.
 
-    def __init__(self, labels, length, burn_in, device):
+    Unlike training, validity does not matter: a decision with no usable label is exactly
+    what labelling is for. The last window is pulled back to end on the last such decision.
+    """
+    readable = int(labels["readable"].sum())
+    if readable < length:
+        return []
+    starts = list(range(0, readable - length + 1, length))
+    if starts[-1] + length < readable:
+        starts.append(readable - length)
+    return starts
+
+
+class _Stream:
+    """One recording decoded front to back, yielding its windows as they fill."""
+
+    def __init__(self, labels, length, burn_in, device, starts=None):
         self.labels, self.length, self.burn_in, self.device = labels, length, burn_in, device
         manifest = labels["manifest"]
         self.w, self.h = manifest["width"], manifest["height"]
-        self.starts = sequence_starts(labels["valid"], length, burn_in)
+        self.starts = (
+            list(starts)
+            if starts is not None
+            else sequence_starts(labels["valid"], length, burn_in)
+        )
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("FFmpeg is required to read recordings")
@@ -324,8 +368,9 @@ class _Stream:
             "fovea": fovea,
             "actions": actions,
             "previous": previous,
-            "valid": torch.ones(n, dtype=torch.bool),
+            "valid": torch.from_numpy(labels["valid"][start : start + n].copy()),
             "speed": torch.full((n,), labels["speed"], dtype=torch.long),
+            "start": start,
         }
 
     def advance(self):
@@ -357,7 +402,7 @@ class _Stream:
                 self.details[d] = (quads, fovea)
         done = []
         n = self.length + self.burn_in
-        while self.starts and self.starts[0] + n - 1 in self.details:
+        while self.starts and labels["last_frame"][self.starts[0] + n - 1] <= i:
             done.append(self._window(self.starts.pop(0)))
             if not self.starts:
                 break
@@ -391,6 +436,8 @@ class VideoSessions(IterableDataset):
         shuffle=32,
         seed=0,
         device=None,
+        clip_shift=0,
+        detail_shift=0,
     ):
         self.length, self.burn_in = length, burn_in
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
@@ -398,11 +445,19 @@ class VideoSessions(IterableDataset):
         self.sessions = []
         for path in sorted(Path(root).glob("*/manifest.json")):
             meta = json.loads(path.read_text())
-            if meta.get("split") != split or meta.get("source") not in sources:
+            labelled = "idm" in sources and (path.parent / IDM_LABELS).exists()
+            if meta.get("split") != split or not (meta.get("source") in sources or labelled):
                 continue
             if not meta.get("complete"):
                 continue
-            self.sessions.append(session_labels(path.parent, sources=sources))
+            self.sessions.append(
+                session_labels(
+                    path.parent,
+                    sources=sources,
+                    clip_shift=clip_shift,
+                    detail_shift=detail_shift,
+                )
+            )
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)
         if not self.windows:
             raise ValueError(f"No complete valid {split} sequences; record human sessions first")
