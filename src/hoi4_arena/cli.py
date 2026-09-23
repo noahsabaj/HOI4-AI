@@ -111,6 +111,21 @@ def main():
     idm.add_argument("--sequence", type=int, default=16)
     idm.add_argument("--seed", type=int, default=42)
     idm.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["human", "ai"])
+    pointer = sub.add_parser(
+        "pointer",
+        help="Save the pointer image Windows is showing in the game, to find it in video",
+    )
+    pointer.add_argument("output", help="A .png; its hotspot is written beside it as .json.")
+    pointer.add_argument("--peer")
+    imported = sub.add_parser(
+        "import-video",
+        help="Make a recording, with no inputs, from plain video of the game, for `label`",
+    )
+    imported.add_argument("video")
+    imported.add_argument("output")
+    imported.add_argument("--pointers", nargs="+", required=True, help="Saved pointer images.")
+    imported.add_argument("--game-speed", type=int, required=True, choices=[1, 2, 3, 4, 5])
+    imported.add_argument("--split", choices=["train", "validation", "test"])
     label = sub.add_parser(
         "label", help="Label a recording's inputs with a trained inverse dynamics model"
     )
@@ -317,6 +332,17 @@ def _dispatch(command, args):
 
         args["sources"] = tuple(args["sources"])
         result = train_idm(args.pop("data"), args.pop("model"), args.pop("output"), **args)
+    elif command == "pointer":
+        from .desktop import Desktop
+        from .remote import RemoteDesktop
+        from .video_import import save_pointer
+
+        with RemoteDesktop(args["peer"]) if args["peer"] else Desktop() as desktop:
+            result = save_pointer(desktop, args["output"])
+    elif command == "import-video":
+        from .video_import import import_video
+
+        result = import_video(args.pop("video"), args.pop("output"), **args)
     elif command == "label":
         from .idm import label_recording
 

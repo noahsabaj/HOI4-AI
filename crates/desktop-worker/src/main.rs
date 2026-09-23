@@ -164,6 +164,92 @@ pub fn cursor_crop_bgra(
     out
 }
 
+/// A pointer image, ready to draw into a captured frame.
+///
+/// Neither capture path contains the pointer: HOI4 uses the Windows cursor, which the
+/// blit never draws and Desktop Duplication hands over separately. A player sees it, and
+/// so does any video of the game recorded by other means, which is what the inverse
+/// dynamics model has to read. So the worker draws it in, the way Windows does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pointer {
+    pub width: usize,
+    pub height: usize,
+    /// The pixel of the image that sits on the pointer position.
+    pub hotspot: (i32, i32),
+    pub pixels: PointerPixels,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PointerPixels {
+    /// BGRA with straight alpha: blended over the frame.
+    Alpha(Vec<u8>),
+    /// The classic cursor: each pixel is kept or cleared by the AND mask, then XORed with
+    /// a BGR colour. Black on a cleared pixel draws black, white on a kept one inverts.
+    Mask { and: Vec<bool>, xor: Vec<[u8; 3]> },
+}
+
+/// Draw `pointer` into a BGRA frame with its hotspot on client pixel (`x`, `y`).
+/// Parts outside the frame are clipped.
+pub fn draw_pointer(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    pointer: &Pointer,
+    x: i32,
+    y: i32,
+) {
+    let left = x as i64 - pointer.hotspot.0 as i64;
+    let top = y as i64 - pointer.hotspot.1 as i64;
+    for py in 0..pointer.height {
+        let fy = top + py as i64;
+        if fy < 0 || fy >= height as i64 {
+            continue;
+        }
+        for px in 0..pointer.width {
+            let fx = left + px as i64;
+            if fx < 0 || fx >= width as i64 {
+                continue;
+            }
+            let o = (fy as usize * width + fx as usize) * 4;
+            let i = py * pointer.width + px;
+            match &pointer.pixels {
+                PointerPixels::Alpha(bgra) => {
+                    let a = bgra[i * 4 + 3] as u32;
+                    for c in 0..3 {
+                        let blended =
+                            (bgra[i * 4 + c] as u32 * a + frame[o + c] as u32 * (255 - a) + 127)
+                                / 255;
+                        frame[o + c] = blended as u8;
+                    }
+                }
+                PointerPixels::Mask { and, xor } => {
+                    for c in 0..3 {
+                        let kept = if and[i] { frame[o + c] } else { 0 };
+                        frame[o + c] = kept ^ xor[i][c];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The pointer as straight-alpha BGRA, for saving as an image to look for in video.
+/// A mask pixel that inverts the screen has no fixed colour; it is shown as white.
+pub fn pointer_bgra(pointer: &Pointer) -> Vec<u8> {
+    match &pointer.pixels {
+        PointerPixels::Alpha(bgra) => bgra.clone(),
+        PointerPixels::Mask { and, xor } => and
+            .iter()
+            .zip(xor)
+            .flat_map(|(&kept, &[b, g, r])| match (kept, [b, g, r] == [0, 0, 0]) {
+                (true, true) => [0, 0, 0, 0],
+                (true, false) => [255, 255, 255, 255],
+                (false, _) => [b, g, r, 255],
+            })
+            .collect(),
+    }
+}
+
 /// The arena mod's lines among complete lines of game.log text, without the engine's
 /// timestamp prefix, and how many bytes were consumed. A trailing partial line is left
 /// for the next read.
@@ -400,6 +486,132 @@ mod platform {
             return Err("cursor_unavailable".into());
         }
         Ok((point.x, point.y))
+    }
+    /// The pointer Windows is showing now, or None when it is hidden.
+    ///
+    /// Reading a cursor's bitmaps costs several GDI calls and the game shows the same few
+    /// cursors all match, so the last one read is kept, keyed by its handle. The image is
+    /// the cursor's own size; a pointer Windows enlarges for display scaling or the
+    /// accessibility size setting is drawn at its original size.
+    unsafe fn current_pointer(cache: &mut Option<(usize, Pointer)>) -> Option<Pointer> {
+        let mut info: CURSORINFO = zeroed();
+        info.cbSize = size_of::<CURSORINFO>() as u32;
+        if GetCursorInfo(&mut info) == 0
+            || info.flags & CURSOR_SHOWING == 0
+            || info.hCursor.is_null()
+        {
+            return None;
+        }
+        let handle = info.hCursor as usize;
+        if let Some((cached, pointer)) = cache {
+            if *cached == handle {
+                return Some(pointer.clone());
+            }
+        }
+        let pointer = read_pointer(info.hCursor)?;
+        *cache = Some((handle, pointer.clone()));
+        Some(pointer)
+    }
+    /// A bitmap's pixels as 32-bit top-down BGRA, with its size.
+    unsafe fn bitmap_bgra(bitmap: HBITMAP) -> Option<(usize, usize, Vec<u8>)> {
+        let mut bm: BITMAP = zeroed();
+        if GetObjectW(
+            bitmap,
+            size_of::<BITMAP>() as i32,
+            &mut bm as *mut _ as *mut _,
+        ) == 0
+        {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if w <= 0 || h <= 0 || w > 256 || h > 512 {
+            return None;
+        }
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        let dc = GetDC(null_mut());
+        let lines = GetDIBits(
+            dc,
+            bitmap,
+            0,
+            h as u32,
+            bytes.as_mut_ptr() as *mut _,
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(null_mut(), dc);
+        (lines == h).then_some((w as usize, h as usize, bytes))
+    }
+    /// A cursor handle's image: a colour cursor with alpha, a colour cursor with an AND
+    /// mask, or a monochrome one whose mask holds the AND half above the XOR half.
+    unsafe fn read_pointer(cursor: HCURSOR) -> Option<Pointer> {
+        let mut icon: ICONINFO = zeroed();
+        if GetIconInfo(cursor, &mut icon) == 0 {
+            return None;
+        }
+        let mask = bitmap_bgra(icon.hbmMask);
+        let color = if icon.hbmColor.is_null() {
+            None
+        } else {
+            let color = bitmap_bgra(icon.hbmColor);
+            DeleteObject(icon.hbmColor);
+            color
+        };
+        DeleteObject(icon.hbmMask);
+        let (mask_w, mask_h, mask) = mask?;
+        let (width, height, pixels) = match color {
+            Some((w, h, bgra)) if bgra.as_chunks::<4>().0.iter().any(|p| p[3] != 0) => {
+                (w, h, PointerPixels::Alpha(bgra))
+            }
+            Some((w, h, bgra)) => {
+                if mask_w != w || mask_h < h {
+                    return None;
+                }
+                let and = mask
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .take(w * h)
+                    .map(|p| p[0] != 0)
+                    .collect();
+                let xor = bgra
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| [p[0], p[1], p[2]])
+                    .collect();
+                (w, h, PointerPixels::Mask { and, xor })
+            }
+            None => {
+                let h = mask_h / 2;
+                let split = mask_w * h * 4;
+                let and = mask[..split]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| p[0] != 0)
+                    .collect();
+                let xor = mask[split..split * 2]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| [p[0], p[1], p[2]])
+                    .collect();
+                (mask_w, h, PointerPixels::Mask { and, xor })
+            }
+        };
+        Some(Pointer {
+            width,
+            height,
+            hotspot: (icon.xHotspot as i32, icon.yHotspot as i32),
+            pixels,
+        })
     }
     fn record(e: Event) {
         if !foreground() {
@@ -1135,6 +1347,15 @@ mod platform {
             // The arena mod's own lines from HOI4's game.log: surrenders, peace, states
             // changing hands and a weekly count per country. Read-only, one fixed file,
             // and only lines the mod wrote, so it exposes nothing else on the machine.
+            // The pointer's current image, straight-alpha BGRA, and its hotspot: the
+            // template for finding the pointer in video that did not record where it was.
+            "pointer" => {
+                let pointer = unsafe { current_pointer(&mut None) }.ok_or("pointer_hidden")?;
+                Ok((
+                    serde_json::json!({"width": pointer.width, "height": pointer.height, "hotspot": [pointer.hotspot.0, pointer.hotspot.1]}),
+                    pointer_bgra(&pointer),
+                ))
+            }
             "game_log" => {
                 let offset = cmd["offset"].as_u64().unwrap_or(0);
                 let (lines, offset) = read_arena_log(offset)?;
@@ -1254,6 +1475,7 @@ mod platform {
         // enumeration and the staging texture all cost far more to create than the
         // capture they serve. It stays on this thread. Apply runs on the reader.
         let mut screen = Screen::Untried;
+        let mut pointer_cache: Option<(usize, Pointer)> = None;
         let mut rebuilds = 0u32;
         while let Ok(cmd) = rx.recv() {
             let result = (|| -> Result<(serde_json::Value, Vec<u8>), String> {
@@ -1292,7 +1514,7 @@ mod platform {
                             state.held.hwnd as HWND
                         };
                         let Capture {
-                            bytes: raw,
+                            bytes: mut raw,
                             width: w,
                             height: h,
                             start_ns: start,
@@ -1301,6 +1523,17 @@ mod platform {
                         } = unsafe { capture(&mut screen, &mut rebuilds, hwnd)? };
                         let (uw, uh) = (w as usize, h as usize);
                         let (cx, cy) = unsafe { client_cursor(hwnd)? };
+                        // Draw the pointer before anything is cut from the frame, so every
+                        // view and the recorded video show it where a player saw it.
+                        // `"pointer": false` leaves the frame as captured.
+                        let pointer_drawn = cmd["pointer"].as_bool().unwrap_or(true)
+                            && match unsafe { current_pointer(&mut pointer_cache) } {
+                                Some(pointer) => {
+                                    draw_pointer(&mut raw, uw, uh, &pointer, cx, cy);
+                                    true
+                                }
+                                None => false,
+                            };
                         // The global view, the quadrants and the fovea each have their own
                         // size (`hoi4_arena.dataset.views`). Detail and fovea default to the
                         // global size, which is the layout from before they were separate.
@@ -1381,7 +1614,7 @@ mod platform {
                         seq += 1;
                         let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                         Ok((
-                            serde_json::json!({"seq": seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": start, "t_ns": end, "events": events, "overflow": OVERFLOW.swap(false, Ordering::Relaxed), "stopped": STOP.load(Ordering::SeqCst), "foreground": foreground(), "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "detail_size": detail_size, "fovea_size": fovea_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": backend}),
+                            serde_json::json!({"seq": seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": start, "t_ns": end, "events": events, "overflow": OVERFLOW.swap(false, Ordering::Relaxed), "stopped": STOP.load(Ordering::SeqCst), "foreground": foreground(), "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "detail_size": detail_size, "fovea_size": fovea_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": backend, "pointer_drawn": pointer_drawn}),
                             bytes,
                         ))
                     }
@@ -1650,6 +1883,59 @@ mod tests {
                 "vk {vk:#x} is part of the demonstration vocabulary"
             );
         }
+    }
+    #[test]
+    fn a_pointer_lands_on_its_hotspot_and_is_clipped_at_the_edge() {
+        // A 2x2 opaque red pointer whose hotspot is its bottom-right pixel.
+        let pointer = Pointer {
+            width: 2,
+            height: 2,
+            hotspot: (1, 1),
+            pixels: PointerPixels::Alpha([0, 0, 255, 255].repeat(4)),
+        };
+        let mut frame = vec![10u8; 4 * 4 * 4];
+        draw_pointer(&mut frame, 4, 4, &pointer, 2, 2);
+        let red = |x: usize, y: usize, f: &[u8]| f[(y * 4 + x) * 4..][..3] == [0, 0, 255];
+        for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            assert!(red(x, y, &frame), "({x}, {y}) should be under the pointer");
+        }
+        assert!(!red(3, 3, &frame) && !red(0, 0, &frame));
+        // At the corner only the part inside the frame is drawn, and nothing panics.
+        let mut corner = vec![10u8; 4 * 4 * 4];
+        draw_pointer(&mut corner, 4, 4, &pointer, 0, 0);
+        assert!(red(0, 0, &corner));
+        assert_eq!(corner.iter().filter(|&&b| b == 255).count(), 1);
+    }
+    #[test]
+    fn half_alpha_blends_and_a_mask_keeps_clears_or_inverts() {
+        let half = Pointer {
+            width: 1,
+            height: 1,
+            hotspot: (0, 0),
+            pixels: PointerPixels::Alpha(vec![200, 200, 200, 128]),
+        };
+        let mut frame = vec![0u8, 0, 0, 255];
+        draw_pointer(&mut frame, 1, 1, &half, 0, 0);
+        assert_eq!(&frame[..3], &[100, 100, 100]);
+        // Transparent, black, and inverting, the three things a classic cursor pixel does.
+        let classic = Pointer {
+            width: 3,
+            height: 1,
+            hotspot: (0, 0),
+            pixels: PointerPixels::Mask {
+                and: vec![true, false, true],
+                xor: vec![[0, 0, 0], [0, 0, 0], [255, 255, 255]],
+            },
+        };
+        let mut row = [50u8, 60, 70, 255].repeat(3);
+        draw_pointer(&mut row, 3, 1, &classic, 0, 0);
+        assert_eq!(&row[..3], &[50, 60, 70]);
+        assert_eq!(&row[4..7], &[0, 0, 0]);
+        assert_eq!(&row[8..11], &[205, 195, 185]);
+        let image = pointer_bgra(&classic);
+        assert_eq!(&image[..4], &[0, 0, 0, 0]);
+        assert_eq!(&image[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&image[8..12], &[255, 255, 255, 255]);
     }
     #[test]
     fn arena_lines_skip_other_and_partial_lines() {

@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 146 Python tests and 22 Rust tests (2 need a live desktop and are
+Automated checks: 148 Python tests and 24 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -192,6 +192,11 @@ The policy was rebuilt so it can read the screen and point at what it sees:
   inputs as labels.
 - **Inverse dynamics model** (`train-idm`, `label`): the same reader, shown each clip
   shifted 0.8 s past the decision, labels the inputs behind video that has none.
+- **The pointer is drawn into every captured frame.** HOI4 uses the Windows cursor,
+  which neither capture path includes, so no frame showed the pointer a player sees.
+  The worker now draws it (live: the gauntlet pointer, fingertip on the position, views
+  still byte-identical to `dataset.views`). `import-video` finds it again in video from
+  elsewhere by matching saved pointer images, so that video can be labelled.
 - **Screen encoder option** (`--variant screen`, SigLIP 2 base): reads the quadrants as one
   896 px screen.
 
