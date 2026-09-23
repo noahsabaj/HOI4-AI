@@ -296,6 +296,12 @@ def test_record_with_a_peer_focuses_its_game_and_records_it_here(tmp_path, monke
             calls.append(("focus",))
             return True
 
+        def arm(self, setup=False):
+            calls.append(("arm",))
+
+        def release(self):
+            calls.append(("release",))
+
         def capture(self):
             self.seq += 1
             meta = {"t_ns": self.seq * 100_000_000, "cursor": [4, 4], "foreground": True}
@@ -314,13 +320,15 @@ def test_record_with_a_peer_focuses_its_game_and_records_it_here(tmp_path, monke
             lines = ["declare RED", "player BLU", "capitulated BLU winner RED 1:00, 30 May, 1937"]
             if offset == 0:  # an earlier game of the same launch, already over
                 return ["player RED", "capitulated RED winner BLU 1:00, 2 June, 1936"], 2
-            return lines, offset + len(lines)
+            if offset == 2:  # this recording's game, read once
+                return lines, offset + len(lines)
+            return [], offset
 
         def worker_log(self):
             return []
 
     monkeypatch.setattr(remote, "RemoteDesktop", Peer)
-    recording.record(tmp_path / "rec", 0.5, hz=10, game_speed=5, codec="ffv1", peer="p.json")
+    recording.record(tmp_path / "rec", 4, hz=10, game_speed=5, codec="ffv1", peer="p.json")
     manifest = json.loads((tmp_path / "rec" / "manifest.json").read_text())
     assert manifest["complete"] and manifest["station"] == "peer" and manifest["frames"] >= 5
     assert calls[0] == ("connect", "p.json") and calls[1] == ("focus",)

@@ -43,6 +43,10 @@ class DesktopError(RuntimeError):
     pass
 
 
+class EmergencyStop(DesktopError):
+    """The player pressed F12, the worker's stop key: input stops, and so does recording."""
+
+
 @dataclass
 class Frame:
     rgb: np.ndarray | None
@@ -239,8 +243,10 @@ class Desktop:
             payload = lz4.block.decompress(payload, uncompressed_size=size)
         if len(payload) != size:
             raise DesktopError("Capture payload does not match its declared layout")
-        if meta["overflow"] or meta["stopped"]:
-            raise DesktopError("Input queue overflow or F12 emergency stop")
+        if meta["stopped"]:
+            raise EmergencyStop("F12 emergency stop")
+        if meta["overflow"]:
+            raise DesktopError("Input queue overflow")
         buffer = np.frombuffer(payload, np.uint8)
         offset = 0
         rgb = None

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .arena_log import ArenaLog
 from .dataset import FOVEA_SIZE, parse_cursor, recorded_speed
-from .desktop import Desktop
+from .desktop import Desktop, DesktopError, EmergencyStop
 
 log = logging.getLogger(__name__)
 
@@ -159,10 +159,43 @@ class Recorder:
         self._manifest()
 
 
+# How long the game may stay out of focus before the recording ends, and how long after
+# the arena log names a winner it goes on, so the end screen is in the video.
+AWAY_LIMIT = 600
+AFTER_SURRENDER = 15
+# How often the arena log is read during a recording, in seconds.
+LOG_EVERY = 5
+# A recording with fewer frames than this cannot train anything (session_labels).
+MIN_FRAMES = 32
+
+
+def _first_frame(desktop, clock):
+    """The first frame of the game in front, waiting up to AWAY_LIMIT for it to be there."""
+    since = clock()
+    while True:
+        try:
+            frame = desktop.capture()
+            if frame.meta.get("foreground"):
+                return frame
+        except DesktopError as error:
+            if "not_foreground" not in str(error) or clock() - since > AWAY_LIMIT:
+                raise
+        log.warning("waiting for the game to be in front")
+        time.sleep(1)
+
+
 def record(
-    root, seconds, hz=15, command=None, split=None, game_speed=None, codec="ffv1", peer=None
+    root,
+    seconds,
+    hz=15,
+    command=None,
+    split=None,
+    game_speed=None,
+    codec="ffv1",
+    peer=None,
+    clock=time.monotonic,
 ):
-    """Write the manifest whatever happens, then fail loudly if the session is unusable.
+    """Record a player until `seconds` pass, they press F12 or Ctrl+C, or the arena ends.
 
     `game_speed` is the speed the operator set for the whole session. It is checked
     before the worker starts. With `peer`, a pairing file, the game and the player are on
@@ -170,8 +203,14 @@ def record(
     on its clock, and the frames come here over the network to be encoded. A full 1080p
     frame takes about 86 ms to arrive, so 5 Hz holds and 10 does not.
 
-    An incomplete recording is rejected by training (session_labels), so exiting zero on a failed
-    or interrupted run would hand the operator a session that can never be trained on.
+    Nothing already recorded is lost to a mistake. While the game is out of focus (a
+    click outside it, an alt-tab) or its window has another size, recording pauses and
+    then resumes; the worker records no input outside the game, and training drops only
+    the decisions whose frames span the pause (session_labels). A capture that falls
+    behind skips ahead rather than failing. On an arena game the recording stops by
+    itself AFTER_SURRENDER seconds after the log names a winner. If anything else ends it
+    early, what was recorded is kept and usable, and the manifest's `ended` says why.
+    Only a recording too short to train on fails.
     """
     speed = recorded_speed(game_speed)["game_speed"]
     if peer:
@@ -184,6 +223,13 @@ def record(
         # The worker captures only a game in front. Bring it there once, before the
         # first frame: nobody may have clicked it yet, least of all on the second PC.
         desktop.focus()
+        # F12 is the worker's stop key and stays latched until input is armed again, so
+        # an earlier press would end this recording at once. Arming and releasing clears it.
+        try:
+            desktop.arm(setup=True)
+            desktop.release()
+        except DesktopError as error:
+            log.warning("could not clear an earlier F12: %s", error)
         # The arena mod's log names who declared, which country the player took and who
         # won, as it does for the AI games (arena_log). Lines from before this recording
         # belong to earlier games of the same launch, so they are read now and dropped.
@@ -196,32 +242,74 @@ def record(
         else:
             arena.declarer, arena.players = None, []
             arena.winner = arena.loser = arena.surrendered = None
-        first = desktop.capture()
+        first = _first_frame(desktop, clock)
         recorder = Recorder(root, first, hz=hz, split=split, game_speed=speed, codec=codec)
         recorder.manifest["station"] = "peer" if peer else "here"
-        start = time.monotonic()
-        deadline = start
-        reason = None
-        failure = None
+        size = (first.meta.get("width"), first.meta.get("height"))
+        start = deadline = next_poll = clock()
+        away_since = over_at = None
+        pauses, skipped = 0, 0
+        ended = "time"
         try:
             recorder.append(first)
-            while time.monotonic() - start < seconds:
+            while clock() - start < seconds:
                 deadline += 1 / hz
-                time.sleep(max(0, deadline - time.monotonic()))
-                frame = desktop.capture()
+                time.sleep(max(0, deadline - clock()))
+                if clock() - deadline > 1:
+                    # Behind by over a second: skip ahead. The gap costs the decisions
+                    # that span it, not the recording.
+                    deadline = clock()
+                    skipped += 1
+                try:
+                    frame = desktop.capture()
+                except EmergencyStop:
+                    ended = "F12"
+                    break
+                except DesktopError as error:
+                    if "not_foreground" not in str(error):
+                        raise
+                    frame = None
+                usable = (
+                    frame is not None
+                    and frame.meta.get("foreground")
+                    and (frame.meta.get("width"), frame.meta.get("height")) == size
+                )
+                if not usable:
+                    if away_since is None:
+                        away_since = clock()
+                        pauses += 1
+                        log.warning("the game is not in front: recording paused")
+                    elif clock() - away_since > AWAY_LIMIT:
+                        ended = f"the game was out of focus for over {AWAY_LIMIT} s"
+                        break
+                    continue
+                if away_since is not None:
+                    log.warning("the game is back: recording resumed")
+                    away_since = None
                 recorder.append(frame)
-                if time.monotonic() - deadline > 1:
-                    raise RuntimeError("Recording cannot maintain capture cadence")
-        except (Exception, KeyboardInterrupt) as error:
-            failure = error
-            reason = str(error) or type(error).__name__
+                if arena is not None and clock() >= next_poll:
+                    next_poll = clock() + LOG_EVERY
+                    try:
+                        arena.poll()
+                    except Exception as error:  # noqa: BLE001 - keep recording regardless.
+                        log.warning("arena log unavailable: %s", error)
+                    if arena.winner and over_at is None:
+                        over_at = clock() + AFTER_SURRENDER
+                if over_at is not None and clock() >= over_at:
+                    ended = "surrender"
+                    break
+        except KeyboardInterrupt:
+            ended = "Ctrl+C"
+        except Exception as error:  # noqa: BLE001 - keep what was recorded; say why it ended.
+            ended = f"error: {error}"
+            log.error("recording ended early, and what was recorded is kept: %s", error)
         finally:
             tail = None
             try:
                 tail = desktop.request("events")
                 tail.pop("payload", None)
-            except Exception as error:
-                reason = reason or f"Final input drain failed: {error}"
+            except Exception as error:  # noqa: BLE001
+                log.warning("final input drain failed: %s", error)
             if arena is not None:
                 try:
                     arena.poll()
@@ -239,12 +327,14 @@ def record(
                     (recorder.root / "worker.log").write_text("\n".join(lines) + "\n")
             except Exception as error:  # noqa: BLE001 - diagnostics must never mask cleanup.
                 log.warning("could not write worker.log: %s", error)
-            recorder.close(complete=reason is None, reason=reason, trailing_events=tail)
+            recorder.manifest.update(ended=ended, focus_pauses=pauses, skipped_ahead=skipped)
+            enough = recorder.manifest["frames"] >= MIN_FRAMES
+            reason = None if enough else f"only {recorder.manifest['frames']} frames"
+            recorder.close(complete=enough, reason=reason, trailing_events=tail)
             print(json.dumps(recorder.manifest, indent=2))
         # Recorder.close independently clears `complete` on a nonzero encoder exit without
         # setting a reason, so key the failure on the manifest rather than on `reason`.
         if not recorder.manifest["complete"]:
-            if failure is not None:
-                raise failure
             detail = reason or f"encoder exit {recorder.manifest['encoder_exit']}"
-            raise RuntimeError(f"Recording incomplete: {detail}")
+            raise RuntimeError(f"Recording unusable: {detail} (ended by {ended})")
+        return recorder.manifest
