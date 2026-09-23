@@ -25,7 +25,7 @@ from .dataset import (
     session_labels,
 )
 from .learning import file_hash, save_checkpoint
-from .models import InverseDynamics, VideoEncoder
+from .models import InverseDynamics, build_encoder
 
 # How far ahead the model looks, in decision intervals. The clip ends four intervals
 # (0.8 s) after the decision, so it spans 0.6 s before it and the effect after; the
@@ -86,7 +86,7 @@ def train_idm(
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
-    model = InverseDynamics(VideoEncoder(model_path, variant=variant)).to(device)
+    model = InverseDynamics(build_encoder(model_path, variant)).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=1e-4)
     config = {
@@ -160,7 +160,7 @@ def load_idm(checkpoint, model_path=None, device="cuda"):
     config = saved["config"]
     if config.get("kind") != "idm":
         raise ValueError("Not an inverse dynamics checkpoint")
-    encoder = VideoEncoder(model_path or config["model_path"], variant=config["variant"])
+    encoder = build_encoder(model_path or config["model_path"], config["variant"])
     model = InverseDynamics(encoder)
     model.load_state_dict(saved["policy"])
     return model.to(device).eval(), config, metadata["sha256"]

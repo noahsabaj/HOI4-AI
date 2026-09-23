@@ -22,7 +22,7 @@ from hoi4_arena.models import CELL_DIM, InverseDynamics
 class _Encoder(torch.nn.Module):
     dim = 8
 
-    def forward(self, clip):
+    def forward(self, clip, quadrants=None):
         batch = clip.shape[0]
         pooled = clip.mean((1, 3, 4))  # (B, T): each frame's brightness, in order.
         summary = torch.nn.functional.pad(pooled, (0, self.dim - pooled.shape[1]))

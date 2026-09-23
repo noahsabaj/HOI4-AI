@@ -18,7 +18,7 @@ from .dataset import CLIP_FRAMES, clip_frame_ids, normalize, recorded_speed, vie
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
 from .learning import approximate_kl, file_hash
-from .models import CELL_DIM, Policy, VideoEncoder, halve_frozen
+from .models import CELL_DIM, Policy, build_encoder, halve_frozen
 from .recording import Recorder
 from .remote import RemoteDesktop
 from .vision import ScreenRules
@@ -82,7 +82,7 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
         raise ValueError("Checkpoint does not match its immutable manifest")
     saved = torch.load(path, map_location="cpu", weights_only=True)
     config = saved["config"]
-    encoder = VideoEncoder(model_path or config["model_path"], variant=config["variant"])
+    encoder = build_encoder(model_path or config["model_path"], config["variant"])
     policy = Policy(encoder)
     policy.load_state_dict(saved["policy"])
     # Both collection and PPO come through here, so the frozen weights are halved in

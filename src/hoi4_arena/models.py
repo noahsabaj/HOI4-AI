@@ -56,7 +56,8 @@ class VideoEncoder(nn.Module):
                     block.requires_grad_(True)
                 self.model.encoder.norm.requires_grad_(True)
 
-    def forward(self, clip):
+    def forward(self, clip, quadrants=None):
+        """`quadrants` is ignored: this encoder reads the global clip."""
         # All input frames are <= current observation time. No token dropping for control.
         tokens = self.model(pixel_values=clip).last_hidden_state
         h, w = clip.shape[-2] // self.patch, clip.shape[-1] // self.patch
@@ -64,6 +65,72 @@ class VideoEncoder(nn.Module):
         # are the newest frame.
         grid = tokens[:, -h * w :].transpose(1, 2).reshape(tokens.shape[0], self.dim, h, w)
         return tokens[:, 0], grid
+
+
+class ScreenEncoder(nn.Module):
+    """An image encoder trained on web images with text, reading the screen in detail.
+
+    LeVJEPA learned from natural video. A HOI4 screen is interface: panels, icons and
+    small text. SigLIP 2 (Tschannen et al., 2025) was trained on image-text pairs that
+    include rendered text and documents, and its NaFlex variant takes any grid of
+    patches. This reads the four detail quadrants tiled back into one screen, at `size`
+    square, rather than the 224 px global clip, and returns the same summary and patch
+    grid as VideoEncoder. It sees one frame; the policy's memory carries time.
+
+    At the default 896 px the quadrants' pixels go in unscaled, 56 x 56 patches. Measured
+    on the 4060 Ti at batch one in bfloat16 (random weights of the real size, 2026-09-23):
+    31.4 ms, against 63.5 ms for LeVJEPA's eight-frame clip; 16.2 ms at 672 and 8.2 at 448.
+
+    Weights are google/siglip2-base-patch16-naflex, kept locally like the video encoder:
+    nothing is fetched at run time.
+    """
+
+    def __init__(self, model_path=None, *, config=None, size=896, train_last=2):
+        super().__init__()
+        from transformers import Siglip2VisionModel
+
+        if config is not None:
+            self.model = Siglip2VisionModel(config)
+        else:
+            self.model = Siglip2VisionModel.from_pretrained(str(model_path), local_files_only=True)
+        config = self.model.config
+        self.dim, self.patch, self.size = config.hidden_size, config.patch_size, size
+        self.variant = "screen"
+        if train_last >= 0:
+            self.model.requires_grad_(False)
+            if train_last:
+                for layer in self.model.encoder.layers[-train_last:]:
+                    layer.requires_grad_(True)
+                self.model.post_layernorm.requires_grad_(True)
+                self.model.head.requires_grad_(True)
+        # The views arrive normalized with ImageNet statistics; SigLIP expects [-1, 1].
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406])[:, None, None], False)
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225])[:, None, None], False)
+
+    def forward(self, clip, quadrants):
+        top = torch.cat([quadrants[:, 0], quadrants[:, 1]], -1)
+        bottom = torch.cat([quadrants[:, 2], quadrants[:, 3]], -1)
+        screen = torch.cat([top, bottom], -2)
+        screen = F.interpolate(screen.float(), (self.size, self.size), mode="area")
+        screen = ((screen * self.std + self.mean) - 0.5) / 0.5
+        b, side = screen.shape[0], self.size // self.patch
+        # NaFlex takes flattened patches, row-major, each channels-last within the patch.
+        patches = screen.unfold(2, self.patch, self.patch).unfold(3, self.patch, self.patch)
+        patches = patches.permute(0, 2, 3, 4, 5, 1).reshape(b, side * side, -1)
+        output = self.model(
+            pixel_values=patches.to(self.model.dtype),
+            pixel_attention_mask=torch.ones(b, side * side, dtype=torch.long, device=screen.device),
+            spatial_shapes=torch.tensor([[side, side]] * b, device=screen.device),
+        )
+        grid = output.last_hidden_state.transpose(1, 2).reshape(b, self.dim, side, side)
+        return output.pooler_output, grid
+
+
+def build_encoder(model_path, variant="large", **kwargs):
+    """The encoder a checkpoint names: "large" or "tiny" LeVJEPA, or "screen" SigLIP 2."""
+    if variant == "screen":
+        return ScreenEncoder(model_path, **kwargs)
+    return VideoEncoder(model_path, variant=variant, **kwargs)
 
 
 class Stage(nn.Module):
@@ -301,7 +368,7 @@ class Policy(nn.Module):
         """
         scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
         prior = self.previous_action((previous / scales).flatten(1).to(clip.dtype))
-        summary, grid = self.encoder(clip)
+        summary, grid = self.encoder(clip, quadrants)
         cells = self.cells(grid, quadrants)
         centre = self.foveal(fovea).mean((-2, -1))
         attention = torch.einsum("bnc,bc->bn", cells, self.read(hidden).to(cells.dtype))

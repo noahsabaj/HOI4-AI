@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from .dataset import VideoSessions, batch_to_device
 from .learning import save_checkpoint
-from .models import Policy, PredictiveAuxiliary, VideoEncoder, xm_loss
+from .models import Policy, PredictiveAuxiliary, VideoEncoder, build_encoder, xm_loss
 
 
 def unroll(policy, batch, burn_in=2, training=True):
@@ -97,7 +97,7 @@ def train_bc(
     loader = DataLoader(dataset, batch_size=batch_size, drop_last=auxiliary != "none")
     if len(dataset) < (2 if auxiliary != "none" else 1):
         raise ValueError("Need at least two sequences for independent-batch regularization")
-    encoder = VideoEncoder(model_path, variant=variant)
+    encoder = build_encoder(model_path, variant)
     if variant == "tiny":
         if not student:
             raise ValueError("Distill a student before training a compact policy")

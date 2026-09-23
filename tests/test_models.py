@@ -220,12 +220,39 @@ class _Encoder(torch.nn.Module):
 
     dim = 8
 
-    def forward(self, clip):
+    def forward(self, clip, quadrants=None):
         batch = clip.shape[0]
         pooled = clip.mean((1, 2, 3, 4))[:, None]
         return pooled.expand(batch, self.dim), pooled[:, :, None, None].expand(
             batch, self.dim, 14, 14
         )
+
+
+def test_the_screen_encoder_reads_the_tiled_quadrants_as_one_screen():
+    """Same outputs as the video encoder: a summary and a patch grid the cells resize."""
+    from transformers import Siglip2VisionConfig
+
+    from hoi4_arena.models import ScreenEncoder
+
+    torch.manual_seed(9)
+    config = Siglip2VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=3, num_attention_heads=2
+    )
+    encoder = ScreenEncoder(config=config, size=64).eval()
+    quadrants = torch.randn(2, QUADRANTS, 3, 32, 32)
+    summary, grid = encoder(None, quadrants)
+    assert summary.shape == (2, 32) and grid.shape == (2, 32, 4, 4)
+    # Only the last layers, the final norm and the pooling head train.
+    trainable = {n.split(".")[0] for n, p in encoder.model.named_parameters() if p.requires_grad}
+    assert trainable == {"encoder", "post_layernorm", "head"}
+    assert not encoder.model.encoder.layers[0].self_attn.q_proj.weight.requires_grad
+    # What the quadrants show reaches the grid the cells are built from.
+    moved = quadrants.clone()
+    moved[:, 0] += 3
+    _, other = encoder(None, moved)
+    policy = Policy(encoder, memory_dim=16)
+    assert policy.fusion.in_features == 32 + 3 * CELL_DIM + 64 + 32
+    assert not torch.allclose(grid, other)
 
 
 @pytest.mark.parametrize("speed", [1, 4])
