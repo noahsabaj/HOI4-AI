@@ -244,3 +244,30 @@ def test_recorded_speed_fixes_the_game_length_of_a_clip():
     for bad in (None, True, False, 0, 6, 2.0):
         with pytest.raises(ValueError, match="game speed"):
             recorded_speed(bad)
+
+
+def test_a_capture_stall_costs_only_the_decisions_that_read_across_it(tmp_path):
+    """The second PC's capture sometimes stalls for over a second; the rest still trains."""
+    _recording(tmp_path / "game", [8, 8], frames=80)
+    path = tmp_path / "game" / "frames.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows[40:]:
+        row["t_ns"] += 1_300_000_000  # 3.9 s, then nothing until 5.3 s
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    labels = session_labels(tmp_path / "game")
+    seconds = labels["decisions"] / 1e9
+    # A decision reads from 1.8 s (the clip and a margin) before it to 0.2 s after.
+    spans = (seconds - 1.8 < 5.3) & (seconds + 0.2 > 3.9)
+    assert spans.any() and (~spans).any()
+    assert not labels["valid"][spans].any() and labels["valid"][~spans].all()
+    assert sum(e["reason"] == "capture gap" for e in labels["excluded"]) == spans.sum()
+
+
+def test_timestamps_that_go_backwards_still_refuse_the_recording(tmp_path):
+    _recording(tmp_path / "game", [8, 8], frames=40)
+    path = tmp_path / "game" / "frames.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[20]["t_ns"] = rows[19]["t_ns"]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    with pytest.raises(ValueError, match="Nonmonotonic"):
+        session_labels(tmp_path / "game")

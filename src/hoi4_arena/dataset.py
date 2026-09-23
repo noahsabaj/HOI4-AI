@@ -29,6 +29,8 @@ from .learning import GAMMA
 # clip_frame_ids. Eight frames then cover 1.6 s.
 CLIP_FRAMES = 8
 PERIOD_NS = int(round(PERIOD * 1e9))
+# The longest wait between two frames a decision may read across.
+MAX_GAP_NS = 1_000_000_000
 # Three views of each decision's frame, all area-averaged the same way (see `views`).
 # Sizes are (height, width); the screen is 16:9 and so are the resized views, since
 # squashing it into squares cost the encoders what they read (2026-09-23, STATUS.md):
@@ -245,8 +247,12 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
     if len(rows) != manifest["frames"] or len(rows) < 32:
         raise ValueError("Missing frames or session too short")
     times = np.array([row["t_ns"] for row in rows], dtype=np.int64)
-    if np.any(np.diff(times) <= 0) or max(np.diff(times)) > 1e9:
-        raise ValueError("Nonmonotonic timestamps or capture gap exceeding one second")
+    if np.any(np.diff(times) <= 0):
+        raise ValueError("Nonmonotonic timestamps")
+    # Frames more than a second apart: over the network the second PC's capture stalls
+    # now and then, for 1.1 to 1.5 s (six of its 44 speed-5 games, 2026-09-23). Only the
+    # decisions whose frames would span the stall are lost, not the recording.
+    gap = np.flatnonzero(np.diff(times) > MAX_GAP_NS)
     cursors = [parse_cursor(row.get("cursor")) for row in rows]
     key = "events" if manifest["source"] == "human" else "scripted_events"
     events = [e for row in rows for e in row.get(key, [])]
@@ -289,6 +295,14 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
     # Frames the reader needs that the video does not have.
     readable = decisions + max(clip_shift, detail_shift) * PERIOD_NS <= times[-1]
     valid &= readable
+    # A decision reads frames from a clip before it to its interval (and any shift) after.
+    first = decisions + min(0, clip_shift) * PERIOD_NS - lead_in
+    last = decisions + (max(clip_shift, detail_shift) + 1) * PERIOD_NS
+    for i in gap:
+        spans = (first < times[i + 1]) & (last > times[i])
+        for d in np.flatnonzero(spans & valid):
+            excluded.append({"decision": int(d), "reason": "capture gap"})
+        valid &= ~spans
     return {
         "root": source,
         "manifest": manifest,
