@@ -37,7 +37,7 @@ New-SmbShare -Name HOI4Worker -Path "$HOME\HOI4Worker" -ChangeAccess ([Security.
 
 If that account has no usable password (a Microsoft account signed in by PIN), create a local account for the share instead and grant it the share and the folder (`New-LocalUser`, `Grant-SmbShareAccess -AccessRight Change`, `icacls /grant <name>:(OI)(CI)M`).
 
-On this PC, save that account's sign-in once (`cmdkey` asks for the password), then deploy. `Deploy-Peer.ps1` builds the worker and copies it, `Start-Worker.ps1` and the pairing files into the share, skipping anything unchanged.
+On this PC, save that account's sign-in once (`cmdkey` asks for the password), then deploy. `Deploy-Peer.ps1` builds the worker and copies it, its scripts and the pairing files into the share, skipping anything unchanged.
 
 ```powershell
 cmdkey /add:<second-pc-ip> /user:<second-pc-account> /pass
@@ -46,9 +46,10 @@ cmdkey /add:<second-pc-ip> /user:<second-pc-account> /pass
 
 Then on the second PC, once, in PowerShell 7: `& "$HOME\HOI4Worker\Start-Worker.ps1" -Install`. That starts the worker now and at every logon, hidden, so there is no window to close by accident. It writes `worker.log` in that folder, which this PC can read through the share (`HOI4 worker ready` means it is listening). `-Stop` stops it; undo the install with `-Stop` and by deleting `HOI4 Worker` from `shell:startup`. After that, deploys need nothing on the second PC: a new worker is swapped in before the next connection, and a changed script or pairing restarts the bridge once it is idle, never during a match. Keep the folder private: it contains pairing credentials.
 
-For a two-player match, `Deploy-Peer.ps1 -Mod artifacts\mods\<arena> -Launch <arena>` copies the arena there and asks the idle worker to start HOI4 with it. The outcome lands in `launch-result.txt`. The worker does nothing if HOI4 is already running or the request is over 30 minutes old. `-Launch quit` closes HOI4 there instead, `-Launch restart-discord` restarts Discord, and `-Launch report` writes its windows, busiest processes and log ends to `launch-result.txt`.
+For a two-player match, `Deploy-Peer.ps1 -Mod artifacts\mods\<arena>` copies the arena there, and `control launch` asks the worker to start HOI4 with it and prints the outcome. It is refused if HOI4 is already running there. `control quit` closes HOI4, `control restart-discord` restarts Discord, and `control report` prints its windows, busiest processes and log ends. Without `--peer` they act on this PC. The worker runs these through `Game-Control.ps1` and refuses them while input is armed.
 
 ```powershell
+.venv\Scripts\hoi4-arena.exe control launch --mod <arena> --peer artifacts/pairing/peer.json
 .venv\Scripts\hoi4-arena.exe probe-peer artifacts/pairing/peer.json
 .venv\Scripts\hoi4-arena.exe capture artifacts/peer.png --peer artifacts/pairing/peer.json
 ```

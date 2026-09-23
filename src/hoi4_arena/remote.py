@@ -17,7 +17,9 @@ log = logging.getLogger(__name__)
 
 
 class RemoteDesktop(Desktop):
-    def __init__(self, config):
+    def __init__(self, config, *, attach: bool = True):
+        """Connect to the second PC's worker. `attach=False` as for Desktop: the control
+        operations need no game running there."""
         from collections import deque
 
         # The peer worker's stderr stays on the peer's console; keep the attribute so
@@ -51,11 +53,13 @@ class RemoteDesktop(Desktop):
         self.stream.write(spec["token"].encode("ascii") + b"\n")
         self.stream.flush()
         threading.Thread(target=self._read_remote, daemon=True).start()
-        try:
-            self.attached = self.request("attach")
-        except Exception:
-            self._shutdown()
-            raise
+        self.attached = None
+        if attach:
+            try:
+                self.attached = self.request("attach")
+            except Exception:
+                self._shutdown()
+                raise
 
     def _read_remote(self):
         try:

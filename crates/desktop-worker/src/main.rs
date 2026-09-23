@@ -1,4 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
 
 #[cfg(windows)]
 mod duplication;
@@ -198,6 +202,123 @@ fn valid_event(e: &Event, setup: bool) -> bool {
     }
 }
 
+/// Where the control operations find Game-Control.ps1 and the arena mods it may launch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Options {
+    pub scripts: PathBuf,
+    pub mods: PathBuf,
+}
+
+/// `--scripts <dir>` and `--mods <dir>`, defaulting to the worker's own folder and `mods`
+/// in it. That is the second PC's layout, where Deploy-Peer puts everything in one shared
+/// folder; a local caller passes the repo's `scripts` and `artifacts/mods`. Relative paths
+/// are made absolute now, against the directory the worker was started in.
+pub fn parse_options(
+    args: impl IntoIterator<Item = OsString>,
+    exe_dir: &Path,
+) -> Result<Options, String> {
+    let mut options = Options {
+        scripts: exe_dir.to_path_buf(),
+        mods: exe_dir.join("mods"),
+    };
+    let mut args = args.into_iter();
+    while let Some(flag) = args.next() {
+        let slot = match flag.to_str() {
+            Some("--scripts") => &mut options.scripts,
+            Some("--mods") => &mut options.mods,
+            _ => return Err(format!("unknown argument {}", flag.to_string_lossy())),
+        };
+        let value = args
+            .next()
+            .ok_or_else(|| format!("{} needs a directory", flag.to_string_lossy()))?;
+        *slot = std::path::absolute(&value).map_err(|e| e.to_string())?;
+    }
+    Ok(options)
+}
+
+/// The Game-Control.ps1 action behind a worker operation, if it is one.
+fn control_action(op: &str) -> Option<&'static str> {
+    match op {
+        "launch" => Some("launch"),
+        "quit" => Some("quit"),
+        "report" => Some("report"),
+        "restart_discord" => Some("restart-discord"),
+        _ => None,
+    }
+}
+
+/// A folder name in the mods directory: ASCII letters, digits, `_`, `.` and `-`, as
+/// Game-Control's `^[\w.-]+$`, but never `.` or `..`, which would name a directory
+/// outside it.
+fn valid_mod_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        && !name.bytes().all(|b| b == b'.')
+}
+
+/// A window size like 1920x1080, as Game-Control's `^\d{3,4}x\d{3,4}$`.
+fn valid_window(window: &str) -> bool {
+    let digits = |s: &str| (3..=4).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    window
+        .split_once('x')
+        .is_some_and(|(w, h)| digits(w) && digits(h))
+}
+
+/// The arguments after `pwsh -File Game-Control.ps1` for one control operation.
+///
+/// This is the whole of what a connection can ask the script to do: one of four fixed
+/// actions, a mod folder name and a window size, each checked here before pwsh starts.
+/// Nothing from the request reaches the command line unchecked, so the worker still
+/// exposes no shell: no command text, no paths and no other scripts.
+fn control_arguments(
+    op: &str,
+    cmd: &serde_json::Value,
+    mods: &Path,
+) -> Result<Vec<String>, String> {
+    let action = control_action(op).ok_or("unknown_operation")?;
+    let mut args = vec!["-Action".to_string(), action.to_string()];
+    if action == "launch" {
+        let name = cmd["mod"].as_str().unwrap_or("");
+        if !valid_mod_name(name) {
+            return Err("invalid_mod_name".into());
+        }
+        let mods = mods.to_str().ok_or("mods_path_not_unicode")?;
+        args.extend(["-Mods".into(), mods.into(), "-Mod".into(), name.into()]);
+        match &cmd["window"] {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(window) if valid_window(window) => {
+                args.extend(["-Window".into(), window.clone()]);
+            }
+            _ => return Err("invalid_window".into()),
+        }
+    }
+    Ok(args)
+}
+
+/// The end of a control operation's output as text, at most `cap` bytes of it. The end
+/// is the part kept because that is where a script says how it finished. Line ends are
+/// `\n`, not PowerShell's `\r\n`.
+fn output_tail(bytes: &[u8], cap: usize) -> String {
+    let cut = bytes.len().saturating_sub(cap);
+    let text = String::from_utf8_lossy(&bytes[cut..]).replace("\r\n", "\n");
+    if cut > 0 {
+        format!("[{cut} earlier bytes cut]\n{}", text.trim())
+    } else {
+        text.trim().to_string()
+    }
+}
+
+/// The first `name` in a PATH-style list. An App Execution Alias, which is how the Store
+/// build of PowerShell puts pwsh.exe on PATH, is a reparse point that cannot be opened as
+/// a file, so its own entry is checked rather than what it points to.
+fn find_on_path(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok_and(|m| !m.is_dir()))
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -226,6 +347,9 @@ mod platform {
     static OVERFLOW: AtomicBool = AtomicBool::new(false);
     static EVENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
     static LOG: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+    /// A control operation is running. Set and checked under the input-state lock, so
+    /// `arm` and a control operation can never both succeed.
+    static CONTROL: AtomicBool = AtomicBool::new(false);
     fn note(message: &str) {
         eprintln!("{message}");
         if let Ok(mut log) = LOG.lock() {
@@ -235,6 +359,9 @@ mod platform {
             log.push_back(message.to_string());
         }
     }
+    /// One reply: a JSON line, then its binary payload. The reader, the capture thread and
+    /// a control operation's thread all reply, in any order. The stdout lock is held from
+    /// the line through the payload, so one reply can never land inside another.
     fn respond(cmd: &serde_json::Value, result: Result<(serde_json::Value, Vec<u8>), String>) {
         let (mut response, bytes) = match result {
             Ok(value) => value,
@@ -775,6 +902,146 @@ mod platform {
         Ok((lines, start + used as u64))
     }
 
+    /// How long a control operation may run before pwsh is stopped. A launch waits up to
+    /// 90 s for the game log and a quit up to 30 s for a polite close; a report takes
+    /// about 5 s. A hung script would otherwise hold `control_busy` for the connection.
+    const CONTROL_LIMIT: Duration = Duration::from_secs(300);
+    /// Output kept per control operation. A report is a few kilobytes.
+    const CONTROL_OUTPUT: usize = 64 * 1024;
+
+    /// Clears CONTROL when the operation's thread finishes, or never starts.
+    struct ControlGuard;
+    impl Drop for ControlGuard {
+        fn drop(&mut self) {
+            CONTROL.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Start a control operation on its own thread, which replies when it finishes.
+    ///
+    /// Launch, quit, report and restart_discord take from seconds to minutes. On the
+    /// reader they would stall apply, release and status, and on the capture thread every
+    /// frame, so they run beside both. Setup only: refused while input is armed, and arm
+    /// is refused while one runs. One at a time.
+    fn start_control(
+        shared: &Arc<Mutex<InputState>>,
+        cmd: &serde_json::Value,
+        options: &Options,
+    ) -> Result<(), String> {
+        let op = cmd["op"].as_str().unwrap_or("");
+        let args = control_arguments(op, cmd, &options.mods)?;
+        let script = options.scripts.join("Game-Control.ps1");
+        if !script.is_file() {
+            return Err("control_script_missing".into());
+        }
+        let pwsh = find_on_path("pwsh.exe", std::env::var_os("PATH").as_deref())
+            .ok_or("pwsh_not_found")?;
+        let guard = {
+            let state = shared.lock().map_err(|_| "input_lock")?;
+            if state.armed {
+                return Err(format!("{op}_refused_while_armed"));
+            }
+            if CONTROL.swap(true, Ordering::SeqCst) {
+                return Err("control_busy".into());
+            }
+            ControlGuard
+        };
+        let cmd = cmd.clone();
+        thread::Builder::new()
+            .name(format!("control-{op}"))
+            .spawn(move || {
+                let result = run_control(&pwsh, &script, &args);
+                // Free before replying, so a caller that sends the next control operation
+                // as soon as this reply arrives is not told the worker is still busy.
+                drop(guard);
+                respond(&cmd, result);
+            })
+            .map(|_| ())
+            .map_err(|e| format!("control_thread_failed: {e}"))
+    }
+
+    /// Run Game-Control.ps1 and collect what it printed, stdout and stderr interleaved.
+    ///
+    /// The reply comes when pwsh exits, not when its output pipe closes. A launch starts
+    /// HOI4 and a watcher that outlive the script, and a process started with inherited
+    /// handles keeps the pipe open until it exits too; waiting for the end of the pipe
+    /// would hold the reply for the whole game. The worker's own stdio is made
+    /// uninheritable at startup for the same reason, in `run`.
+    fn run_control(
+        pwsh: &Path,
+        script: &Path,
+        args: &[String],
+    ) -> Result<(serde_json::Value, Vec<u8>), String> {
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let (mut pipe, writer) = io::pipe().map_err(|e| e.to_string())?;
+        let mut child = {
+            let mut command = Command::new(pwsh);
+            command
+                .args(["-NoProfile", "-NonInteractive", "-File"])
+                .arg(script)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(writer.try_clone().map_err(|e| e.to_string())?)
+                .stderr(writer)
+                // The worker on the second PC has no console, so pwsh would open a
+                // visible one on a screen nobody may be watching.
+                .creation_flags(CREATE_NO_WINDOW);
+            command
+                .spawn()
+                .map_err(|e| format!("control_start_failed: {e}"))?
+            // `command` holds this end of the pipe. Dropping it here lets the read below
+            // end once pwsh and everything that inherited the pipe have exited.
+        };
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel();
+        let sink = Arc::clone(&output);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                let mut out = sink.lock().unwrap_or_else(|e| e.into_inner());
+                out.extend_from_slice(&chunk[..n]);
+                if out.len() > 2 * CONTROL_OUTPUT {
+                    let excess = out.len() - CONTROL_OUTPUT;
+                    out.drain(..excess);
+                }
+            }
+            let _ = done.send(());
+        });
+        let deadline = Instant::now() + CONTROL_LIMIT;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        // Whatever pwsh wrote before it exited is in the pipe by now; this only waits for
+        // the reader to drain it. If a child that outlives pwsh holds the pipe, the reader
+        // thread stays blocked until that child exits and is left behind.
+        let _ = finished.recv_timeout(Duration::from_secs(2));
+        let mut text = output_tail(
+            &output.lock().unwrap_or_else(|e| e.into_inner()),
+            CONTROL_OUTPUT,
+        );
+        let exit = match status {
+            Some(status) => status.code().unwrap_or(-1),
+            None => {
+                text.push_str(&format!(
+                    "\nGame-Control.ps1 did not finish within {} s and was stopped.",
+                    CONTROL_LIMIT.as_secs()
+                ));
+                -1
+            }
+        };
+        Ok((serde_json::json!({"output": text, "exit": exit}), vec![]))
+    }
+
     fn fast_op(
         shared: &Arc<Mutex<InputState>>,
         cmd: &serde_json::Value,
@@ -790,6 +1057,10 @@ mod platform {
             "arm" => {
                 if !foreground() {
                     return Err("game_not_foreground".into());
+                }
+                // A launch or quit changes which game is running under the input.
+                if CONTROL.load(Ordering::SeqCst) {
+                    return Err("arm_refused_during_control".into());
                 }
                 *setup = cmd["mode"] == "setup";
                 STOP.store(false, Ordering::SeqCst);
@@ -894,9 +1165,22 @@ mod platform {
         }
     }
 
-    pub fn run() -> Result<(), String> {
+    pub fn run(options: Options) -> Result<(), String> {
         unsafe {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            // The protocol pipes come from the bridge or Python as inheritable handles.
+            // Left that way, pwsh and the game a launch starts would inherit them too, and
+            // a game holding the worker's stdout keeps the pipe open after the worker has
+            // exited, so its reader never sees the end. The worker's own use is unchanged.
+            use windows_sys::Win32::System::Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
         }
         ORIGIN.get_or_init(Instant::now);
         hooks()?;
@@ -945,6 +1229,16 @@ mod platform {
                 if op == "capture" || op == "attach" {
                     if tx.send(cmd).is_err() {
                         break;
+                    }
+                    continue;
+                }
+                // Launch, quit, report and restart_discord reply from their own thread.
+                // They need no attached game: with none running, attach finds no window
+                // and fails, and a launch is how there comes to be one.
+                if control_action(op).is_some() {
+                    if let Err(error) = start_control(&reader_state, &cmd, &options) {
+                        disarm(&reader_state);
+                        respond(&cmd, Err(error));
                     }
                     continue;
                 }
@@ -1100,13 +1394,25 @@ mod platform {
 }
 
 fn main() {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let options = match parse_options(std::env::args_os().skip(1), &exe_dir) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     #[cfg(windows)]
-    if let Err(e) = platform::run() {
+    if let Err(e) = platform::run(options) {
         eprintln!("{e}");
         std::process::exit(1);
     }
     #[cfg(not(windows))]
     {
+        let _ = options;
         eprintln!("The desktop worker requires Windows.");
         std::process::exit(1);
     }
@@ -1344,6 +1650,160 @@ mod tests {
         let (lines, used) = arena_lines(text);
         assert_eq!(lines, vec!["week  1:00, 4 January, 1936 BLU states 4"]);
         assert_eq!(&text[used..], b"[3][x][effectbase.cpp:1783]: ARENA capitu");
+    }
+    #[test]
+    fn mod_names_are_folder_names_never_paths() {
+        for name in ["small-arena-v1", "infantry_arena.v5", "A1"] {
+            assert!(valid_mod_name(name), "{name} should be accepted");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "...",
+            "../x",
+            "a\\b",
+            "a/b",
+            "C:x",
+            "a b",
+            "a;b",
+            "a`b",
+            "a$b",
+            "arena\n",
+            "arène",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_mod_name(name), "{name:?} should be refused");
+        }
+    }
+    #[test]
+    fn window_sizes_are_three_or_four_digits_each_way() {
+        for window in ["1920x1080", "800x600", "3840x2160"] {
+            assert!(valid_window(window), "{window} should be accepted");
+        }
+        for window in [
+            "",
+            "1920",
+            "1920X1080",
+            "19200x1080",
+            "1920x10",
+            " 1920x1080",
+            "1920x1080 ",
+            "1920x1080x1",
+            "+920x1080",
+            "１９２０x1080",
+        ] {
+            assert!(!valid_window(window), "{window:?} should be refused");
+        }
+    }
+    #[test]
+    fn control_arguments_pass_only_checked_values() {
+        let mods = Path::new("D:\\worker\\mods");
+        let launch =
+            serde_json::json!({"op": "launch", "mod": "small-arena-v1", "window": "1920x1080"});
+        assert_eq!(
+            control_arguments("launch", &launch, mods).unwrap(),
+            [
+                "-Action",
+                "launch",
+                "-Mods",
+                "D:\\worker\\mods",
+                "-Mod",
+                "small-arena-v1",
+                "-Window",
+                "1920x1080"
+            ]
+        );
+        let no_window = serde_json::json!({"mod": "small-arena-v1"});
+        assert!(!control_arguments("launch", &no_window, mods)
+            .unwrap()
+            .contains(&"-Window".to_string()));
+        for (cmd, error) in [
+            (serde_json::json!({}), "invalid_mod_name"),
+            (serde_json::json!({"mod": 7}), "invalid_mod_name"),
+            (serde_json::json!({"mod": ".."}), "invalid_mod_name"),
+            (
+                serde_json::json!({"mod": "a", "window": "1920x1080; calc"}),
+                "invalid_window",
+            ),
+            (
+                serde_json::json!({"mod": "a", "window": 1920}),
+                "invalid_window",
+            ),
+        ] {
+            assert_eq!(
+                control_arguments("launch", &cmd, mods).unwrap_err(),
+                error,
+                "{cmd}"
+            );
+        }
+        // The other actions take nothing from the request, whatever it carries.
+        let noisy = serde_json::json!({"mod": "../x", "window": "; calc", "args": ["-Command"]});
+        for (op, action) in [
+            ("quit", "quit"),
+            ("report", "report"),
+            ("restart_discord", "restart-discord"),
+        ] {
+            assert_eq!(
+                control_arguments(op, &noisy, mods).unwrap(),
+                ["-Action", action]
+            );
+        }
+        assert_eq!(
+            control_arguments("restart-discord", &noisy, mods).unwrap_err(),
+            "unknown_operation"
+        );
+    }
+    #[test]
+    fn options_default_to_the_workers_own_folder() {
+        let exe = Path::new("D:\\worker");
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse_options(args(&[]), exe).unwrap(),
+            Options {
+                scripts: exe.to_path_buf(),
+                mods: exe.join("mods")
+            }
+        );
+        let given = parse_options(
+            args(&[
+                "--mods",
+                "D:\\repo\\artifacts\\mods",
+                "--scripts",
+                "D:\\repo\\scripts",
+            ]),
+            exe,
+        )
+        .unwrap();
+        assert_eq!(given.scripts, Path::new("D:\\repo\\scripts"));
+        assert_eq!(given.mods, Path::new("D:\\repo\\artifacts\\mods"));
+        assert!(parse_options(args(&["--scripts"]), exe).is_err());
+        assert!(parse_options(args(&["--shell", "x"]), exe).is_err());
+    }
+    #[test]
+    fn output_tail_keeps_the_end() {
+        assert_eq!(output_tail(b"  start\r\ndone\r\n", 64), "start\ndone");
+        let long = format!("{}end", "x".repeat(100));
+        assert_eq!(
+            output_tail(long.as_bytes(), 10),
+            "[93 earlier bytes cut]\nxxxxxxxend"
+        );
+    }
+    #[test]
+    fn finds_a_program_in_a_later_path_entry() {
+        let root = std::env::temp_dir().join(format!("worker-path-{}", std::process::id()));
+        let (empty, full) = (root.join("empty"), root.join("full"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("pwsh.exe"), b"").unwrap();
+        let path = std::env::join_paths([&empty, &full]).unwrap();
+        assert_eq!(
+            find_on_path("pwsh.exe", Some(&path)),
+            Some(full.join("pwsh.exe"))
+        );
+        assert_eq!(find_on_path("missing.exe", Some(&path)), None);
+        assert_eq!(find_on_path("pwsh.exe", None), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn setup_can_open_the_console() {

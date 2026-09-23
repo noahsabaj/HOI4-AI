@@ -74,115 +74,10 @@ if (-not $Bridge) {
     }
 }
 
-# A launch request from the first PC (Deploy-Peer -Launch): start HOI4 with an arena mod
-# that Deploy-Peer mirrored into mods\. The request names a folder there, never a path,
-# and a game that is already running is left alone. The outcome is written beside it.
-# An optional second word asks for a window of that size, such as "small-arena-v1 1920x1080".
-# The single word "quit" closes HOI4 instead, "report" lists its windows and log ends, and
-# "restart-discord" restarts Discord, whose overlay can hang the game's startup.
-$request = Join-Path $PSScriptRoot 'launch.txt'
-if (Test-Path -LiteralPath $request) {
-    $name, $window = -split (Get-Content -LiteralPath $request -Raw)
-    $age = (Get-Date) - (Get-Item -LiteralPath $request).LastWriteTime
-    Remove-Item -LiteralPath $request
-    $mod = Join-Path $PSScriptRoot "mods\$name"
-    $result = Join-Path $PSScriptRoot 'launch-result.txt'
-    # A request left waiting while this PC was off must not open a game at the next logon.
-    if ($age.TotalMinutes -gt 30) {
-        Set-Content -LiteralPath $result "refused: request is $([int]$age.TotalMinutes) minutes old"
-    } elseif ($name -eq 'quit') {
-        # Ends the game between recorded AI games. Test-ArenaLoad's watcher then puts the
-        # display settings back, as after any exit. Asked to close first: a game killed
-        # outright left the next one hanging at startup, probably through an overlay.
-        Get-Process hoi4 -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }
-        $deadline = (Get-Date).AddSeconds(30)
-        while ((Get-Process hoi4 -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep 1 }
-        Get-Process hoi4 -ErrorAction SilentlyContinue | Stop-Process -Force
-        while (Get-Process hoi4 -ErrorAction SilentlyContinue) { Start-Sleep 1 }
-        Set-Content -LiteralPath $result 'quit: HOI4 is closed'
-    } elseif ($name -eq 'restart-discord') {
-        # Discord's overlay hooks the game; once stuck, it can hang every later launch.
-        $update = Join-Path $env:LOCALAPPDATA 'Discord\Update.exe'
-        Get-Process Discord -ErrorAction SilentlyContinue | Stop-Process -Force
-        Start-Sleep 3
-        if (Test-Path -LiteralPath $update) { Start-Process $update -ArgumentList '--processStart', 'Discord.exe' }
-        Set-Content -LiteralPath $result "restart-discord: $(if (Test-Path -LiteralPath $update) { 'restarted' } else { 'Discord not found' })"
-    } elseif ($name -eq 'report') {
-        # What the first PC cannot see through the game window: other windows the game
-        # or Steam opened, such as a dialog blocking startup, and the ends of its logs.
-        $logs = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Paradox Interactive\Hearts of Iron IV\logs'
-        & {
-            'report:'
-            Get-Process | Where-Object { $_.ProcessName -match 'hoi4|crash|steam|paradox|dowser|discord' } |
-                Format-Table Id, ProcessName, StartTime, Responding, CPU, WorkingSet64 -AutoSize | Out-String -Width 200
-            # The busiest processes over three seconds, for anything starving the game.
-            $before = @{}; Get-Process | ForEach-Object { $before[$_.Id] = $_.CPU }
-            Start-Sleep 3
-            'Busiest processes (CPU seconds in 3 s):'
-            Get-Process | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.ProcessName; Busy = [math]::Round($_.CPU - $before[$_.Id], 2) } } |
-                Sort-Object Busy -Descending | Select-Object -First 8 | Format-Table -AutoSize | Out-String -Width 200
-            "pwsh processes: $(@(Get-Process pwsh -ErrorAction SilentlyContinue).Count); workers: $(@(Get-Process hoi4-desktop-worker -ErrorAction SilentlyContinue).Count)"
-            # A display that has gone to sleep stops the game drawing, and with it loading.
-            powercfg /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE | Select-String 'Current (AC|DC)' | ForEach-Object { "display off after (s, hex): $($_.Line.Trim())" }
-            # On battery (status 1) Windows throttles background processes hard.
-            Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | ForEach-Object { "battery status $($_.BatteryStatus), charge $($_.EstimatedChargeRemaining)%" }
-            Add-Type -AssemblyName System.Windows.Forms
-            "power line: $([Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus)"
-            # Every visible titled window, including dialogs a process's main window hides.
-            Add-Type @'
-using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
-public static class Windows {
-  delegate bool Proc(IntPtr h, IntPtr p);
-  [DllImport("user32.dll")] static extern bool EnumWindows(Proc f, IntPtr p);
-  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-  public static List<string> Visible() {
-    var found = new List<string>();
-    EnumWindows((h, p) => {
-      var title = new StringBuilder(256);
-      if (IsWindowVisible(h) && GetWindowText(h, title, 256) > 0) {
-        uint pid; GetWindowThreadProcessId(h, out pid);
-        found.Add(pid + "\t" + title);
-      }
-      return true;
-    }, IntPtr.Zero);
-    return found;
-  }
-}
-'@
-            'Visible windows (pid, title):'
-            [Windows]::Visible() | ForEach-Object {
-                $id, $title = $_ -split "`t", 2
-                "{0,6} {1,-16} {2}" -f $id, (Get-Process -Id $id -ErrorAction SilentlyContinue).ProcessName, $title
-            }
-            $steam = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
-            foreach ($file in 'game.log', 'error.log', 'system.log', 'steam:gameprocess_log.txt', 'steam:connection_log.txt') {
-                $path = if ($file -like 'steam:*') { Join-Path "$steam\logs" $file.Substring(6) } else { Join-Path $logs $file }
-                if (Test-Path -LiteralPath $path) {
-                    "== $file ($((Get-Item -LiteralPath $path).LastWriteTime))"
-                    Get-Content -LiteralPath $path -Tail 15
-                }
-            }
-        } *> $result
-    } elseif ($name -notmatch '^[\w.-]+$' -or -not (Test-Path -LiteralPath (Join-Path $mod 'descriptor.mod'))) {
-        Set-Content -LiteralPath $result "refused: no arena mod named '$name' in mods"
-    } elseif ($window -and $window -notmatch '^\d{3,4}x\d{3,4}$') {
-        Set-Content -LiteralPath $result "refused: '$window' is not a window size like 1920x1080"
-    } elseif (Get-Process hoi4 -ErrorAction SilentlyContinue) {
-        Set-Content -LiteralPath $result 'refused: HOI4 is already running'
-    } else {
-        $launch = @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'Test-ArenaLoad.ps1'), '-Mod', $mod)
-        if ($window) { $launch += @('-Window', $window) }
-        & $pwsh @launch *> $result
-    }
-    # The first PC waits for this line, whatever the outcome.
-    Add-Content -LiteralPath $result 'end of request'
-    Write-Output "Launch request for '$name': $((Get-Content -LiteralPath $result) -join ' ')"
-}
-
 $spec = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server.json') -Raw | ConvertFrom-Json
 # The bridge accepts only raw worker requests. It exposes no shell or filesystem API.
+# Launching, closing and inspecting HOI4 are worker operations too; the worker runs
+# Game-Control.ps1 from this folder for them, with arguments it has checked.
 Add-Type -TypeDefinition @'
 using System;
 using System.IO;
@@ -215,9 +110,7 @@ public static class Hoi4Bridge {
         return stamp.ToString();
     }
     // True when the watched files changed and the caller should restart from them.
-    // A request file that exists at all is new: each one is deleted once handled. A stamp
-    // alone missed one written while the bridge was restarting.
-    public static bool Run(string bind, int port, string peer, string pfx, string password, string token, string exe, string[] watch, string request) {
+    public static bool Run(string bind, int port, string peer, string pfx, string password, string token, string exe, string[] watch) {
         var stamp = Stamp(watch);
         var cert = X509CertificateLoader.LoadPkcs12FromFile(pfx, password, X509KeyStorageFlags.UserKeySet);
         var listener = new TcpListener(IPAddress.Parse(bind), port);
@@ -230,7 +123,7 @@ public static class Hoi4Bridge {
                     if (tick % 2 == 1) {
                         string now;
                         try { now = Stamp(watch); } catch (IOException) { now = stamp; }
-                        if (now != stamp || File.Exists(request)) return true;
+                        if (now != stamp) return true;
                     }
                     Thread.Sleep(500);
                 }
@@ -298,5 +191,5 @@ public static class Hoi4Bridge {
 $pairing = Join-Path $PSScriptRoot 'server.json'
 $pfx = Join-Path $PSScriptRoot 'worker.pfx'
 $restart = [Hoi4Bridge]::Run($spec.bind, $spec.port, $spec.coordinator, $pfx, $spec.pfx_password, $spec.token,
-    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'), @($PSCommandPath, $pairing, $pfx), $request)
+    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'), @($PSCommandPath, $pairing, $pfx))
 if ($restart) { exit 3 }
