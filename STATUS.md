@@ -216,13 +216,14 @@ updates by itself, but only between connections, never mid-match. See the README
 - **Popups are clicked, not disabled.** An agent must learn to clear them in a vanilla
   game, so the recorder clicks each popup's Ok button 1 to 4 s after it opens, found
   anywhere on screen with OpenCV template matching. A popup was open in 44% of sampled
-  frames of the last game without this, and in 2% of the first game with it.
+  frames of the last game without this, and in 2% of both games with it.
 - **The camera comes back to the whole arena** every one to two and a half minutes: it
   zooms fully out and pans until the land is centred, steered by what it sees. Pans
   alone drifted, because pan speed changes with zoom.
 - **The default arena is 12x8 provinces a side** (`arena-12x8-v1`, 8 states a side).
-  The first game on it (2026-09-23) ended in a surrender after 24.8 minutes at speed 4:
-  Red won in July 1937.
+  The first two games on it (2026-09-23, one on each PC) both ended in a surrender read
+  from the log, after 24.8 and 31.5 minutes at speed 4. Red won both, in July and
+  December 1937.
 - The pause mark blinks, so the start check looks for it over 10 s rather than in one
   frame.
 
