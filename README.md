@@ -76,12 +76,12 @@ What the policy sees of each decision: the last eight global views (448x256, the
 Other demonstrations:
 
 - `--sources ai` also trains on the AI games' scripted camera and popup clicks, which `record-ai` stores with each game.
-- The inverse dynamics model (`train-idm`) learns to read inputs from video, looking 0.8 s past each decision, on recordings whose inputs are known. It reads with LeVJEPA (`--model models/levjepa-large --variant large`, the default), four 448x256 frames in sequence, which read the camera's inputs best. `label` then writes its labels into recordings that have none, and `--sources idm` trains the policy on them (the Video PreTraining recipe).
+- The inverse dynamics model (`train-idm`) learns to read inputs from video, looking 0.8 s past each decision, on recordings whose inputs are known. It reads with LeVJEPA (`--model models/levjepa-large --variant large`, the default), four 448x256 frames in sequence, which read the camera's inputs best. Over the window it runs a two-way GRU, or with `--context transformer` full two-way attention, as VPT's model did; `--sequence 32` or `64` lets a label read further around it, since at speed 5 an input's effect can show late. `label` then writes its labels into recordings that have none, each with its likelihood, and `--sources idm` trains the policy on them (the Video PreTraining recipe). Inferred labels are noisier than recorded ones: `--idm-min-logp` drops the ones the model was least sure of, and `--idm-weight` makes the rest count less.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe train-idm data/raw artifacts/idm
 .venv\Scripts\hoi4-arena.exe label artifacts/idm/epoch-0000.pt data/unlabelled/game-001
-.venv\Scripts\hoi4-arena.exe train-bc data/raw artifacts/bc-idm --sources human idm
+.venv\Scripts\hoi4-arena.exe train-bc data/raw artifacts/bc-idm --sources human idm --idm-weight 0.5
 ```
 
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.

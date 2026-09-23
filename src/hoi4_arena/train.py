@@ -69,6 +69,17 @@ def imitation_score(policy, memory, cells, actions, objective, xm=None):
     raise ValueError(objective)
 
 
+def imitation_loss(score, weight):
+    """The imitation loss from per-step log-likelihoods and each step's weight.
+
+    The mean of the weighted negative log-likelihoods over every step, not their sum over
+    the weights' sum: that would cancel a weight shared by the whole batch, and a batch of
+    inferred labels alone would train as hard as recorded ones. With every weight 1 it is
+    the plain mean.
+    """
+    return -(score * weight.flatten().to(score.dtype)).mean()
+
+
 def train_bc(
     data,
     model_path,
@@ -91,11 +102,16 @@ def train_bc(
     xm_candidates=5,
     xm_form="hard",
     xm_latents=0,
+    idm_min_logp=None,
+    idm_weight=1.0,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
-    `sources` picks which recordings' inputs are demonstrations: "human" play, and "ai"
-    games' scripted camera and popup clicks (see ai_games).
+    `sources` picks which recordings' inputs are demonstrations: "human" play, "ai"
+    games' scripted camera and popup clicks (see ai_games), and "idm", inputs the inverse
+    dynamics model labelled. Those are noisier than recorded ones: `idm_min_logp` drops
+    the ones it was least sure of and `idm_weight` (0 < W <= 1) scales the rest's loss
+    against a recorded label's (dataset.session_labels says why).
 
     `recompute` recomputes each step in the backward pass instead of keeping its
     activations. Measured on the 4060 Ti with LeVJEPA, windows of 8 steps after 2 of
@@ -103,23 +119,24 @@ def train_bc(
     batch 2 checkpointed took 1.3 s a window and 2.5 GB, and without it 34.6 s a step,
     because at 7 GB Windows moved GPU memory into system memory instead of failing.
     """
+    if not 0 < idm_weight <= 1:
+        raise ValueError("idm_weight must be in (0, 1]")
     torch.manual_seed(seed)
     output = Path(output)
     if (output / "epoch-0000.pt").exists():
         raise FileExistsError("Checkpoints are immutable")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset = VideoSessions(
-        data, length=sequence, burn_in=burn_in, sources=sources, seed=seed, device=device
-    )
-    validation = VideoSessions(
-        data,
-        split="validation",
-        length=sequence,
-        burn_in=burn_in,
-        sources=sources,
-        seed=seed,
-        device=device,
-    )
+    common = {
+        "length": sequence,
+        "burn_in": burn_in,
+        "sources": sources,
+        "seed": seed,
+        "device": device,
+        "idm_min_logp": idm_min_logp,
+        "idm_weight": idm_weight,
+    }
+    dataset = VideoSessions(data, **common)
+    validation = VideoSessions(data, split="validation", **common)
     # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
     loader = DataLoader(dataset, batch_size=batch_size, drop_last=auxiliary != "none")
     if len(dataset) < (2 if auxiliary != "none" else 1):
@@ -158,6 +175,8 @@ def train_bc(
         "batch_size": batch_size,
         "model_path": str(Path(model_path).resolve()),
         "sources": list(sources),
+        "idm_min_logp": idm_min_logp,
+        "idm_weight": idm_weight,
     }
     output.mkdir(parents=True, exist_ok=True)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
@@ -173,7 +192,8 @@ def train_bc(
                         policy, batch, burn_in, checkpoint=recompute
                     )
                     actions = batch["actions"][:, burn_in:]
-                    bc = -imitation_score(policy, memory, cells, actions, objective, xm).mean()
+                    score = imitation_score(policy, memory, cells, actions, objective, xm)
+                    bc = imitation_loss(score, batch["weight"][:, burn_in:])
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
                     loss = bc + 0.1 * predictive
                 if not torch.isfinite(loss):

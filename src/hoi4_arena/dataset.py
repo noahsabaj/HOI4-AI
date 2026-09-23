@@ -220,7 +220,15 @@ def batch_to_device(batch, device):
     return out
 
 
-def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
+def session_labels(
+    source,
+    *,
+    sources=("human",),
+    clip_shift=0,
+    detail_shift=0,
+    idm_min_logp=None,
+    idm_weight=1.0,
+):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
     Checked before any frame is decoded, so a recording that cannot train fails here
@@ -232,6 +240,14 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
     than the decision itself. The policy uses none: it acts on the past. The inverse
     dynamics model looks ahead, at frames that already show what the input did. A decision
     whose shifted frames run past the end of the video is not valid for that reader.
+
+    Labels the inverse dynamics model inferred are noisier than recorded ones, so they
+    can count for less. D2E found its IDM's labels helped navigation but hurt precise
+    manipulation (LIBERO, 96.6% to 92.2%; arXiv 2510.05684), and a click is precise.
+    `idm_min_logp` marks invalid every inferred label whose log-likelihood under the IDM
+    (summed over the slots; 0 is certain) falls below it, and `weight` gives each
+    decision's share of the imitation loss: `idm_weight` for an inferred label, 1 for a
+    recorded one. The defaults change nothing.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -279,11 +295,18 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
             valid[i] = False
             excluded.append({"decision": i, "reason": str(error)})
     label_source = manifest["source"]
+    weight = np.ones(len(decisions), dtype=np.float32)
     if inferred:
         stored = np.load(source / IDM_LABELS)
         if not np.array_equal(stored["decisions"], decisions):
             raise ValueError("IDM labels were made on a different decision grid; label again")
         actions, valid = stored["actions"].copy(), stored["valid"].copy()
+        if idm_min_logp is not None:
+            unsure = valid & (stored["logp"] < idm_min_logp)
+            for d in np.flatnonzero(unsure):
+                excluded.append({"decision": int(d), "reason": "IDM label below confidence"})
+            valid &= ~unsure
+        weight[:] = idm_weight
         label_source = "idm"
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
@@ -318,6 +341,7 @@ def session_labels(source, *, sources=("human",), clip_shift=0, detail_shift=0):
         "outcome": outcome.astype(np.float32),
         "actions": actions,
         "valid": valid,
+        "weight": weight,
         "excluded": excluded,
         "label_source": label_source,
     }
@@ -398,6 +422,7 @@ class _Stream:
             "actions": actions,
             "previous": previous,
             "valid": torch.from_numpy(labels["valid"][start : start + n].copy()),
+            "weight": torch.from_numpy(labels["weight"][start : start + n].copy()),
             "speed": torch.full((n,), labels["speed"], dtype=torch.long),
             "outcome": torch.from_numpy(labels["outcome"][start : start + n].copy()),
             "start": start,
@@ -452,6 +477,10 @@ class VideoSessions(IterableDataset):
     fly, so their sizes can change without redoing any data, and no 43 GB per hour of
     448 px quadrants is ever written to disk. Several recordings play at once and their
     windows pass through a shuffle buffer, so a batch mixes games.
+
+    `idm_min_logp` and `idm_weight` pass to session_labels. Since a window is trained only
+    when all its decisions are valid, one inferred label below the threshold drops the
+    window that holds it.
     """
 
     def __init__(
@@ -468,6 +497,8 @@ class VideoSessions(IterableDataset):
         device=None,
         clip_shift=0,
         detail_shift=0,
+        idm_min_logp=None,
+        idm_weight=1.0,
     ):
         self.length, self.burn_in = length, burn_in
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
@@ -486,6 +517,8 @@ class VideoSessions(IterableDataset):
                     sources=sources,
                     clip_shift=clip_shift,
                     detail_shift=detail_shift,
+                    idm_min_logp=idm_min_logp,
+                    idm_weight=idm_weight,
                 )
             )
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)
