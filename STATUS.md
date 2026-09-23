@@ -19,7 +19,7 @@ Wrong claims are fixed in place; `git log` keeps the history.
 | **A capitulation on demand** | `capitulation-harness-v5`, `artifacts/capitulation-harness-run-2026-09-22/` | **Works on a small map.** Blue (AI) beat an unarmed Red and signed a peace taking 2 of Red's 4 states by 29 Jan 1936 |
 | **An armed match ends in time** | `small-arena-v1`, `artifacts/small-arena-armed-run-2026-09-22/`, `…-armed-run2-…` | Both sides armed, both AI (observer mode), speed 4. Run 1: Blue surrendered in early 1937, about 17–18 minutes of real time. Run 2: Red surrendered on 1 Jul 1936, about 7.5 minutes. Two of two ended in time, with a different winner each time |
 
-Automated checks: 155 Python tests and 24 Rust tests (2 need a live desktop and are
+Automated checks: 156 Python tests and 24 Rust tests (2 need a live desktop and are
 skipped in CI), plus Ruff and Clippy. CI runs all of them on Windows.
 
 **Not yet shown:** a match between two agents. A two-player match across the two PCs
@@ -212,6 +212,26 @@ no trained ones exist yet):
 
 At 31.4 ms the screen encoder costs half of LeVJEPA, so two actors on one GPU should fit
 with it; that is measured once it has weights.
+
+**End to end, 2026-09-23.** One `record-ai` game on each PC with all of the above: both
+launched and closed through the worker, both ended on the log's surrender (Red both
+times, after 19.5 and 30.2 minutes), the pointer was drawn in both PCs' frames, and the
+camera's inputs came along as labels (5,825 decisions on this PC, none excluded). Behaviour
+cloning on those two games ran with LeVJEPA: the loss on the camera's inputs fell from 37.4
+to 20.5 in 20 steps.
+
+**Training memory.** A training step keeps every step's activations for the backward
+pass, and at batch 2 (windows of 8 steps after 2 of burn-in) that reached 7 GB of the
+card's 8. Windows then quietly moves GPU memory into system memory instead of failing,
+and a step took 34.6 s. Recomputing each step in the backward pass (activation
+checkpointing, now the default for `train-bc`, `train-idm` and `train-critic`;
+`--no-checkpoint` turns it off):
+
+| | Time per window | Peak |
+|---|---|---|
+| Batch 1 | 1.0 s | 4.3 GB |
+| Batch 1, recomputed | 1.6 s | 2.1 GB |
+| Batch 2, recomputed | 1.3 s | 2.5 GB |
 
 ## Performance
 

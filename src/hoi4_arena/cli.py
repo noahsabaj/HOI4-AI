@@ -97,6 +97,13 @@ def main():
     train.add_argument("--burn-in", type=int, default=2)
     train.add_argument("--batch-size", type=int, default=2)
     train.add_argument("--seed", type=int, default=42)
+    train.add_argument(
+        "--no-checkpoint",
+        dest="recompute",
+        action="store_false",
+        help="Keep every step's activations instead of recomputing them: faster, but a "
+        "batch of 2 no longer fits 8 GB.",
+    )
     idm = sub.add_parser(
         "train-idm",
         help="Train the inverse dynamics model: inputs inferred from video, trained on "
@@ -110,6 +117,13 @@ def main():
     idm.add_argument("--batch-size", type=int, default=2)
     idm.add_argument("--sequence", type=int, default=16)
     idm.add_argument("--seed", type=int, default=42)
+    idm.add_argument(
+        "--no-checkpoint",
+        dest="recompute",
+        action="store_false",
+        help="Keep every step's activations instead of recomputing them: faster, but a "
+        "batch of 2 no longer fits 8 GB.",
+    )
     idm.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["human", "ai"])
     pointer = sub.add_parser(
         "pointer",
@@ -266,6 +280,13 @@ def main():
     critic.add_argument("--epochs", type=int, default=1)
     critic.add_argument("--batch-size", type=int, default=2)
     critic.add_argument("--seed", type=int, default=42)
+    critic.add_argument(
+        "--no-checkpoint",
+        dest="recompute",
+        action="store_false",
+        help="Keep every step's activations instead of recomputing them: faster, but a "
+        "batch of 2 no longer fits 8 GB.",
+    )
     critic.add_argument(
         "--trunk", action="store_true", help="Also train the shared trunk, not only the head."
     )
