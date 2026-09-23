@@ -13,25 +13,21 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .actions import SLOTS
-from .dataset import (
-    CLIP_FRAMES,
-    TILES,
-    clip_frame_ids,
-    normalize,
-    recorded_speed,
-    require_one_game_speed,
-    views,
-)
+from .actions import GRID, SLOTS
+from .dataset import CLIP_FRAMES, clip_frame_ids, normalize, recorded_speed, views
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
 from .learning import approximate_kl, file_hash
-from .models import Policy, VideoEncoder, halve_frozen
+from .models import CELL_DIM, Policy, VideoEncoder, halve_frozen
 from .recording import Recorder
 from .remote import RemoteDesktop
 from .vision import ScreenRules
 
 log = logging.getLogger(__name__)
+
+# Which views a rollout stored. 1: global view and five 224 px tiles. 2: global view, four
+# 448 px quadrants and a 224 px fovea, and the game speed.
+OBSERVATION = 2
 
 
 def seed_everything(seed, *, salt=None):
@@ -73,6 +69,9 @@ def ppo_exclusion(meta):
     frames = meta.get("clip_frames", 16)
     if frames != CLIP_FRAMES:
         return f"collected against a {frames}-frame clip; the policy now reads {CLIP_FRAMES}"
+    layout = meta.get("observation", 1)
+    if layout != OBSERVATION:
+        return f"observation layout {layout}; the policy now reads layout {OBSERVATION}"
     return None
 
 
@@ -109,9 +108,19 @@ def act_noise(objective, width, deterministic, device):
 
 class Actor:
     def __init__(
-        self, checkpoint, model_path=None, deterministic=False, device="cuda", compile_head=True
+        self,
+        checkpoint,
+        model_path=None,
+        deterministic=False,
+        device="cuda",
+        compile_head=True,
+        *,
+        game_speed,
     ):
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
+        # The policy is told the speed the match runs at: the same clip is a different
+        # amount of game time at each one.
+        self.speed = recorded_speed(game_speed)["game_speed"]
         self.policy.eval().requires_grad_(False)
         # Evaluation runs take the argmax so paired_evaluation's bound is not inflated by
         # sampling noise the analysis does not model. Self-play collection must sample.
@@ -165,6 +174,7 @@ class Actor:
         exactly the reproducibility seed_everything exists to provide.
         """
         memory = torch.zeros(1, self.policy.memory_dim, device=self.device)
+        cells = torch.zeros(1, GRID, CELL_DIM, device=self.device)
         # Inductor keeps its cudagraph tree manager in thread-local storage, so a graph
         # captured here can only be replayed from this thread. `collect_pair` calls act
         # from the main thread and only hands capture and dispatch to a pool, so the
@@ -180,6 +190,7 @@ class Actor:
                 ):
                     self.policy.actor(
                         memory,
+                        cells,
                         noise=torch.zeros(1, self.policy.actor.noise_dim, device=self.device),
                         deterministic=self.deterministic,
                     )
@@ -201,18 +212,10 @@ class Actor:
         # The worker downscales on the capture side when it can, which keeps a 33 MB
         # frame off the wire and the resize out of this loop entirely. Fall back to
         # resizing here, on the GPU, when it handed back a full frame instead. The
-        # fallback still needs the pointer, because the cursor crop is part of the tiles.
-        if precomputed is None:
-            global_view, tiles = views(rgb, device=device, cursor=cursor)
-        else:
-            global_view, tiles = precomputed
+        # fallback still needs the pointer, because the fovea is centred on it.
+        seen = precomputed if precomputed is not None else views(rgb, device=device, cursor=cursor)
         # The worker hands back numpy; the local fallback hands back device tensors.
-        global_view = torch.as_tensor(global_view, device=device)
-        tiles = torch.as_tensor(tiles, device=device)
-        if tiles.shape[0] != TILES:
-            raise ValueError(
-                f"detail tiles must include the cursor crop ({TILES} tiles, got {tiles.shape[0]})"
-            )
+        global_view, quads, fovea = (torch.as_tensor(v, device=device) for v in seen)
         # Same lookback Sessions uses. Integer nanoseconds: dividing t_ns by 1e9 and
         # stepping in float seconds would not land on the same frames.
         timestamp_ns = int(timestamp_ns)
@@ -229,10 +232,12 @@ class Actor:
             torch.inference_mode(),
             torch.autocast(torch.device(device).type, dtype=torch.bfloat16),
         ):
-            self.hidden, value, _ = self.policy(
+            self.hidden, value, _, cells = self.policy(
                 normalize(clip).permute(3, 0, 1, 2)[None],
-                normalize(tiles).permute(0, 3, 1, 2)[None],
+                normalize(quads).permute(0, 3, 1, 2)[None],
+                normalize(fovea).permute(2, 0, 1)[None],
                 torch.from_numpy(self.previous)[None].to(device),
+                torch.tensor([self.speed], device=device),
                 self.hidden,
             )
             noise = act_noise(
@@ -242,13 +247,14 @@ class Actor:
                 device,
             )
             action, logp, _ = self.policy.actor(
-                self.hidden, noise=noise, deterministic=self.deterministic
+                self.hidden, cells, noise=noise, deterministic=self.deterministic
             )
         # One host transfer for the whole sample. Four separate .cpu()/.item() calls
         # each waited for the GPU, on the same thread that has to start the next capture.
         host = {
             "clip": clip.detach().to("cpu", non_blocking=True),
-            "tiles": tiles.detach().to("cpu", non_blocking=True),
+            "quadrants": quads.detach().to("cpu", non_blocking=True),
+            "fovea": fovea.detach().to("cpu", non_blocking=True),
             "action": action[0].detach().to("cpu", non_blocking=True),
             "old_logp": logp.detach().to("cpu", non_blocking=True),
             "old_value": value.detach().to("cpu", non_blocking=True),
@@ -259,7 +265,9 @@ class Actor:
         action_np = host["action"].numpy()
         sample = {
             "clip": host["clip"].numpy(),
-            "tiles": host["tiles"].numpy(),
+            "quadrants": host["quadrants"].numpy(),
+            "fovea": host["fovea"].numpy(),
+            "speed": np.int64(self.speed),
             "hidden": before,
             "previous": self.previous.copy(),
             "action": action_np,
@@ -343,8 +351,13 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
     # audit video records the global view the policy actually saw.
     record_full = bool(config.get("record_full", False))
     actors = [
-        Actor(left_checkpoint, config.get("model_path"), deterministic=deterministic),
-        Actor(right_checkpoint, config.get("model_path"), deterministic=deterministic),
+        Actor(
+            checkpoint,
+            config.get("model_path"),
+            deterministic=deterministic,
+            game_speed=speed["game_speed"],
+        )
+        for checkpoint in (left_checkpoint, right_checkpoint)
     ]
     environments = []
     recorders = []
@@ -362,6 +375,7 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
         "deterministic": deterministic,
         "record_full": record_full,
         "clip_frames": CLIP_FRAMES,
+        "observation": OBSERVATION,
         **speed,
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -507,26 +521,17 @@ def collect_pair(config_path, output, left_checkpoint, right_checkpoint):
 
 
 def replay_batch(files, device):
+    """Stored rollout steps as one batch, normalized the way Actor.act normalized them."""
     rows = [dict(np.load(path)) for path in files]
+    missing = {"quadrants", "fovea", "speed"} - rows[0].keys()
+    if missing:
+        raise ValueError(f"rollout step predates observation layout {OBSERVATION}: {missing}")
     batch = {
         name: torch.as_tensor(np.stack([r[name] for r in rows]), device=device) for name in rows[0]
     }
-    if batch["tiles"].shape[1] != TILES:
-        raise ValueError(
-            "detail tiles must include the cursor crop "
-            f"({TILES} tiles, got {batch['tiles'].shape[1]})"
-        )
-    batch["clips"] = (
-        (
-            batch.pop("clip").float() / 255
-            - batch["tiles"].new_tensor([0.485, 0.456, 0.406], dtype=torch.float32)
-        )
-        / batch["tiles"].new_tensor([0.229, 0.224, 0.225], dtype=torch.float32)
-    ).permute(0, 4, 1, 2, 3)
-    tiles = batch["tiles"].float() / 255
-    batch["tiles"] = (
-        (tiles - tiles.new_tensor([0.485, 0.456, 0.406])) / tiles.new_tensor([0.229, 0.224, 0.225])
-    ).permute(0, 1, 4, 2, 3)
+    batch["clips"] = normalize(batch.pop("clip")).permute(0, 4, 1, 2, 3)
+    batch["quadrants"] = normalize(batch["quadrants"]).permute(0, 1, 4, 2, 3)
+    batch["fovea"] = normalize(batch["fovea"]).permute(0, 3, 1, 2)
     return batch
 
 
@@ -570,8 +575,9 @@ def train_ppo(
         if not on_policy:
             continue  # Historical opponents are not on-policy training data.
         # A rollout that would train with no recorded speed is a data error, not a skip.
+        # Each step also stores the speed the policy was told, so matches at different
+        # speeds can train together.
         speed = recorded_speed(meta.get("game_speed"))["game_speed"]
-        require_one_game_speed([*speeds, speed])
         for player in on_policy:
             files = sorted((manifest_path.parent / f"player-{player}").glob("*.npz"))
             scalars = []
@@ -601,7 +607,7 @@ def train_ppo(
             speeds.append(speed)
     if not episodes:
         raise ValueError("No completed valid on-policy episodes; collection must precede PPO")
-    game_speed = require_one_game_speed(speeds)
+    game_speed = sorted(set(speeds))
     losses = []
     rng = np.random.default_rng(seed)
     early_stop = False
@@ -626,17 +632,20 @@ def train_ppo(
                         torch.set_grad_enabled(not burn),
                         torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"),
                     ):
-                        hidden, value, _ = policy(
-                            batch["clips"][t : t + 1],
-                            batch["tiles"][t : t + 1],
-                            batch["previous"][t : t + 1],
+                        step = slice(t, t + 1)
+                        hidden, value, _, cells = policy(
+                            batch["clips"][step],
+                            batch["quadrants"][step],
+                            batch["fovea"][step],
+                            batch["previous"][step],
+                            batch["speed"][step],
                             hidden,
                         )
                         if burn:
                             hidden = hidden.detach()
                         else:
                             _, logp, entropy = policy.actor(
-                                hidden, batch["action"][t : t + 1], noise=batch["noise"][t : t + 1]
+                                hidden, cells, batch["action"][step], noise=batch["noise"][step]
                             )
                             logps.append(logp)
                             values.append(value)
@@ -677,7 +686,7 @@ def train_ppo(
             "rollouts": str(Path(rollouts).resolve()),
             "episodes": len(episodes),
             "seed": seed,
-            "game_speed": game_speed,
+            "game_speeds": game_speed,
             "epochs": epochs,
             "sequence": sequence,
             "burn_in": burn_in,

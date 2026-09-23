@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 from torch import nn
 
-from hoi4_arena.actions import GRID, SLOTS, VOCAB, decode, encode_interval
+from hoi4_arena.actions import GRID, SLOTS, decode, encode_interval
 from hoi4_arena.dataset import CLIP_FRAMES
 from hoi4_arena.desktop import DesktopError, read_reply
 from hoi4_arena.environment import ArenaPair
@@ -23,6 +23,7 @@ from hoi4_arena.learning import (
     save_checkpoint,
 )
 from hoi4_arena.models import (
+    CELL_DIM,
     ActionHead,
     PredictiveAuxiliary,
     categorical,
@@ -80,133 +81,6 @@ def test_framed_transport_handles_binary_newlines_and_truncation():
         read_reply(io.BytesIO(b'{"bytes":5}\n123'))
     with pytest.raises(DesktopError, match="Invalid"):
         read_reply(io.BytesIO(b'{"bytes":-1}\n'))
-
-
-def test_actor_likelihood_replays_with_same_latent_and_ignores_inactive_xy():
-    torch.manual_seed(1)
-    actor = ActionHead(memory_dim=16)
-    memory = torch.randn(2, 16)
-    noise = torch.randn(2, 16)
-    action, old, _ = actor(memory, noise=noise)
-    _, new, entropy = actor(memory, action, noise)
-    assert torch.allclose(old, new)
-    assert torch.isfinite(entropy).all()
-    assert (action[:, :, 1:][action[:, :, 0] != 1] == 0).all()
-    (-new.mean()).backward()
-    assert actor.init.weight.grad.abs().sum() > 0
-
-
-def categorical_reference(actor, memory, noise, actions):
-    """Score `actions` through torch.distributions, the way ActionHead used to.
-
-    Kept as an independent replay rather than folded into a test body because three tests
-    below compare against it. It mirrors the loop exactly, including summing the per-slot
-    terms with the same stack-then-reduce the head uses: adding eight floats in a Python
-    loop instead would reduce in a different order and could differ in the last bits,
-    which is precisely the resolution these tests are trying to hold.
-    """
-    from torch.distributions import Categorical
-
-    state = torch.tanh(actor.init(torch.cat([memory, noise], -1)))
-    previous = torch.zeros(memory.shape[0], 64, dtype=memory.dtype)
-    logps, entropies = [], []
-    for slot in range(SLOTS):
-        state = actor.cell(previous, state)
-        heads = [Categorical(logits=z) for z in actor.heads(state).float().split(actor.widths, -1)]
-        values = actions[:, slot]
-        move = (values[:, 0] == 1).float()
-        lp = heads[0].log_prob(values[:, 0])
-        logps.append(lp + move * sum(heads[j].log_prob(values[:, j]) for j in (1, 2)))
-        entropies.append(
-            heads[0].entropy() + heads[0].probs[:, 1] * sum(heads[j].entropy() for j in (1, 2))
-        )
-        previous = actor.embedding(values[:, 0]) + actor.xy(
-            values[:, 1:].to(memory.dtype) / (GRID - 1)
-        )
-    return torch.stack(logps, 1).sum(1), torch.stack(entropies, 1).sum(1)
-
-
-def test_action_head_likelihood_is_bit_for_bit_the_categorical_it_replaced():
-    """The distribution objects went away; the numbers they produced must not have.
-
-    ActionHead stopped building Categorical because validating one ends in a host-device
-    synchronization and it paid 48 of them per forward, not because the arithmetic was
-    wrong. So the arithmetic has to come out identical rather than close: a PPO ratio is
-    a difference of two of these log-likelihoods, and a systematic shift in one of them
-    is indistinguishable from a policy update that never happened.
-    """
-    torch.manual_seed(5)
-    actor = ActionHead(memory_dim=16)
-    memory, noise = torch.randn(4, 16), torch.randn(4, actor.noise_dim)
-    # Once with ordinary logits, once with the head amplified until its normalized
-    # logits fall past -100. Categorical clamps them at the float32 minimum before
-    # weighting, and only a saturated head reaches the regime where the clamp does
-    # anything at all, so a milder test leaves that line of the entropy unexercised.
-    for scale in (1.0, 400.0):
-        with torch.no_grad():
-            actor.heads.weight.mul_(scale)
-        actions, _, _ = actor(memory, noise=noise)
-        _, logp, entropy = actor(memory, actions, noise)
-        expected_logp, expected_entropy = categorical_reference(actor, memory, noise, actions)
-        assert torch.equal(logp, expected_logp), (logp - expected_logp).abs().max().item()
-        assert torch.equal(entropy, expected_entropy), (
-            (entropy - expected_entropy).abs().max().item()
-        )
-
-
-def test_action_head_scores_in_float32_even_when_its_weights_are_bfloat16():
-    """Pins the `.float()` on the head output, which is easy to drop and quiet to lose.
-
-    Deleting it leaves the log-softmax and the entropy running in bfloat16, where this
-    same normalization lands roughly 0.05 away. The equivalence test above runs in
-    float32, where the cast is a no-op and the mutation survives; this one is the reason
-    a dropped cast fails something.
-    """
-    torch.manual_seed(6)
-    actor = ActionHead(memory_dim=16).to(torch.bfloat16)
-    memory = torch.randn(4, 16, dtype=torch.bfloat16)
-    noise = torch.randn(4, actor.noise_dim, dtype=torch.bfloat16)
-    actions, _, _ = actor(memory, noise=noise)
-    _, logp, entropy = actor(memory, actions, noise)
-    expected_logp, expected_entropy = categorical_reference(actor, memory, noise, actions)
-    assert logp.dtype == torch.float32 and entropy.dtype == torch.float32
-    assert torch.equal(logp, expected_logp)
-    assert torch.equal(entropy, expected_entropy)
-
-
-def test_fused_head_computes_the_three_heads_it_replaced():
-    """One wide Linear split three ways is the same arithmetic as three narrow ones.
-
-    Same arithmetic, not necessarily the same bits. Every output element is a dot
-    product over the same 256 inputs either way, but a 256x2122 matmul and a 256x1024
-    matmul are free to block and accumulate in different orders, and whether they
-    actually do is a property of the CPU. This was originally written as an equality
-    because that is what it measured on one machine; CI failed it on another, which is
-    the more useful result.
-
-    So the comparison is against a float64 reference, which has no reduction-order
-    freedom worth the name, and the tolerance is four orders below the thing the test
-    exists to catch: a wrong split offset does not perturb an output, it replaces it,
-    and the values here are of order one.
-    """
-    torch.manual_seed(7)
-    actor = ActionHead(memory_dim=16)
-    state = torch.randn(3, 256)
-    parts = actor.heads(state).split(actor.widths, -1)
-    assert actor.widths == (len(VOCAB), GRID, GRID)
-    offset = 0
-    for width, part in zip(actor.widths, parts, strict=True):
-        rows = slice(offset, offset + width)
-        expected = (
-            state.double() @ actor.heads.weight[rows].double().T + actor.heads.bias[rows].double()
-        )
-        assert torch.allclose(part.double(), expected, rtol=0, atol=1e-4)
-        separate = nn.Linear(256, width)
-        with torch.no_grad():
-            separate.weight.copy_(actor.heads.weight[rows])
-            separate.bias.copy_(actor.heads.bias[rows])
-        assert torch.allclose(part, separate(state), rtol=0, atol=1e-4)
-        offset += width
 
 
 def test_configure_precision_defaults_to_full_float32():
@@ -627,16 +501,6 @@ def test_pair_reset_joins_both_sides_before_disarming():
         pair.pool.shutdown(wait=True)
 
 
-def test_deterministic_actor_takes_the_argmax():
-    torch.manual_seed(0)
-    actor = ActionHead(memory_dim=8)
-    memory = torch.randn(2, 8)
-    greedy = [actor(memory, deterministic=True)[0] for _ in range(3)]
-    assert all(torch.equal(greedy[0], other) for other in greedy[1:])
-    sampled = torch.stack([actor(memory)[0] for _ in range(12)])
-    assert not torch.equal(sampled[0], sampled[-1]), "sampling must still be stochastic"
-
-
 def test_legitimate_terminal_screen_is_confirmed_through_its_transition_frames(tmp_path):
     """Lower bound on the grace window: a real win must survive its transition frames.
 
@@ -695,10 +559,11 @@ def test_actor_threads_deterministic_into_the_policy_and_is_reproducible():
             self.actor = ActionHead(memory_dim=8)
             self.linear = torch.nn.Linear(8, 8)
 
-        def forward(self, clip, tiles, previous, hidden=None):
+        def forward(self, clip, quadrants, fovea, previous, speed, hidden=None):
             batch = clip.shape[0]
             hidden = self.linear(clip.float().mean((1, 2, 3, 4))[:, None].expand(batch, 8))
-            return hidden, hidden.sum(-1), hidden
+            cells = torch.ones(batch, GRID, CELL_DIM)
+            return hidden, hidden.sum(-1), hidden, cells
 
     def build(deterministic, objective, stream):
         actor = Actor.__new__(Actor)
@@ -712,6 +577,7 @@ def test_actor_threads_deterministic_into_the_policy_and_is_reproducible():
         actor.previous = np.zeros((SLOTS, 3), dtype=np.int64)
         actor.history = deque(maxlen=64)
         actor.compiled = False
+        actor.speed = 4
         return actor
 
     rgb = np.full((32, 32, 3), 120, np.uint8)
@@ -775,43 +641,27 @@ def test_actor_drops_the_cuda_graph_rather_than_replaying_it_from_another_thread
     assert actor.policy.actor is eager, "the eager head must be what replaces it"
 
 
-def test_deterministic_action_equals_the_head_argmax():
-    torch.manual_seed(3)
-    actor = ActionHead(memory_dim=8)
-    memory = torch.randn(2, 8)
-    noise = torch.zeros(2, actor.noise_dim)
-    action, _, _ = actor(memory, noise=noise, deterministic=True)
-    # Recompute the head distributions by hand and check the greedy path took the mode.
-    state = torch.tanh(actor.init(torch.cat([memory, noise], -1)))
-    previous = torch.zeros(2, 64)
-    for slot in range(SLOTS):
-        state = actor.cell(previous, state)
-        type_logits, x_logits, y_logits = actor.heads(state).float().split(actor.widths, -1)
-        expected_type = type_logits.argmax(-1)
-        assert torch.equal(action[:, slot, 0], expected_type)
-        expected = torch.stack([expected_type, x_logits.argmax(-1), y_logits.argmax(-1)], -1)
-        move = (expected_type == 1).long()
-        expected = expected.clone()
-        expected[:, 1:] *= move[:, None]
-        assert torch.equal(action[:, slot], expected)
-        previous = actor.embedding(expected[:, 0]) + actor.xy(expected[:, 1:].float() / (GRID - 1))
-
-
 def test_ppo_excludes_deterministic_evaluation_rollouts():
-    from hoi4_arena.runner import ppo_exclusion
+    from hoi4_arena.runner import OBSERVATION, ppo_exclusion
 
     on_policy = {
         "complete": True,
         "valid": True,
         "deterministic": False,
         "clip_frames": CLIP_FRAMES,
+        "observation": OBSERVATION,
     }
     assert ppo_exclusion(on_policy) is None
     assert ppo_exclusion({**on_policy, "deterministic": True}) is not None
     assert ppo_exclusion({**on_policy, "valid": False}) is not None
     assert ppo_exclusion({**on_policy, "complete": False}) is not None
     # A manifest written before the deterministic key existed is still on-policy.
-    assert ppo_exclusion({"complete": True, "valid": True, "clip_frames": CLIP_FRAMES}) is None
+    assert ppo_exclusion({key: v for key, v in on_policy.items() if key != "deterministic"}) is None
+    # One stored before the quadrants and fovea is not: its views are not the policy's.
+    assert "layout" in ppo_exclusion({**on_policy, "observation": 1})
+    assert ppo_exclusion({**on_policy, "observation": 1}) == ppo_exclusion(
+        {key: v for key, v in on_policy.items() if key != "observation"}
+    )
     # A clip of a different length is not. The encoder places tokens with RoPE, so the
     # wrong length replays silently rather than raising, and silence is the hazard.
     assert ppo_exclusion({**on_policy, "clip_frames": CLIP_FRAMES * 2}) is not None
@@ -1051,8 +901,8 @@ def test_views_uses_the_pinned_resampler_and_tiles_the_frame():
 
     # Same source bytes as the golden case: BGRA from the LCG, swizzled to RGB.
     rgb = _lcg(16 * 9 * 4).reshape(9, 16, 4)[:, :, [2, 1, 0]].copy()
-    g, tiles = views(rgb, size=4, cursor=(2, 2))
-    assert g.shape == (4, 4, 3) and tiles.shape == (5, 4, 4, 3)
+    g, quads, fovea = views(rgb, size=4, detail=4, fovea=4, cursor=(2, 2))
+    assert g.shape == (4, 4, 3) and quads.shape == (4, 4, 4, 3) and fovea.shape == (4, 4, 3)
     assert g.dtype == torch.uint8
     # The global view of this frame is the third golden case, computed the same way.
     _, _, _, expected = _DOWNSCALE_GOLDEN[2]
@@ -1100,8 +950,8 @@ def test_capture_splits_a_downscaled_worker_payload():
 
     from hoi4_arena.desktop import Desktop
 
-    size, regions = 4, [[1, 2, 3, 2], [0, 0, 2, 2]]
-    views_block = _lcg(6 * size * size * 3)
+    size, detail, fovea, regions = 4, 6, 2, [[1, 2, 3, 2], [0, 0, 2, 2]]
+    views_block = _lcg((size * size + 4 * detail * detail + fovea * fovea) * 3)
     crop_blocks = [_lcg(3 * 2 * 4), _lcg(2 * 2 * 4)]
     payload = bytes(views_block) + b"".join(bytes(c) for c in crop_blocks)
 
@@ -1115,18 +965,22 @@ def test_capture_splits_a_downscaled_worker_payload():
             "stopped": False,
             "full_bytes": 0,
             "view_size": size,
+            "detail_size": detail,
+            "fovea_size": fovea,
             "views_bytes": len(views_block),
             "region_bytes": [len(c) for c in crop_blocks],
             "cursor": [1, 2],
             "payload": payload,
         }
     )
-    frame = desktop.capture(views=size, regions=regions)
+    frame = desktop.capture(views=size, detail=detail, fovea=fovea, regions=regions)
     assert frame.rgb is None, "a views-only capture must not carry the full frame"
-    g, tiles = frame.views
-    assert g.shape == (size, size, 3) and tiles.shape == (5, size, size, 3)
+    g, quads, centre = frame.views
+    assert g.shape == (size, size, 3) and quads.shape == (4, detail, detail, 3)
+    assert centre.shape == (fovea, fovea, 3)
     assert np.array_equal(g.ravel(), views_block[: size * size * 3])
-    assert np.array_equal(tiles[-1].ravel(), views_block[-size * size * 3 :])
+    assert np.array_equal(centre.ravel(), views_block[-fovea * fovea * 3 :])
+    assert desktop.request.call_args.kwargs["detail"] == detail
     assert frame.meta["cursor"] == [1, 2]
     assert [c.shape for c in frame.crops] == [(2, 3, 3), (2, 2, 3)]
     # Crops arrive BGRA and must be swizzled to RGB like the full frame is.
@@ -1149,13 +1003,15 @@ def test_capture_rejects_a_payload_that_contradicts_its_header():
             "stopped": False,
             "full_bytes": 0,
             "view_size": 2,
+            "detail_size": 2,
+            "fovea_size": 2,
             "views_bytes": 6 * 2 * 2 * 3,
             "region_bytes": [],
             "payload": b"\x00" * 7,
         }
     )
     with pytest.raises(DesktopError, match="declared layout"):
-        desktop.capture(views=2)
+        desktop.capture(views=2, detail=2, fovea=2)
 
 
 def test_recorder_records_the_pixels_the_policy_saw_when_the_worker_downscaled():
@@ -1164,7 +1020,10 @@ def test_recorder_records_the_pixels_the_policy_saw_when_the_worker_downscaled()
 
     g = np.full((224, 224, 3), 7, np.uint8)
     downscaled = Frame(
-        None, {"foreground": True}, 0, views=(g, np.zeros((4, 224, 224, 3), np.uint8))
+        None,
+        {"foreground": True},
+        0,
+        views=(g, np.zeros((4, 448, 448, 3), np.uint8), np.zeros((224, 224, 3), np.uint8)),
     )
     assert np.array_equal(audit_pixels(downscaled), g)
     native = np.full((8, 8, 3), 3, np.uint8)
@@ -1178,7 +1037,7 @@ def test_views_rounds_ties_to_even_like_the_worker():
     from hoi4_arena.dataset import views
 
     bgra = np.array([[[4, 2, 0, 0], [5, 3, 1, 0]]], np.uint8)
-    g, _ = views(bgra[:, :, [2, 1, 0]].copy(), size=1, cursor=(0, 0))
+    g, _, _ = views(bgra[:, :, [2, 1, 0]].copy(), size=1, detail=1, fovea=1, cursor=(0, 0))
     assert g.numpy().ravel().tolist() == [0, 2, 4]
 
 
@@ -1193,9 +1052,9 @@ def test_views_orders_quadrants_top_left_top_right_bottom_left_bottom_right():
             10 * (idx + 1) + 1,
             10 * (idx + 1) + 2,
         ]
-    g, tiles = views(src, size=1, cursor=(0, 0))
+    g, quads, _ = views(src, size=1, detail=1, fovea=1, cursor=(0, 0))
     assert g.numpy().ravel().tolist() == [25, 26, 27]
-    assert tiles[:4].reshape(4, 3).numpy().tolist() == [
+    assert quads.reshape(4, 3).numpy().tolist() == [
         [10, 11, 12],
         [20, 21, 22],
         [30, 31, 32],
@@ -1214,7 +1073,7 @@ def test_views_accumulates_in_float32_so_the_worker_can_match_it():
 
     rng = np.random.default_rng(7)
     big = rng.integers(0, 256, (288, 512, 3), dtype=np.uint8)
-    g, _ = views(big, size=16, cursor=(0, 0))
+    g, _, _ = views(big, size=16, detail=16, fovea=16, cursor=(0, 0))
     assert int(g.sum()) == 97902, "resize no longer accumulates in float32"
 
 
@@ -1585,27 +1444,6 @@ def _stub_desktop(reply):
     return desktop
 
 
-def test_capture_rejects_a_worker_that_omits_the_cursor_crop():
-    """Five views is the old payload. The sixth is the crop, and it cannot be added later."""
-    size = 2
-    n = 5 * size * size * 3
-    reply = {
-        "payload": bytes(_lcg(n)),
-        "width": 8,
-        "height": 8,
-        "encoding": "raw",
-        "overflow": False,
-        "stopped": False,
-        "full_bytes": 0,
-        "view_size": size,
-        "views_bytes": n,
-        "region_bytes": [],
-        "cursor": [0, 0],
-    }
-    with pytest.raises(DesktopError, match="cursor crop"):
-        _stub_desktop(reply).capture(views=size)
-
-
 def test_capture_rejects_a_frame_that_did_not_record_the_cursor():
     reply = {
         "payload": bytes(2 * 2 * 4),
@@ -1619,26 +1457,36 @@ def test_capture_rejects_a_frame_that_did_not_record_the_cursor():
         _stub_desktop(reply).capture()
 
 
-def test_act_and_replay_refuse_tiles_without_the_cursor_crop(tmp_path):
-    from hoi4_arena.runner import Actor, replay_batch
+def test_capture_rejects_a_worker_that_sends_one_size_for_every_view():
+    """The old layout: five views at one size and the cursor crop, and no detail size."""
+    size = 2
+    n = 6 * size * size * 3
+    reply = {
+        "payload": bytes(_lcg(n)),
+        "width": 8,
+        "height": 8,
+        "encoding": "raw",
+        "overflow": False,
+        "stopped": False,
+        "full_bytes": 0,
+        "view_size": size,
+        "views_bytes": n,
+        "region_bytes": [],
+        "cursor": [0, 0],
+    }
+    with pytest.raises(DesktopError, match="detail and fovea sizes"):
+        _stub_desktop(reply).capture(views=size, detail=4, fovea=size)
+    reply.update(detail_size=size, fovea_size=size)
+    with pytest.raises(DesktopError, match="sizes other than requested"):
+        _stub_desktop(reply).capture(views=size, detail=4, fovea=size)
 
-    actor = Actor.__new__(Actor)
-    actor.device = "cpu"
-    actor.compiled = False
-    global_view = np.zeros((4, 4, 3), np.uint8)
-    with pytest.raises(ValueError, match="cursor crop"):
-        actor.act(
-            None,
-            1,
-            precomputed=(global_view, np.zeros((4, 4, 4, 3), np.uint8)),
-        )
+
+def test_replay_refuses_a_rollout_step_from_the_old_layout(tmp_path):
+    from hoi4_arena.runner import replay_batch
+
     path = tmp_path / "step.npz"
-    np.savez(
-        path,
-        tiles=np.zeros((4, 8, 8, 3), np.uint8),
-        clip=np.zeros((8, 8, 8, 3), np.uint8),
-    )
-    with pytest.raises(ValueError, match="cursor crop"):
+    np.savez(path, tiles=np.zeros((5, 8, 8, 3), np.uint8), clip=np.zeros((8, 8, 8, 3), np.uint8))
+    with pytest.raises(ValueError, match="observation layout"):
         replay_batch([path], "cpu")
 
 

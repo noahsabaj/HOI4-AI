@@ -143,6 +143,36 @@ class Station:
         say(self.name, "launch:", out.replace("\n", " | "))
 
 
+class Logged:
+    """A desktop whose applied inputs are kept, with the worker's time of each.
+
+    The camera's pans, zooms and popup clicks are real inputs to the game, even though a
+    script chose them rather than a player. Kept beside the frames as `scripted_events`,
+    they make an AI game a labelled recording of camera control and popup clearing, and
+    session_labels reads them the way it reads a player's events.
+    """
+
+    def __init__(self, desk):
+        self.desk = desk
+        self.lock = threading.Lock()
+        self.events = []
+
+    def __getattr__(self, name):
+        return getattr(self.desk, name)
+
+    def apply(self, events):
+        reply = self.desk.apply(events)
+        with self.lock:
+            self.events.extend({"t_ns": reply["t_ns"], "event": e} for e in events)
+        return reply
+
+    def take(self):
+        """The inputs applied since the last call, oldest first."""
+        with self.lock:
+            taken, self.events = self.events, []
+        return taken
+
+
 def focus(desk, tries=5):
     for _ in range(tries):
         try:
@@ -364,7 +394,8 @@ def camera(desk, stop, station, popups, recentre_every=(60, 150)):
 
 def play(desk, root, popups, settings, station):
     stop = threading.Event()
-    mover = threading.Thread(target=camera, args=(desk, stop, station, popups), daemon=True)
+    inputs = Logged(desk)
+    mover = threading.Thread(target=camera, args=(inputs, stop, station, popups), daemon=True)
     outcome, reason = "timeout", None
     first = desk.capture()
     hz = settings["hz"]
@@ -382,7 +413,7 @@ def play(desk, root, popups, settings, station):
             if not frame.meta.get("foreground"):
                 focus(desk, tries=1)
                 continue
-            rec.append(frame)
+            rec.append(frame, scripted_events=inputs.take())
             now = time.monotonic()
             if now - deadline > 1:
                 late += 1
@@ -414,6 +445,8 @@ def play(desk, root, popups, settings, station):
             late_ticks=late,
             arena=Path(settings["mod"]).name,
             driver="observe + scripted camera + popup clicks",
+            # frames.jsonl carries the camera's inputs as scripted_events.
+            labels="scripted_events",
             station=station,
         )
         rec.close(complete=reason is None, reason=reason)

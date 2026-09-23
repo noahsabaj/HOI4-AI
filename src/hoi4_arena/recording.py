@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .dataset import VIEW_SIZE, parse_cursor, recorded_speed
+from .dataset import FOVEA_SIZE, parse_cursor, recorded_speed
 from .desktop import Desktop
 
 log = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ class Recorder:
             "video_source": "full_frame" if first.rgb is not None else "global_view",
             "nominal_fps": hz,
             "codec": codec,
-            "cursor_crop": VIEW_SIZE,
+            "fovea": FOVEA_SIZE,
             # The operator sets this for the whole session. The match loop leaves it alone.
             **recorded_speed(game_speed),
             "complete": False,
@@ -161,7 +161,7 @@ def record(root, seconds, hz=15, command=None, split=None, game_speed=None, code
     `game_speed` is the speed the operator set for the whole session. It is checked
     before the worker starts.
 
-    An incomplete recording is rejected by prepare_session, so exiting zero on a failed
+    An incomplete recording is rejected by training (session_labels), so exiting zero on a failed
     or interrupted run would hand the operator a session that can never be trained on.
     """
     speed = recorded_speed(game_speed)["game_speed"]

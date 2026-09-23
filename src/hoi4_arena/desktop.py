@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import VIEW_COUNT, parse_cursor
+from .dataset import DETAIL_SIZE, FOVEA_SIZE, QUADRANTS, Views, parse_cursor
 
 log = logging.getLogger(__name__)
 
@@ -48,10 +48,10 @@ class Frame:
     rgb: np.ndarray | None
     meta: dict
     received_ns: int
-    # Populated when the worker downscaled on the capture side. `views` is
-    # (global, tiles) already at policy resolution; `crops` holds the calibrated
+    # Populated when the worker downscaled on the capture side. `views` is a
+    # dataset.Views already at policy resolution; `crops` holds the calibrated
     # template regions at native resolution, keyed by the order they were requested.
-    views: tuple | None = None
+    views: Views | None = None
     crops: list | None = None
 
 
@@ -194,18 +194,22 @@ class Desktop:
             raise DesktopError(reply["error"])
         return reply
 
-    def capture(self, *, views=None, regions=None, full=None) -> Frame:
+    def capture(
+        self, *, views=None, detail=DETAIL_SIZE, fovea=FOVEA_SIZE, regions=None, full=None
+    ) -> Frame:
         """Capture a frame, optionally downscaled and cropped by the worker.
 
-        `views` asks the worker for the policy views at that size: the global frame, four
-        quadrants, and a native crop centered on the pointer. `regions` is a list of
-        [x, y, w, h] crops at native resolution. Asking for either keeps the 33 MB frame
-        off the wire; the two together are under a megabyte. The full frame is returned
-        only when nothing narrower was requested, or `full=True`.
+        `views` asks the worker for the policy views: the global frame at that size, the
+        four quadrants at `detail`, and a native `fovea` square centered on the pointer
+        (see dataset.views). `regions` is a list of [x, y, w, h] crops at native
+        resolution. Asking for either keeps the full frame off the wire. The full frame
+        is returned only when nothing narrower was requested, or `full=True`.
         """
         options = {}
         if views:
             options["views"] = int(views)
+            options["detail"] = int(detail)
+            options["fovea"] = int(fovea)
         if regions:
             options["regions"] = [[int(v) for v in r] for r in regions]
         if full is not None:
@@ -246,20 +250,31 @@ class Desktop:
                 .copy()
             )
             offset = full_bytes
-        view_pair = None
+        seen = None
         if meta.get("views_bytes"):
-            s = meta.get("view_size")
-            if not isinstance(s, int) or isinstance(s, bool) or s <= 0:
-                raise DesktopError("Worker view payload has no view size")
-            if meta["views_bytes"] != VIEW_COUNT * s * s * 3:
+            sizes = [meta.get(k) for k in ("view_size", "detail_size", "fovea_size")]
+            if not all(isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in sizes):
+                raise DesktopError(
+                    "Worker view payload has no view, detail and fovea sizes. Rebuild and "
+                    "redeploy hoi4-desktop-worker."
+                )
+            s, d, f = sizes
+            if (d, f) != (options["detail"], options["fovea"]):
+                raise DesktopError("Worker returned views at sizes other than requested")
+            parts = [s * s * 3, QUADRANTS * d * d * 3, f * f * 3]
+            if meta["views_bytes"] != sum(parts):
                 raise DesktopError(
                     "Worker view payload is not the global frame, four quadrants, and "
-                    "cursor crop. Rebuild and redeploy hoi4-desktop-worker."
+                    "fovea. Rebuild and redeploy hoi4-desktop-worker."
                 )
             # The worker already emits RGB at policy resolution; no swizzle needed.
-            # The last tile is the native cursor crop.
-            stack = buffer[offset : offset + meta["views_bytes"]].reshape(VIEW_COUNT, s, s, 3)
-            view_pair = (stack[0].copy(), stack[1:].copy())
+            block = buffer[offset : offset + meta["views_bytes"]]
+            ends = np.cumsum(parts)
+            seen = Views(
+                block[: ends[0]].reshape(s, s, 3).copy(),
+                block[ends[0] : ends[1]].reshape(QUADRANTS, d, d, 3).copy(),
+                block[ends[1] :].reshape(f, f, 3).copy(),
+            )
             offset += meta["views_bytes"]
         crops = None
         if region_bytes:
@@ -271,7 +286,7 @@ class Desktop:
             parse_cursor(meta.get("cursor"))
         except ValueError as error:
             raise DesktopError(str(error)) from error
-        return Frame(rgb, meta, time.monotonic_ns(), views=view_pair, crops=crops)
+        return Frame(rgb, meta, time.monotonic_ns(), views=seen, crops=crops)
 
     def arm(self, *, setup=False):
         self.request("arm", mode="setup" if setup else "match")

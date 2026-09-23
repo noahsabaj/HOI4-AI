@@ -1,15 +1,36 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from .actions import GRID, SLOTS, VOCAB
 from .benchmark import load_encoder, verify_model_source
-from .dataset import TILES
+
+# The pointer is placed in two steps: one of CELLS x CELLS cells of the screen, then one of
+# CELLS x CELLS positions inside that cell. That is exactly the GRID x GRID lattice the
+# action tokens already use (cell times CELLS plus offset, on each axis), so recorded labels
+# and checkpoints keep their meaning. At 1080p a cell is 60 x 34 px and a step inside it
+# about 1.9 x 1.1 px.
+CELLS = 32
+assert CELLS * CELLS == GRID
+# Channels of every spatial feature the pointer head scores.
+CELL_DIM = 256
+# Game speeds 1 to 5, and 0 for a recording that predates the field.
+SPEEDS = 6
 
 
 class VideoEncoder(nn.Module):
+    """The global clip encoder. Returns the summary token and the last frame's patch grid.
+
+    The encoder attends block-causally over time, so the last frame's patch tokens have
+    seen the whole clip. Keeping them, and not only the summary token, is what lets the
+    pointer head score places on the screen: a single pooled vector had to encode every
+    position the policy might click.
+    """
+
     def __init__(self, model_path, variant="large", train_last=2):
         super().__init__()
         if variant == "large":
@@ -26,6 +47,7 @@ class VideoEncoder(nn.Module):
         else:
             raise ValueError(variant)
         self.dim = self.model.config.embed_dim
+        self.patch = self.model.config.patch_size
         self.variant = variant
         if variant == "large" and train_last >= 0:
             self.model.requires_grad_(False)
@@ -37,26 +59,57 @@ class VideoEncoder(nn.Module):
     def forward(self, clip):
         # All input frames are <= current observation time. No token dropping for control.
         tokens = self.model(pixel_values=clip).last_hidden_state
-        return tokens[:, 0]
+        h, w = clip.shape[-2] // self.patch, clip.shape[-1] // self.patch
+        # Patches are ordered time-major after the summary token, so the last h*w tokens
+        # are the newest frame.
+        grid = tokens[:, -h * w :].transpose(1, 2).reshape(tokens.shape[0], self.dim, h, w)
+        return tokens[:, 0], grid
+
+
+class Stage(nn.Module):
+    """A strided convolution and a residual convolution after it."""
+
+    def __init__(self, inputs, outputs):
+        super().__init__()
+        self.down = nn.Conv2d(inputs, outputs, 3, 2, 1)
+        self.norm = nn.GroupNorm(8, outputs)
+        self.body = nn.Conv2d(outputs, outputs, 3, 1, 1)
+
+    def forward(self, x):
+        x = F.gelu(self.norm(self.down(x)))
+        return x + F.gelu(self.body(x))
 
 
 class DetailEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 24, 5, 2, 2),
-            nn.GELU(),
-            nn.Conv2d(24, 48, 3, 2, 1),
-            nn.GELU(),
-            nn.Conv2d(48, 64, 3, 2, 1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((2, 2)),
-            nn.Flatten(),
-        )
+    """A convolutional reader for the quadrants and the fovea, at stride 16.
 
-    def forward(self, tiles):
-        b, n, c, h, w = tiles.shape
-        return self.net(tiles.reshape(b * n, c, h, w)).reshape(b, n * 256)
+    It keeps the spatial map. The old reader pooled each 224 px tile to 2 x 2 before the
+    policy saw it, which kept that something was there and threw away where.
+    """
+
+    def __init__(self, width=CELL_DIM):
+        super().__init__()
+        self.stages = nn.Sequential(Stage(3, 32), Stage(32, 64), Stage(64, 128), Stage(128, width))
+
+    def forward(self, images):
+        """(..., 3, H, W) to (..., width, H / 16, W / 16)."""
+        lead = images.shape[:-3]
+        maps = self.stages(images.reshape(-1, *images.shape[-3:]))
+        return maps.reshape(*lead, *maps.shape[-3:])
+
+
+def screen_cells(quadrant_maps):
+    """Four quadrant maps pooled and tiled into one CELLS x CELLS map of the whole screen.
+
+    (B, 4, C, h, w) in the order top-left, top-right, bottom-left, bottom-right, to
+    (B, C, CELLS, CELLS). Each quadrant is one quarter of the cells.
+    """
+    half = CELLS // 2
+    pooled = F.adaptive_avg_pool2d(quadrant_maps.flatten(0, 1), half)
+    pooled = pooled.reshape(*quadrant_maps.shape[:3], half, half)
+    top = torch.cat([pooled[:, 0], pooled[:, 1]], -1)
+    bottom = torch.cat([pooled[:, 2], pooled[:, 3]], -1)
+    return torch.cat([top, bottom], -2)
 
 
 def gumbel_argmax(logits):
@@ -95,33 +148,51 @@ def entropy(normalized, probabilities):
 class ActionHead(nn.Module):
     """Autoregressive event slots with an exact, replayable conditional likelihood.
 
+    Each slot picks an event kind. A move also picks where: first a cell of the screen,
+    by scoring every cell's features against the slot's state, then a position inside
+    that cell, from the chosen cell's own features. So a click is chosen by looking at what
+    is at each place on the screen, and x and y are chosen together rather than as two
+    independent numbers. The old head took x and y from two separate 1024-way outputs of
+    one pooled vector.
+
     The likelihood is computed directly rather than through torch.distributions. That is
     not a stylistic preference: Distribution validates its arguments whenever __debug__
     is set, and each validation ends in `Tensor.__bool__` on a CUDA tensor, which is a
-    host-device synchronization. Three heads times eight slots times a construction and a
-    log_prob is 48 of them per forward -- including on the teacher-forcing path, which
-    never samples anything. Removing the objects removes the stalls; the arithmetic below
-    reproduces Categorical's exactly, and a test pins it bit-for-bit.
+    host-device synchronization, paid for every head of every slot -- including on the
+    teacher-forcing path, which never samples anything. The arithmetic below reproduces
+    Categorical's exactly, and a test pins it bit-for-bit.
     """
 
-    def __init__(self, memory_dim=512, noise_dim=16):
+    def __init__(self, memory_dim=512, noise_dim=16, cell_dim=CELL_DIM):
         super().__init__()
         self.noise_dim = noise_dim
         self.init = nn.Linear(memory_dim + noise_dim, 256)
         self.embedding = nn.Embedding(len(VOCAB), 64)
         self.xy = nn.Linear(2, 64)
         self.cell = nn.GRUCell(64, 256)
-        # One projection, split three ways. At batch one these are launch-bound rather
-        # than arithmetic-bound, so three narrow GEMMs cost more than one wide one:
-        # measured 0.51 ms to 0.23 ms across the eight slots. Every output element is a
-        # dot product over the same 256 inputs either way, but that is the arithmetic
-        # being identical, not the bits -- a 256x2122 matmul may accumulate in a
-        # different order than a 256x1024 one, and whether it does depends on the CPU.
-        self.widths = (len(VOCAB), GRID, GRID)
-        self.heads = nn.Linear(256, sum(self.widths))
+        self.kinds = nn.Linear(256, len(VOCAB))
+        self.query = nn.Linear(256, cell_dim)
+        # A learned preference over cells, before looking: popups open near the middle,
+        # the speed and pause controls sit in one corner.
+        self.cell_bias = nn.Parameter(torch.zeros(GRID))
+        self.fine = nn.Sequential(nn.Linear(256 + cell_dim, 256), nn.GELU(), nn.Linear(256, GRID))
+        self.scale = 1 / math.sqrt(cell_dim)
 
-    def forward(self, memory, actions=None, noise=None, deterministic=False):
+    def forward(self, memory, cells, actions=None, noise=None, deterministic=False):
+        """Sample (or score, given `actions`) the eight slots.
+
+        `cells` is (B, GRID, cell_dim): the screen's CELLS x CELLS map, row-major, as
+        Policy builds it. Returns the actions, their summed log-likelihood and the summed
+        entropy.
+
+        The entropy of a slot is the kind's, plus, weighted by the chance of a move, the
+        cell's and the position's within one cell. That last term is exact only for the
+        cell the slot actually chose (the sampled or scored one; cell 0 when the slot is
+        not a move). The expectation over all 1024 cells would need 1024 fine heads per
+        slot, a million logits, for a regularizer.
+        """
         b = memory.shape[0]
+        rows = torch.arange(b, device=memory.device)
         if noise is None:
             noise = torch.zeros(b, self.noise_dim, device=memory.device, dtype=memory.dtype)
         state = torch.tanh(self.init(torch.cat([memory, noise], -1)))
@@ -129,25 +200,35 @@ class ActionHead(nn.Module):
         result, logps, entropies = [], [], []
         for slot in range(SLOTS):
             state = self.cell(previous, state)
-            # The float cast is load-bearing, not incidental: run in bfloat16 this same
+            # The float casts are load-bearing, not incidental: run in bfloat16 this same
             # normalization lands about 0.05 away, which is a large number to put inside
             # a ratio of likelihoods.
-            heads = [categorical(z) for z in self.heads(state).float().split(self.widths, -1)]
+            kinds = categorical(self.kinds(state).float())
+            where = torch.einsum("bnc,bc->bn", cells, self.query(state).to(cells.dtype))
+            places = categorical(where.float() * self.scale + self.cell_bias.float())
             if actions is not None:
-                values = actions[:, slot]
+                kind, x, y = actions[:, slot].unbind(-1)
+                place = (y // CELLS) * CELLS + x // CELLS
+                offset = (y % CELLS) * CELLS + x % CELLS
             elif deterministic:
-                values = torch.stack([z.argmax(-1) for z in heads], -1)
+                kind, place = kinds.argmax(-1), places.argmax(-1)
             else:
-                values = torch.stack([gumbel_argmax(z) for z in heads], -1)
-            probabilities = [z.softmax(-1) for z in heads]
-            chosen = [log_prob(z, values[:, j]) for j, z in enumerate(heads)]
-            each = [entropy(z, p) for z, p in zip(heads, probabilities, strict=True)]
-            move = (values[:, 0] == 1).float()
-            lp = chosen[0] + move * sum(chosen[j] for j in (1, 2))
-            # Expected entropy of xy conditional on a move, not the sampled move indicator.
-            expected = each[0] + probabilities[0][:, 1] * sum(each[j] for j in (1, 2))
-            values = values.clone()
-            values[:, 1:] *= move.long()[:, None]
+                kind, place = gumbel_argmax(kinds), gumbel_argmax(places)
+            chosen = cells[rows, place].to(state.dtype)
+            fine = categorical(self.fine(torch.cat([state, chosen], -1)).float())
+            if actions is None:
+                offset = fine.argmax(-1) if deterministic else gumbel_argmax(fine)
+            kind_p, place_p, fine_p = kinds.softmax(-1), places.softmax(-1), fine.softmax(-1)
+            move = (kind == 1).float()
+            lp = log_prob(kinds, kind) + move * (log_prob(places, place) + log_prob(fine, offset))
+            expected = entropy(kinds, kind_p) + kind_p[:, 1] * (
+                entropy(places, place_p) + entropy(fine, fine_p)
+            )
+            x = (place % CELLS) * CELLS + offset % CELLS
+            y = (place // CELLS) * CELLS + offset // CELLS
+            values = torch.stack([kind, x, y], -1) * torch.stack(
+                [torch.ones_like(kind), move.long(), move.long()], -1
+            )
             previous = self.embedding(values[:, 0]) + self.xy(
                 values[:, 1:].to(memory.dtype) / (GRID - 1)
             )
@@ -162,29 +243,65 @@ class ActionHead(nn.Module):
 
 
 class Policy(nn.Module):
+    """Global clip, quadrants and fovea in; a recurrent memory, a value and the cells out.
+
+    The cells are the screen as a CELLS x CELLS map: the quadrants' detail pooled into
+    each cell, plus the video encoder's patch grid (which has seen the whole clip)
+    resized onto the same map, plus a learned position. The action head scores them to
+    place the pointer. The memory reads the whole screen through their mean, the pointer's
+    surroundings through the fovea, and one place of its own choosing through attention.
+    """
+
     def __init__(self, encoder, memory_dim=512):
         super().__init__()
         self.encoder = encoder
         self.details = DetailEncoder()
+        self.foveal = DetailEncoder()
+        self.global_cells = nn.Conv2d(encoder.dim, CELL_DIM, 1)
+        self.position = nn.Parameter(torch.zeros(1, CELL_DIM, CELLS, CELLS))
+        self.cell_norm = nn.LayerNorm(CELL_DIM)
         self.previous_action = nn.Linear(SLOTS * 3, 64)
-        # 256 is one tile of DetailEncoder. The fifth tile is the cursor crop.
-        self.fusion = nn.Linear(encoder.dim + TILES * 256 + 64, memory_dim)
+        self.speed = nn.Embedding(SPEEDS, 32)
+        self.read = nn.Linear(memory_dim, CELL_DIM)
+        # Summary token, mean cell, fovea, attention readout, previous action, speed.
+        self.fusion = nn.Linear(encoder.dim + 3 * CELL_DIM + 64 + 32, memory_dim)
         self.memory = nn.GRUCell(memory_dim, memory_dim)
         self.actor = ActionHead(memory_dim)
         self.value = nn.Linear(memory_dim, 1)
         self.memory_dim = memory_dim
 
-    def forward(self, clip, tiles, previous, hidden=None, reset=None):
+    def cells(self, grid, quadrants):
+        """The (B, GRID, CELL_DIM) map the action head scores."""
+        local = screen_cells(self.details(quadrants))
+        broad = F.interpolate(
+            self.global_cells(grid), (CELLS, CELLS), mode="bilinear", align_corners=False
+        )
+        cells = (local + broad + self.position).flatten(2).transpose(1, 2)
+        return self.cell_norm(cells)
+
+    def forward(self, clip, quadrants, fovea, previous, speed, hidden=None, reset=None):
+        """One decision. `speed` is the game speed, 1 to 5 (0 unknown), per sample.
+
+        Returns the new memory, the value, the summary token (for the auxiliary loss) and
+        the cells (for the action head).
+        """
         if hidden is None:
             hidden = clip.new_zeros(clip.shape[0], self.memory_dim)
         if reset is not None:
             hidden = hidden * (~reset.bool()).to(hidden.dtype)[:, None]
         scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
         prior = self.previous_action((previous / scales).flatten(1).to(clip.dtype))
-        features = self.encoder(clip)
-        merged = torch.cat([features, self.details(tiles), prior], -1)
+        summary, grid = self.encoder(clip)
+        cells = self.cells(grid, quadrants)
+        centre = self.foveal(fovea).mean((-2, -1))
+        attention = torch.einsum("bnc,bc->bn", cells, self.read(hidden).to(cells.dtype))
+        weights = (attention.float() / math.sqrt(CELL_DIM)).softmax(-1).to(cells.dtype)
+        readout = torch.einsum("bn,bnc->bc", weights, cells)
+        merged = torch.cat(
+            [summary, cells.mean(1), centre, readout, prior, self.speed(speed)], -1
+        ).to(clip.dtype)
         hidden = self.memory(F.gelu(self.fusion(merged)), hidden)
-        return hidden, self.value(hidden).squeeze(-1), features
+        return hidden, self.value(hidden).squeeze(-1), summary, cells
 
 
 def configure_precision(tf32: bool = False):
@@ -297,7 +414,7 @@ class PredictiveAuxiliary(nn.Module):
         return prediction_loss + 0.5 * reg
 
 
-def xm_loss(actor, memories, actions, candidates=5):
+def xm_loss(actor, memories, cells, actions, candidates=5):
     """XM-inspired best-of-K conditional BC, not a reproduction of continuous XM.
 
     Select candidate noise without a graph, re-evaluate its exact categorical likelihood.
@@ -307,7 +424,7 @@ def xm_loss(actor, memories, actions, candidates=5):
         candidates, memories.shape[0], actor.noise_dim, device=memories.device, dtype=memories.dtype
     )
     with torch.no_grad():
-        losses = torch.stack([-actor(memories, actions, noise=z)[1] for z in noises])
+        losses = torch.stack([-actor(memories, cells, actions, noise=z)[1] for z in noises])
         best = losses.argmin(0)
     selected = noises[best, torch.arange(memories.shape[0], device=memories.device)]
-    return -actor(memories, actions, noise=selected)[1]
+    return -actor(memories, cells, actions, noise=selected)[1]

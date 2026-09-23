@@ -69,11 +69,23 @@ def main():
     ai.add_argument("--cap-minutes", type=float, default=45)
     ai.add_argument("--peer", help="The second PC's pairing file, to record there too.")
     ai.add_argument("--peer-only", action="store_true", help="Leave this PC free.")
-    prepare = sub.add_parser("prepare")
-    prepare.add_argument("source")
-    prepare.add_argument("output")
+    check = sub.add_parser(
+        "check-session",
+        help="Check that a recording can train, and count its decisions. Training reads "
+        "recordings directly; nothing is prepared.",
+    )
+    check.add_argument("source")
+    check.add_argument("--sources", nargs="+", default=["human", "ai"])
     train = sub.add_parser("train-bc")
-    train.add_argument("data")
+    train.add_argument("data", help="A folder of recordings, each with its own manifest.")
+    train.add_argument(
+        "--sources",
+        nargs="+",
+        choices=["human", "ai"],
+        default=["human"],
+        help="Whose inputs are demonstrations: the player's, and the AI games' scripted "
+        "camera and popup clicks.",
+    )
     train.add_argument("output")
     train.add_argument("--model", default="models/levjepa-large")
     train.add_argument("--variant", choices=["large", "tiny"], default="large")
@@ -263,10 +275,18 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
-    elif command == "prepare":
-        from .dataset import prepare_session
+    elif command == "check-session":
+        from .dataset import sequence_starts, session_labels
 
-        result = prepare_session(args["source"], args["output"])
+        labels = session_labels(args["source"], sources=tuple(args["sources"]))
+        result = {
+            "decisions": len(labels["decisions"]),
+            "excluded": len(labels["excluded"]),
+            "windows": len(sequence_starts(labels["valid"], 8, 2)),
+            "split": labels["manifest"]["split"],
+            "source": labels["label_source"],
+            "game_speed": labels["speed"],
+        }
     elif command == "train-bc":
         from .train import train_bc
 

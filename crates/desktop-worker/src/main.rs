@@ -1301,9 +1301,17 @@ mod platform {
                         } = unsafe { capture(&mut screen, &mut rebuilds, hwnd)? };
                         let (uw, uh) = (w as usize, h as usize);
                         let (cx, cy) = unsafe { client_cursor(hwnd)? };
+                        // The global view, the quadrants and the fovea each have their own
+                        // size (`hoi4_arena.dataset.views`). Detail and fovea default to the
+                        // global size, which is the layout from before they were separate.
                         let view_size = cmd["views"].as_u64().unwrap_or(0) as usize;
-                        if view_size > 1024 {
+                        let detail_size = cmd["detail"].as_u64().map_or(view_size, |v| v as usize);
+                        let fovea_size = cmd["fovea"].as_u64().map_or(view_size, |v| v as usize);
+                        if view_size > 1024 || detail_size > 1024 || fovea_size > 1024 {
                             return Err("view_size_too_large".into());
+                        }
+                        if view_size > 0 && (detail_size == 0 || fovea_size == 0) {
+                            return Err("view_size_zero".into());
                         }
                         let mut regions: Vec<[usize; 4]> = Vec::new();
                         if let Some(list) = cmd["regions"].as_array() {
@@ -1336,15 +1344,16 @@ mod platform {
                         }
                         let mut views_bytes = 0usize;
                         if view_size > 0 {
-                            for b in view_boxes(uw, uh) {
-                                let v = downscale_bgra(&raw, uw, b, view_size);
+                            for (i, b) in view_boxes(uw, uh).into_iter().enumerate() {
+                                let size = if i == 0 { view_size } else { detail_size };
+                                let v = downscale_bgra(&raw, uw, b, size);
                                 views_bytes += v.len();
                                 payload.extend_from_slice(&v);
                             }
                             // Cropped from the same frame as the other views, on either
-                            // backend. prepare_session crops the recorded full frame, so a
+                            // backend. Training crops the recorded full frame, so a
                             // separate, later blit would disagree exactly at the pointer.
-                            let v = cursor_crop_bgra(&raw, uw, uh, cx, cy, view_size);
+                            let v = cursor_crop_bgra(&raw, uw, uh, cx, cy, fovea_size);
                             views_bytes += v.len();
                             payload.extend_from_slice(&v);
                         }
@@ -1372,7 +1381,7 @@ mod platform {
                         seq += 1;
                         let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                         Ok((
-                            serde_json::json!({"seq": seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": start, "t_ns": end, "events": events, "overflow": OVERFLOW.swap(false, Ordering::Relaxed), "stopped": STOP.load(Ordering::SeqCst), "foreground": foreground(), "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": backend}),
+                            serde_json::json!({"seq": seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": start, "t_ns": end, "events": events, "overflow": OVERFLOW.swap(false, Ordering::Relaxed), "stopped": STOP.load(Ordering::SeqCst), "foreground": foreground(), "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "detail_size": detail_size, "fovea_size": fovea_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": backend}),
                             bytes,
                         ))
                     }
