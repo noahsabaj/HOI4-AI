@@ -85,3 +85,10 @@ def test_the_front_is_where_blue_land_meets_red():
     frame[300:700, 1152:1604] = SEA
     assert ai_games.front_points(frame) == []
     assert len(ai_games.land_points(frame)) == 400 * 452
+
+
+def test_each_speed_is_played_as_both_countries_and_the_pcs_are_out_of_step():
+    here = [ai_games.game_plan("here", i, [4, 5]) for i in range(4)]
+    peer = [ai_games.game_plan("peer", i, [4, 5]) for i in range(4)]
+    assert here == [("BLU", 4), ("RED", 4), ("BLU", 5), ("RED", 5)]
+    assert peer == [("RED", 4), ("BLU", 4), ("RED", 5), ("BLU", 5)]
