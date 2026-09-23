@@ -43,7 +43,8 @@ was played to a surrender on 2026-09-22, driven from this PC.
   6 months in the other. The winner took land in the peace deal but did not annex the
   loser, and the game kept running at peace. So a match must end at the surrender, not when a country disappears.
 - Observer mode: the `observe` console command (debug mode) hands both countries to the
-  AI. The console key is outside the worker's allowed keys, so it is sent separately.
+  AI. The worker allows the console key in setup mode only, never in a match, so the
+  recorder can type it on either PC.
 - Useful game constants: `BASE_SURRENDER_LEVEL = 1.0` (`NDiplomacy`) is the surrender
   threshold. `BASE_SURRENDER_LIMIT = 0.8` is an occupation fraction, not the threshold.
 - Game speed in wall-clock seconds per in-game hour: `{2.0, 0.5, 0.2, 0.1, 0.0}` for
@@ -205,23 +206,31 @@ updates by itself, but only between connections, never mid-match. See the README
 
 In order:
 
-1. **Record AI games on both PCs at once.** Needs the console key on the second PC
-   (setup only) so `observe` can be sent there, and a recorder that drives both.
-   `desync` gets calibrated whenever one happens.
-2. **Record AI-vs-AI games** on the arena with `scripts/record_ai_games.py`. They have
+1. **Record AI-vs-AI games in bulk** on the arena with `scripts/record_ai_games.py`,
+   on both PCs at once with `--peer artifacts/pairing/peer.json`. The second PC's games
+   are launched and closed through its worker (`launch.txt`, and `quit` to close) and
+   its frames are recorded here: a full 1080p frame takes about 86 ms over the network,
+   so 5 Hz fits. Both monitors must stay switched on (brightness can be zero): a
+   monitor switched off disconnects on DisplayPort, Windows shrinks the desktop to
+   1024x768, and the capture breaks, which the recorder now reports. On the second PC
+   the Discord overlay is off: after a force-closed game it hung every later launch at
+   startup. Games are now closed politely first, and a hung launch restarts Discord
+   (`-Launch restart-discord`) and retries once. `-Launch report` lists the second
+   PC's windows, busy processes and log ends. `desync` gets calibrated whenever one
+   happens. The AI games have
    no actions, so they can't teach clicks, but they need no human time and are enough
-   for the encoder (step 4), for learning to predict who wins, and as a first opponent.
+   for the encoder (step 3), for learning to predict who wins, and as a first opponent.
    Three recorded at 4K so far (Red, Red, Blue; 7 to 15 minutes each). Every armed game
    so far, five of five, ended inside 1800 s. Recordings are now 1080p x264 (CRF 18,
    4:4:4): about 48 dB against lossless and about a hundredth of the size; the 4K
    lossless games were 7 to 19 GB each.
-3. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
+2. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
    speed actually used. This is the only source of real actions. Recordings need the
    cursor position, which the worker now sends.
-4. **Distil the compact encoder** from the AI games and human recordings. It is the only
+3. **Distil the compact encoder** from the AI games and human recordings. It is the only
    measured way to fit two actors in one tick on one GPU; the other is one GPU per side.
-5. Train the behaviour-cloning baseline, then recurrent PPO self-play with a league.
-6. Run a two-PC match between agents, and check reset and recovery when something goes
+4. Train the behaviour-cloning baseline, then recurrent PPO self-play with a league.
+5. Run a two-PC match between agents, and check reset and recovery when something goes
    wrong. (A two-PC match driven by hand, from this PC, works.)
-7. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
-8. Test the same interface in an unmodified private multiplayer lobby.
+6. Complete 20 unattended matches and 50 side-swapped evaluation pairs.
+7. Test the same interface in an unmodified private multiplayer lobby.

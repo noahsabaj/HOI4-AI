@@ -10,7 +10,8 @@ param(
     # same map with Test-ArenaLoad.ps1 for a two-player match.
     [string[]]$Mod = @(),
     # Ask the second PC's idle Start-Worker to launch HOI4 with this deployed mod, in a
-    # window of -Window's size if given (as Test-ArenaLoad.ps1 -Window).
+    # window of -Window's size if given (as Test-ArenaLoad.ps1 -Window). -Launch quit
+    # closes the second PC's HOI4 instead.
     [string]$Launch,
     [string]$Window
 )
