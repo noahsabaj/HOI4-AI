@@ -211,8 +211,8 @@ def test_screen_cells_tile_the_quadrants_in_screen_order():
 
 
 def test_the_detail_reader_keeps_a_spatial_map_at_stride_sixteen():
-    maps = DetailEncoder()(torch.zeros(2, QUADRANTS, 3, DETAIL_SIZE, DETAIL_SIZE))
-    assert maps.shape == (2, QUADRANTS, CELL_DIM, DETAIL_SIZE // 16, DETAIL_SIZE // 16)
+    maps = DetailEncoder()(torch.zeros(2, QUADRANTS, 3, *DETAIL_SIZE))
+    assert maps.shape == (2, QUADRANTS, CELL_DIM, DETAIL_SIZE[0] // 16, DETAIL_SIZE[1] // 16)
 
 
 class _Encoder(torch.nn.Module):
@@ -246,6 +246,11 @@ def test_the_screen_encoder_reads_the_tiled_quadrants_as_one_screen():
     # Only the last two blocks train.
     trainable = {n.split(".")[1] for n, p in encoder.model.named_parameters() if p.requires_grad}
     assert trainable == {str(len(encoder.model.blocks) - 2), str(len(encoder.model.blocks) - 1)}
+    # 16:9 quadrants tile into a 16:9 screen, read as it is when it is already the size.
+    wide = ScreenEncoder(size=(64, 96), pretrained=False).eval()
+    with torch.no_grad():
+        _, grid = wide(None, torch.randn(1, QUADRANTS, 3, 32, 48))
+    assert grid.shape[-2:] == (4, 6)
     with pytest.raises(FileNotFoundError, match="weights"):
         ScreenEncoder("no/such/folder")
     policy = Policy(encoder, memory_dim=16)
@@ -256,8 +261,8 @@ def test_the_screen_encoder_reads_the_tiled_quadrants_as_one_screen():
 def test_the_policy_reads_every_view_and_the_speed(speed):
     torch.manual_seed(4)
     policy = Policy(_Encoder(), memory_dim=32)
-    clip = torch.randn(2, 3, 8, VIEW_SIZE, VIEW_SIZE)
-    quadrants = torch.randn(2, QUADRANTS, 3, DETAIL_SIZE, DETAIL_SIZE)
+    clip = torch.randn(2, 3, 8, *VIEW_SIZE)
+    quadrants = torch.randn(2, QUADRANTS, 3, *DETAIL_SIZE)
     fovea = torch.randn(2, 3, FOVEA_SIZE, FOVEA_SIZE)
     previous = torch.zeros(2, SLOTS, 3, dtype=torch.long)
     speeds = torch.full((2,), speed)

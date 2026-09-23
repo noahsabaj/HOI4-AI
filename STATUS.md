@@ -175,10 +175,12 @@ every rule below came from a crash dump or the stock files.
 
 The policy was rebuilt so it can read the screen and point at what it sees:
 
-- **Views.** Eight 224 px global views (the video encoder's clip), the four quadrants at
-  448 px instead of 224, and a 224 px native fovea on the pointer. The worker's views of
-  a live 1080p frame matched `dataset.views` byte for byte, and a views-only capture took
-  21.5 ms (p50, this PC).
+- **Views.** Eight global views at 448x256 (the video encoder's clip), the four
+  quadrants at 576x320, and a 224 px native fovea on the pointer. All are 16:9 since
+  2026-09-23; before, the screen was squashed into 224 and 448 px squares, which cost
+  both encoders what they read (see "LeVJEPA, a second look"). The worker takes view
+  sizes as [width, height]. Its views of a live 1080p frame matched `dataset.views` byte
+  for byte at the new sizes too. (A views-only capture took 21.5 ms at the old sizes.)
 - **Reader.** The video encoder's last-frame patch grid is kept, not only its summary
   token. The quadrants go through a convolutional reader that keeps a stride-16 map
   instead of pooling each tile to 2x2. Both are combined into a 32x32 map of the screen.
@@ -191,14 +193,20 @@ The policy was rebuilt so it can read the screen and point at what it sees:
   px would have been about 43 GB per hour. AI games now keep the scripted camera's
   inputs as labels.
 - **Inverse dynamics model** (`train-idm`, `label`): the same reader, shown each clip
-  shifted 0.8 s past the decision, labels the inputs behind video that has none.
+  shifted 0.8 s past the decision, labels the inputs behind video that has none. Its
+  encoder is LeVJEPA reading the last four 448x256 frames (`--variant large`), the best
+  reader of the camera's inputs probed; it runs offline, so its cost does not matter. One
+  epoch on one speed-5 AI game, tested on another: input kind right 93.5% of the time
+  (about 3 s a step at batch 1 with the game running beside it).
 - **The pointer is drawn into every captured frame.** HOI4 uses the Windows cursor,
   which neither capture path includes, so no frame showed the pointer a player sees.
   The worker now draws it (live: the gauntlet pointer, fingertip on the position, views
   still byte-identical to `dataset.views`). `import-video` finds it again in video from
   elsewhere by matching saved pointer images, so that video can be labelled.
 - **The image encoder is now the vision tower of Qwen3.5-0.8B** (`--variant screen`, the
-  default), reading the quadrants as one 896 px screen; see "Choosing the screen encoder".
+  default), reading the quadrants as one 1152x640 screen; see "Choosing the screen
+  encoder". Behaviour cloning on the new views ran: one epoch on one AI game, loss 35 to
+  2.5. The whole-step times below are from before the 16:9 views and were not re-timed.
 
 Measured at batch one in bfloat16 on the 4060 Ti (random weights of the real sizes where
 no trained ones exist yet):

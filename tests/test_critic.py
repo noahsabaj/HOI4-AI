@@ -17,6 +17,7 @@ from hoi4_arena.learning import (
     value_estimate,
 )
 from hoi4_arena.models import Policy
+from hoi4_arena.runner import OBSERVATION
 
 
 def _episode(steps=12):
@@ -130,7 +131,7 @@ def _rollout(root, policy, digest, steps=10):
                 "complete": True,
                 "valid": True,
                 "clip_frames": 8,
-                "observation": 2,
+                "observation": OBSERVATION,
                 "checkpoint_sha256": [digest, "opponent"],
                 "game_speed": 4,
             }

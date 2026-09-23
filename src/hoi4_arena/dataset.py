@@ -29,18 +29,19 @@ from .learning import GAMMA
 # clip_frame_ids. Eight frames then cover 1.6 s.
 CLIP_FRAMES = 8
 PERIOD_NS = int(round(PERIOD * 1e9))
-# Three views of each decision's frame, all area-averaged the same way (see `views`):
+# Three views of each decision's frame, all area-averaged the same way (see `views`).
+# Sizes are (height, width); the screen is 16:9 and so are the resized views, since
+# squashing it into squares cost the encoders what they read (2026-09-23, STATUS.md):
 #
-# - The global view, the whole screen at VIEW_SIZE square, is what the video encoder
-#   reads, eight frames at a time. Its cost sets the tick, so it stays small.
-# - The four quadrants at DETAIL_SIZE. HOI4 is read from text: 10 px text at 1080p. At
-#   224 a quadrant shrank 4.3x across and that text to about 2 px, which nothing can read.
-#   At 448 it is about 4.5 px tall and 2.1x narrower, which a convolutional reader can.
-#   These go through a small CNN, not the encoder, so the extra pixels are cheap.
-# - The fovea, FOVEA_SIZE native pixels centred on the pointer, never resized: whatever
-#   the pointer is over is seen at full resolution.
-VIEW_SIZE = 224
-DETAIL_SIZE = 448
+# - The global view, the whole screen at VIEW_SIZE, is what the video encoder (LeVJEPA)
+#   reads, frames in sequence. At 448x256 with four frames it read camera motion best.
+# - The four quadrants at DETAIL_SIZE, tiled back into a 1152x640 screen for the Qwen3.5
+#   tower and read by a small CNN. HOI4 is read from text, 10 px at 1080p: the tower named
+#   58% of such characters at 1152x640 against 56.5% from the old 896 square, for less time.
+# - The fovea, FOVEA_SIZE native pixels square, centred on the pointer, never resized:
+#   whatever the pointer is over is seen at full resolution.
+VIEW_SIZE = (256, 448)
+DETAIL_SIZE = (320, 576)
 FOVEA_SIZE = 224
 QUADRANTS = 4
 # Wall seconds of one in-game hour: the game's GAME_SPEED_SECONDS, speeds 1 through 5.
@@ -59,8 +60,8 @@ STD = (0.229, 0.224, 0.225)
 class Views(NamedTuple):
     """One frame as the policy sees it. All uint8, channels last."""
 
-    global_view: torch.Tensor  # (VIEW_SIZE, VIEW_SIZE, 3)
-    quadrants: torch.Tensor  # (4, DETAIL_SIZE, DETAIL_SIZE, 3)
+    global_view: torch.Tensor  # (*VIEW_SIZE, 3)
+    quadrants: torch.Tensor  # (4, *DETAIL_SIZE, 3)
     fovea: torch.Tensor  # (FOVEA_SIZE, FOVEA_SIZE, 3)
 
 
@@ -136,8 +137,13 @@ def cursor_crop(rgb, x, y, size):
     return out
 
 
+def hw(size):
+    """A view size as (height, width): an int is a square."""
+    return (size, size) if isinstance(size, int) else tuple(int(v) for v in size)
+
+
 def _area(box, size):
-    scaled = F.interpolate(box.float(), (size, size), mode="area")
+    scaled = F.interpolate(box.float(), hw(size), mode="area")
     return scaled.round().clamp(0, 255).to(torch.uint8)
 
 

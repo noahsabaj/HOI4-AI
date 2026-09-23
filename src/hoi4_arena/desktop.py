@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import DETAIL_SIZE, FOVEA_SIZE, QUADRANTS, Views, parse_cursor
+from .dataset import DETAIL_SIZE, FOVEA_SIZE, QUADRANTS, Views, hw, parse_cursor
 
 log = logging.getLogger(__name__)
 
@@ -201,14 +201,15 @@ class Desktop:
 
         `views` asks the worker for the policy views: the global frame at that size, the
         four quadrants at `detail`, and a native `fovea` square centered on the pointer
-        (see dataset.views). `regions` is a list of [x, y, w, h] crops at native
+        (see dataset.views). View sizes are (height, width), or an int for a square; the
+        worker takes them as [width, height]. `regions` is a list of [x, y, w, h] crops at native
         resolution. Asking for either keeps the full frame off the wire. The full frame
         is returned only when nothing narrower was requested, or `full=True`.
         """
         options = {}
         if views:
-            options["views"] = int(views)
-            options["detail"] = int(detail)
+            options["views"] = list(hw(views))[::-1]
+            options["detail"] = list(hw(detail))[::-1]
             options["fovea"] = int(fovea)
         if regions:
             options["regions"] = [[int(v) for v in r] for r in regions]
@@ -253,15 +254,29 @@ class Desktop:
         seen = None
         if meta.get("views_bytes"):
             sizes = [meta.get(k) for k in ("view_size", "detail_size", "fovea_size")]
-            if not all(isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in sizes):
-                raise DesktopError(
-                    "Worker view payload has no view, detail and fovea sizes. Rebuild and "
-                    "redeploy hoi4-desktop-worker."
+
+            def pair(v):
+                ok = isinstance(v, list) and len(v) == 2
+                return ok and all(
+                    isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in v
                 )
-            s, d, f = sizes
-            if (d, f) != (options["detail"], options["fovea"]):
+
+            f = sizes[2]
+            if not (
+                pair(sizes[0])
+                and pair(sizes[1])
+                and isinstance(f, int)
+                and not isinstance(f, bool)
+                and f > 0
+            ):
+                raise DesktopError(
+                    "Worker view payload has no [width, height] view and detail sizes. "
+                    "Rebuild and redeploy hoi4-desktop-worker."
+                )
+            (sw, sh), (dw, dh) = sizes[0], sizes[1]
+            if ([sw, sh], [dw, dh], f) != (options["views"], options["detail"], options["fovea"]):
                 raise DesktopError("Worker returned views at sizes other than requested")
-            parts = [s * s * 3, QUADRANTS * d * d * 3, f * f * 3]
+            parts = [sh * sw * 3, QUADRANTS * dh * dw * 3, f * f * 3]
             if meta["views_bytes"] != sum(parts):
                 raise DesktopError(
                     "Worker view payload is not the global frame, four quadrants, and "
@@ -271,8 +286,8 @@ class Desktop:
             block = buffer[offset : offset + meta["views_bytes"]]
             ends = np.cumsum(parts)
             seen = Views(
-                block[: ends[0]].reshape(s, s, 3).copy(),
-                block[ends[0] : ends[1]].reshape(QUADRANTS, d, d, 3).copy(),
+                block[: ends[0]].reshape(sh, sw, 3).copy(),
+                block[ends[0] : ends[1]].reshape(QUADRANTS, dh, dw, 3).copy(),
                 block[ends[1] :].reshape(f, f, 3).copy(),
             )
             offset += meta["views_bytes"]

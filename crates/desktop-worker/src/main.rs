@@ -37,27 +37,28 @@ pub enum Event {
 /// 2.9 ms to compress and 8.3 ms to decompress before any transport at all, and the
 /// second machine receives this same protocol over a LAN socket where 33 MB five times
 /// a second is not slower but impossible.
-pub fn downscale_bgra(src: &[u8], width: usize, box_: [usize; 4], size: usize) -> Vec<u8> {
-    let mut out = vec![0u8; size * size * 3];
+pub fn downscale_bgra(src: &[u8], width: usize, box_: [usize; 4], out: [usize; 2]) -> Vec<u8> {
+    let [ow, oh] = out;
+    let mut pixels = vec![0u8; ow * oh * 3];
     let threads = downscale_threads();
-    if threads <= 1 || size < threads {
-        for (oy, row) in out.chunks_exact_mut(size * 3).enumerate() {
-            downscale_row(src, width, box_, size, oy, row);
+    if threads <= 1 || oh < threads {
+        for (oy, row) in pixels.chunks_exact_mut(ow * 3).enumerate() {
+            downscale_row(src, width, box_, out, oy, row);
         }
-        return out;
+        return pixels;
     }
-    let stripe = size.div_ceil(threads);
+    let stripe = oh.div_ceil(threads);
     std::thread::scope(|scope| {
-        for (index, chunk) in out.chunks_mut(stripe * size * 3).enumerate() {
+        for (index, chunk) in pixels.chunks_mut(stripe * ow * 3).enumerate() {
             let base = index * stripe;
             scope.spawn(move || {
-                for (offset, row) in chunk.chunks_exact_mut(size * 3).enumerate() {
-                    downscale_row(src, width, box_, size, base + offset, row);
+                for (offset, row) in chunk.chunks_exact_mut(ow * 3).enumerate() {
+                    downscale_row(src, width, box_, out, base + offset, row);
                 }
             });
         }
     });
-    out
+    pixels
 }
 
 /// How many threads the downscale spreads across.
@@ -82,16 +83,17 @@ fn downscale_row(
     src: &[u8],
     width: usize,
     box_: [usize; 4],
-    size: usize,
+    size: [usize; 2],
     oy: usize,
     out: &mut [u8],
 ) {
     let [top, left, bh, bw] = box_;
-    let y0 = oy * bh / size;
-    let y1 = ((oy + 1) * bh).div_ceil(size);
-    for ox in 0..size {
-        let x0 = ox * bw / size;
-        let x1 = ((ox + 1) * bw).div_ceil(size);
+    let [ow, oh] = size;
+    let y0 = oy * bh / oh;
+    let y1 = ((oy + 1) * bh).div_ceil(oh);
+    for ox in 0..ow {
+        let x0 = ox * bw / ow;
+        let x1 = ((ox + 1) * bw).div_ceil(ow);
         let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
         for y in y0..y1 {
             let start = ((top + y) * width + left + x0) * 4;
@@ -112,6 +114,22 @@ fn downscale_row(
 /// The global frame plus the four spatially ordered quadrants, in the order the policy
 /// expects. Mirrors `hoi4_arena.dataset.quadrants`. The cursor crop is not one of these
 /// boxes: it is a native copy, appended after them by `cursor_crop_bgra`.
+/// A requested view size as [width, height]: a number is a square, an absent or zero
+/// value no view.
+fn view_dims(value: &serde_json::Value) -> Result<Option<[usize; 2]>, String> {
+    if let Some(n) = value.as_u64() {
+        return Ok((n > 0).then_some([n as usize, n as usize]));
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    let pair: Vec<u64> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    match pair[..] {
+        [w, h] => Ok(Some([w as usize, h as usize])),
+        _ => Err("invalid_view_size".into()),
+    }
+}
+
 pub fn view_boxes(width: usize, height: usize) -> [[usize; 4]; 5] {
     let (hh, hw) = (height / 2, width / 2);
     [
@@ -1535,15 +1553,22 @@ mod platform {
                                 None => false,
                             };
                         // The global view, the quadrants and the fovea each have their own
-                        // size (`hoi4_arena.dataset.views`). Detail and fovea default to the
-                        // global size, which is the layout from before they were separate.
-                        let view_size = cmd["views"].as_u64().unwrap_or(0) as usize;
-                        let detail_size = cmd["detail"].as_u64().map_or(view_size, |v| v as usize);
-                        let fovea_size = cmd["fovea"].as_u64().map_or(view_size, |v| v as usize);
-                        if view_size > 1024 || detail_size > 1024 || fovea_size > 1024 {
+                        // size (`hoi4_arena.dataset.views`): [width, height] for the first
+                        // two, or a number for a square, and a square fovea.
+                        let view_size = view_dims(&cmd["views"])?;
+                        let detail_size = view_dims(&cmd["detail"])?.or(view_size);
+                        let fovea_size = cmd["fovea"]
+                            .as_u64()
+                            .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
+                        let dims = [view_size, detail_size].into_iter().flatten();
+                        if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
                             return Err("view_size_too_large".into());
                         }
-                        if view_size > 0 && (detail_size == 0 || fovea_size == 0) {
+                        if view_size.is_some()
+                            && (detail_size.is_none()
+                                || fovea_size == 0
+                                || dims.clone().any(|[w, h]| w == 0 || h == 0))
+                        {
                             return Err("view_size_zero".into());
                         }
                         let mut regions: Vec<[usize; 4]> = Vec::new();
@@ -1565,7 +1590,7 @@ mod platform {
                                 regions.push([y, x, rh, rw]);
                             }
                         }
-                        let want_full = if view_size == 0 && regions.is_empty() {
+                        let want_full = if view_size.is_none() && regions.is_empty() {
                             true
                         } else {
                             cmd["full"].as_bool().unwrap_or(false)
@@ -1576,9 +1601,9 @@ mod platform {
                             payload.extend_from_slice(&raw);
                         }
                         let mut views_bytes = 0usize;
-                        if view_size > 0 {
+                        if let (Some(global), Some(detail)) = (view_size, detail_size) {
                             for (i, b) in view_boxes(uw, uh).into_iter().enumerate() {
-                                let size = if i == 0 { view_size } else { detail_size };
+                                let size = if i == 0 { global } else { detail };
                                 let v = downscale_bgra(&raw, uw, b, size);
                                 views_bytes += v.len();
                                 payload.extend_from_slice(&v);
@@ -1684,11 +1709,11 @@ mod tests {
     /// on, which is why this is pinned rather than eyeballed.
     #[test]
     fn downscale_matches_the_training_resize() {
-        let cases: [(usize, usize, usize, &[u8]); 3] = [
+        let cases: [(usize, usize, [usize; 2], &[u8]); 4] = [
             (
                 12,
                 8,
-                3,
+                [3, 3],
                 &[
                     124, 133, 134, 126, 104, 79, 159, 144, 150, 144, 135, 132, 126, 131, 128, 167,
                     142, 133, 112, 146, 125, 119, 129, 154, 148, 117, 118,
@@ -1697,7 +1722,7 @@ mod tests {
             (
                 7,
                 5,
-                3,
+                [3, 3],
                 &[
                     96, 103, 140, 172, 105, 110, 210, 58, 109, 94, 130, 129, 149, 110, 99, 162,
                     116, 141, 144, 159, 102, 149, 138, 164, 151, 186, 218,
@@ -1706,33 +1731,45 @@ mod tests {
             (
                 16,
                 9,
-                4,
+                [4, 4],
                 &[
                     116, 167, 123, 160, 96, 116, 145, 123, 130, 154, 106, 105, 144, 137, 177, 162,
                     130, 107, 124, 149, 104, 132, 117, 128, 144, 122, 167, 135, 137, 98, 137, 149,
                     142, 125, 122, 109, 135, 121, 158, 121, 137, 112, 164, 142, 117, 131, 142, 133,
                 ],
             ),
+            // 16:9 to [5, 3] (width, height), as in the Python golden list.
+            (
+                16,
+                9,
+                [5, 3],
+                &[
+                    116, 167, 123, 169, 124, 109, 127, 114, 116, 165, 127, 137, 154, 106, 105, 140,
+                    103, 161, 138, 116, 110, 129, 153, 119, 140, 150, 109, 105, 139, 110, 135, 121,
+                    158, 104, 145, 126, 175, 144, 131, 141, 144, 105, 131, 142, 133,
+                ],
+            ),
         ];
         for (w, h, size, expected) in cases {
             let src = lcg(w * h * 4);
             let got = downscale_bgra(&src, w, [0, 0, h, w], size);
-            assert_eq!(got, expected, "{w}x{h} -> {size}x{size}");
+            assert_eq!(got, expected, "{w}x{h} -> {size:?}");
         }
     }
 
     /// Rounding ties must go to even, as torch does. Every channel here averages
     /// exactly x.5, so half-away-from-zero would give 1,3,5 instead of 0,2,4.
     /// The scalar loop the threaded downscale replaced, kept as the thing it must equal.
-    fn downscale_serial(src: &[u8], width: usize, box_: [usize; 4], size: usize) -> Vec<u8> {
+    fn downscale_serial(src: &[u8], width: usize, box_: [usize; 4], size: [usize; 2]) -> Vec<u8> {
         let [top, left, bh, bw] = box_;
-        let mut out = vec![0u8; size * size * 3];
-        for oy in 0..size {
-            let y0 = oy * bh / size;
-            let y1 = ((oy + 1) * bh).div_ceil(size);
-            for ox in 0..size {
-                let x0 = ox * bw / size;
-                let x1 = ((ox + 1) * bw).div_ceil(size);
+        let [ow, oh] = size;
+        let mut out = vec![0u8; ow * oh * 3];
+        for oy in 0..oh {
+            let y0 = oy * bh / oh;
+            let y1 = ((oy + 1) * bh).div_ceil(oh);
+            for ox in 0..ow {
+                let x0 = ox * bw / ow;
+                let x1 = ((ox + 1) * bw).div_ceil(ow);
                 let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
                 for y in y0..y1 {
                     let row = (top + y) * width * 4;
@@ -1744,7 +1781,7 @@ mod tests {
                     }
                 }
                 let n = ((y1 - y0) * (x1 - x0)) as f32;
-                let o = (oy * size + ox) * 3;
+                let o = (oy * ow + ox) * 3;
                 out[o] = (sr as f32 / n).round_ties_even().clamp(0., 255.) as u8;
                 out[o + 1] = (sg as f32 / n).round_ties_even().clamp(0., 255.) as u8;
                 out[o + 2] = (sb as f32 / n).round_ties_even().clamp(0., 255.) as u8;
@@ -1765,12 +1802,21 @@ mod tests {
     fn threaded_downscale_is_byte_identical_to_the_serial_loop() {
         let (w, h) = (96usize, 64usize);
         let src = lcg(w * h * 4);
-        for size in [1usize, 2, 3, 5, 7, 8, 16, 32] {
+        for size in [
+            [1usize, 1],
+            [2, 2],
+            [3, 3],
+            [5, 7],
+            [7, 5],
+            [8, 8],
+            [16, 9],
+            [32, 32],
+        ] {
             for b in view_boxes(w, h) {
                 assert_eq!(
                     downscale_bgra(&src, w, b, size),
                     downscale_serial(&src, w, b, size),
-                    "size {size} box {b:?} differs between the threaded and serial loops"
+                    "size {size:?} box {b:?} differs between the threaded and serial loops"
                 );
             }
         }
@@ -1789,7 +1835,7 @@ mod tests {
     #[test]
     fn downscale_rounds_ties_to_even() {
         let src = [4u8, 2, 0, 0, 5, 3, 1, 0];
-        assert_eq!(downscale_bgra(&src, 2, [0, 0, 1, 2], 1), vec![0, 2, 4]);
+        assert_eq!(downscale_bgra(&src, 2, [0, 0, 1, 2], [1, 1]), vec![0, 2, 4]);
     }
 
     /// The four quadrants must arrive in the order the policy's detail encoder expects:
@@ -1810,13 +1856,13 @@ mod tests {
             }
         }
         let boxes = view_boxes(4, 4);
-        assert_eq!(downscale_bgra(&src, 4, boxes[0], 1), vec![25, 26, 27]);
+        assert_eq!(downscale_bgra(&src, 4, boxes[0], [1, 1]), vec![25, 26, 27]);
         for (n, expected) in [[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42]]
             .iter()
             .enumerate()
         {
             assert_eq!(
-                downscale_bgra(&src, 4, boxes[n + 1], 1),
+                downscale_bgra(&src, 4, boxes[n + 1], [1, 1]),
                 expected.to_vec(),
                 "quadrant {n} is out of order"
             );
@@ -1853,7 +1899,7 @@ mod tests {
         // Center index is size/2 = 2, so cursor (5, 6) opens the box at (3, 4).
         assert_eq!(
             cursor_crop_bgra(&src, w, h, 5, 6, size),
-            downscale_bgra(&src, w, [4, 3, size, size], size)
+            downscale_bgra(&src, w, [4, 3, size, size], [size, size])
         );
     }
 

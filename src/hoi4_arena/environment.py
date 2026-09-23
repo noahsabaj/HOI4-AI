@@ -10,6 +10,7 @@ import numpy as np
 
 from .actions import GRID, PERIOD, SLOTS, VOCAB, decode
 from .arena_log import ArenaLog
+from .dataset import VIEW_SIZE
 from .desktop import DesktopError
 from .vision import (
     BLUE,
@@ -82,7 +83,7 @@ class ArenaEnv(gym.Env):
         seconds=1800,
         recorder=None,
         downscale=True,
-        view_size=224,
+        view_size=VIEW_SIZE,
         country="BLU",
         reward="screen",
     ):

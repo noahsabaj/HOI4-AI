@@ -65,7 +65,10 @@ def train_idm(
     model_path,
     output,
     *,
-    variant="screen",
+    # LeVJEPA reading four 448x256 frames in sequence: it told the camera's inputs apart
+    # best of the encoders probed (STATUS.md, "LeVJEPA, a second look"), and this model
+    # runs offline, where its cost does not matter.
+    variant="large",
     epochs=1,
     batch_size=2,
     sequence=16,

@@ -30,9 +30,14 @@ class VideoEncoder(nn.Module):
     seen the whole clip. Keeping them, and not only the summary token, is what lets the
     pointer head score places on the screen: a single pooled vector had to encode every
     position the policy might click.
+
+    It reads the last `frames` of the clip. Probed on recorded games (2026-09-23), LeVJEPA
+    told the camera's motion apart best from four 448x256 frames in sequence (64.6%, where
+    eight gave 59.1% and the Qwen3.5 tower's four side by side 54.4%), so that is the
+    default, and why the inverse dynamics model uses it.
     """
 
-    def __init__(self, model_path, variant="large", train_last=2):
+    def __init__(self, model_path, variant="large", train_last=2, frames=4):
         super().__init__()
         if variant == "large":
             self.model = load_encoder(model_path)
@@ -49,7 +54,7 @@ class VideoEncoder(nn.Module):
             raise ValueError(variant)
         self.dim = self.model.config.embed_dim
         self.patch = self.model.config.patch_size
-        self.variant = variant
+        self.variant, self.frames = variant, frames
         if variant == "large" and train_last >= 0:
             self.model.requires_grad_(False)
             if train_last:
@@ -60,6 +65,7 @@ class VideoEncoder(nn.Module):
     def forward(self, clip, quadrants=None):
         """`quadrants` is ignored: this encoder reads the global clip."""
         # All input frames are <= current observation time. No token dropping for control.
+        clip = clip[:, :, -self.frames :]
         tokens = self.model(pixel_values=clip).last_hidden_state
         h, w = clip.shape[-2] // self.patch, clip.shape[-1] // self.patch
         # Patches are ordered time-major after the summary token, so the last h*w tokens
@@ -80,15 +86,16 @@ class ScreenEncoder(nn.Module):
     trained with a vision-language model on documents, screenshots and GUIs, which is the
     difference. 37 ms at 896 px on the 4060 Ti in bfloat16, against 63.5 for LeVJEPA.
 
-    It sees one frame, the quadrants tiled back into a `size` square; the policy's memory
-    carries time. Returns the patch grid's mean as the summary, and the grid. Weights are
+    It sees one frame, the quadrants tiled back into a 16:9 screen of `size` (height,
+    width); the policy's memory carries time. Probed again on 2026-09-23 it read 58.0% at
+    1152x640 against 56.5% from the 896 square it had been fed, in 32 ms against 36. Returns the patch grid's mean as the summary, and the grid. Weights are
     timm's `qwen3_vit_88m_enc.qwen3_5_0_8b` (Apache-2.0), kept locally: `model_path` is
     the folder holding its `model.safetensors`, and nothing is fetched at run time.
     """
 
     ARCH = "qwen3_vit_88m_enc"
 
-    def __init__(self, model_path=None, *, size=896, train_last=2, pretrained=True):
+    def __init__(self, model_path=None, *, size=(640, 1152), train_last=2, pretrained=True):
         super().__init__()
         import timm
 
@@ -102,7 +109,8 @@ class ScreenEncoder(nn.Module):
             )
         else:
             self.model = timm.create_model(self.ARCH, pretrained=False)
-        self.dim, self.size, self.variant = self.model.embed_dim, size, "screen"
+        self.dim, self.variant = self.model.embed_dim, "screen"
+        self.size = (size, size) if isinstance(size, int) else tuple(size)
         if train_last >= 0:
             self.model.requires_grad_(False)
             for block in list(self.model.blocks)[len(self.model.blocks) - train_last :]:
@@ -116,8 +124,9 @@ class ScreenEncoder(nn.Module):
         top = torch.cat([quadrants[:, 0], quadrants[:, 1]], -1)
         bottom = torch.cat([quadrants[:, 2], quadrants[:, 3]], -1)
         screen = torch.cat([top, bottom], -2)
-        screen = F.interpolate(screen.float(), (self.size, self.size), mode="area")
-        screen = ((screen * self.std + self.mean) - 0.5) / 0.5
+        if tuple(screen.shape[-2:]) != self.size:
+            screen = F.interpolate(screen.float(), self.size, mode="area")
+        screen = ((screen.float() * self.std + self.mean) - 0.5) / 0.5
         grid = self.model.forward_features(screen.to(self.model.patch_embed.proj.weight.dtype))
         grid = grid.permute(0, 3, 1, 2)  # (B, h, w, C) to (B, C, h, w)
         return grid.mean((-2, -1)), grid
