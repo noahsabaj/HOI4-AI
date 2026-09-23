@@ -744,11 +744,21 @@ def generate(
     # names both sides, so a match ends without reading pixels, and the weekly counts
     # give an exact territory figure. Checked on 2026-09-22: the dynamic variables
     # resolve in log strings, and a state changing hands logs its name.
+    #
+    # A coin flip picks who declares the war. With Blue always declaring, Red won all six
+    # AI games on the 12x8 arena (2026-09-23) on a map that is a true mirror, so the side
+    # that declares is logged, as is each human player's country.
+    declare = "".join(
+        f" 50 = {{ {tag} = {{ declare_war_on = {{ target = {enemy} type = annex_everything }} }}"
+        f' log = "ARENA declare {tag}" }}'
+        for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
+    )
     write(
         "common/on_actions/arena.txt",
         "on_actions = {\n"
-        "\ton_startup = { effect = { BLU = { declare_war_on = { target = RED type = annex_everything } }"
-        ' log = "ARENA start [GetDateText]" } }\n'
+        f"\ton_startup = {{ effect = {{ random_list = {{{declare} }}"
+        ' log = "ARENA start [GetDateText]"'
+        ' every_country = { limit = { is_ai = no } log = "ARENA player [THIS.GetTag]" } } }\n'
         '\ton_weekly = { effect = { log = "ARENA week [GetDateText] [ROOT.GetTag] states'
         " [?num_controlled_states] owned [?num_owned_controlled_states] divisions"
         ' [?num_divisions] surrender [?surrender_progress]" } }\n'

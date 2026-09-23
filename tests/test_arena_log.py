@@ -26,6 +26,8 @@ def test_every_kind_of_mod_line_parses_including_the_padded_hour():
     capitulated = parse("capitulated RED winner BLU 12:00, 2 June, 1936")
     assert (capitulated["loser"], capitulated["winner"]) == ("RED", "BLU")
     assert parse("peace RED BLU 12:00, 3 June, 1936")["other"] == "BLU"
+    assert parse("declare RED") == {"kind": "declare", "tag": "RED"}
+    assert parse("player BLU") == {"kind": "player", "tag": "BLU"}
     # A line from a newer mod is skipped, not an error.
     assert parse("supply BLU 3") is None
 
@@ -115,3 +117,9 @@ def test_an_unknown_reward_source_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="reward"):
         ArenaEnv(Mock(), _rules_with(tmp_path, _MATCH), [], reward="pixels")
+
+
+def test_the_declarer_and_the_players_are_kept():
+    log = ArenaLog(_log(["declare RED", "start  12:00, 1 January, 1936", "player BLU", WEEK]))
+    log.poll()
+    assert (log.declarer, log.players) == ("RED", ["BLU"])

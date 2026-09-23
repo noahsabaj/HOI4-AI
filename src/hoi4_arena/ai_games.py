@@ -284,14 +284,38 @@ def recentre(desk, tries=10):
     return False
 
 
-def start_game(desk, rules, failure_shot):
-    """From the main menu to an AI-vs-AI game running at speed 4."""
+def pick_country(desk, country):
+    """On the country picker, click the middle of `country`'s land. False if none shows."""
+    rgb = screen(desk)
+    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+    masks = dict(zip(("BLU", "RED"), country_pixels(rgb[top:bottom]), strict=True))
+    if masks[country] is None or not masks[country].any():
+        return False
+    ys, xs = np.nonzero(masks[country])
+    # The land pixel nearest the median, so the click is on the land whatever its shape.
+    k = np.argmin((ys - np.median(ys)) ** 2 + (xs - np.median(xs)) ** 2)
+    click(desk, xs[k] / rgb.shape[1], (ys[k] + top) / rgb.shape[0])
+    return True
+
+
+def start_game(desk, rules, failure_shot, country="BLU"):
+    """From the main menu to an AI-vs-AI game running at speed 4, started as `country`.
+
+    Which country the game starts as is varied because only one side ever won while the
+    recorder always started as Blue; the arena logs the country each human started as.
+    """
     click(desk, *SINGLE_PLAYER)
     time.sleep(8)
     click(desk, *NEW_GAME)
     time.sleep(40)
     click(desk, *SELECT_COUNTRY)  # Blue is preselected.
     time.sleep(40)
+    if country != "BLU":
+        # Clicking a country's land on the picker's map selects it.
+        if not pick_country(desk, country):
+            Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
+            raise RuntimeError(f"no {country} land on the country picker")
+        time.sleep(3)
     click(desk, *START)
     time.sleep(20)
     # A new game starts paused. The pause mark is the same on both PCs; the alert row that
@@ -392,7 +416,7 @@ def camera(desk, stop, station, popups, recentre_every=(60, 150)):
             pass
 
 
-def play(desk, root, popups, settings, station):
+def play(desk, root, popups, settings, station, country="BLU"):
     stop = threading.Event()
     inputs = Logged(desk)
     mover = threading.Thread(target=camera, args=(inputs, stop, station, popups), daemon=True)
@@ -441,6 +465,11 @@ def play(desk, root, popups, settings, station):
         rec.manifest.update(
             winner=outcome,
             surrendered=arena.surrendered,
+            # The country the recorder picked, and what the arena logged: who declared the
+            # war and the country the human started as (None on arenas before v2).
+            started_as=country,
+            declarer=arena.declarer,
+            players=arena.players,
             seconds=round(time.monotonic() - start),
             late_ticks=late,
             arena=Path(settings["mod"]).name,
@@ -455,11 +484,14 @@ def play(desk, root, popups, settings, station):
 
 def run_station(station, out_root, rules, templates, settings, end):
     results = []
+    # Alternate the starting country, the two PCs out of step so both are covered at once.
+    countries = ("BLU", "RED") if station.name == "here" else ("RED", "BLU")
     # A game needs about 3 minutes to launch and most end within 10; do not start one
     # that cannot plausibly finish.
     while time.monotonic() + 12 * 60 < end:
         name = time.strftime(f"ai-{station.name}-%Y%m%d-%H%M%S")
-        entry = {"game": name, "station": station.name}
+        country = countries[len(results) % 2]
+        entry = {"game": name, "station": station.name, "started_as": country}
         try:
             station.quit()
             station.launch(settings["mod"])
@@ -467,10 +499,10 @@ def run_station(station, out_root, rules, templates, settings, end):
             with station.connect() as desk:
                 if not focus(desk):
                     raise RuntimeError("could not bring the game window to the front")
-                start_game(desk, rules, out_root / f"{name}-start-failed.png")
-                say(station.name, "recording", name)
+                start_game(desk, rules, out_root / f"{name}-start-failed.png", country)
+                say(station.name, "recording", name, "as", country)
                 outcome, reason, manifest = play(
-                    desk, out_root / name, Popups(templates), settings, station.name
+                    desk, out_root / name, Popups(templates), settings, station.name, country
                 )
         except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
             say(station.name, "start failed:", error)
@@ -484,13 +516,16 @@ def run_station(station, out_root, rules, templates, settings, end):
                 outcome,
                 "after",
                 manifest["seconds"],
-                "s",
+                "s, declared by",
+                manifest["declarer"],
                 reason or "",
             )
             entry.update(
                 winner=outcome,
                 seconds=manifest["seconds"],
                 frames=manifest["frames"],
+                declarer=manifest["declarer"],
+                players=manifest["players"],
                 complete=manifest["complete"],
                 reason=reason,
             )
@@ -509,7 +544,7 @@ def record_ai_games(
     output,
     minutes,
     *,
-    mod="artifacts/mods/arena-12x8-v1",
+    mod="artifacts/mods/arena-12x8-v2",
     rules="artifacts/calibration-1080p/rules.json",
     ok_button=("artifacts/screens-1080p/ok-button.png",),
     hz=5,
