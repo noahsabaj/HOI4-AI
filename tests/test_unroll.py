@@ -339,3 +339,58 @@ def test_behaviour_cloning_trains_from_worker_processes_without_clips(
     assert sum("step" in row for row in rows) == 2  # Four windows, two a batch.
     assert rows[-1]["validation_nll"] > 0
     assert (tmp_path / "out" / "epoch-0000.pt").exists()
+
+
+def test_an_interrupted_run_resumes_to_where_an_uninterrupted_one_ends(tmp_path, monkeypatch):
+    """Saved after every batch, killed after the second, resumed: the same weights, the same log."""
+    import json
+    import shutil
+
+    from test_dataset import _recording
+
+    import hoi4_arena.train as train
+    from hoi4_arena.learning import Progress
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("needs ffmpeg")
+    (tmp_path / "data").mkdir()
+    for name, split in (("game", "train"), ("held-out", "validation")):
+        _recording(tmp_path / "data" / name, [8, 6])
+        manifest = tmp_path / "data" / name / "manifest.json"
+        manifest.write_text(json.dumps({**json.loads(manifest.read_text()), "split": split}))
+    monkeypatch.setattr(train, "build_encoder", lambda path, variant: _Screen())
+    common = {"sequence": 2, "burn_in": 1, "batch_size": 1, "workers": 0, "save_every": 1e-9}
+    train.train_bc(tmp_path / "data", "model", tmp_path / "whole", **common)
+
+    tick = Progress.tick
+
+    def interrupt(self, epoch, step, modules, optimizer):
+        tick(self, epoch, step, modules, optimizer)
+        if step == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Progress, "tick", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        train.train_bc(tmp_path / "data", "model", tmp_path / "cut", **common)
+    assert (tmp_path / "cut" / "progress.pt").exists()
+    with pytest.raises(FileExistsError, match="resume"):
+        train.train_bc(tmp_path / "data", "model", tmp_path / "cut", **common)
+    monkeypatch.setattr(Progress, "tick", tick)
+    train.train_bc(tmp_path / "data", "model", tmp_path / "cut", resume=True, **common)
+
+    whole = torch.load(tmp_path / "whole" / "epoch-0000.pt", weights_only=True)["policy"]
+    resumed = torch.load(tmp_path / "cut" / "epoch-0000.pt", weights_only=True)["policy"]
+    for name, value in whole.items():
+        assert torch.equal(value, resumed[name]), name
+    rows = [json.loads(line) for line in (tmp_path / "cut" / "metrics.jsonl").open()]
+    assert [row["step"] for row in rows if "step" in row] == [0, 1, 2, 3]
+    assert not (tmp_path / "cut" / "progress.pt").exists(), "a finished run leaves no progress"
+    # A resume with other settings is refused rather than quietly continuing another run.
+    monkeypatch.setattr(Progress, "tick", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        train.train_bc(tmp_path / "data", "model", tmp_path / "again", **common)
+    monkeypatch.setattr(Progress, "tick", tick)
+    with pytest.raises(ValueError, match="other settings"):
+        train.train_bc(
+            tmp_path / "data", "model", tmp_path / "again", resume=True, **{**common, "seed": 7}
+        )

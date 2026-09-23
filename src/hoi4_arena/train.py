@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .dataset import VideoSessions, batch_to_device, window_loader
-from .learning import save_checkpoint
+from .learning import Progress, save_checkpoint
 from .models import (
     CHUNK,
     Policy,
@@ -131,6 +131,8 @@ def train_bc(
     idm_weight=1.0,
     workers=2,
     chunk=CHUNK,
+    save_every=600.0,
+    resume=False,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -157,7 +159,7 @@ def train_bc(
         raise ValueError("idm_weight must be in (0, 1]")
     torch.manual_seed(seed)
     output = Path(output)
-    if (output / "epoch-0000.pt").exists():
+    if (output / "epoch-0000.pt").exists() and not resume:
         raise FileExistsError("Checkpoints are immutable")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     encoder = build_encoder(model_path, variant)
@@ -216,14 +218,19 @@ def train_bc(
         "idm_weight": idm_weight,
     }
     output.mkdir(parents=True, exist_ok=True)
+    progress = Progress(output, config, every=save_every, resume=resume)
+    modules = {"policy": policy, "auxiliary": aux}
+    first_epoch, skip = progress.start(modules, optimizer)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
     with (output / "metrics.jsonl").open("a") as log:
-        for epoch in range(epochs):
+        for epoch in range(first_epoch, epochs):
             policy.train()
             aux.train()
             # Workers iterate copies of the dataset, so its epoch is set here, not counted.
             dataset.epoch = epoch
             for step, batch in enumerate(loader):
+                if epoch == first_epoch and step < skip:
+                    continue  # Trained before the run was interrupted.
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
@@ -249,6 +256,7 @@ def train_bc(
                 }
                 log.write(json.dumps(row) + "\n")
                 log.flush()
+                progress.tick(epoch, step + 1, modules, optimizer)
             policy.eval()
             validation_losses = []
             with torch.no_grad():
@@ -282,6 +290,8 @@ def train_bc(
                 optimizer=optimizer,
                 provenance={"dataset": str(Path(data).resolve()), "gameplay_verified": False},
             )
+            progress.save(epoch + 1, 0, modules, optimizer)
+    progress.finish()
     return config
 
 

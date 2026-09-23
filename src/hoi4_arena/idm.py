@@ -25,7 +25,7 @@ from .dataset import (
     session_labels,
     window_loader,
 )
-from .learning import file_hash, save_checkpoint
+from .learning import Progress, file_hash, save_checkpoint
 from .models import CHUNK, InverseDynamics, build_encoder, reads_clip
 
 # How far ahead the model looks, in decision intervals. The clip ends four intervals
@@ -85,6 +85,8 @@ def train_idm(
     context_layers=2,
     workers=2,
     chunk=CHUNK,
+    save_every=600.0,
+    resume=False,
 ):
     """Train the inverse dynamics model on recordings whose inputs are known.
 
@@ -98,7 +100,7 @@ def train_idm(
     """
     torch.manual_seed(seed)
     output = Path(output)
-    if (output / "epoch-0000.pt").exists():
+    if (output / "epoch-0000.pt").exists() and not resume:
         raise FileExistsError("Checkpoints are immutable")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     encoder = build_encoder(model_path, variant)
@@ -131,12 +133,17 @@ def train_idm(
     }
     output.mkdir(parents=True, exist_ok=True)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
+    progress = Progress(output, config, every=save_every, resume=resume)
+    modules = {"model": model}
+    first_epoch, skip = progress.start(modules, optimizer)
     with (output / "metrics.jsonl").open("a") as log:
-        for epoch in range(epochs):
+        for epoch in range(first_epoch, epochs):
             model.train()
             dataset.epoch = epoch  # Workers iterate copies of the dataset.
             loader = window_loader(dataset, batch_size, workers=workers, device=device)
             for step, batch in enumerate(loader):
+                if epoch == first_epoch and step < skip:
+                    continue  # Trained before the run was interrupted.
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
@@ -151,6 +158,7 @@ def train_idm(
                 optimizer.step()
                 log.write(json.dumps({"epoch": epoch, "step": step, "nll": loss.item()}) + "\n")
                 log.flush()
+                progress.tick(epoch, step + 1, modules, optimizer)
             model.eval()
             nll, kinds, errors = [], [], []
             with torch.no_grad():
@@ -183,6 +191,8 @@ def train_idm(
                 optimizer=optimizer,
                 provenance={"dataset": str(Path(data).resolve()), "gameplay_verified": False},
             )
+            progress.save(epoch + 1, 0, modules, optimizer)
+    progress.finish()
     return config
 
 
