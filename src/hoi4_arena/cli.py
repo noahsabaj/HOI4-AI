@@ -142,6 +142,38 @@ def main():
         "batch of 2 no longer fits 8 GB.",
     )
     idm.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["human", "ai"])
+    cache = sub.add_parser(
+        "cache-features",
+        help="Cache what a behaviour-cloned policy's frozen perception reads at every "
+        "decision, so its memory can train on long windows",
+    )
+    cache.add_argument("data")
+    cache.add_argument("checkpoint")
+    cache.add_argument("output")
+    cache.add_argument("--model")
+    cache.add_argument("--sources", nargs="+", choices=["human", "ai"], default=["ai"])
+    memory = sub.add_parser(
+        "train-memory",
+        help="Train the memory and action head on cached features, and score it on "
+        "held-out games (imitation loss, probes of what the memory holds)",
+    )
+    memory.add_argument("cache")
+    memory.add_argument("output")
+    memory.add_argument("--memory", choices=["gru", "gdn2", "mamba3", "none"], default="gru")
+    memory.add_argument("--window", type=int, default=256)
+    memory.add_argument(
+        "--no-carry",
+        dest="carry",
+        action="store_false",
+        help="Start each window from an empty memory after --burn-in steps, as train-bc "
+        "does, instead of running through whole games",
+    )
+    memory.add_argument("--burn-in", type=int, default=0)
+    memory.add_argument("--decisions", type=int, default=1024, help="Decisions per update")
+    memory.add_argument("--epochs", type=int, default=4)
+    memory.add_argument("--lr", type=float, default=1e-4)
+    memory.add_argument("--seed", type=int, default=0)
+    memory.add_argument("--probe-games", type=int)
     pointer = sub.add_parser(
         "pointer",
         help="Save the pointer image Windows is showing in the game, to find it in video",
@@ -420,6 +452,20 @@ def _dispatch(command, args):
 
         args["sources"] = tuple(args["sources"])
         result = train_idm(args.pop("data"), args.pop("model"), args.pop("output"), **args)
+    elif command == "cache-features":
+        from .features import cache_features
+
+        result = cache_features(
+            args["data"],
+            args["checkpoint"],
+            args["output"],
+            model_path=args["model"],
+            sources=tuple(args["sources"]),
+        )
+    elif command == "train-memory":
+        from .features import train_memory
+
+        result = train_memory(args.pop("cache"), args.pop("output"), **args)
     elif command == "pointer":
         from .desktop import Desktop
         from .remote import RemoteDesktop

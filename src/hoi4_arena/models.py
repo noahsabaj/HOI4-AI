@@ -374,18 +374,35 @@ class Policy(nn.Module):
         `hidden` only steers the attention readout. Returns the fused vector, the summary
         token and the cells.
         """
-        scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
-        prior = self.previous_action((previous / scales).flatten(1).to(clip.dtype))
+        summary, cells, centre = self.perceive(clip, quadrants, fovea)
+        merged = fuse(self, summary, cells, centre, previous, speed, hidden, clip.dtype)
+        return merged, summary, cells
+
+    def perceive(self, clip, quadrants, fovea):
+        """What the screen shows, before any memory: the summary, the cells, the fovea."""
         summary, grid = self.encoder(clip, quadrants)
-        cells = self.cells(grid, quadrants)
-        centre = self.foveal(fovea).mean((-2, -1))
-        attention = torch.einsum("bnc,bc->bn", cells, self.read(hidden).to(cells.dtype))
-        weights = (attention.float() / math.sqrt(CELL_DIM)).softmax(-1).to(cells.dtype)
-        readout = torch.einsum("bn,bnc->bc", weights, cells)
-        merged = torch.cat(
-            [summary, cells.mean(1), centre, readout, prior, self.speed(speed)], -1
-        ).to(clip.dtype)
-        return F.gelu(self.fusion(merged)), summary, cells
+        return summary, self.cells(grid, quadrants), self.foveal(fovea).mean((-2, -1))
+
+
+def fuse(module, summary, cells, centre, previous, speed, hidden, dtype=None):
+    """One decision's inputs as one vector for the memory.
+
+    The screen through its summary, its mean cell and the fovea, one place the memory
+    chooses to read (attention over the cells, steered by `hidden`), the previous action
+    and the game speed. `module` holds the layers: a Policy, or features.MemoryHead,
+    which trains the same layers on cached perception. `dtype` is what the parts are
+    joined in, the clip's for a Policy, as it always was.
+    """
+    dtype = dtype or summary.dtype
+    scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
+    prior = module.previous_action((previous / scales).flatten(1).to(dtype))
+    attention = torch.einsum("bnc,bc->bn", cells, module.read(hidden).to(cells.dtype))
+    weights = (attention.float() / math.sqrt(CELL_DIM)).softmax(-1).to(cells.dtype)
+    readout = torch.einsum("bn,bnc->bc", weights, cells)
+    merged = torch.cat(
+        [summary, cells.mean(1), centre, readout, prior, module.speed(speed)], -1
+    ).to(dtype)
+    return F.gelu(module.fusion(merged))
 
 
 class InverseDynamics(nn.Module):
