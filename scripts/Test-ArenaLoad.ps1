@@ -1,6 +1,7 @@
 # -Window 1920x1080 runs the game in a window of that client size instead of the player's
 # own display mode, which is put back once the game has read it, like the mod list.
-param([string]$Mod='artifacts\mods\infantry-arena-v5', [string]$Game, [string]$Window)
+# -Save <name> loads that save game at startup, skipping the main menu (-start_save).
+param([string]$Mod='artifacts\mods\infantry-arena-v5', [string]$Game, [string]$Window, [string]$Save)
 $ErrorActionPreference='Stop'
 if (Get-Process hoi4 -ErrorAction SilentlyContinue) { throw 'Close the disposable test game first.' }
 # Steam records where it installed the game (app 394360); the second PC's library may
@@ -70,7 +71,12 @@ try {
     # This marks only the launched process DPI aware; the player's own launches keep
     # Windows' default.
     if ($Window) { $env:__COMPAT_LAYER = 'HighDpiAware' }
-    $gameProcess=Start-Process -FilePath (Join-Path $game 'hoi4.exe') -WorkingDirectory $game -ArgumentList '-debug_mode','-gdpr-compliant' -WindowStyle Normal -PassThru
+    $arguments=@('-debug_mode','-gdpr-compliant')
+    if ($Save) {
+        if ($Save -cnotmatch '^[A-Za-z0-9_]{1,64}$') { throw "'$Save' is not a save name (letters, digits and _)" }
+        $arguments += "-start_save=$Save"
+    }
+    $gameProcess=Start-Process -FilePath (Join-Path $game 'hoi4.exe') -WorkingDirectory $game -ArgumentList $arguments -WindowStyle Normal -PassThru
     Write-Output "Arena load test PID $($gameProcess.Id)"
     # Mod selection is read during startup. Wait until the log shows the game got that
     # far, up to 90s, instead of restoring the user's file on a fixed 20s guess.

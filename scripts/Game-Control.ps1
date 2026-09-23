@@ -4,17 +4,20 @@
 # already checked; it can be run by hand too. The result goes to stdout, and the exit code
 # is nonzero when the request was refused or failed.
 #
-# -Action launch -Mod <folder> [-Window 1920x1080] [-Mods <dir>]
+# -Action launch -Mod <folder> [-Window 1920x1080] [-Save <name>] [-Mods <dir>]
 #   Start HOI4 with the arena mod in that folder of -Mods (default: mods beside this
 #   script), through Test-ArenaLoad.ps1. -Mod names a folder, never a path. A game that is
-#   already running is left alone.
+#   already running is left alone. -Save loads that save game straight away, skipping the
+#   main menu (the game's -start_save): a name in the save games folder, without .hoi4.
 # -Action quit              Close HOI4, politely first.
 # -Action report            Its processes, windows and log ends.
+# -Action saves             The save games there, newest first.
 # -Action restart-discord   Restart Discord, whose overlay can hang the game's startup.
 param(
-    [Parameter(Mandatory)][ValidateSet('launch', 'quit', 'report', 'restart-discord')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('launch', 'quit', 'report', 'saves', 'restart-discord')][string]$Action,
     [string]$Mod,
     [string]$Window,
+    [string]$Save,
     [string]$Mods = (Join-Path $PSScriptRoot 'mods')
 )
 $ErrorActionPreference = 'Stop'
@@ -43,6 +46,17 @@ if ($Action -eq 'restart-discord') {
     Start-Sleep 3
     if (Test-Path -LiteralPath $update) { Start-Process $update -ArgumentList '--processStart', 'Discord.exe' }
     Write-Output "restart-discord: $(if (Test-Path -LiteralPath $update) { 'restarted' } else { 'Discord not found' })"
+    exit 0
+}
+
+$saveGames = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Paradox Interactive\Hearts of Iron IV\save games'
+
+if ($Action -eq 'saves') {
+    # Which mid-game starts exist, to pick one for -Save: name, size and when it was written.
+    if (-not (Test-Path -LiteralPath $saveGames)) { Write-Output 'saves: none'; exit 0 }
+    Get-ChildItem -LiteralPath $saveGames -Filter '*.hoi4' | Sort-Object LastWriteTime -Descending |
+        Format-Table @{ n = 'name'; e = { $_.BaseName } }, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }, LastWriteTime -AutoSize |
+        Out-String -Width 200
     exit 0
 }
 
@@ -117,11 +131,21 @@ if ($Window -and $Window -notmatch '^\d{3,4}x\d{3,4}$') {
     Write-Output "refused: '$Window' is not a window size like 1920x1080"
     exit 1
 }
+# The game's -start_save takes a bare name: no spaces, no hyphens, no path.
+if ($Save -and $Save -cnotmatch '^[A-Za-z0-9_]{1,64}$') {
+    Write-Output "refused: '$Save' is not a save name (letters, digits and _)"
+    exit 1
+}
+if ($Save -and -not (Test-Path -LiteralPath (Join-Path $saveGames "$Save.hoi4"))) {
+    Write-Output "refused: no save game named '$Save'"
+    exit 1
+}
 if (Get-Process hoi4 -ErrorAction SilentlyContinue) {
     Write-Output 'refused: HOI4 is already running'
     exit 1
 }
 $launch = @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'Test-ArenaLoad.ps1'), '-Mod', $path)
 if ($Window) { $launch += @('-Window', $Window) }
+if ($Save) { $launch += @('-Save', $Save) }
 & (Get-Process -Id $PID).Path @launch
 exit $LASTEXITCODE

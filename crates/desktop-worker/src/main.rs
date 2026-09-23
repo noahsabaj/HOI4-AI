@@ -346,6 +346,7 @@ fn control_action(op: &str) -> Option<&'static str> {
         "launch" => Some("launch"),
         "quit" => Some("quit"),
         "report" => Some("report"),
+        "saves" => Some("saves"),
         "restart_discord" => Some("restart-discord"),
         "job" => Some("job"),
         _ => None,
@@ -447,6 +448,12 @@ fn valid_mod_name(name: &str) -> bool {
         && !name.bytes().all(|b| b == b'.')
 }
 
+/// A save game's name, as Game-Control's `^[A-Za-z0-9_]{1,64}$`: the game's -start_save
+/// takes no spaces or hyphens, and a name is never a path.
+fn valid_save_name(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// A window size like 1920x1080, as Game-Control's `^\d{3,4}x\d{3,4}$`.
 fn valid_window(window: &str) -> bool {
     let digits = |s: &str| (3..=4).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
@@ -484,6 +491,13 @@ fn control_arguments(
                 args.extend(["-Window".into(), window.clone()]);
             }
             _ => return Err("invalid_window".into()),
+        }
+        match &cmd["save"] {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(save) if valid_save_name(save) => {
+                args.extend(["-Save".into(), save.clone()]);
+            }
+            _ => return Err("invalid_save_name".into()),
         }
     }
     Ok(args)
@@ -2182,6 +2196,23 @@ mod tests {
             control_arguments("restart-discord", &noisy, mods).unwrap_err(),
             "unknown_operation"
         );
+    }
+    #[test]
+    fn a_launch_may_load_a_save_by_name_only() {
+        let mods = Path::new("D:\\worker\\mods");
+        let launch = serde_json::json!({"mod": "arena-12x8-v2", "save": "front_1937_03"});
+        let args = control_arguments("launch", &launch, mods).unwrap();
+        assert_eq!(args[args.len() - 2..], ["-Save", "front_1937_03"]);
+        for save in ["", "a b", "a-b", "../x", "x.hoi4", "C:x", "a;calc"] {
+            let cmd = serde_json::json!({"mod": "arena-12x8-v2", "save": save});
+            assert_eq!(
+                control_arguments("launch", &cmd, mods).unwrap_err(),
+                "invalid_save_name",
+                "{save:?}"
+            );
+        }
+        let saves = control_arguments("saves", &serde_json::json!({"save": "../x"}), mods);
+        assert_eq!(saves.unwrap(), ["-Action", "saves"]);
     }
     #[test]
     fn job_arguments_pass_only_checked_values() {

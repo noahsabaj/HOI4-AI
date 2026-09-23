@@ -2101,6 +2101,7 @@ for line in sys.stdin:
         reply = {"armed": False}
     elif op == "launch":
         output = f"Arena load test PID 1 {cmd['mod']} {cmd['window']} {sys.argv[1:]}"
+        output += f" save={cmd.get('save')}"
         reply = {"output": output, "exit": 0}
     elif op == "quit":
         reply = {"output": "refused: something", "exit": 1}
@@ -2129,6 +2130,9 @@ def test_control_operations_need_no_game_and_raise_on_a_nonzero_exit(tmp_path):
         assert "small-arena-v1 1920x1080" in launched
         assert "'--mods', 'D:/mods'" in launched, "worker_args reach the worker"
         assert desktop.launch("a", window=None).startswith("Arena load test PID 1 a None")
+        assert "save=None" in launched
+        assert desktop.launch("a", save="front_1937").endswith("save=front_1937")
+        assert desktop.saves() == "saves"
         assert desktop.report() == "report"
         assert desktop.restart_discord() == "restart_discord"
         with pytest.raises(DesktopError, match="quit exited 1: refused: something"):
