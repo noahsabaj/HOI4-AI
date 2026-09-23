@@ -54,7 +54,15 @@ For a two-player match, `Deploy-Peer.ps1 -Mod artifacts\mods\<arena>` copies the
 .venv\Scripts\hoi4-arena.exe capture artifacts/peer.png --peer artifacts/pairing/peer.json
 ```
 
-The connection uses a pinned TLS certificate, a random token and the coordinator's source IP. It exposes worker operations, not a remote shell. Both addresses and the port are supplied to `bundle-peer` and stored in the generated config, which is ignored by Git; a DHCP change means regenerating it. No firewall rules are changed automatically. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed. Full screenshot round-trip p95 was 411 ms over 20 menu captures; the transport still needs optimization before the 5 Hz runtime gate.
+The second PC's GPU can train too. `Deploy-Peer.ps1 -Compute` copies the package, its lock file, the study scripts, uv and ffmpeg into the share's `compute` folder (`-Data <folder>` mirrors data such as a feature cache to the same path there). `hoi4-arena job` then runs compute there through the worker's `job` operation and `Run-Job.ps1`. It can build the Python environment (`--kind setup`), run one of a fixed list of `hoi4-arena` training commands (`--kind run`), or run a study script (`--kind script`); `job stop` and `job status` (jobs, GPU, free disk) complete it. Jobs run hidden and detached, with their output in the share's `jobs` folder. Arguments may be flags, values or paths inside `compute`, nothing else, and the worker and the script both check them.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe job start --peer artifacts/pairing/peer.json --id setup-1 --kind setup
+.venv\Scripts\hoi4-arena.exe job start --peer artifacts/pairing/peer.json --id study --kind script -- memory_study.py artifacts/features artifacts/memory-study --seeds 3 4
+.venv\Scripts\hoi4-arena.exe job status --peer artifacts/pairing/peer.json
+```
+
+The connection uses a pinned TLS certificate, a random token and the coordinator's source IP. It exposes worker operations, not a remote shell: the compute jobs, approved on 2026-09-23 so the second GPU can work, start only the fixed commands above. Both addresses and the port are supplied to `bundle-peer` and stored in the generated config, which is ignored by Git; a DHCP change means regenerating it. No firewall rules are changed automatically. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed. Full screenshot round-trip p95 was 411 ms over 20 menu captures; the transport still needs optimization before the 5 Hz runtime gate.
 
 ## Demonstrations and learning
 
