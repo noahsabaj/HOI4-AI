@@ -1109,6 +1109,37 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   scripted player's steps it made (`milestones` in its result): the alert, the create
   button, the commander, the law slot, confirmations, the bin, the army card, the plan's
   arrow, fronts (Z then a click) and offensives (X then a right-click).
+- **More training and more games.** Two more epochs of the weighted run brought the
+  pressing decisions' held-out loss to 6.09 and 5.97 (the whole loss to 3.73 and 3.69),
+  the next-order read-out to 0.48, and the true-state read-out to a positive R2 for the
+  enemy's numbers (0.43) and the date (0.54). One epoch on 23 games instead of 13 (the
+  newer ones start from saves, as the live games do) brought them to 5.73 and 3.46.
+- **Live games so far: 0 wins in 6** (95% interval 0.00-0.39), each lasting longer than a
+  player that does nothing (152 s):
+
+| Policy | Side | Lost after | Setup and orders it made | Act time p50 / p95 | Late ticks |
+|---|---|---|---|---|---|
+| Dead memory (bc1c, 1 epoch) | Blue | 203 s | none (Q 4) | 166 / 565 ms | 423 |
+| Dead memory (bc1c, 1 epoch) | Red | 219 s | one front (Q 7) | 158 / 169 ms | 7 |
+| Weighted, fixed memory (bc3c, 5 epochs) | Blue | 206 s | 3 dialog OKs, one offensive (Q 16) | 69 / 99 ms | 49 |
+| Weighted, fixed memory (bc3c, 5 epochs) | Red | 227 s | **raised conscription**: Q, the law slot, Limited, OK (Q 17) | 66 / 99 ms | 7 |
+| Same, 23 games (bc4c, 1 more epoch) | Blue | 225 s | commander-list presses 3, law slot 1, one front, one offensive | 71 / 84 ms | 14 |
+| Same, 23 games (bc4c, 1 more epoch) | Red | 221 s | create-army button 2 (Q 17) | 76 / 84 ms | 7 |
+
+  No game clicked the unassigned-divisions alert, so no army formed and no plan was
+  executed; the harness started every game at its 90 s limit. The conscription change is
+  certain: in the recording the "Replace Volunteer Only with Limited Conscription for 150"
+  dialog shows, the pointer is on its OK, political power falls from 241 to 133 over the
+  next 16 days, and the law slot's tooltip then reads Limited Conscription. It is the
+  first of the scripted player's procedures a learned policy has carried out live. The
+  first two games ran with training on the same card (act time 158-166 ms); since then
+  training pauses during live games (`pause` file).
+- **Why the setup fails.** At the scripted player's setup clicks the policy's press
+  probability is 0.02-0.12 a decision (10-60 times the base rate), but its pointer puts
+  about 60% of its mass on the cell at the screen's centre: the scripted player moves the
+  pointer to the centre before each screen search (forming the army, clearing orders,
+  activating), so the centre is a frequent real target. Moves to the create button and the
+  commander portrait miss by 500-1000 px; clicks on the front miss by about 60 px.
 
 ## The memory study (2026-09-24)
 
@@ -1178,6 +1209,15 @@ In order. Since 2026-09-23 the scripted player comes first: it gives a win rate 
 and games whose inputs decide the outcome, so learning from outcomes no longer waits on
 hand-recorded play.
 
+0. **Teach the learned policy the setup**, the step that now stops it: without the army
+   there is no front, plan or offensive. In order: drop the scripted player's pointer
+   parking at the screen's centre from the labels (a move to (0.5, 0.5) that no press
+   follows is the script reading the screen, not play), so the pointer stops favouring
+   the centre; weigh the first 30 s of each game (the setup) more; train longer on all
+   the main-arena games, which now start from saves and so show the same setup screens as
+   the live games; then correct the policy where it goes wrong live (DAgger), with the
+   scripted player's screen checks labelling the states the policy reaches. Keep playing
+   2 live games per checkpoint and count the milestones (`milestones`) before the wins.
 1. **Scripted games in bulk, and their win rate against the AI**, both sides, both PCs,
    unattended (`record-ai --player scripted --mod artifacts/mods/arena-12x8-v3`, then
    `win-rate`). Keep improving the script where it is weak: it is also the first
