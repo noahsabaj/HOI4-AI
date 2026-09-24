@@ -49,13 +49,23 @@ Calibrated live at 1920x1080 on 2026-09-23:
 - An offensive line spreads the front's divisions along it. One drawn across the whole
   front, parallel to it, moves the front forward as one ("broad"); one drawn from the
   front toward a single state draws the divisions toward that state.
+- U opens Recruit & Deploy. Train on the army's template adds a deployment line that
+  trains division after division ("∞") while manpower and equipment last; its "No
+  location set" asks for a state, picked on the map, where the player's own land shows
+  green; Add Unit adds a slot to the line. Trained divisions deploy there unassigned,
+  and the top bar's alert shows again: shift+click on it selects them, and a
+  right-click on the army's card adds them to the army (8/24 became 16/24 in the
+  calibration game). Winning games left up to 148k manpower unused while the AI never
+  had more than 8 divisions.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -80,6 +90,10 @@ FOUND = {
     "law_list": 0.8,
     # The plan's arrow with a green check (ready, not executing): 1.00 where it showed.
     "ready": 0.8,
+    # Recruit & Deploy's title: 1.00 open, at most 0.33 closed. A deployment line's red
+    # "No location set": 0.96-1.00 shown, 0.73 on every other screen.
+    "recruit_title": 0.8,
+    "no_location": 0.9,
 }
 # The create-army + glows while divisions are selected, so no fixed picture of it holds:
 # the first live game's frames scored 0.17 against a template taken a minute earlier.
@@ -101,6 +115,19 @@ LAW_ROWS = {law: (703, 322 + 74 * i) for i, law in enumerate(LAWS[1:])}
 CONSCRIPTION = {"limited": 0.1, "extensive": 0.2, "service": 0.3, "all_adults": 0.4}
 # Tries at one law step before giving up on it (every 10 s).
 LAW_TRIES = 30
+# Recruit & Deploy at 1080p (U): the first template's Train button, and on the line it
+# adds, the location button, Add Unit and the line's delete button. The panels cover the
+# screen's left PANELS_RIGHT pixels, so the deployment state is picked to their right.
+RECRUIT = 0x55
+TRAIN, DEPLOY_AT, ADD_UNIT, DROP_LINE = (742, 276), (220, 433), (386, 433), (480, 435)
+PANELS_RIGHT = 910
+# Training slots a game opens for new divisions; 0 recruits none, to measure the rest.
+RECRUITS = {0: 0.25, 2: 0.35, 4: 0.4}
+# Seconds after the conscription goal before recruiting, about 150 days at speed 5. Slots
+# opened at the start took every man the divisions needed to fill up from 31%: in the
+# first game with them, as Blue, the army's deployed manpower fell from 14.7k to 5.5k, no
+# new division ever finished, and Blue surrendered in December 1936.
+RECRUIT_AFTER = 60
 # The army panel's commander portrait, and the first commander in the list it opens.
 COMMANDER_SLOT, FIRST_COMMANDER = (30, 140), (950, 352)
 # How far a broad offensive goes: this share of the way from the front to the enemy's
@@ -115,6 +142,10 @@ CLEAN = 5
 # button above it (x0, y0, x1, y1 in 1080p pixels), which shows while the army has a plan.
 ARMY_CARD = (947 / 1920, 1010 / 1080)
 STOP_BUTTON = (924, 953, 938, 961)
+# The execute arrow beside it (x0, y0, x1, y1), dark while the plan is idle or ready and
+# lit while it executes: its green averaged 54-65 in the first two looks and 90-105 lit
+# (2026-09-24). The dots or the check before it come and go while executing too.
+ARROW, LIT_GREEN = (962, 951, 996, 965), 78
 # The army bar, where the create-army + shows: the bottom tenth of the screen.
 ARMY_BAR_TOP = 0.88
 # The arena's land grid: 24 province columns (12 a side) by 8 rows, and states of 3 by 4
@@ -122,12 +153,45 @@ ARMY_BAR_TOP = 0.88
 COLUMNS, ROWS, STATE_WIDTH, STATE_HEIGHT, STATE_ROWS = 24, 8, 3, 4, 2
 ENEMY = {"BLU": "RED", "RED": "BLU"}
 # Arrows toward one state lost the front's flanks or its rear in every game with them
-# (2026-09-23), so most games attack broad.
-ATTACKS = {"broad": 0.7, "near": 0.15, "deep": 0.15}
+# (2026-09-23), so most games attack broad. A "front" attack draws no offensive line: the
+# front line itself is executed, and pushes along the whole border.
+ATTACKS = {"broad": 0.55, "front": 0.15, "near": 0.15, "deep": 0.15}
+# The attacks that draw an offensive line.
+OFFENSIVES = ("broad", "near", "deep")
+# The share of games for each kind of plan: the best found so far (best_plan), the best
+# with one change under test (CHALLENGER), and the rest with every choice drawn at random,
+# so the recordings still show varied plans, good and bad.
+SHARES = {"best": 0.4, "challenger": 0.3, "explore": 0.3}
+# The change under test. Broad offensives pulled the middle of the front forward while
+# the AI kept pockets and a salient in the script's own land (2026-09-23), and one won
+# game swung back from the AI's 96% surrender to 24%: a front line executed alone pushes
+# along the whole border and follows it as it moves.
+CHALLENGER = {"variant": "front", "attack": "front"}
 
 
-def choose_plan(rng):
-    """One game's strategy, drawn at random.
+def best_plan(rng):
+    """The best plan found so far: hold the line, then broad offensives.
+
+    Since the fixes of 2026-09-23, every game that held for 90 s or more before
+    attacking won (6 of 6, holds of 113 to 227 s), and three of the four that attacked
+    within 60 s lost. While the front holds, the AI loses 3 to 6 men for each of the
+    script's attacking it, and the script's divisions fill up from the manpower that All
+    Adults Serve brings, to about 48k against the AI's 14-18k.
+    """
+    return {
+        "best": True,
+        "variant": "best",
+        "conscription": "all_adults",
+        "attack": "broad",
+        "recruit": 0,
+        "wait": round(rng.uniform(120, 240)),
+        "redraw": round(rng.uniform(30, 90)),
+    }
+
+
+def choose_plan(rng, shares=None):
+    """One game's strategy: the best plan (best_plan), the best plan with the change under
+    test (CHALLENGER), or every choice drawn at random, in the given `shares` (SHARES).
 
     `attack` is where the offensive goes: "broad", the whole front forward by a third of
     the enemy's land; "near", toward one of the enemy's border states; or "deep", toward
@@ -136,11 +200,21 @@ def choose_plan(rng):
     divisions fill up, while the enemy may strike first. `redraw` is how often the plan
     is drawn afresh: every order deleted, then a new front and offensive.
     """
+    shares = shares or SHARES
+    kind = rng.choices(list(shares), weights=list(shares.values()))[0]
+    if kind == "best":
+        return best_plan(rng)
+    if kind == "challenger":
+        return {**best_plan(rng), "best": False, **CHALLENGER}
     attack = rng.choices(list(ATTACKS), weights=list(ATTACKS.values()))[0]
     return {
+        "best": False,
+        "variant": "explore",
         # How far up the conscription laws to go as political power allows.
         "conscription": rng.choices(list(CONSCRIPTION), weights=list(CONSCRIPTION.values()))[0],
         "attack": attack,
+        # Slots training new divisions with the manpower the laws bring.
+        "recruit": rng.choices(list(RECRUITS), weights=list(RECRUITS.values()))[0],
         # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5. Most games
         # hold far longer: the first win held 142 s while the AI lost 29k men against the
         # line to its 10k and the script's divisions filled up, and the next broad game,
@@ -152,13 +226,39 @@ def choose_plan(rng):
     }
 
 
-def state_at(u, v):
+def arena_layout(mod):
+    """Which state lies where in a generated arena, as a grid over its land box, or None.
+
+    mapgen samples it into generation.json (since the terrain arenas), so a border that
+    bends round a bulge, or a bay, is read off the arena itself rather than the grid.
+    """
+    try:
+        found = json.loads((Path(mod) / "generation.json").read_text()).get("layout")
+    except (OSError, ValueError):
+        return None
+    if not found:
+        return None
+    return np.array([[int(s) for s in row.split()] for row in found["states"]])
+
+
+def state_at(u, v, layout=None):
     """The arena state under a point at (u, v), fractions of the arena's land box.
 
-    The box is both countries' land fully zoomed out, Blue's on the left. Red's half is
-    Blue's turned half a turn, so its columns count from the east and its rows from the
-    bottom. Provinces are hexagons, so a point near a state's edge can be off by one.
+    The box is both countries' land fully zoomed out, Blue's on the left. With the
+    arena's `layout` (arena_layout) the state is looked up there, and a point over water
+    takes the nearest land's. Without one, Red's half is Blue's turned half a turn, so its
+    columns count from the east and its rows from the bottom. Provinces are irregular, so
+    a point near a state's edge can be off by one.
     """
+    if layout is not None:
+        rows, columns = layout.shape
+        row = min(rows - 1, max(0, int(v * rows)))
+        column = min(columns - 1, max(0, int(u * columns)))
+        if layout[row, column]:
+            return int(layout[row, column])
+        ys, xs = np.nonzero(layout)
+        nearest = np.argmin((ys - row) ** 2 + (xs - column) ** 2)
+        return int(layout[ys[nearest], xs[nearest]])
     column = min(COLUMNS - 1, max(0, int(u * COLUMNS)))
     row = min(ROWS - 1, max(0, int(v * ROWS)))
     first = 1
@@ -192,21 +292,31 @@ class Planner:
     game runs. `frame` returns the number of frames recorded so far, to stamp orders.
     """
 
-    def __init__(self, country, plan, templates, rules, speed, frame, rng=None):
+    def __init__(self, country, plan, templates, rules, speed, frame, rng=None, layout=None):
         self.country, self.enemy = country, ENEMY[country]
+        # The arena's state layout, when its mod has one (arena_layout).
+        self.layout = layout
         self.plan, self.templates, self.rules, self.speed = plan, templates, rules, speed
         self.frame = frame
         self.rng = rng or random.Random()
         self.orders = []
-        self.activate_at = self.redraw_at = self.law_at = math.inf
-        self.active = self.running = False
+        self.activate_at = self.redraw_at = self.law_at = self.reinforce_at = math.inf
+        self.recruit_at = math.inf
+        self.recruit_tries = 0
+        # Whether the plan executes now (lit), the game runs, and the hold is over.
+        self.active = self.running = self.attacking = False
         # Attempts at activating the current plan.
         self.tries = 0
         # The conscription law in force, as an index into LAWS, and failed tries at the
         # next step.
         self.law_step = self.law_fails = 0
-        # A setup that failed, for play() to end the game with.
+        # A setup that failed, for play() to end the game with; later orders that failed.
         self.error = None
+        self.failures = []
+        # Where to keep each settled full view of the map, if anywhere (arena tests), and
+        # the land masks of the last one.
+        self.overview_dir = None
+        self.last_view = None
 
     def order(self, kind, **details):
         self.orders.append({"frame": self.frame(), "order": kind, **details})
@@ -262,6 +372,9 @@ class Planner:
         if not self.selected(desk):
             self.click(desk, ARMY_CARD)
             time.sleep(0.8)
+            # Off the card: the general's tooltip over it covers the plan's buttons.
+            act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+            time.sleep(0.3)
         return self.selected(desk)
 
     def overview(self, desk, tries=8):
@@ -288,6 +401,12 @@ class Planner:
             if last is not None and max(abs(int(a) - int(b)) for a, b in zip(box, last)) <= 2:
                 break
             last = box
+        if self.overview_dir is not None:
+            from PIL import Image
+
+            Image.fromarray(rgb).save(self.overview_dir / f"{self.frame():06d}.png")
+        if blue is not None:
+            self.last_view = (blue, red)
         return rgb, blue, red, box
 
     def assign_general(self, desk, tries=3):
@@ -434,7 +553,7 @@ class Planner:
                 "offensive",
                 attack="broad",
                 line=points,
-                target_states=sorted({state_at(u, v) for u, v in points}),
+                target_states=sorted({state_at(u, v, self.layout) for u, v in points}),
             )
             return
         # How far each enemy pixel lies from the seam, as a fraction of the enemy's width:
@@ -460,7 +579,7 @@ class Planner:
             attack=self.plan["attack"],
             start=self.box_point(box, *start),
             target=[u, v],
-            target_state=state_at(u, v),
+            target_state=state_at(u, v, self.layout),
         )
 
     def activate(self, desk):
@@ -473,75 +592,127 @@ class Planner:
         """
         if not self.select_army(desk):
             return False
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        time.sleep(0.3)
         rgb = screen(desk)
         button = self.find(rgb, "activate", top=0.8) or self.find(rgb, "ready", top=0.8)
         if button is None:
-            return plan_shown(rgb) and self.lit(desk)
+            return self.lit(desk)
         self.click(desk, button)
         time.sleep(0.8)
-        # Off the button, so that it is not drawn hovered.
-        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
-        time.sleep(0.3)
         if not self.lit(desk):
             return False
         self.order("activate")
         return True
 
     def lit(self, desk):
-        """Whether the army's plan is executing: a plan shows, neither idle nor ready."""
+        """Whether the army's plan is executing: a plan shows and its arrow is lit.
+
+        Looked at with the pointer off the bar. In a game on 2026-09-24 the general's
+        tooltip covered the arrow, neither the idle nor the ready look was found, and the
+        plan was taken for executing: it stood ready for 65 s of an attack.
+        """
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        time.sleep(0.3)
         rgb = screen(desk)
         waiting = self.find(rgb, "activate", top=0.8) or self.find(rgb, "ready", top=0.8)
-        self.active = plan_shown(rgb) and waiting is None
+        self.active = plan_shown(rgb) and waiting is None and arrow_lit(rgb)
         return self.active
+
+    def guarding(self):
+        """Whether the home half needs the army: with a plan's `guard`, a redraw during the
+        attack executes the front line alone (it pushes along the whole border, the
+        enemy's incursion included) instead of pushing on, while the enemy holds at
+        least that share of the home half (incursion)."""
+        guard = self.plan.get("guard")
+        if not guard or self.last_view is None:
+            return False
+        held = incursion(*self.last_view, self.country)
+        if held >= guard:
+            self.order("guard", held=round(held, 3))
+        return held >= guard
 
     def setup(self, desk):
         """While paused: the army, its general, its front, its offensive; then run."""
         self.form_army(desk)
         self.assign_general(desk)
         self.draw_front(desk)
-        if self.plan["attack"] != "none":
+        if self.plan["attack"] in OFFENSIVES:
             self.draw_offensive(desk)
         run_at(desk, self.rules, self.speed)
         self.running = True
         self.order("run", speed=self.speed)
-        now = time.monotonic()
+        self.start(time.monotonic())
+
+    def start(self, now):
+        """The later orders' times, from the moment the game runs. The redraws start with
+        the attack (step): while the front holds, the plan stands."""
         if self.plan["attack"] != "none":
             self.activate_at = now + self.plan["wait"]
-        if self.plan["redraw"]:
-            self.redraw_at = now + self.plan["redraw"]
         if self.plan.get("conscription") in LAWS[1:]:
             # About 150 political power after half a minute at speed 5.
             self.law_at = now + 30
+        if self.plan.get("recruit") and self.law_at == math.inf:
+            self.recruit_at = now + RECRUIT_AFTER
 
     def due(self):
         now = time.monotonic()
-        return min(self.activate_at, self.redraw_at, self.law_at) <= now
+        waits = (self.activate_at, self.redraw_at, self.law_at, self.recruit_at, self.reinforce_at)
+        return min(waits) <= now
 
     def step(self, desk):
-        """The next due order, once the game runs. True if the camera was moved."""
+        """The next due order, once the game runs. True if the camera was moved.
+
+        Conscription comes before redraws, and the plan is first redrawn once it executes.
+        In a game on 2026-09-24 the plan was redrawn every 33 s while the front held, each
+        redraw taking 15-30 s: the law steps found few turns between them (Limited at 67 s
+        and Extensive at 146 s, against 41 s and 65 s in the wins), every redraw deleted
+        the front line under the divisions, and the AI broke through before the attack.
+        """
         now = time.monotonic()
         if now >= self.activate_at:
+            # The hold is over: from now on every new plan is executed.
+            self.attacking = True
             self.tries += 1
-            if self.activate(desk) or self.tries >= 6:
-                self.activate_at, self.tries = math.inf, 0
-            else:
+            if not self.activate(desk) and self.tries < 6:
                 self.activate_at = now + 5
+                return False
+            self.activate_at, self.tries = math.inf, 0
+            if self.redraw_at == math.inf and self.plan["redraw"]:
+                # The first redraw; soon, if the plan would not execute, to draw it afresh.
+                self.redraw_at = time.monotonic() + (self.plan["redraw"] if self.active else 5)
+            return False
+        if now >= self.law_at:
+            done = self.raise_conscription(desk)
+            self.law_at = math.inf if done else now + 10
+            if done and self.plan.get("recruit"):
+                self.recruit_at = now + RECRUIT_AFTER
             return False
         if now >= self.redraw_at:
             # Soon again, should the redraw fail part way.
             self.redraw_at = now + 5
             self.clear_orders(desk)
             self.draw_front(desk)
-            if self.plan["attack"] != "none":
+            if self.plan["attack"] in OFFENSIVES and not self.guarding():
                 self.draw_offensive(desk)
-            if self.active:
+            if self.attacking:
                 # A new plan waits to be executed, like the first.
-                self.activate_at = now
-            self.redraw_at = now + self.plan["redraw"]
+                self.activate_at = time.monotonic()
+            # The period counts from the redraw's end, so it never crowds out the rest.
+            self.redraw_at = time.monotonic() + self.plan["redraw"]
             return True
-        if now >= self.law_at:
-            done = self.raise_conscription(desk)
-            self.law_at = math.inf if done else now + 10
+        if now >= self.recruit_at:
+            self.overview(desk)
+            self.recruit_tries += 1
+            if self.recruit(desk):
+                self.recruit_at, self.reinforce_at = math.inf, now + 20
+            else:
+                self.recruit_at = now + 30 if self.recruit_tries < 3 else math.inf
+            return True
+        if now >= self.reinforce_at:
+            alert = self.find(screen(desk), "unassigned") is not None
+            # A full army (24) leaves the alert up: then stop trying.
+            self.reinforce_at = now + 20 if not alert or self.reinforce(desk) else math.inf
         return False
 
     def law(self, rgb):
@@ -563,12 +734,69 @@ class Planner:
         in a live game on 2026-09-23 it stayed open from the second law change to the
         end, over the map the camera and the other orders work on.
         """
+        return self.panel(desk, "political_title", POLITICS, shown, tries)
+
+    def panel(self, desk, title, key, shown, tries=3):
+        """A screen that `key` toggles, opened or closed, checked by its `title`."""
         for _ in range(tries):
-            if (self.find(screen(desk), "political_title") is not None) == shown:
+            if (self.find(screen(desk), title) is not None) == shown:
                 return True
-            act(desk, tap(POLITICS))
+            act(desk, tap(key))
             time.sleep(0.8)
         return False
+
+    def recruit(self, desk):
+        """Training slots for more divisions of the army's template, deployed in one of
+        the player's own states. True once they are queued with a place to deploy.
+
+        A line left without a place would train and never deploy, so it is deleted.
+        """
+        slots = self.plan.get("recruit", 0)
+        if not slots or not self.panel(desk, "recruit_title", RECRUIT, True):
+            return False
+        self.click(desk, pixels(*TRAIN))
+        time.sleep(0.8)
+        placed = False
+        if self.find(screen(desk), "no_location") is not None:
+            self.click(desk, pixels(*DEPLOY_AT))
+            time.sleep(0.8)
+            spot = own_land_lit(screen(desk))
+            if spot is not None:
+                self.click(desk, spot)
+                time.sleep(0.8)
+                placed = self.find(screen(desk), "no_location") is None
+            if not placed:
+                self.click(desk, pixels(*DROP_LINE))
+                time.sleep(0.5)
+        if placed:
+            for _ in range(slots - 1):
+                self.click(desk, pixels(*ADD_UNIT))
+                time.sleep(0.4)
+            self.order("recruit", slots=slots)
+        self.panel(desk, "recruit_title", RECRUIT, False)
+        return placed
+
+    def reinforce(self, desk):
+        """New divisions into the army: shift+click on the Unassigned divisions alert
+        selects them all, and a right-click on the army's card adds them. True if they
+        joined, as the alert went away; False with no alert, or a full army."""
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        alert = self.find(screen(desk), "unassigned")
+        if alert is None:
+            return False
+        self.click(desk, alert, shift=True)
+        time.sleep(0.8)
+        self.click(desk, ARMY_CARD, button=1)
+        time.sleep(0.8)
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        time.sleep(0.3)
+        joined = self.find(screen(desk), "unassigned") is None
+        if joined:
+            self.order("reinforce")
+            if self.active:
+                # Execute again, should the new divisions have left the plan waiting.
+                self.activate_at = time.monotonic()
+        return joined
 
     def raise_conscription(self, desk):
         """One step up the conscription laws toward the plan's. True once it is there, or
@@ -614,6 +842,26 @@ class Planner:
         return self.law_fails >= LAW_TRIES
 
 
+def incursion(blue, red, country):
+    """The share of `country`'s home half of the arena that its enemy holds, from the
+    land masks of a full view: the half of the land box on its own side of the seam.
+
+    In the wins the enemy held 0-14% of it when the attack began, and none after the
+    push. In the loss of 2026-09-24 it grew while the army pushed on, 10%, 17%, then
+    89%, as the AI's last divisions walked into the empty rear and took its victory
+    points; in a win that swung back it reached 22%.
+    """
+    box = land_box(blue, red)
+    if box is None:
+        return 0.0
+    top, left, bottom, right = box
+    seam = (left + right) // 2
+    own, enemy = (blue, red) if country == "BLU" else (red, blue)
+    half = slice(left, seam) if country == "BLU" else slice(seam, right)
+    held = enemy[top:bottom, half].sum()
+    return float(held / max(1, held + own[top:bottom, half].sum()))
+
+
 def green_plus(rgb):
     """The centre of the green + in the army bar, as screen fractions, or None."""
     top = int(ARMY_BAR_TOP * rgb.shape[0])
@@ -636,6 +884,27 @@ def plan_shown(rgb):
     box = rgb[y0:y1, x0:x1].astype(np.int32)
     red = (box[..., 0] > 100) & (box[..., 0] - np.maximum(box[..., 1], box[..., 2]) > 50)
     return bool(red.mean() > 0.3)
+
+
+def arrow_lit(rgb):
+    """Whether the first army's execute arrow is lit, as while its plan executes."""
+    x0, y0, x1, y1 = ARROW
+    return float(rgb[y0:y1, x0:x1, 1].mean()) > LIT_GREEN
+
+
+def own_land_lit(rgb, least=2000):
+    """Where to click to pick a deployment state, as screen fractions, or None: the middle
+    of the player's own land, which the map lights green while a location is being picked,
+    right of the recruitment panels. 22,102 such pixels while picking in the calibration
+    game, at most 332 green ones on other screens."""
+    part = rgb[100:900, PANELS_RIGHT:].astype(np.int32)
+    r, g, b = part[..., 0], part[..., 1], part[..., 2]
+    ys, xs = np.nonzero((g - r > 40) & (g - b > 15) & (g > 100))
+    if len(xs) < least:
+        return None
+    return (float(np.median(xs)) + PANELS_RIGHT) / rgb.shape[1], (
+        float(np.median(ys)) + 100
+    ) / rgb.shape[0]
 
 
 def pixels(x, y):
@@ -661,6 +930,8 @@ TEMPLATES = {
     "trash": "artifacts/screens-1080p/plan-trash.png",
     "law_list": "artifacts/screens-1080p/law-list-title.png",
     "ready": "artifacts/screens-1080p/plan-ready.png",
+    "recruit_title": "artifacts/screens-1080p/recruit-title.png",
+    "no_location": "artifacts/screens-1080p/no-location.png",
 }
 
 
@@ -700,11 +971,28 @@ def win_rate(results):
 
     played = [g for g in results if "error" not in g]
     report = {"all": tally(played), "errors": len(results) - len(played)}
+    # The best plan's record apart from the rest (plans before 2026-09-24 have no `best`
+    # and count as exploring), and each variant's: the best, challengers, exploration.
+    best = [g for g in played if (g.get("plan") or {}).get("best")]
+    report["best"] = tally(best)
+    report["explore"] = tally([g for g in played if not (g.get("plan") or {}).get("best")])
+    variants = {(g.get("plan") or {}).get("variant") for g in played} - {None}
+    for variant in sorted(variants):
+        chosen = [g for g in played if (g.get("plan") or {}).get("variant") == variant]
+        report[f"variant_{variant}"] = tally(chosen)
     for side in ("BLU", "RED"):
         report[side] = tally([g for g in played if g["started_as"] == side])
+        report[f"best_{side}"] = tally([g for g in best if g["started_as"] == side])
+    # By arena, where the results name it (since 2026-09-24).
+    for arena in sorted({g["arena"] for g in played if g.get("arena")}):
+        report[f"arena_{arena}"] = tally([g for g in played if g.get("arena") == arena])
+        report[f"best_arena_{arena}"] = tally([g for g in best if g.get("arena") == arena])
     for attack in ATTACKS:
         report[attack] = tally([g for g in played if (g.get("plan") or {}).get("attack") == attack])
     for law in CONSCRIPTION:
         chosen = [g for g in played if (g.get("plan") or {}).get("conscription") == law]
         report[f"conscription_{law}"] = tally(chosen)
+    for slots in RECRUITS:
+        chosen = [g for g in played if (g.get("plan") or {}).get("recruit", 0) == slots]
+        report[f"recruit_{slots}"] = tally(chosen)
     return report

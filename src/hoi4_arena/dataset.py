@@ -243,6 +243,21 @@ def presses_after_move(actions):
     return (np.isin(kinds, PRESS_KINDS) & before).any(-1)
 
 
+def player_outcome(manifest):
+    """ "win" or "loss" for the recording's own player, or None when it names no result.
+
+    The player is the one country the arena logged a human for (`players`), else the
+    country the recorder started as. A game that ended without a surrender (a draw at
+    the cap, `winner` "timeout") counts as not won: "loss".
+    """
+    players = manifest.get("players") or []
+    player = players[0] if len(players) == 1 else manifest.get("started_as")
+    winner = manifest.get("winner")
+    if player not in ("BLU", "RED") or winner is None:
+        return None
+    return "win" if winner == player else "loss"
+
+
 def session_labels(
     source,
     *,
@@ -253,6 +268,11 @@ def session_labels(
     idm_weight=1.0,
     advantage=False,
     look_before_click=False,
+    lead_in=None,
+    drop_keys=(),
+    loser_weight=1.0,
+    state=False,
+    orders=False,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -273,6 +293,19 @@ def session_labels(
     (summed over the slots; 0 is certain) falls below it, and `weight` gives each
     decision's share of the imitation loss: `idm_weight` for an inferred label, 1 for a
     recorded one. The defaults change nothing.
+
+    `lead_in` is how many decision intervals of video come before the first decision
+    (None: a whole clip and one interval more, CLIP_FRAMES + 1). An encoder that reads no
+    clip (models.reads_clip) needs none, and the scripted player forms its army in the
+    first 1-2.5 s of a game: inside the clip's 1.8 s lead-in, 23 of 31 games never showed
+    that click as a label. `drop_keys` are key codes whose events are not the player's to
+    learn: the harness presses them (space, which unpauses the game, when a learned
+    policy plays), so they are left out of the labels rather than invalidating the
+    decision. `loser_weight` scales every decision of a game the player did not win
+    (player_outcome). `state` adds each decision's true state from the arena log
+    (privileged.decision_states), and `orders` the scripted player's next order and the
+    time until it (privileged.decision_orders), which the agent never sees: targets for
+    training only.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -300,11 +333,20 @@ def session_labels(
     tail = source / "trailing-events.json"
     if tail.exists() and key == "events":
         events += json.loads(tail.read_text())["events"]
+    if drop_keys:
+        dropped = set(drop_keys)
+        events = [
+            e
+            for e in events
+            if not (e["event"].get("kind") == "key" and e["event"].get("vk") in dropped)
+        ]
     events.sort(key=lambda e: e["t_ns"])
     # The first decision needs a whole clip of recorded video behind it, plus one
     # interval of margin. The lead-in is derived from the clip rather than written down:
     # a hardcoded 2.1 s was correct only while a clip spanned 2.0 s.
-    lead_in = (CLIP_FRAMES + 1) * PERIOD_NS
+    lead_in = (CLIP_FRAMES + 1 if lead_in is None else int(lead_in)) * PERIOD_NS
+    if lead_in < 0:
+        raise ValueError("the lead-in cannot be negative")
     decisions = np.arange(times[0] + lead_in, times[-1] - PERIOD_NS, PERIOD_NS, dtype=np.int64)
     frame_ids = np.searchsorted(times, decisions + detail_shift * PERIOD_NS, side="right") - 1
     clip_ids = clip_frame_ids(times, decisions + clip_shift * PERIOD_NS)
@@ -348,6 +390,8 @@ def session_labels(
                 "Advantage weights were made on a different decision grid; weigh again"
             )
         weight = weight * stored["weight"]
+    if loser_weight != 1.0 and player_outcome(manifest) == "loss":
+        weight = weight * np.float32(loser_weight)
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the
@@ -366,7 +410,17 @@ def session_labels(
         for d in np.flatnonzero(spans & valid):
             excluded.append({"decision": int(d), "reason": "capture gap"})
         valid &= ~spans
+    extra = {}
+    if state:
+        from .privileged import decision_states
+
+        extra["state"] = decision_states(source, manifest, frame_ids)
+    if orders:
+        from .privileged import decision_orders
+
+        extra["order_kind"], extra["order_eta"] = decision_orders(manifest, frame_ids)
     return {
+        **extra,
         "root": source,
         "manifest": manifest,
         "speed": speed["game_speed"],
@@ -385,6 +439,18 @@ def session_labels(
         "excluded": excluded,
         "label_source": label_source,
     }
+
+
+def recording_splits(root):
+    """The `splits.json` in a data folder, {recording folder name: split}, or {}."""
+    path = Path(root) / "splits.json"
+    if not path.exists():
+        return {}
+    chosen = json.loads(path.read_text())
+    unknown = set(chosen.values()) - {"train", "validation", "test"}
+    if unknown:
+        raise ValueError(f"splits.json names unknown splits: {sorted(unknown)}")
+    return chosen
 
 
 def sequence_starts(valid, length, burn_in):
@@ -468,6 +534,9 @@ class _Stream:
             "outcome": torch.from_numpy(labels["outcome"][start : start + n].copy()),
             "start": start,
         }
+        for key in ("state", "order_kind", "order_eta"):
+            if key in labels:
+                window[key] = torch.from_numpy(labels[key][start : start + n].copy())
         if self.clips:
             window["clips"] = torch.stack(
                 [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]
@@ -538,6 +607,11 @@ class VideoSessions(IterableDataset):
     of the recordings, so every window is read exactly once, with its own share of the
     streams and of the shuffle buffer. `clips` False cuts windows without the global
     clips, for an encoder that does not read them (models.reads_clip).
+
+    A `splits.json` in `root`, {recording folder name: split}, overrides the split each
+    recording's manifest drew, so a study can choose its held-out games without touching
+    the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state` and `orders` pass to
+    session_labels; a lead-in shorter than a clip needs `clips` off.
     """
 
     def __init__(
@@ -559,15 +633,27 @@ class VideoSessions(IterableDataset):
         clips=True,
         advantage=False,
         look_before_click=False,
+        lead_in=None,
+        drop_keys=(),
+        loser_weight=1.0,
+        state=False,
+        orders=False,
     ):
+        if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
+            raise ValueError(
+                f"a lead-in under {CLIP_FRAMES + 1} intervals leaves the first clips "
+                "without frames; it is for an encoder that reads no clip"
+            )
         self.length, self.burn_in, self.clips = length, burn_in, clips
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sessions = []
+        overrides = recording_splits(root)
         for path in sorted(Path(root).glob("*/manifest.json")):
             meta = json.loads(path.read_text())
             labelled = "idm" in sources and (path.parent / IDM_LABELS).exists()
-            if meta.get("split") != split or not (meta.get("source") in sources or labelled):
+            chosen = overrides.get(path.parent.name, meta.get("split"))
+            if chosen != split or not (meta.get("source") in sources or labelled):
                 continue
             if not meta.get("complete"):
                 continue
@@ -581,6 +667,11 @@ class VideoSessions(IterableDataset):
                     idm_weight=idm_weight,
                     advantage=advantage,
                     look_before_click=look_before_click,
+                    lead_in=lead_in,
+                    drop_keys=drop_keys,
+                    loser_weight=loser_weight,
+                    state=state,
+                    orders=orders,
                 )
             )
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)

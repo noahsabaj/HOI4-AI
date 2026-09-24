@@ -15,6 +15,94 @@ def test_plans_cover_every_attack_and_always_redraw():
     assert all(30 <= p["redraw"] <= 90 for p in plans)
 
 
+def test_most_games_play_the_best_plan_and_the_rest_explore():
+    from hoi4_arena.scripted import CHALLENGER, SHARES, best_plan
+
+    plans = [choose_plan(random.Random(i)) for i in range(1000)]
+    best = [p for p in plans if p["best"]]
+    assert abs(len(best) / len(plans) - SHARES["best"]) < 0.05
+    assert all(p.keys() == best_plan(random.Random(0)).keys() for p in plans)
+    # The challenger is the best plan with one change.
+    challengers = [p for p in plans if p["variant"] == CHALLENGER["variant"]]
+    assert abs(len(challengers) / len(plans) - SHARES["challenger"]) < 0.05
+    changed = {k for p in challengers for k in p if p[k] != best_plan(random.Random(0))[k]}
+    assert changed - {"wait", "redraw", "best", "variant"} == set(CHALLENGER) - {"variant"}
+    # The best plan holds at least two minutes, then attacks broad, at All Adults Serve.
+    assert {(p["attack"], p["conscription"], p["recruit"]) for p in best} == {
+        ("broad", "all_adults", 0)
+    }
+    assert all(120 <= p["wait"] <= 240 for p in best)
+    explore = [p for p in plans if p["variant"] == "explore"]
+    assert len({(p["attack"], p["conscription"], p["recruit"]) for p in explore}) > 20
+    games = [
+        {"started_as": "BLU", "winner": "BLU", "plan": best[0]},
+        {"started_as": "RED", "winner": "BLU", "plan": best[1]},
+        {"started_as": "RED", "winner": "RED", "plan": explore[0]},
+        {"started_as": "RED", "winner": "RED", "plan": {"attack": "deep"}},  # Before `best`.
+    ]
+    report = win_rate(games)
+    assert (report["best"]["decided"], report["best"]["wins"]) == (2, 1)
+    assert (report["explore"]["decided"], report["explore"]["wins"]) == (2, 2)
+    assert report["best_BLU"]["wins"] == 1 and report["best_RED"]["wins"] == 0
+
+
+def test_the_hold_is_quiet_and_conscription_comes_before_redraws(monkeypatch):
+    from hoi4_arena import scripted
+
+    clock = [0.0]
+    monkeypatch.setattr(scripted.time, "monotonic", lambda: clock[0])
+    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "wait": 100, "redraw": 40}
+    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
+    calls = []
+
+    def takes(name, seconds, result=True):
+        def order(desk):
+            calls.append((clock[0], name))
+            clock[0] += seconds
+            return result() if callable(result) else result
+
+        return order
+
+    for name in ("clear_orders", "draw_front", "draw_offensive"):
+        setattr(planner, name, takes(name, 6))
+    # Political power for a step every 25 s after the first 40.
+    paid = {"steps": 0}
+
+    def conscription():
+        if clock[0] < 40 + 25 * paid["steps"]:
+            return False
+        paid["steps"] += 1
+        return paid["steps"] == 4
+
+    planner.raise_conscription = takes("law", 4, conscription)
+
+    def lit():
+        planner.active = True
+        return True
+
+    planner.activate = takes("activate", 1, lit)
+    planner.start(0.0)
+    while clock[0] < 400:
+        if planner.due():
+            planner.step(None)
+        else:
+            clock[0] += 1
+    first_attack = min(t for t, name in calls if name == "activate")
+    assert 100 <= first_attack < 106
+    # Nothing is redrawn while the front holds.
+    assert all(t > first_attack for t, name in calls if name == "clear_orders")
+    # The ladder is climbed as political power allows: a step every 25 s from 40 s.
+    steps = [t for t, name in calls if name == "law"]
+    assert steps[0] == 30 and len([t for t in steps if t < 120]) >= 8
+    assert paid["steps"] == 4
+    # After the attack, a redraw every 40 s counted from the last one's end, each executed.
+    clears = [t for t, name in calls if name == "clear_orders"]
+    assert len(clears) >= 5
+    assert all(b - a >= 40 + 18 for a, b in zip(clears, clears[1:]))
+    activations = [t for t, name in calls if name == "activate"]
+    assert all(any(0 < a - c < 25 for a in activations) for c in clears)
+
+
 def test_points_map_to_the_states_mapgen_numbers():
     # Blue's states run down each column pair from the west; Red's are Blue's turned half
     # a turn, so its border states 15 and 16 face Blue's 7 and 8 across the seam.
@@ -25,6 +113,23 @@ def test_points_map_to_the_states_mapgen_numbers():
     assert sorted({state_at(u / 48, v / 16) for u in range(48) for v in range(16)}) == list(
         range(1, 17)
     )
+
+
+def test_a_layout_names_states_off_the_arena_itself(tmp_path):
+    import json
+
+    from hoi4_arena.scripted import arena_layout
+
+    # A 4x2 layout with water (0) in its top right corner, as a bay leaves.
+    (tmp_path / "generation.json").write_text(
+        json.dumps({"layout": {"box": [0, 0, 8, 4], "states": ["1 7 16 0", "2 8 15 9"]}})
+    )
+    layout = arena_layout(tmp_path)
+    assert state_at(0.1, 0.1, layout) == 1 and state_at(0.6, 0.9, layout) == 15
+    # Over water the nearest land's state: the bay's corner is next to state 16 and 9.
+    assert state_at(0.95, 0.1, layout) in (16, 9)
+    # An arena from before the layouts has none, and the grid is used.
+    assert arena_layout(tmp_path / "missing") is None
 
 
 def test_the_front_is_where_the_two_countries_touch():
@@ -271,14 +376,59 @@ def test_a_plan_executes_only_once_its_arrow_is_neither_idle_nor_ready(monkeypat
         rgb = background.copy()
         x0, y0, x1, y1 = scripted.STOP_BUTTON
         rgb[y0:y1, x0:x1] = (200, 40, 40) if looks["plan"] else (30, 30, 30)
-        if looks["arrow"]:
+        if looks["arrow"] in shapes:
             rgb[949:969, 953:985] = shapes[looks["arrow"]]
+        elif looks["arrow"] == "lit":
+            x0, y0, x1, y1 = scripted.ARROW
+            rgb[y0:y1, x0:x1] = (160, 200, 160)
+        elif looks["arrow"] == "covered":
+            rgb[930:1000, 940:1200] = (20, 20, 20)
         return rgb
 
     monkeypatch.setattr(scripted, "screen", fake_screen)
+    monkeypatch.setattr(scripted, "act", lambda desk, events, pause=0.0: None)
+    monkeypatch.setattr(scripted.time, "sleep", lambda seconds: None)
     planner = Planner("BLU", choose_plan(random.Random(1)), shapes, None, 5, frame=lambda: 0)
-    for arrow, executing in (("activate", False), ("ready", False), (None, True)):
+    for arrow, executing in (("activate", False), ("ready", False), ("lit", True)):
         looks["arrow"] = arrow
         assert planner.lit(None) is executing
-    looks["plan"] = False
+    # A tooltip over the arrow hides both waiting looks, and that is not executing.
+    looks["arrow"] = "covered"
     assert planner.lit(None) is False
+    looks["plan"], looks["arrow"] = False, "lit"
+    assert planner.lit(None) is False
+
+
+def test_the_deployment_state_is_picked_on_the_own_land_the_map_lights_green():
+    from hoi4_arena.scripted import PANELS_RIGHT, RECRUITS, own_land_lit
+
+    screen = np.full((1080, 1920, 3), 40, np.uint8)
+    screen[500:540, 20:600] = (40, 200, 60)  # Green under the panels does not count.
+    assert own_land_lit(screen) is None
+    screen[300:500, PANELS_RIGHT + 10 : PANELS_RIGHT + 90] = (40, 200, 60)
+    x, y = own_land_lit(screen)
+    assert abs(x * 1920 - (PANELS_RIGHT + 50)) < 2 and abs(y * 1080 - 400) < 2
+    plans = [choose_plan(random.Random(i)) for i in range(300)]
+    assert {p["recruit"] for p in plans} == set(RECRUITS)
+
+
+def test_an_incursion_is_the_enemy_s_share_of_the_home_half():
+    from hoi4_arena.scripted import incursion
+
+    blue = np.zeros((80, 240), bool)
+    red = np.zeros((80, 240), bool)
+    blue[:, :120], red[:, 120:] = True, True
+    assert incursion(blue, red, "BLU") == 0 and incursion(blue, red, "RED") == 0
+    # Red holds a quarter of Blue's half; Blue has pushed a third into Red's.
+    red[:40, 60:120], blue[:40, 60:120] = True, False
+    blue[:, 120:160], red[:, 120:160] = True, False
+    assert incursion(blue, red, "BLU") == pytest.approx(0.25)
+    assert incursion(blue, red, "RED") == pytest.approx(1 / 3)
+    # With a guard, a redraw during the attack executes the front alone while it holds.
+    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "guard": 0.2}
+    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
+    assert not planner.guarding()  # No view yet.
+    planner.last_view = (blue, red)
+    assert planner.guarding() and planner.orders[-1]["order"] == "guard"
+    planner.plan["guard"] = 0.3
+    assert not planner.guarding()

@@ -124,6 +124,13 @@ Since v4 (`arena-12x8-v4`) the recorder decides who declares the war with a fair
 .venv\Scripts\hoi4-arena.exe advantage --state-value artifacts/state-value.pt artifacts/scripted-games/scripted-peer-20260923-185544
 ```
 
+A learned policy imitates the scripted player's games and then plays them itself. `--lead-in 0` starts a recording's decisions at its first frame (the Qwen tower reads no clip, and the scripted player forms its army in the first 2.5 s), and `--drop-keys 0x20` leaves the space bar out of the labels, since the harness presses it. `--state-weight` and `--order-weight` add training-only losses: the memory predicts the arena's true state from its log and the scripted player's next order. A `splits.json` in the data folder chooses the held-out games. `play-policy` then has a checkpoint play on the second PC against the game's AI, from the screen, recorded; it reserves that PC from the scripted player's recorder first (`artifacts/eval`), and `--point` places each move on its likeliest spot.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe train-bc data/scripted artifacts/bc-scripted --sources scripted --lead-in 0 --drop-keys 0x20 --look-before-click --state-weight 0.5 --order-weight 0.2
+.venv\Scripts\hoi4-arena.exe play-policy artifacts/bc-scripted/epoch-0000.pt artifacts/live --peer artifacts/pairing/peer.json --games 2 --minutes 40 --reservation first-look --point
+```
+
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
 
 ```powershell
@@ -157,9 +164,16 @@ Dense and sparse predictive objectives use separate projection modules. Sparse t
 .\scripts\Test-ArenaLoad.ps1 -Mod artifacts/mods/infantry-arena
 ```
 
+`--preset` picks a named arena instead of the plain one, and `preview-map` draws it from its files. There are six, all 12x8 provinces a side in 8 states, each an exact half-turn mirror, painted with stock terrain, relief, rivers on province borders, trees, cities holding the victory points, and borders that wander: `plains` (open farmland), `river` (a large river behind each border), `passes` (a mountain range on the border crossed by two valleys), `marsh` (a marsh and lake in the middle, forests on the wings), `bay` (the sea cuts in at the border, leaving an isthmus) and `salient` (the border bends round a bulge on each side). STATUS.md says what each changes.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe generate-map artifacts/mods/arena-river-v3 --preset river --game 'C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV'
+.venv\Scripts\hoi4-arena.exe preview-map artifacts/mods/arena-river-v3 artifacts/arenas/previews/arena-river-v3.png
+```
+
 Generation requires a new output directory. The disposable launch script temporarily selects the mod and restores the prior mod-selection file. Its current 20-second startup assumption requires local verification. Normal later launches use the restored selection. The map is an original rotationally mirrored island with equal infantry forces and ordinary supply; playable match startup remains unverified.
 
-`generate-map` audits what it wrote and exits non-zero if anything is wrong, and `audit-map` re-checks a mod on disk. The audit exists because the engine does not report bad map data: `CProvinceProvider::GetProvince` returns null for any id below 1, and the match-start callers dereference the result without checking, so an unset province id ends the process with an access violation and no log line. It checks every province id the generated files ask the engine to resolve, that both sides of a coast agree, that every province carries the unit-counter anchors and building placements the stock database supplies for it, and that each strategic region has all twelve weather periods.
+`generate-map` audits what it wrote and exits non-zero if anything is wrong, and `audit-map` re-checks a mod on disk. The audit exists because the engine does not report bad map data: `CProvinceProvider::GetProvince` returns null for any id below 1, and the match-start callers dereference the result without checking, so an unset province id ends the process with an access violation and no log line. It checks every province id the generated files ask the engine to resolve, that both sides of a coast agree, that every province carries the unit-counter anchors and building placements the stock database supplies for it, and that each strategic region has all twelve weather periods. It also checks the bitmaps: each province is one piece with no four-way pixel corners, its painted terrain matches `definition.csv`, land is above sea level, rivers can be traced (a source at a free end, one pixel wide, joins marked) and lie on province borders where they are crossed, and a preset is an exact half-turn mirror with no seam down the middle.
 
 `template` creates screenshot ROI templates. `clock` calibrates the changing-clock ROI and `speed` is the selected-speed indicator; collection refuses to start without them. A running frame that stops matching `speed` ends the episode, because a click on the speed control would otherwise falsify the manifest. `configs/pair.example.json` shows the two-player configuration, including its `seed` and `deterministic` keys. Real ready/healthy/paused/win/loss/disconnect/desync templates, a changing-clock ROI and observed lobby/reset recipes must be calibrated before collection. Missing evidence fails closed. There are no fabricated default victory templates.
 

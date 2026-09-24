@@ -128,8 +128,20 @@ class Actor:
         compile_head=True,
         *,
         game_speed,
+        memory_window=None,
+        point=False,
     ):
+        """`memory_window` N runs the memory afresh over the last N decisions' perception
+        at every decision, from an empty state, instead of carrying it from the game's
+        start: the memory then sees what it saw in training, where windows are a few
+        decisions long (train-bc's burn-in plus sequence). None carries it, as always.
+        `point` places each move on its likeliest spot while still sampling what to do
+        (models.ActionHead): for evaluation, not for self-play, whose likelihoods must be of
+        samples."""
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
+        self.point = point
+        self.memory_window = memory_window
+        self.recent = deque(maxlen=memory_window) if memory_window else None
         # The policy is told the speed the match runs at: the same clip is a different
         # amount of game time at each one.
         self.speed = recorded_speed(game_speed)["game_speed"]
@@ -148,6 +160,8 @@ class Actor:
         self.hidden = None
         self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
         self.history.clear()
+        if getattr(self, "recent", None) is not None:
+            self.recent.clear()
 
     def _compile_head(self):
         """Capture the action head into a CUDA graph, and prove it before trusting it.
@@ -205,6 +219,7 @@ class Actor:
                         cells,
                         noise=torch.zeros(1, self.policy.actor.noise_dim, device=self.device),
                         deterministic=self.deterministic,
+                        point=getattr(self, "point", False),
                     )
         torch.cuda.synchronize()
 
@@ -244,14 +259,24 @@ class Actor:
             torch.inference_mode(),
             torch.autocast(torch.device(device).type, dtype=torch.bfloat16),
         ):
-            self.hidden, value, _, cells = self.policy(
+            inputs = (
                 normalize(clip).permute(3, 0, 1, 2)[None],
                 normalize(quads).permute(0, 3, 1, 2)[None],
                 normalize(fovea).permute(2, 0, 1)[None],
                 torch.from_numpy(self.previous)[None].to(device),
                 torch.tensor([self.speed], device=device),
-                self.hidden,
             )
+            recent = getattr(self, "recent", None)
+            if recent is None:
+                self.hidden, value, _, cells = self.policy(*inputs, self.hidden)
+            else:
+                summary, cells, centre = self.policy.perceive(*inputs[:3])
+                recent.append((summary, cells, centre, *inputs[3:]))
+                # An empty memory, as Policy.forward starts one: in the quadrants' dtype.
+                hidden = inputs[1].new_zeros(1, self.policy.memory_dim)
+                for step in recent:
+                    hidden, value = self.policy.recall(*step, hidden, inputs[1].dtype)
+                self.hidden = hidden
             noise = act_noise(
                 self.config["objective"],
                 self.policy.actor.noise_dim,
@@ -260,7 +285,11 @@ class Actor:
                 getattr(self.policy.actor, "latents", None),
             )
             action, logp, entropy = self.policy.actor(
-                self.hidden, cells, noise=noise, deterministic=self.deterministic
+                self.hidden,
+                cells,
+                noise=noise,
+                deterministic=self.deterministic,
+                point=getattr(self, "point", False),
             )
         # One host transfer for the whole sample. Four separate .cpu()/.item() calls
         # each waited for the GPU, on the same thread that has to start the next capture.

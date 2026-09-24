@@ -147,8 +147,36 @@ def hot_share(grid, target_xy):
     return bool(grid[y, x] >= np.quantile(grid, 0.99))
 
 
-def draw_heatmaps(checkpoint, recording, output, *, decisions=None, count=24, model_path=None):
-    """Heat maps for `decisions` of a recording (default: `count` spread over its moves)."""
+def aimed(actions, decision, ahead=3):
+    """Whether a decision's first move is aimed: a button is pressed where it lands.
+
+    The press may come later in the same decision or in the next `ahead` decisions, as
+    long as no other move comes first. The scripted player moves onto a button and looks
+    for 0.25 to 0.45 s before pressing it; its camera's pointing about does not press.
+    """
+    slot = first_move(actions[decision])
+    if slot is None:
+        return False
+    rows = [actions[decision][slot + 1 :]]
+    rows += [actions[d] for d in range(decision + 1, min(decision + 1 + ahead, len(actions)))]
+    for kind in np.concatenate(rows)[:, 0]:
+        if kind == 1:
+            return False
+        if kind in PRESSES:
+            return True
+    return False
+
+
+def draw_heatmaps(
+    checkpoint, recording, output, *, decisions=None, count=24, model_path=None, targets="moves"
+):
+    """Heat maps for `decisions` of a recording (default: `count` spread over its moves).
+
+    `targets` "clicks" spreads them over the aimed moves only (`aimed`): where the
+    pointer went to press something, the pointing that decides a game, rather than the
+    camera's looking about. The recording is cut into decisions as the checkpoint's
+    training cut them (its lead-in and dropped keys).
+    """
     from PIL import Image
 
     from .runner import load_policy
@@ -156,11 +184,18 @@ def draw_heatmaps(checkpoint, recording, output, *, decisions=None, count=24, mo
     device = "cuda" if torch.cuda.is_available() else "cpu"
     recording, output = Path(recording), Path(output)
     manifest = json.loads((recording / "manifest.json").read_text())
-    labels = session_labels(recording, sources=(manifest["source"],))
+    config = json.loads(Path(checkpoint).with_suffix(".json").read_text())["config"]
+    labels = session_labels(
+        recording,
+        sources=(manifest["source"],),
+        lead_in=config.get("lead_in"),
+        drop_keys=tuple(config.get("drop_keys") or ()),
+    )
     moves = [
         d
         for d in np.flatnonzero(labels["valid"] & labels["readable"])
         if first_move(labels["actions"][d]) is not None
+        and (targets == "moves" or aimed(labels["actions"], d))
     ]
     if decisions is None:
         if not moves:
