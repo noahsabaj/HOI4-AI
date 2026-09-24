@@ -1129,6 +1129,36 @@ policy with a memory that never changed. The fix is a parameter-free layer norm 
 summary and fovea inside `fuse`, which every arm uses. The rerun uses the same cache and
 rule, and treats any arm whose memory is dead as invalid rather than ranking it.
 
+**The rerun, first pass (2026-09-24): both claims hold, on living memories.** Four arms,
+seeds 0-2, 8 epochs, same cache, with the layer norm (#81). Each report now carries its
+memory's health (#83), and `scripts/memory_study.py` treats an arm as invalid if any of
+its seeds' memory reads dead. That guard and this pass's two comparisons were written
+down before any result. This pass has no 256-decision GRU, so the carried GRU it compares
+against is the 16-decision one. No arm read dead. The 12 runs took 35.6 min.
+
+| Arm | Held-out loss | Cleared every 18 | Units still | Output std over time | From empty | Time since zoom-out, R² |
+|---|---|---|---|---|---|---|
+| GRU, 16, carried | **3.102 ± 0.012** | 3.342 | 16.5% | 0.078 | 58% | 0.133 |
+| Mamba-3, 256, carried | 3.126 ± 0.006 | 3.385 | 0% | 8.47 | 95% | 0.145 |
+| No memory | 3.144 ± 0.003 | 3.144 | 10% | 0.008 | 0% | 0.0005 |
+| GRU, 16, from empty | 3.181 ± 0.002 | 3.182 | 1.7% | 0.0075 | 20% | 0.005 |
+
+"Units still" means an output with less than 0.001 std over a held-out game. "From
+empty" is how far one step from an empty memory lands from the carried step.
+
+- **A memory carried through games replaces the old training.** The carried GRU beats the
+  GRU trained from empty windows by 0.079, against a bar of 0.024 (twice the noise).
+- **Mamba-3 does not replace the GRU.** It is 0.024 worse than the carried GRU.
+- **The memories are used now.** Clearing them every 18 decisions costs the carried GRU
+  0.24 and Mamba-3 0.26, where it cost the dead GRUs nothing. Both read how long since
+  the camera zoomed out (R² 0.13-0.15), which the dead GRUs could not.
+- The carried GRU keeps many gates at their bounds: 65% of its update gates and 92% of
+  its candidates. Its memory still moves, so this reads as long retention, not death.
+- **Training from empty windows still loses to no memory** (3.181 against 3.144), as in
+  the first study. Why is not understood.
+- Left for a later GPU window: the 256-decision GRU, Gated DeltaNet-2, and seeds 3-4 of
+  every arm.
+
 The original write-up follows, for the record.
 
 Which memory should the policy have, and how should it be trained?
