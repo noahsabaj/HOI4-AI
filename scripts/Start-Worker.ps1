@@ -146,6 +146,18 @@ public static class Hoi4Bridge {
         using (client)
         using (var tls = new SslStream(client.GetStream(), false)) {
             if (!((IPEndPoint)client.Client.RemoteEndPoint).Address.Equals(IPAddress.Parse(peer))) return;
+            // A frame's row or a reply goes out at once, not after the last video bytes are
+            // acknowledged (Nagle's wait, which the other side's delayed acknowledgement can
+            // stretch to 200 ms). And a peer that vanished without closing (its PC off, its
+            // cable out) is noticed within about 20 s even while nothing is sent, so it
+            // cannot hold the game here until this bridge restarts.
+            client.NoDelay = true;
+            try {
+                client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 10);
+                client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 2);
+                client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+            } catch (Exception error) { Console.WriteLine("Keepalive not set: " + error.Message); }
             Process worker = null;
             StreamWriter errorLog = null;
             Task errors = null;

@@ -615,6 +615,31 @@ second PC with `focus` every third frame and a full capture every seventh: tick 
 by 10.7 / 14.1 / 15.7 s. Without views, rows arrived within a millisecond of the capture
 at the median and 18 ms at p95.
 
+**Rows and replies leave at once.** The bridge and the client used to hold a small message
+until the last one sent was acknowledged (Nagle's algorithm). They now send it at once.
+Measured on the second PC during a 60 s stream, with a focus every third frame and a full
+capture every seventh:
+- rows arrived 0.8 ms p50 and 4.1 ms p95 after capture, against 2.4 and 35.6 ms before;
+- status round trips took 1.2 ms p50 and 16.3 ms p95, against 1.5 and 57.7 ms.
+
+Both ends also probe a quiet connection after 10 s. A peer that vanishes (its PC switched
+off) no longer holds the game there until the bridge restarts.
+
+**A game that exits or hangs during a stream.**
+- The stream's gaps now say `game_exited` or `game_not_responding` instead of looking like
+  focus loss. A hung game's frozen ghost is never recorded.
+- `focus` refuses with `game_window_gone` instead of pressing Alt at whatever is in front,
+  such as the crash reporter.
+- Input, capture and focus now also check that the window still belongs to the game's
+  process, because Windows can reuse a closed window's handle for another program.
+
+Checked by quitting the game during a stream: every gap said `game_exited`, focus
+refused, and the 28 frames before the quit made a complete recording.
+
+Rows' `received_ns` now uses the high-resolution clock. `time.monotonic` ticks in 15.6 ms
+steps on Windows before Python 3.13. Manifests give `clock_offset_ns`, and the clock
+mapping is renewed every 30 s, because the two PCs drift apart by 3-7 ppm.
+
 **Killed recordings can be salvaged.** A recorder killed before it closed its recording
 (a run stopped by hand, say) leaves it incomplete, and training skips every incomplete
 recording. On 2026-09-24, 13 such recordings in artifacts/ held 16,774 usable rows, 56
