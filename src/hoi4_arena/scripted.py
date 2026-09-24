@@ -660,7 +660,7 @@ class Planner:
         if not front or not len(xs):
             raise RuntimeError("no front or enemy land on screen")
         if self.plan["attack"] == "broad":
-            line = self.broad_line(front, box)
+            line = self.broad_line(front, box, self.plan.get("depth", BROAD_DEPTH))
             if len(line) < 2:
                 raise RuntimeError("no front to draw a broad offensive along")
             self.drag(desk, [self.screen_point(rgb, *p) for p in line], steps=3)

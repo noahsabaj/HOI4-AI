@@ -24,6 +24,8 @@ dependencies = [
     "cryptography>=46",
     "opencv-python-headless>=4.10",
     "timm>=1.0.30",
+    # Tunes the scripted player's plans (tuning.py): GPSampler is stable since Optuna 5.
+    "optuna>=5",
     # The live actor compiles its action head into a CUDA graph with torch.compile, which
     # needs Triton; on Windows that is the triton-windows build. 3.6 is the Triton torch
     # 2.11 pins on Linux. Measured on the second PC (2026-09-23): the head compiled with

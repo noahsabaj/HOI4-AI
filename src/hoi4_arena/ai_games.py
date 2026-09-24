@@ -1003,6 +1003,8 @@ def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, plann
                     except (ValueError, OSError):
                         return  # The game ended and its connection closed mid-order.
                     except RuntimeError as error:
+                        if stop.is_set():
+                            return  # The game ended mid-order ("read of closed file").
                         say(station, "planner:", error)
                         planner.failures.append({"frame": planner.frame(), "error": str(error)})
                         moved = True
@@ -1562,9 +1564,44 @@ def log_end(desk):
         offset = after
 
 
-def run_station(station, out_root, rules, templates, settings, end):
+def pick_plan(rng, arena, settings, request=None):
+    """The scripted player's plan for a game on `arena`: the best plan for an arena test;
+    otherwise choose_plan's, whose exploring share asks the tuner (settings["tuner"],
+    tuning.Tuner) for the best plan with its next settings, unless the arena is in
+    settings["tune_skip"]. A tuner that cannot answer leaves the exploring plan."""
     from .scripted import best_plan, choose_plan
 
+    if request:
+        return best_plan(rng)
+    plan = choose_plan(rng)
+    tuner = settings.get("tuner")
+    if tuner is not None and plan["variant"] == "explore" and arena not in settings["tune_skip"]:
+        try:
+            return tuner.propose(rng)
+        except Exception as error:  # noqa: BLE001 - the game explores as before.
+            say("tuner", "no plan:", error)
+    return plan
+
+
+def report_score(settings, entry, game):
+    """A tuned game's score (tuning.game_score) to the tuner, kept in its results entry;
+    a game with no result fails its trial."""
+    from .tuning import game_score
+
+    plan = entry.get("plan") or {}
+    if settings.get("tuner") is None or "trial" not in plan:
+        return
+    score = None
+    if entry.get("winner") in ("BLU", "RED", "timeout") and not entry.get("reason"):
+        score = game_score(game, entry["started_as"], entry["winner"])
+    entry["score"] = score
+    try:
+        settings["tuner"].report(plan, score)
+    except Exception as error:  # noqa: BLE001 - the game itself is saved.
+        say("tuner", "score not reported:", error)
+
+
+def run_station(station, out_root, rules, templates, settings, end):
     results = []
     scripted = settings.get("player") == "scripted"
     queue = settings.get("queue")
@@ -1616,7 +1653,7 @@ def run_station(station, out_root, rules, templates, settings, end):
         entry["declare_drawn"] = rng.choice(("BLU", "RED"))
         player = None
         if scripted:
-            plan = best_plan(rng) if request else choose_plan(rng)
+            plan = pick_plan(rng, entry["arena"], settings, request)
             player = {"plan": plan, "templates": settings["buttons"], "rules": rules}
             entry["plan"] = player["plan"]
         if request:
@@ -1747,6 +1784,7 @@ def run_station(station, out_root, rules, templates, settings, end):
             if result["accepted"]:
                 accept_arena(queue, mod)
             say(station.name, "arena", request["name"], "accepted:", result["accepted"])
+        report_score(settings, entry, out_root / name)
         results.append(entry)
         # One file per run: runs sharing a folder had each rewritten the day's file.
         path.write_text(json.dumps(results, indent=2))
@@ -1778,6 +1816,8 @@ def record_ai_games(
     start_saves=None,
     opening=None,
     main_only=False,
+    tune=None,
+    tune_skip=None,
 ):
     """Record on this PC, the second PC, or both at once, until `minutes` run out.
 
@@ -1796,6 +1836,10 @@ def record_ai_games(
     `start_saves` ("ARENA:COUNTRY:SAVE") launch a game straight into a save made paused at
     the start of a new game, skipping the menus. `opening` is a range of seconds the game
     runs at speed 1 before the war begins (run_briefly).
+
+    With `tune`, a tuning study's SQLite file (tuning.py), the scripted player's exploring
+    games play the best plan with the settings the study asks for, except on the arenas
+    in `tune_skip`, and each reports its score to the study (pick_plan).
     """
     from .scripted import TEMPLATES, load_templates
 
@@ -1827,7 +1871,13 @@ def record_ai_games(
         "speeds": list(speeds),
         "player": player,
         "buttons": load_templates(TEMPLATES) if player == "scripted" else None,
+        "tuner": None,
+        "tune_skip": set(tune_skip or ()),
     }
+    if tune and player == "scripted":
+        from .tuning import Tuner
+
+        settings["tuner"] = Tuner(tune)
     stations = [] if peer_only else [Station("here")]
     if peer:
         stations.append(Station("peer", peer))
