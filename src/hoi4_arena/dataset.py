@@ -197,6 +197,22 @@ PRESS_KINDS = [i for i, e in enumerate(VOCAB) if e and e["kind"] == "button" and
 # (run_at). A lit alert or a tooltip under the pointer would spoil the search.
 PARKING = ((0.5, 0.5), (0.65, 0.012), (0.5, 0.75))
 
+# The camera's arrow-key pans. Until #90 (2026-09-24 13:10) the recorder's camera chose
+# 30% of its pans at random, whatever the screen showed. A policy that learned them walked
+# its camera off the top of the map in a live game and had never seen the way back
+# (2026-09-24); since #90 the camera keeps the front in view.
+ARROW_KEYS = (0x25, 0x26, 0x27, 0x28)
+
+
+def camera_keys_dropped(manifest, camera_since):
+    """The keys to leave out of a recording's labels for its camera: the arrows, when a
+    script's recording (not a player's) was made before `camera_since` (unix seconds), or
+    when it has no start time; else none."""
+    if camera_since is None or manifest.get("source") == "human":
+        return ()
+    started = (manifest.get("recorder") or {}).get("started_unix")
+    return () if started is not None and started >= camera_since else ARROW_KEYS
+
 
 def parking_moves(events):
     """Indices of the moves in `events` (in time order) that only park the pointer.
@@ -675,7 +691,8 @@ class VideoSessions(IterableDataset):
     the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state`, `orders`,
     `press_weight`, `drop_parking` and `setup_weight` pass to session_labels; a lead-in
     shorter than a clip needs `clips` off. `tower`, a tower cache (tower_cache.py), adds
-    each decision's frozen-tower reading to its window.
+    each decision's frozen-tower reading to its window. `camera_since` (unix seconds)
+    also drops the arrow keys from recordings made before it (camera_keys_dropped).
     """
 
     def __init__(
@@ -706,6 +723,7 @@ class VideoSessions(IterableDataset):
         press_weight=1.0,
         drop_parking=False,
         setup_weight=1.0,
+        camera_since=None,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -736,7 +754,7 @@ class VideoSessions(IterableDataset):
                     advantage=advantage,
                     look_before_click=look_before_click,
                     lead_in=lead_in,
-                    drop_keys=drop_keys,
+                    drop_keys=tuple(drop_keys) + camera_keys_dropped(meta, camera_since),
                     loser_weight=loser_weight,
                     state=state,
                     orders=orders,

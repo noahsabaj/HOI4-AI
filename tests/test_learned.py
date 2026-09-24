@@ -45,6 +45,35 @@ def test_a_key_the_harness_presses_is_dropped_from_the_labels_not_the_decision(t
     assert dropped["valid"][1] and not dropped["actions"][1].any()
 
 
+UP = {"kind": "key", "vk": 0x26, "down": True}
+
+
+def test_the_old_camera_s_arrow_keys_are_dropped_from_recordings_made_before_it_changed():
+    """Until #90 the recorder's camera panned at random; a policy that learned it walked its
+    camera off the map live. A player's own recordings keep their arrows."""
+    from hoi4_arena.dataset import ARROW_KEYS, camera_keys_dropped
+
+    old = {"source": "scripted", "recorder": {"started_unix": 1000.0}}
+    assert camera_keys_dropped(old, None) == ()
+    assert camera_keys_dropped(old, 2000.0) == ARROW_KEYS
+    assert camera_keys_dropped({**old, "recorder": {"started_unix": 3000.0}}, 2000.0) == ()
+    assert camera_keys_dropped({"source": "ai"}, 2000.0) == ARROW_KEYS, "no start time: old"
+    assert camera_keys_dropped({**old, "source": "human"}, 2000.0) == ()
+
+
+@needs_ffmpeg
+def test_training_drops_the_old_camera_per_recording(tmp_path):
+    for name, started in (("old", 1000.0), ("new", 3000.0)):
+        _recording(tmp_path / name, [1, 1], source="scripted", events=[(2_000_000_000, UP)])
+        path = tmp_path / name / "manifest.json"
+        manifest = {**json.loads(path.read_text()), "recorder": {"started_unix": started}}
+        path.write_text(json.dumps(manifest))
+    common = {"sources": ("scripted",), "length": 2, "burn_in": 1, "device": "cpu"}
+    sessions = VideoSessions(tmp_path, camera_since=2000.0, **common).sessions
+    pressed = {s["root"].name: (s["actions"][..., 0] == VOCAB.index(UP)).any() for s in sessions}
+    assert pressed == {"old": False, "new": True}
+
+
 def test_a_lost_game_counts_for_its_loser_weight(tmp_path):
     _scripted(tmp_path / "won", winner="BLU", started_as="BLU", players=["BLU"])
     _scripted(tmp_path / "lost", winner="BLU", started_as="RED", players=["RED"])

@@ -23,7 +23,7 @@ import torch
 from torch.utils.data import default_collate
 
 from .actions import GRID
-from .dataset import _Stream, batch_to_device, cover_starts, session_labels
+from .dataset import _Stream, batch_to_device, camera_keys_dropped, cover_starts, session_labels
 from .models import PRESSES, reads_clip
 
 # Cold to hot, the way a heat camera shows it: dark blue, purple, red, orange, yellow.
@@ -174,12 +174,14 @@ def aimed(actions, decision, ahead=3):
 
 def trained_labels(config, recording, manifest):
     """A recording's labels cut as a checkpoint's training cut them (`config`: its lead-in,
-    dropped keys and parking moves), with its frozen tower's cache when it has one."""
+    dropped keys, the old camera's keys and parking moves), with its frozen tower's cache
+    when it has one."""
+    keys = tuple(config.get("drop_keys") or ())
     labels = session_labels(
         recording,
         sources=(manifest["source"],),
         lead_in=config.get("lead_in"),
-        drop_keys=tuple(config.get("drop_keys") or ()),
+        drop_keys=keys + camera_keys_dropped(manifest, config.get("camera_since")),
         drop_parking=bool(config.get("drop_parking")),
     )
     if config.get("tower_cache"):

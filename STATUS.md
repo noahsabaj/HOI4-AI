@@ -1133,7 +1133,7 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   the next-order read-out to 0.48, and the true-state read-out to a positive R2 for the
   enemy's numbers (0.43) and the date (0.54). One epoch on 23 games instead of 13 (the
   newer ones start from saves, as the live games do) brought them to 5.73 and 3.46.
-- **Live games so far: 0 wins in 6** (95% interval 0.00-0.39), each lasting longer than a
+- **Live games so far: 0 wins in 8** (95% interval 0.00-0.32), each lasting longer than a
   player that does nothing (152 s):
 
 | Policy | Side | Lost after | Setup and orders it made | Act time p50 / p95 | Late ticks |
@@ -1144,21 +1144,35 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
 | Weighted, fixed memory (bc3c, 5 epochs) | Red | 227 s | **raised conscription**: Q, the law slot, Limited, OK (Q 17) | 66 / 99 ms | 7 |
 | Same, 23 games (bc4c, 1 more epoch) | Blue | 225 s | commander-list presses 3, law slot 1, one front, one offensive | 71 / 84 ms | 14 |
 | Same, 23 games (bc4c, 1 more epoch) | Red | 221 s | create-army button 2 (Q 17) | 76 / 84 ms | 7 |
+| bc4c, 1 epoch more (e1) | Blue | 286 s | **formed an army with a general**: alert 6, create-army 3, portrait 16; no front | 74 / 107 ms | 19 |
+| bc4c, 1 epoch more (e1) | Red | 230 s | alert 2, create-army 6, portrait 17, fronts 17, offensives 5; never executed | 56 / 103 ms | 7 |
 
-  No game clicked the unassigned-divisions alert, so no army formed and no plan was
-  executed; the harness started every game at its 90 s limit. The conscription change is
+  Until bc4c e1 no game clicked the unassigned-divisions alert, so no army formed. e1
+  formed one and gave it a general as Blue, but its alert clicks lacked Shift, so the army
+  took one division of eight; as Red it drew fronts and offensives but never executed a
+  plan. No game has executed one, and the harness started every game at its 90 s limit
+  (the policy never clicked the speed control's +). The conscription change is
   certain: in the recording the "Replace Volunteer Only with Limited Conscription for 150"
   dialog shows, the pointer is on its OK, political power falls from 241 to 133 over the
   next 16 days, and the law slot's tooltip then reads Limited Conscription. It is the
   first of the scripted player's procedures a learned policy has carried out live. The
   first two games ran with training on the same card (act time 158-166 ms); since then
   training pauses during live games (`pause` file).
-- **Why the setup fails.** At the scripted player's setup clicks the policy's press
-  probability is 0.02-0.12 a decision (10-60 times the base rate), but its pointer puts
-  about 60% of its mass on the cell at the screen's centre: the scripted player moves the
-  pointer to the centre before each screen search (forming the army, clearing orders,
-  activating), so the centre is a frequent real target. Moves to the create button and the
-  commander portrait miss by 500-1000 px; clicks on the front miss by about 60 px.
+- **Why the setup failed.** For the older checkpoints, the pointer put about 60% of its
+  mass on the cell at the screen's centre: the scripted player moves the pointer there
+  before each screen search (forming the army, clearing orders, activating), so the centre
+  was a frequent target. `train-bc --drop-parking` now leaves those moves out (#99).
+- **Setup pointing** (`hoi4-arena setup-pointing`, the 4 held-out games, memory carried
+  from each game's start): bc4c e0 missed the alert, the create-army + and the commander
+  portrait by 502, 36 and 30 px, with a 3-15% chance of a hit within 30 px. One more
+  epoch (e1) missed them by 0, 6 and 0 px, a hit 60-93% of the time, which the live games
+  bore out. Its front clicks got worse (925 px against 58). Both give a move only about a
+  2% chance at the decision where the scripted player moved.
+- **The camera.** bc4c learned its camera from games recorded before #90, when 30% of the
+  recorder's pans were random arrow presses. Live, as Blue, its pans walked the camera off
+  the top of the map, a view no recording shows, and it never came back. `train-bc
+  --camera-since 20260924-131000` leaves the arrow keys out of the recordings made before
+  the front director; the 72 games recorded since keep theirs.
 
 ## The memory study (2026-09-24)
 
