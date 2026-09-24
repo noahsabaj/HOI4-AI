@@ -5,7 +5,6 @@ import random
 import shutil
 import subprocess
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -13,6 +12,21 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from .actions import PERIOD, SLOTS, VOCAB, encode_interval
+
+# The view sizes, the game speeds, the pointer and the speed record are in layout.py, which
+# needs no torch, so the recorders and the worker's client can use them without it. They
+# are imported here so every `from .dataset import ...` keeps working.
+from .layout import (  # noqa: F401
+    DETAIL_SIZE,
+    FOVEA_SIZE,
+    GAME_SPEED_SECONDS,
+    QUADRANTS,
+    VIEW_SIZE,
+    Views,
+    hw,
+    parse_cursor,
+    recorded_speed,
+)
 from .learning import GAMMA
 
 # How many past global views one decision looks at. Eight frames is what fits the
@@ -31,42 +45,12 @@ CLIP_FRAMES = 8
 PERIOD_NS = int(round(PERIOD * 1e9))
 # The longest wait between two frames a decision may read across.
 MAX_GAP_NS = 1_000_000_000
-# Three views of each decision's frame, all area-averaged the same way (see `views`).
-# Sizes are (height, width); the screen is 16:9 and so are the resized views, since
-# squashing it into squares cost the encoders what they read (2026-09-23, STATUS.md):
-#
-# - The global view, the whole screen at VIEW_SIZE, is what the video encoder (LeVJEPA)
-#   reads, frames in sequence. At 448x256 with four frames it read camera motion best.
-# - The four quadrants at DETAIL_SIZE, tiled back into a 1152x640 screen for the Qwen3.5
-#   tower and read by a small CNN. HOI4 is read from text, 10 px at 1080p: the tower named
-#   58% of such characters at 1152x640 against 56.5% from the old 896 square, for less time.
-# - The fovea, FOVEA_SIZE native pixels square, centred on the pointer, never resized:
-#   whatever the pointer is over is seen at full resolution.
-VIEW_SIZE = (256, 448)
-DETAIL_SIZE = (320, 576)
-FOVEA_SIZE = 224
-QUADRANTS = 4
-# Wall seconds of one in-game hour: the game's GAME_SPEED_SECONDS, speeds 1 through 5.
-# Speed 1 was measured at 2.0 (48 s per in-game day) and speed 4 at 0.1. Speed 5 is 0
-# because the simulation does not sleep, so that clip has no fixed game length. Eight
-# frames at the decision interval are 1.6 s of wall time: 3.2 in-game hours at speed 2
-# and 16 at speed 4. The policy is told the speed (Policy's speed input), so one model can
-# learn from recordings made at different speeds.
-GAME_SPEED_SECONDS = (2.0, 0.5, 0.2, 0.1, 0.0)
 # Where `hoi4-arena label` writes the inverse dynamics model's labels in a recording.
 IDM_LABELS = "labels-idm.npz"
 # Where `hoi4-arena advantage` writes a player's recording's weights (offline.py).
 ADVANTAGE_LABELS = "labels-advantage.npz"
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
-
-
-class Views(NamedTuple):
-    """One frame as the policy sees it. All uint8, channels last."""
-
-    global_view: torch.Tensor | None  # (*VIEW_SIZE, 3); None when not asked for
-    quadrants: torch.Tensor  # (4, *DETAIL_SIZE, 3)
-    fovea: torch.Tensor  # (FOVEA_SIZE, FOVEA_SIZE, 3)
 
 
 def clip_frame_ids(frame_times_ns, decision_ns):
@@ -89,29 +73,6 @@ def quadrants(h, w):
         (h // 2, 0, h - h // 2, w // 2),
         (h // 2, w // 2, h - h // 2, w - w // 2),
     ]
-
-
-def recorded_speed(value):
-    """Manifest fields for the speed the operator set.
-
-    There is no default. A recording that omits the speed cannot be assigned one
-    afterwards, and the documented 2 is not what the long runs used.
-    """
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
-        raise ValueError("game speed must be an integer from 1 to 5")
-    seconds = GAME_SPEED_SECONDS[value - 1]
-    return {"game_speed": value, "seconds_per_hour": None if seconds == 0 else seconds}
-
-
-def parse_cursor(value):
-    """Client-pixel pointer the fovea is centered on."""
-    if (
-        isinstance(value, (list, tuple))
-        and len(value) == 2
-        and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
-    ):
-        return int(value[0]), int(value[1])
-    raise ValueError("cursor must be two client-pixel integers")
 
 
 def cursor_crop(rgb, x, y, size):
@@ -139,11 +100,6 @@ def cursor_crop(rgb, x, y, size):
         dst_x0 : dst_x0 + (src_x1 - src_x0),
     ] = image[src_y0:src_y1, src_x0:src_x1]
     return out
-
-
-def hw(size):
-    """A view size as (height, width): an int is a square."""
-    return (size, size) if isinstance(size, int) else tuple(int(v) for v in size)
 
 
 def _area(box, size):

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import DETAIL_SIZE, FOVEA_SIZE, QUADRANTS, Views, hw, parse_cursor
+from .layout import DETAIL_SIZE, FOVEA_SIZE, QUADRANTS, Views, hw, parse_cursor
 
 log = logging.getLogger(__name__)
 
