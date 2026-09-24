@@ -1068,6 +1068,104 @@ def _evaluate(heads, games, device, clear_every=None, loader=None, graphs=True, 
     return results
 
 
+# A unit whose output moves less than this over a held-out game (its standard deviation
+# over time) never moves. A memory most of whose units never move is dead.
+STILL = 1e-3
+
+
+@torch.no_grad()
+def memory_health(heads, games, device, loader=None):
+    """Whether each head's memory is alive, over held-out games with the memory carried from
+    each game's start, as `evaluate` runs it, one decision at a time.
+
+    The memory study of 2026-09-24 compared GRUs whose memory was dead: the tower's summary,
+    about 70 in size, saturated every gate, so over a whole game their output did not move
+    (0.003 standard deviation over time, 89% of units never moving) and one step from an
+    empty memory landed within 3% of the carried one. Nothing in the report showed it. Each
+    head gets:
+
+    - `std_over_time`: the memory output's standard deviation over the steps of a game, mean
+      over units and games;
+    - `still_units`: the fraction of units whose standard deviation over time is under STILL;
+    - `one_step_from_empty`: how far one step taken from an empty memory lands from the same
+      step taken from the carried one: mean |difference| over mean |output|, over steps;
+    - `saturated_gates`: for the GRU, the fraction of reset and update gates below 0.01 or
+      above 0.99 and of candidate values beyond +-0.99; None for other cells;
+    - `dead`: whether most units never move.
+    """
+    autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
+    chunk = 128
+    reader = loader or _Loader(games, device)
+    plans = (
+        ([(game, start)], chunk, [start == 0])
+        for game in games
+        for start in range(0, game.length, chunk)
+    )
+    batches = reader(plans)
+    spread = [[] for _ in heads]
+    distance = [[] for _ in heads]
+    gated = [hasattr(head.memory, "gates") for head in heads]
+    saturated = [{"reset": [], "update": [], "candidate": []} for _ in heads]
+    try:
+        for game in games:
+            memories = [head.initial(1, device) for head in heads]
+            outputs = [[] for _ in heads]
+            for start in range(0, game.length, chunk):
+                batch, _ = next(batches)
+                for t in range(min(chunk, game.length - start)):
+                    for i, head in enumerate(heads):
+                        out, state = memories[i]
+                        with torch.autocast(**autocast):
+                            x = fuse(
+                                head,
+                                batch["summary"][:, t],
+                                batch["cells"][:, t],
+                                batch["centre"][:, t],
+                                batch["previous"][:, t],
+                                batch["speed"][:, t],
+                                out,
+                            )
+                            if gated[i]:
+                                gates = head.memory.gates(x, state)
+                            out, state = head.memory(x, state)
+                            empty, _ = head.memory(x, head.memory.initial(1, device))
+                        memories[i] = out, state
+                        outputs[i].append(out[0].float())
+                        size = out.float().abs().mean().clamp_min(1e-12)
+                        distance[i].append((out.float() - empty.float()).abs().mean() / size)
+                        if gated[i]:
+                            for name, value in gates.items():
+                                if name == "candidate":
+                                    edge = value.abs() > 0.99
+                                else:
+                                    edge = (value < 0.01) | (value > 0.99)
+                                saturated[i][name].append(edge.float().mean())
+            for i in range(len(heads)):
+                std = torch.stack(outputs[i]).std(0)
+                spread[i].append((std.mean(), (std < STILL).float().mean()))
+    finally:
+        batches.close()
+        if loader is None:
+            reader.close()
+    health = []
+    for i in range(len(heads)):
+        still = float(torch.stack([s for _, s in spread[i]]).mean())
+        health.append(
+            {
+                "std_over_time": float(torch.stack([m for m, _ in spread[i]]).mean()),
+                "still_units": still,
+                "one_step_from_empty": float(torch.stack(distance[i]).mean()),
+                "saturated_gates": (
+                    {name: float(torch.stack(v).mean()) for name, v in saturated[i].items()}
+                    if gated[i]
+                    else None
+                ),
+                "dead": still > 0.5,
+            }
+        )
+    return health
+
+
 def _probe_targets(game):
     labels = game.labels
     n = game.length
@@ -1243,12 +1341,13 @@ def train_memories(
         probed = train[: probe_games or len(train)]
         on_train = _evaluate(evaluation, probed, device, loader=loader)
         del evaluation  # and its graphs, before the cache is let go
+        healths = memory_health(heads, validation, device, loader=loader)
     finally:
         loader.close()
         _release_cuda(cuda)
     reports = []
-    for run, (nll, nll_acting, outs), (nll_cleared, _, _), (_, _, train_outs) in zip(
-        runs, carried, cleared, on_train, strict=True
+    for run, (nll, nll_acting, outs), (nll_cleared, _, _), (_, _, train_outs), health in zip(
+        runs, carried, cleared, on_train, healths, strict=True
     ):
         report = {
             "memory": run.memory,
@@ -1268,6 +1367,7 @@ def train_memories(
             "probes": probe(train_outs, probed, outs, validation),
             "train_games": len(train),
             "validation_games": len(validation),
+            "memory_health": health,
         }
         torch.save({"head": run.head.state_dict(), "report": report}, run.output / "head.pt")
         (run.output / "report.json").write_text(json.dumps(report, indent=2))
