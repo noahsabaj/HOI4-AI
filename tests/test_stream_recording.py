@@ -179,7 +179,7 @@ def test_stream_messages_reach_their_stream_and_replies_their_request():
     assert box.get_nowait() == {"id": 3, "stream": "abc", "width": 16}
 
 
-def test_the_observer_role_rides_on_the_token_line():
+def test_the_observer_role_rides_on_the_token_line(tmp_path):
     from hoi4_arena import remote
 
     written = []
@@ -219,12 +219,13 @@ def test_the_observer_role_rides_on_the_token_line():
 
     pin = hashlib.sha256(b"cert").hexdigest()
     spec = {"host": "127.0.0.1", "port": 1, "token": "t" * 64, "certificate_sha256": pin}
+    peer = tmp_path / "peer.json"
+    peer.write_text(json.dumps(spec))
     for observer, line in ((False, b"t" * 64 + b"\n"), (True, b"t" * 64 + b" observer\n")):
         written.clear()
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(remote.socket, "create_connection", lambda *a, **k: object())
             mp.setattr(remote.ssl, "SSLContext", _Context)
-            mp.setattr(remote.Path, "read_text", lambda self: json.dumps(spec))
-            desk = remote.RemoteDesktop("peer.json", attach=False, observer=observer)
+            desk = remote.RemoteDesktop(peer, attach=False, observer=observer)
             desk._shutdown()
         assert written[0] == line
