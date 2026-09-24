@@ -27,12 +27,13 @@ Calibrated live at 1920x1080 on 2026-09-23:
 - The green arrow above the army card activates the plan. Once active, it changes.
 - The Battle Plans bar shows while an army is selected.
 - Q opens the political screen. Its first law slot is conscription: a click lists the
-  laws, a click on one asks "Replace Idea?", and OK changes it for political power
-  (Limited Conscription 150, Extensive 300; a country starts with 2 and gains about 2 a
-  day). The AI changes it once it can afford to: in the first v4 games its manpower pool
+  laws, a click on one asks "Replace Idea?", and OK changes it for political power (150
+  a step up the list; a country starts with 2 and gains about 2 a day). With too little
+  power OK does nothing and the question stays. After OK the list closes by itself. The
+  AI changes the law once it can afford to: in the first v4 games its manpower pool
   began refilling in late May and its deployed manpower rose from 15k to 16-21k, while
-  the script's, which never changed the law, only fell. The law is read from the slot's
-  own icon, since the open list shows every law's icon.
+  the script's, which never changed the law, only fell. The starting law is read from
+  the slot's own icon, since the open list shows every law's icon.
 - A new army has no commander ("No Commander" in its panel). A click on the panel's
   portrait lists the country's commanders, and a click on one assigns them. Each arena
   country has three generals and a field marshal, all skill 3; the AI puts one in charge
@@ -84,11 +85,17 @@ FRONT_LINE, OFFENSIVE_LINE, SHIFT, POLITICS = 0x5A, 0x58, 0x10, 0x51
 # The political screen at 1080p: the conscription slot (its icon's box), each law's row
 # in the list it opens, the confirmation's OK and Cancel, and the list's close button.
 LAW_SLOT = (38, 571, 82, 615)
-LAW_ROWS = {"limited": (703, 322), "extensive": (703, 396)}
 CONFIRM, CANCEL, CLOSE_LIST = (1054, 677), (884, 677), (1005, 100)
-# Divisions start at 31% strength and fill from the manpower pool, which the law sets,
-# so most games go as far as Extensive.
-CONSCRIPTION = {"none": 0.1, "limited": 0.2, "extensive": 0.7}
+# The conscription laws up the list from the start's Volunteer Only, one row (74 px) each;
+# every step costs 150 political power. Scraping the Barrel, the last, was not on offer.
+LAWS = ["volunteer", "limited", "extensive", "service", "all_adults"]
+LAW_ROWS = {law: (703, 322 + 74 * i) for i, law in enumerate(LAWS[1:])}
+# Divisions start at 31% strength and fill from the manpower pool, which the law sets.
+# Extensive alone left them at 81% after five years of a held front, with 2,000
+# political power unspent (2026-09-23), so most games go further.
+CONSCRIPTION = {"limited": 0.1, "extensive": 0.2, "service": 0.3, "all_adults": 0.4}
+# Tries at one law step before giving up on it (every 10 s).
+LAW_TRIES = 30
 # The army panel's commander portrait, and the first commander in the list it opens.
 COMMANDER_SLOT, FIRST_COMMANDER = (30, 140), (950, 352)
 # How far a broad offensive goes: this share of the way from the front to the enemy's
@@ -108,35 +115,35 @@ ARMY_BAR_TOP = 0.88
 COLUMNS, ROWS, STATE_WIDTH, STATE_HEIGHT, STATE_ROWS = 24, 8, 3, 4, 2
 ENEMY = {"BLU": "RED", "RED": "BLU"}
 # Arrows toward one state lost the front's flanks or its rear in every game with them
-# (2026-09-23), so most games attack broad or hold.
-ATTACKS = {"broad": 0.55, "near": 0.1, "deep": 0.1, "none": 0.25}
+# (2026-09-23), so most games attack broad. None holds only: a held front with a general
+# and Extensive conscription stood unbroken for five years, a draw.
+ATTACKS = {"broad": 0.7, "near": 0.15, "deep": 0.15}
 
 
 def choose_plan(rng):
     """One game's strategy, drawn at random.
 
     `attack` is where the offensive goes: "broad", the whole front forward by a third of
-    the enemy's land; "near", toward one of the enemy's border states; "deep", toward
-    its rear; or "none", a front line only, held by the game's own general. `wait` is
-    how long the plan prepares before it is activated: preparation raises the plan's
-    bonus, while the enemy may strike first. `redraw` is how often the plan is drawn
-    afresh (every order deleted, then a new front and offensive), or None for never.
+    the enemy's land; "near", toward one of the enemy's border states; or "deep", toward
+    its rear. `wait` is how long the front holds, with the offensive drawn, before the
+    plan is executed: preparation raises the plan's bonus, and a longer hold lets the
+    divisions fill up, while the enemy may strike first. `redraw` is how often the plan
+    is drawn afresh (every order deleted, then a new front and offensive), or None.
     """
     attack = rng.choices(list(ATTACKS), weights=list(ATTACKS.values()))[0]
     return {
-        # How far to raise conscription once political power allows: not at all, to
-        # Limited, or on to Extensive. Mostly raised, as the AI does; sometimes not, to
-        # measure what it is worth.
+        # How far up the conscription laws to go as political power allows.
         "conscription": rng.choices(list(CONSCRIPTION), weights=list(CONSCRIPTION.values()))[0],
         "attack": attack,
-        # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5.
-        "wait": round(rng.uniform(6, 60)),
+        # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5; some games
+        # hold for up to a game year and a half first.
+        "wait": round(rng.uniform(6, 60) if rng.random() < 0.6 else rng.uniform(60, 240)),
         # A broad offensive stops at its line, so it is always drawn again, further on.
         "redraw": (
             round(rng.uniform(30, 90))
             if attack == "broad"
             else None
-            if attack == "none" or rng.random() < 0.5
+            if rng.random() < 0.5
             else round(rng.uniform(40, 120))
         ),
     }
@@ -192,6 +199,9 @@ class Planner:
         self.active = self.running = False
         # Attempts at activating the current plan.
         self.tries = 0
+        # The conscription law in force, as an index into LAWS, and failed tries at the
+        # next step.
+        self.law_step = self.law_fails = 0
         # A setup that failed, for play() to end the game with.
         self.error = None
 
@@ -461,7 +471,7 @@ class Planner:
             self.activate_at = now + self.plan["wait"]
         if self.plan["redraw"]:
             self.redraw_at = now + self.plan["redraw"]
-        if self.plan.get("conscription", "none") != "none":
+        if self.plan.get("conscription") in LAWS[1:]:
             # About 150 political power after half a minute at speed 5.
             self.law_at = now + 30
 
@@ -523,19 +533,24 @@ class Planner:
         return False
 
     def raise_conscription(self, desk):
-        """One step of the conscription law toward the plan's. True once it is there.
+        """One step up the conscription laws toward the plan's. True once it is there, or
+        once a step has failed LAW_TRIES times running.
 
-        Every click is made only where the screen it is meant for shows: after OK the law
-        list closes by itself, and a click on its close button then lands on the map.
+        The law in force is read from the slot's icon only at the start (Volunteer Only or
+        Limited). After that a step counts as taken when its confirmation closes on OK,
+        which it does only with the political power to pay. Every click is made only where
+        the screen it is meant for shows: after OK the law list closes by itself, and a
+        click on its close button then lands on the map.
         """
-        goal = self.plan["conscription"]
+        goal = LAWS.index(self.plan["conscription"])
         if not self.politics(desk, True):
             return False
-        now = self.law(screen(desk))
-        target = {"volunteer": "limited", "limited": "extensive"}.get(now)
-        if now == goal or target is None or (now, goal) == ("limited", "limited"):
+        if self.law_step == 0 and self.law(screen(desk)) == "limited":
+            self.law_step = 1
+        if self.law_step >= goal:
             self.politics(desk, False)
             return True
+        target = LAWS[self.law_step + 1]
         self.click(desk, pixels(LAW_SLOT[0] + 22, LAW_SLOT[1] + 22))
         time.sleep(0.8)
         changed = False
@@ -545,18 +560,20 @@ class Planner:
             if self.find(screen(desk), "confirm_ok") is not None:
                 self.click(desk, pixels(*CONFIRM))
                 time.sleep(0.8)
-            if self.find(screen(desk), "confirm_ok") is not None:
-                self.click(desk, pixels(*CANCEL))  # Not enough political power yet.
-                time.sleep(0.5)
+                changed = self.find(screen(desk), "confirm_ok") is None
+                if not changed:
+                    self.click(desk, pixels(*CANCEL))  # Not enough political power yet.
+                    time.sleep(0.5)
             if self.find(screen(desk), "law_list") is not None:
                 self.click(desk, pixels(*CLOSE_LIST))
                 time.sleep(0.5)
-            rgb = screen(desk)
-            changed = self.find(rgb, "political_title") is not None and self.law(rgb) != now
         self.politics(desk, False)
         if changed:
+            self.law_step, self.law_fails = self.law_step + 1, 0
             self.order("law", law=target)
-        return changed and target == goal
+            return self.law_step >= goal
+        self.law_fails += 1
+        return self.law_fails >= LAW_TRIES
 
 
 def green_plus(rgb):

@@ -11,7 +11,7 @@ def test_plans_cover_every_attack_and_never_redraw_without_one():
     plans = [choose_plan(rng) for _ in range(400)]
     assert {p["attack"] for p in plans} == set(ATTACKS)
     assert all(p["redraw"] is None for p in plans if p["attack"] == "none")
-    assert all(6 <= p["wait"] <= 60 for p in plans)
+    assert all(6 <= p["wait"] <= 240 for p in plans) and any(p["wait"] > 60 for p in plans)
     assert all(p["redraw"] for p in plans if p["attack"] == "broad")
     assert any(p["redraw"] is None for p in plans if p["attack"] in ("near", "deep"))
 
@@ -74,7 +74,7 @@ def test_the_win_rate_counts_decided_games_by_side_and_attack():
         {"started_as": "BLU", "winner": "BLU", "plan": {"attack": "deep"}},
         {"started_as": "BLU", "winner": "RED", "seconds": 150, "plan": {"attack": "near"}},
         {"started_as": "RED", "winner": "RED", "plan": {"attack": "near"}},
-        {"started_as": "RED", "winner": "timeout", "plan": {"attack": "none"}},
+        {"started_as": "RED", "winner": "timeout", "plan": {"attack": "broad"}},
         {"started_as": "BLU", "error": "RuntimeError: no army"},
     ]
     report = win_rate(games)
@@ -84,7 +84,7 @@ def test_the_win_rate_counts_decided_games_by_side_and_attack():
         "interval95": [round(x, 3) for x in wilson(2, 3)], "lost_after_s": 150,
     }  # fmt: skip
     assert report["BLU"]["wins"] == 1 and report["RED"]["decided"] == 1
-    assert report["near"]["decided"] == 2 and report["none"]["decided"] == 0
+    assert report["near"]["decided"] == 2 and report["broad"]["decided"] == 0
     low, high = wilson(50, 100)
     assert low == pytest.approx(0.404, abs=1e-3) and high == pytest.approx(0.596, abs=1e-3)
 
@@ -169,3 +169,81 @@ def test_the_political_screen_is_opened_and_closed_by_looking(monkeypatch):
     assert planner.politics(None, True) and state == {"open": True, "presses": 1}
     assert planner.politics(None, True) and state["presses"] == 1  # Open already: no press.
     assert planner.politics(None, False) and state == {"open": False, "presses": 2}
+
+
+def test_the_conscription_ladder_climbs_one_paid_step_at_a_time(monkeypatch):
+    from hoi4_arena import scripted
+
+    noise = np.random.default_rng(1)
+    shapes = {
+        name: noise.integers(0, 255, size, dtype=np.uint8)
+        for name, size in [
+            ("political_title", (18, 50, 3)),
+            ("law_list", (18, 50, 3)),
+            ("confirm_ok", (18, 50, 3)),
+            ("law_volunteer", (30, 30, 3)),
+            ("law_limited", (30, 30, 3)),
+        ]
+    }
+    background = noise.integers(0, 255, (1080, 1920, 3), dtype=np.uint8)
+    game = {"political": False, "list": False, "confirm": None, "law": 0, "power": 150}
+    pointer = [0.0, 0.0]
+
+    def fake_screen(desk):
+        rgb = background.copy()
+
+        def put(name, y, x):
+            h, w = shapes[name].shape[:2]
+            rgb[y : y + h, x : x + w] = shapes[name]
+
+        if game["political"]:
+            put("political_title", 94, 40)
+            if game["law"] < 2:
+                put(("law_volunteer", "law_limited")[game["law"]], 575, 42)
+        if game["list"]:
+            put("law_list", 86, 700)
+        if game["confirm"] is not None:
+            put("confirm_ok", 660, 1030)
+        return rgb
+
+    def near(x, y, at):
+        return abs(x - at[0]) < 5 and abs(y - at[1]) < 5
+
+    def fake_act(desk, events, pause=0.0):
+        for e in events:
+            if e["kind"] == "move":
+                pointer[:] = e["x"] * 1920, e["y"] * 1080
+            elif e["kind"] == "key" and e["vk"] == scripted.POLITICS and e["down"]:
+                game["political"], game["list"] = not game["political"], False
+            elif e["kind"] == "button" and e["down"]:
+                x, y = pointer
+                if game["confirm"] is not None:
+                    # OK takes only with the power to pay; the list then closes itself.
+                    if near(x, y, scripted.CONFIRM) and game["power"] >= 150:
+                        game["law"], game["confirm"], game["list"] = game["confirm"], None, False
+                        game["power"] -= 150
+                    elif near(x, y, scripted.CANCEL):
+                        game["confirm"] = None
+                elif game["list"]:
+                    for i, law in enumerate(scripted.LAWS[1:], 1):
+                        if near(x, y, scripted.LAW_ROWS[law]):
+                            game["confirm"] = i
+                    if near(x, y, scripted.CLOSE_LIST):
+                        game["list"] = False
+                elif game["political"] and 38 <= x <= 82 and 571 <= y <= 615:
+                    game["list"] = True
+
+    monkeypatch.setattr(scripted, "screen", fake_screen)
+    monkeypatch.setattr(scripted, "act", fake_act)
+    monkeypatch.setattr(scripted.time, "sleep", lambda seconds: None)
+    plan = {**choose_plan(random.Random(1)), "conscription": "service"}
+    planner = Planner("BLU", plan, shapes, None, 5, frame=lambda: 0)
+    assert planner.raise_conscription(None) is False and game["law"] == 1
+    # No power left: the step is cancelled, and every panel is closed again.
+    assert planner.raise_conscription(None) is False and game["law"] == 1
+    assert game == {"political": False, "list": False, "confirm": None, "law": 1, "power": 0}
+    game["power"] = 300
+    assert planner.raise_conscription(None) is False and game["law"] == 2
+    assert planner.raise_conscription(None) is True and game["law"] == 3
+    assert [o["law"] for o in planner.orders] == ["limited", "extensive", "service"]
+    assert not game["political"]
