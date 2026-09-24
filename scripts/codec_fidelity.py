@@ -96,6 +96,20 @@ for _qp in (12, 14, 16):
         "-pix_fmt", "yuv444p", "-rc", "constqp", "-qp", str(_qp), "-bf", "3",
         "-b_ref_mode", "middle", "-g", "100",
     ]  # fmt: skip
+# B-frames at the P-frames' QP (ffmpeg gives them QP x 1.25 + 1.25 by default), and
+# NVENC's constant-quality mode, which spends bits where the picture needs them.
+for _qp in (13, 14, 15):
+    CANDIDATES[f"h264nv-p7-bf3eq-qp{_qp}"] = [
+        "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-profile:v", "high444p",
+        "-pix_fmt", "yuv444p", "-rc", "constqp", "-qp", str(_qp), "-bf", "3",
+        "-b_ref_mode", "middle", "-b_qfactor", "1", "-b_qoffset", "0", "-g", "100",
+    ]  # fmt: skip
+for _cq in (14, 16):
+    CANDIDATES[f"h264nv-p7-cq{_cq}"] = [
+        "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-profile:v", "high444p",
+        "-pix_fmt", "yuv444p", "-rc", "vbr", "-cq", str(_cq), "-b:v", "0", "-bf", "3",
+        "-b_ref_mode", "middle", "-g", "100",
+    ]  # fmt: skip
 CANDIDATES["h264nv-lossless"] = [
     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "lossless", "-profile:v", "high444p",
     "-pix_fmt", "yuv444p", "-bf", "0", "-g", "100",
