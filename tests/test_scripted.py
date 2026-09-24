@@ -536,13 +536,16 @@ def test_while_the_front_holds_the_guard_counter_attacks_an_incursion_and_stops(
         assert planner.defending is defending
 
 
-def test_during_the_attack_the_guard_looks_between_redraws_and_turns_the_army(monkeypatch):
+def guard_looks(monkeypatch, looks, redraw=80):
+    """Drive the attack's guard look by look, 30 s into the attack and its next redraw 40 s
+    away. Each look is the enemy's share of the home land, the planner's calls it leads
+    to, and whether the army is then clearing an incursion. Returns the planner."""
     from hoi4_arena import scripted
 
     clock = [100.0]
     monkeypatch.setattr(scripted.time, "monotonic", lambda: clock[0])
     plan = {**choose_plan(random.Random(0), shares={"best": 1}), "pause_redraw": False}
-    plan["redraw"] = 80
+    plan["redraw"] = redraw
     planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
     planner.home = np.ones((4, 4), bool)
     held = {"share": 0.0}
@@ -559,19 +562,49 @@ def test_during_the_attack_the_guard_looks_between_redraws_and_turns_the_army(mo
         return bool(guard) and held["share"] >= guard
 
     planner.draw_front = draw_front
-    # 30 s into the attack, the next redraw 40 s away.
     planner.attacking, planner.check_at, planner.redraw_at = True, 100.0, 140.0
-    for share, expected, defending in [
-        (0.05, ["look"], False),  # A small incursion: push on.
-        (0.20, ["look", "clear", ("front", 0.15), "activate"], True),  # Round it, at once.
-        (0.10, ["look"], True),  # Over half the guard's share: go on clearing it.
-        # Cleared: the push again, at once. While defending, a redraw goes round the
-        # incursion down to half the guard's share.
-        (0.02, ["look", "clear", ("front", 0.075), "offensive", "activate"], False),
-    ]:
+    for share, expected, defending in looks:
         held["share"], calls[:] = share, []
         while planner.due():
             planner.step(None)
         assert calls == expected and planner.defending is defending
         assert planner.check_at == clock[0] + scripted.GUARD_CHECK
         clock[0] += scripted.GUARD_CHECK
+    return planner
+
+
+def test_during_the_attack_the_guard_looks_between_redraws_and_turns_the_army(monkeypatch):
+    guard_looks(
+        monkeypatch,
+        [
+            (0.05, ["look"], False),  # A small incursion: push on.
+            (0.20, ["look", "clear", ("front", 0.15), "activate"], True),  # Round it, at once.
+            (0.10, ["look"], True),  # Over half the guard's share: go on clearing it.
+            # Cleared: the push again, at once. While defending, a redraw goes round the
+            # incursion down to half the guard's share.
+            (0.02, ["look", "clear", ("front", 0.075), "offensive", "activate"], False),
+        ],
+    )
+
+
+def test_the_attack_leaves_behind_a_pocket_it_cannot_clear_until_it_grows(monkeypatch):
+    planner = guard_looks(
+        monkeypatch,
+        [
+            (0.20, ["look", "clear", ("front", 0.15), "activate"], True),  # Round it.
+            (0.21, ["look"], True),
+            (0.18, ["look"], True),
+            # Three looks within 0.05: the pocket is left behind and the push goes on; a
+            # redraw goes round it only 0.05 above the least share since.
+            (
+                0.20,
+                ["look", "clear", ("front", pytest.approx(0.26)), "offensive", "activate"],
+                False,
+            ),
+            (0.24, ["look"], False),
+            (0.19, ["look"], False),  # Smaller: the share to turn back at falls with it.
+            (0.25, ["look", "clear", ("front", pytest.approx(0.24)), "activate"], True),
+        ],
+        redraw=400,
+    )
+    assert [order["order"] for order in planner.orders] == ["pocket"]
