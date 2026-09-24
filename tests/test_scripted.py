@@ -282,3 +282,16 @@ def test_a_plan_executes_only_once_its_arrow_is_neither_idle_nor_ready(monkeypat
         assert planner.lit(None) is executing
     looks["plan"] = False
     assert planner.lit(None) is False
+
+
+def test_the_deployment_state_is_picked_on_the_own_land_the_map_lights_green():
+    from hoi4_arena.scripted import PANELS_RIGHT, RECRUITS, own_land_lit
+
+    screen = np.full((1080, 1920, 3), 40, np.uint8)
+    screen[500:540, 20:600] = (40, 200, 60)  # Green under the panels does not count.
+    assert own_land_lit(screen) is None
+    screen[300:500, PANELS_RIGHT + 10 : PANELS_RIGHT + 90] = (40, 200, 60)
+    x, y = own_land_lit(screen)
+    assert abs(x * 1920 - (PANELS_RIGHT + 50)) < 2 and abs(y * 1080 - 400) < 2
+    plans = [choose_plan(random.Random(i)) for i in range(300)]
+    assert {p["recruit"] for p in plans} == set(RECRUITS)

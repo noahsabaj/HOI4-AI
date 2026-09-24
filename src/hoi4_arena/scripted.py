@@ -49,6 +49,14 @@ Calibrated live at 1920x1080 on 2026-09-23:
 - An offensive line spreads the front's divisions along it. One drawn across the whole
   front, parallel to it, moves the front forward as one ("broad"); one drawn from the
   front toward a single state draws the divisions toward that state.
+- U opens Recruit & Deploy. Train on the army's template adds a deployment line that
+  trains division after division ("∞") while manpower and equipment last; its "No
+  location set" asks for a state, picked on the map, where the player's own land shows
+  green; Add Unit adds a slot to the line. Trained divisions deploy there unassigned,
+  and the top bar's alert shows again: shift+click on it selects them, and a
+  right-click on the army's card adds them to the army (8/24 became 16/24 in the
+  calibration game). Winning games left up to 148k manpower unused while the AI never
+  had more than 8 divisions.
 """
 
 from __future__ import annotations
@@ -80,6 +88,10 @@ FOUND = {
     "law_list": 0.8,
     # The plan's arrow with a green check (ready, not executing): 1.00 where it showed.
     "ready": 0.8,
+    # Recruit & Deploy's title: 1.00 open, at most 0.33 closed. A deployment line's red
+    # "No location set": 0.96-1.00 shown, 0.73 on every other screen.
+    "recruit_title": 0.8,
+    "no_location": 0.9,
 }
 # The create-army + glows while divisions are selected, so no fixed picture of it holds:
 # the first live game's frames scored 0.17 against a template taken a minute earlier.
@@ -101,6 +113,19 @@ LAW_ROWS = {law: (703, 322 + 74 * i) for i, law in enumerate(LAWS[1:])}
 CONSCRIPTION = {"limited": 0.1, "extensive": 0.2, "service": 0.3, "all_adults": 0.4}
 # Tries at one law step before giving up on it (every 10 s).
 LAW_TRIES = 30
+# Recruit & Deploy at 1080p (U): the first template's Train button, and on the line it
+# adds, the location button, Add Unit and the line's delete button. The panels cover the
+# screen's left PANELS_RIGHT pixels, so the deployment state is picked to their right.
+RECRUIT = 0x55
+TRAIN, DEPLOY_AT, ADD_UNIT, DROP_LINE = (742, 276), (220, 433), (386, 433), (480, 435)
+PANELS_RIGHT = 910
+# Training slots a game opens for new divisions; 0 recruits none, to measure the rest.
+RECRUITS = {0: 0.25, 2: 0.35, 4: 0.4}
+# Seconds after the conscription goal before recruiting, about 150 days at speed 5. Slots
+# opened at the start took every man the divisions needed to fill up from 31%: in the
+# first game with them, as Blue, the army's deployed manpower fell from 14.7k to 5.5k, no
+# new division ever finished, and Blue surrendered in December 1936.
+RECRUIT_AFTER = 60
 # The army panel's commander portrait, and the first commander in the list it opens.
 COMMANDER_SLOT, FIRST_COMMANDER = (30, 140), (950, 352)
 # How far a broad offensive goes: this share of the way from the front to the enemy's
@@ -141,6 +166,8 @@ def choose_plan(rng):
         # How far up the conscription laws to go as political power allows.
         "conscription": rng.choices(list(CONSCRIPTION), weights=list(CONSCRIPTION.values()))[0],
         "attack": attack,
+        # Slots training new divisions with the manpower the laws bring.
+        "recruit": rng.choices(list(RECRUITS), weights=list(RECRUITS.values()))[0],
         # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5. Most games
         # hold far longer: the first win held 142 s while the AI lost 29k men against the
         # line to its 10k and the script's divisions filled up, and the next broad game,
@@ -198,7 +225,9 @@ class Planner:
         self.frame = frame
         self.rng = rng or random.Random()
         self.orders = []
-        self.activate_at = self.redraw_at = self.law_at = math.inf
+        self.activate_at = self.redraw_at = self.law_at = self.reinforce_at = math.inf
+        self.recruit_at = math.inf
+        self.recruit_tries = 0
         self.active = self.running = False
         # Attempts at activating the current plan.
         self.tries = 0
@@ -512,10 +541,13 @@ class Planner:
         if self.plan.get("conscription") in LAWS[1:]:
             # About 150 political power after half a minute at speed 5.
             self.law_at = now + 30
+        if self.plan.get("recruit") and self.law_at == math.inf:
+            self.recruit_at = now + RECRUIT_AFTER
 
     def due(self):
         now = time.monotonic()
-        return min(self.activate_at, self.redraw_at, self.law_at) <= now
+        waits = (self.activate_at, self.redraw_at, self.law_at, self.recruit_at, self.reinforce_at)
+        return min(waits) <= now
 
     def step(self, desk):
         """The next due order, once the game runs. True if the camera was moved."""
@@ -542,6 +574,21 @@ class Planner:
         if now >= self.law_at:
             done = self.raise_conscription(desk)
             self.law_at = math.inf if done else now + 10
+            if done and self.plan.get("recruit"):
+                self.recruit_at = now + RECRUIT_AFTER
+            return False
+        if now >= self.recruit_at:
+            self.overview(desk)
+            self.recruit_tries += 1
+            if self.recruit(desk):
+                self.recruit_at, self.reinforce_at = math.inf, now + 20
+            else:
+                self.recruit_at = now + 30 if self.recruit_tries < 3 else math.inf
+            return True
+        if now >= self.reinforce_at:
+            alert = self.find(screen(desk), "unassigned") is not None
+            # A full army (24) leaves the alert up: then stop trying.
+            self.reinforce_at = now + 20 if not alert or self.reinforce(desk) else math.inf
         return False
 
     def law(self, rgb):
@@ -563,12 +610,69 @@ class Planner:
         in a live game on 2026-09-23 it stayed open from the second law change to the
         end, over the map the camera and the other orders work on.
         """
+        return self.panel(desk, "political_title", POLITICS, shown, tries)
+
+    def panel(self, desk, title, key, shown, tries=3):
+        """A screen that `key` toggles, opened or closed, checked by its `title`."""
         for _ in range(tries):
-            if (self.find(screen(desk), "political_title") is not None) == shown:
+            if (self.find(screen(desk), title) is not None) == shown:
                 return True
-            act(desk, tap(POLITICS))
+            act(desk, tap(key))
             time.sleep(0.8)
         return False
+
+    def recruit(self, desk):
+        """Training slots for more divisions of the army's template, deployed in one of
+        the player's own states. True once they are queued with a place to deploy.
+
+        A line left without a place would train and never deploy, so it is deleted.
+        """
+        slots = self.plan.get("recruit", 0)
+        if not slots or not self.panel(desk, "recruit_title", RECRUIT, True):
+            return False
+        self.click(desk, pixels(*TRAIN))
+        time.sleep(0.8)
+        placed = False
+        if self.find(screen(desk), "no_location") is not None:
+            self.click(desk, pixels(*DEPLOY_AT))
+            time.sleep(0.8)
+            spot = own_land_lit(screen(desk))
+            if spot is not None:
+                self.click(desk, spot)
+                time.sleep(0.8)
+                placed = self.find(screen(desk), "no_location") is None
+            if not placed:
+                self.click(desk, pixels(*DROP_LINE))
+                time.sleep(0.5)
+        if placed:
+            for _ in range(slots - 1):
+                self.click(desk, pixels(*ADD_UNIT))
+                time.sleep(0.4)
+            self.order("recruit", slots=slots)
+        self.panel(desk, "recruit_title", RECRUIT, False)
+        return placed
+
+    def reinforce(self, desk):
+        """New divisions into the army: shift+click on the Unassigned divisions alert
+        selects them all, and a right-click on the army's card adds them. True if they
+        joined, as the alert went away; False with no alert, or a full army."""
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        alert = self.find(screen(desk), "unassigned")
+        if alert is None:
+            return False
+        self.click(desk, alert, shift=True)
+        time.sleep(0.8)
+        self.click(desk, ARMY_CARD, button=1)
+        time.sleep(0.8)
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        time.sleep(0.3)
+        joined = self.find(screen(desk), "unassigned") is None
+        if joined:
+            self.order("reinforce")
+            if self.active:
+                # Execute again, should the new divisions have left the plan waiting.
+                self.activate_at = time.monotonic()
+        return joined
 
     def raise_conscription(self, desk):
         """One step up the conscription laws toward the plan's. True once it is there, or
@@ -638,6 +742,21 @@ def plan_shown(rgb):
     return bool(red.mean() > 0.3)
 
 
+def own_land_lit(rgb, least=2000):
+    """Where to click to pick a deployment state, as screen fractions, or None: the middle
+    of the player's own land, which the map lights green while a location is being picked,
+    right of the recruitment panels. 22,102 such pixels while picking in the calibration
+    game, at most 332 green ones on other screens."""
+    part = rgb[100:900, PANELS_RIGHT:].astype(np.int32)
+    r, g, b = part[..., 0], part[..., 1], part[..., 2]
+    ys, xs = np.nonzero((g - r > 40) & (g - b > 15) & (g > 100))
+    if len(xs) < least:
+        return None
+    return (float(np.median(xs)) + PANELS_RIGHT) / rgb.shape[1], (
+        float(np.median(ys)) + 100
+    ) / rgb.shape[0]
+
+
 def pixels(x, y):
     """1080p pixels as screen fractions."""
     return x / 1920, y / 1080
@@ -661,6 +780,8 @@ TEMPLATES = {
     "trash": "artifacts/screens-1080p/plan-trash.png",
     "law_list": "artifacts/screens-1080p/law-list-title.png",
     "ready": "artifacts/screens-1080p/plan-ready.png",
+    "recruit_title": "artifacts/screens-1080p/recruit-title.png",
+    "no_location": "artifacts/screens-1080p/no-location.png",
 }
 
 
@@ -707,4 +828,7 @@ def win_rate(results):
     for law in CONSCRIPTION:
         chosen = [g for g in played if (g.get("plan") or {}).get("conscription") == law]
         report[f"conscription_{law}"] = tally(chosen)
+    for slots in RECRUITS:
+        chosen = [g for g in played if (g.get("plan") or {}).get("recruit", 0) == slots]
+        report[f"recruit_{slots}"] = tally(chosen)
     return report
