@@ -1007,7 +1007,10 @@ def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, plann
                         planner.failures.append({"frame": planner.frame(), "error": str(error)})
                         moved = True
                     if moved:
-                        zoom = 0  # The planner's moves end fully zoomed out.
+                        # The planner's moves end fully zoomed out, an overview already: its
+                        # guard looks every 30 s (scripted.GUARD_CHECK).
+                        zoom = 0
+                        next_overview = time.monotonic() + rng.uniform(*overview_every)
                     continue
                 if time.monotonic() >= next_overview:
                     overview()
@@ -1039,6 +1042,8 @@ def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, plann
             except (ValueError, OSError):
                 return  # The game ended and its connection closed.
             except DesktopError as error:
+                if stop.is_set():
+                    return  # The game ended mid-move, and its input was disarmed.
                 say(station, "camera:", error)
                 try:
                     desk.release()

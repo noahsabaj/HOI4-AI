@@ -438,14 +438,6 @@ def test_an_incursion_is_the_enemy_s_share_of_the_home_half():
     blue[:, 120:160], red[:, 120:160] = True, False
     assert incursion(blue, red, "BLU") == pytest.approx(0.25)
     assert incursion(blue, red, "RED") == pytest.approx(1 / 3)
-    # With a guard, a redraw during the attack executes the front alone while it holds.
-    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "guard": 0.2}
-    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
-    assert not planner.guarding()  # No view yet.
-    planner.last_view = (blue, red)
-    assert planner.guarding() and planner.orders[-1]["order"] == "guard"
-    planner.plan["guard"] = 0.3
-    assert not planner.guarding()
     # Against the land held at the start: a border that bends is not an incursion.
     home = np.zeros_like(blue)
     home[:, :100] = True  # Blue started with a smaller share than the half.
@@ -542,3 +534,44 @@ def test_while_the_front_holds_the_guard_counter_attacks_an_incursion_and_stops(
         held["share"], calls[:] = share, []
         assert planner.guard_hold(None) and calls == expected
         assert planner.defending is defending
+
+
+def test_during_the_attack_the_guard_looks_between_redraws_and_turns_the_army(monkeypatch):
+    from hoi4_arena import scripted
+
+    clock = [100.0]
+    monkeypatch.setattr(scripted.time, "monotonic", lambda: clock[0])
+    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "pause_redraw": False}
+    plan["redraw"] = 80
+    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
+    planner.home = np.ones((4, 4), bool)
+    held = {"share": 0.0}
+    calls = []
+    monkeypatch.setattr(scripted, "incursion", lambda blue, red, country, home: held["share"])
+    land = (None, np.ones((4, 4), bool), np.zeros((4, 4), bool), (0,) * 4)
+    planner.overview = lambda desk: calls.append("look") or land
+    planner.clear_orders = lambda desk: calls.append("clear")
+    planner.draw_offensive = lambda desk: calls.append("offensive")
+    planner.activate = lambda desk: calls.append("activate") or True
+
+    def draw_front(desk, guard=None):
+        calls.append(("front", guard))
+        return bool(guard) and held["share"] >= guard
+
+    planner.draw_front = draw_front
+    # 30 s into the attack, the next redraw 40 s away.
+    planner.attacking, planner.check_at, planner.redraw_at = True, 100.0, 140.0
+    for share, expected, defending in [
+        (0.05, ["look"], False),  # A small incursion: push on.
+        (0.20, ["look", "clear", ("front", 0.15), "activate"], True),  # Round it, at once.
+        (0.10, ["look"], True),  # Over half the guard's share: go on clearing it.
+        # Cleared: the push again, at once. While defending, a redraw goes round the
+        # incursion down to half the guard's share.
+        (0.02, ["look", "clear", ("front", 0.075), "offensive", "activate"], False),
+    ]:
+        held["share"], calls[:] = share, []
+        while planner.due():
+            planner.step(None)
+        assert calls == expected and planner.defending is defending
+        assert planner.check_at == clock[0] + scripted.GUARD_CHECK
+        clock[0] += scripted.GUARD_CHECK
