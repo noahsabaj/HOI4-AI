@@ -576,6 +576,18 @@ beat (`win-rate`).
   winners' armies filled to 41-48k deployed manpower while the AI's stayed at 8-15k,
   and the AI lost 2 to 4 men for each of the script's. Most plans now hold 90-240 s
   before attacking, from the first win; too few games yet to say which part matters.
+- **Recruitment.** Winning games left manpower unused while the AI never had more
+  than 8 divisions, so plans now draw 0, 2 or 4 training slots. U opens Recruit &
+  Deploy; Train on the army's template adds a deployment line, its "No location set"
+  is answered on the map, where the player's own land shows green, and Add Unit adds
+  slots. New divisions deploy unassigned: a shift+click on the top bar's alert selects
+  them and a right-click on the army's card adds them (8/24 became 16/24 in the
+  calibration game), every 20 s. Slots opened at the start took the manpower the
+  divisions needed to fill up from 31%: in the first game with them the army's
+  deployed manpower fell from 14.7k to 5.5k and Blue surrendered in December 1936. So
+  recruiting starts 60 s after the conscription goal is reached. That is late: in the
+  games since, no new division deployed before the war ended, so its effect on the win
+  rate is not measured yet.
 
 ## A learned player from the scripted games (2026-09-24)
 
