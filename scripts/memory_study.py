@@ -19,6 +19,14 @@ by more than twice that noise. A cell replaces the GRU if it beats gru-256 by mo
 twice that noise, and its since-recentre probe (how long since the camera zoomed out,
 the one target that needs 100 to 300 decisions of memory) is not worse by more than
 twice its own noise. Otherwise the GRU stays: a new cell has to earn its place.
+
+Added on 2026-09-24, before the rerun: the first study's GRUs were dead (the tower's
+unnormalized summary saturated their gates, so their memory never moved), which no report
+showed. Now an arm is invalid, and is not ranked, if the memory of any of its seeds reads
+dead in its report (`memory_health`, features.memory_health: most units of the memory's
+output never move over a held-out game). A run of the smaller first pass, which has no
+gru-256, compares against the carried GRU it has, gru-16: the old training if gru-16 beats
+gru-16-reset, and a cell against gru-16.
 """
 
 import argparse
@@ -55,8 +63,15 @@ def summarise(output, arms, seeds):
             values = [r["probes"].get(key, np.nan) if probe else r[key] for r in reports]
             return float(np.mean(values)), float(np.std(values))
 
+        health = [r.get("memory_health") for r in reports]
+        known = [h for h in health if h is not None]
         rows[arm] = {
             "seeds": len(reports),
+            "dead_seeds": sum(h["dead"] for h in known) if known else None,
+            "still_units": (float(np.mean([h["still_units"] for h in known])) if known else None),
+            "std_over_time": (
+                float(np.mean([h["std_over_time"] for h in known])) if known else None
+            ),
             "nll": stat("validation_nll"),
             "nll_acting": stat("validation_nll_acting"),
             "nll_cleared": stat("validation_nll_cleared_every_18"),
@@ -77,15 +92,36 @@ def beats(rows, challenger, incumbent, key="nll", lower=True):
 
 def verdict(rows):
     lines = []
-    if {"gru-256", "gru-16-reset"} <= rows.keys():
-        long = beats(rows, "gru-256", "gru-16-reset")
-        lines.append(f"long windows {'replace' if long else 'do not replace'} the old training")
+    invalid = {arm for arm, row in rows.items() if row.get("dead_seeds")}
+    for arm in sorted(invalid):
+        seeds = rows[arm]["seeds"]
+        lines.append(
+            f"{arm} is invalid: its memory reads dead in {rows[arm]['dead_seeds']} of {seeds} seeds"
+        )
+    # The carried GRU to compare against: gru-256, or in the first pass gru-16.
+    gru = "gru-256" if "gru-256" in rows else "gru-16"
+
+    def decided(*arms):
+        if not set(arms) <= rows.keys():
+            return False
+        if set(arms) & invalid:
+            lines.append(f"{' against '.join(arms)}: not ranked, an arm is invalid")
+            return False
+        return True
+
+    if decided(gru, "gru-16-reset"):
+        long = beats(rows, gru, "gru-16-reset")
+        if gru == "gru-256":
+            lines.append(f"long windows {'replace' if long else 'do not replace'} the old training")
+        else:
+            said = "replaces" if long else "does not replace"
+            lines.append(f"a memory carried through games {said} the old training")
     for cell in ("gdn2-256", "mamba3-256"):
-        if {cell, "gru-256"} <= rows.keys():
-            better = beats(rows, cell, "gru-256")
-            recall_ok = not beats(rows, "gru-256", cell, "since_recentre", lower=False)
+        if decided(cell, gru):
+            better = beats(rows, cell, gru)
+            recall_ok = not beats(rows, gru, cell, "since_recentre", lower=False)
             wins = better and recall_ok
-            lines.append(f"{cell} {'replaces' if wins else 'does not replace'} the GRU")
+            lines.append(f"{cell} {'replaces' if wins else 'does not replace'} the GRU ({gru})")
     return lines
 
 
