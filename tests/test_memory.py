@@ -9,6 +9,7 @@ from torch.utils.data import default_collate
 from hoi4_arena import features
 from hoi4_arena.actions import GRID, SLOTS
 from hoi4_arena.features import (
+    STILL,
     CachedGame,
     MemoryHead,
     _carried_batches,
@@ -20,6 +21,7 @@ from hoi4_arena.features import (
     camera_targets,
     evaluate,
     load_cache,
+    memory_health,
     train_memories,
     train_memory,
 )
@@ -174,6 +176,9 @@ def test_train_memory_runs_end_to_end_on_a_small_cache(tmp_path, carry):
     )
     assert np.isfinite(report["validation_nll"]) and report["updates"] > 0
     assert {"zoom", "since_recentre", "winner", "pointer_5"} <= report["probes"].keys()
+    health = report["memory_health"]
+    assert {"std_over_time", "still_units", "one_step_from_empty", "dead"} <= health.keys()
+    assert (health["saturated_gates"] is None) == carry  # gates are the GRU's (carry=False)
     head = MemoryHead(8, "gru")
     saved = torch.load(tmp_path / "out" / "head.pt", weights_only=True)["head"]
     if not carry:
@@ -397,3 +402,24 @@ def test_training_from_cuda_graphs_changes_no_bit(tmp_path, monkeypatch, kind, c
     captured.clear()
     _same(graphs, _run(tmp_path, "eager", graphs=False, **settings))
     assert not captured
+
+
+def test_memory_health_calls_a_saturated_gru_dead(tmp_path):
+    """The study's GRUs were dead and nothing said so: a large constant input (the tower's
+    unnormalized summary) held every gate at its bound, so the memory never moved. Here a
+    large constant bias does the same, whatever the inputs are normalized to."""
+    games = _games(tmp_path, [60, 45])
+    torch.manual_seed(0)
+    alive = MemoryHead(8, "gru")
+    dead = MemoryHead(8, "gru")
+    dead.load_state_dict(alive.state_dict())
+    with torch.no_grad():
+        dead.memory.bias_ih.copy_(50 * torch.randn_like(dead.memory.bias_ih).sign())
+    healthy, saturated = memory_health([alive, dead], games, "cpu")
+    assert saturated["dead"] and not healthy["dead"]
+    assert saturated["still_units"] > 0.9 > 0.1 > healthy["still_units"]
+    assert saturated["std_over_time"] < STILL < healthy["std_over_time"]
+    assert min(saturated["saturated_gates"].values()) > 0.9
+    assert max(healthy["saturated_gates"].values()) < 0.1
+    # Dead, a step from an empty memory lands where the carried one does.
+    assert saturated["one_step_from_empty"] < 0.01 < healthy["one_step_from_empty"]
