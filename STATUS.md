@@ -1063,6 +1063,25 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
 
 ## The memory study (2026-09-24)
 
+**Withdrawn: the GRU arms were dead.** A check after the study found every GRU arm's
+memory saturated, so the verdicts below compare broken models, and a fair rerun is needed.
+- **The cause:** the vision tower's summary enters the fusion unnormalised. Its RMS is
+  71, against 1-3 for every other input, so it makes up 35-48 of the fusion's
+  pre-activation RMS.
+- **What that did to the GRUs:** 80-98% of their gates were saturated, 88-90% of units
+  never moved during a game, and their outputs' spread over time was 0.003. One step
+  from an empty memory landed within 3% of the carried state.
+- **The other cells:** Mamba-3, with its own normalisation, was alive (71% from empty).
+  Gated DeltaNet-2's memory added about 2% to a swamped input.
+
+This explains why clearing the GRU's memory changed nothing, and why the GRU trained from
+empty lost to no memory. The same flaw left `bc-v2s5` and the first scripted-game
+policy with a memory that never changed. The fix is a parameter-free layer norm on the
+summary and fovea inside `fuse`, which every arm uses. The rerun uses the same cache and
+rule, and treats any arm whose memory is dead as invalid rather than ranking it.
+
+The original write-up follows, for the record.
+
 Which memory should the policy have, and how should it be trained?
 `scripts/memory_study.py` trained six arms, five seeds each, with `train_memory` on one
 cache of frozen perception features (`artifacts/bc-v2s5` reading the 44 speed-5 AI
@@ -1118,9 +1137,11 @@ hand-recorded play.
    (`train-state-value`), weight the scripted games' decisions by advantage
    (`advantage --state-value`), and train the policy on them (`train-bc --advantage`).
    Judge it by win rate against the AI and against the scripted player, not by loss.
-3. **Train the memory carried through whole games.** The study is done: carrying beats
-   starting each window empty, and the GRU stays (see "The memory study"). Next, train
-   the policy that way on the scripted games, and repeat the GRU against Mamba-3 there.
+3. **Rerun the memory study with a live memory.** Its GRU arms were dead (see "The
+   memory study"), so which memory to use, and whether to carry it, are open again. First
+   normalise the summary in `fuse`, and record each run's memory movement and gate
+   saturation. Then rerun all six arms, and repeat the best against Mamba-3 on the
+   scripted games.
 4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
    with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
    closed through its worker (`launch`, `quit`) and encoded there on its own clock
