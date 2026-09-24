@@ -220,6 +220,13 @@ def main():
         default=1.0,
         help="Below 1 sharpens what the policy does each slot (its likeliest input gains)",
     )
+    live.add_argument(
+        "--start-save",
+        nargs="+",
+        metavar="COUNTRY:SAVE",
+        help="Launch games as COUNTRY straight into SAVE, a save made paused at the start of a "
+        "new game (as record-ai --start-save), skipping the menus",
+    )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
     heat = sub.add_parser(
@@ -445,6 +452,13 @@ def main():
         nargs="+",
         default=[],
         help="Policy layers to start afresh after --init, such as fusion memory",
+    )
+    train.add_argument(
+        "--press-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight of decisions that press a key or button, or move onto what is "
+        "pressed next (dataset.acting), against 1 for waiting and the camera",
     )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
@@ -902,6 +916,7 @@ def _dispatch(command, args):
         from .play import evaluate_policy
 
         args["countries"] = tuple(args["countries"])
+        args["saves"] = dict(item.split(":", 1) for item in args.pop("start_save") or [])
         result = evaluate_policy(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "heatmap":
         from .heatmap import draw_heatmaps

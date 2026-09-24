@@ -72,8 +72,11 @@ def heat_maps(policy, labels, device, decisions, window=64):
                 start = piece.pop("start")
                 batch = batch_to_device(default_collate([piece]), device)
                 with torch.autocast(**autocast):
+                    tower = None
+                    if "tower_grid" in batch:
+                        tower = (batch["tower_summary"], batch["tower_grid"])
                     summary, cells, centre = policy.perceive_window(
-                        batch.get("clips"), batch["quadrants"], batch["fovea"]
+                        batch.get("clips"), batch["quadrants"], batch["fovea"], tower=tower
                     )
                     if hidden is None:
                         hidden = summary.new_zeros(1, policy.memory_dim)
@@ -191,6 +194,14 @@ def draw_heatmaps(
         lead_in=config.get("lead_in"),
         drop_keys=tuple(config.get("drop_keys") or ()),
     )
+    if config.get("tower_cache"):
+        # A policy trained on the frozen tower's cache reads it here too, when the
+        # recording is in it: the same numbers, without running the tower.
+        from .tower_cache import tower_paths
+
+        found = tower_paths(config["tower_cache"], recording)
+        if found is not None:
+            labels["tower"] = found
     moves = [
         d
         for d in np.flatnonzero(labels["valid"] & labels["readable"])

@@ -290,7 +290,15 @@ def wait_while_paused(output, poll=5.0, sleep=None):
     return True
 
 
-def train_bc(
+def train_bc(data, model_path, output, **options):
+    """Behaviour cloning (_train_bc), one run at a time per output folder (RunLock)."""
+    from .learning import RunLock
+
+    with RunLock(output):
+        return _train_bc(data, model_path, output, **options)
+
+
+def _train_bc(
     data,
     model_path,
     output,
@@ -332,6 +340,7 @@ def train_bc(
     tower_cache=None,
     carry=False,
     reinit=(),
+    press_weight=1.0,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -400,6 +409,7 @@ def train_bc(
         "state": state_weight > 0,
         "orders": order_weight > 0,
         "tower": tower_cache,
+        "press_weight": press_weight,
     }
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
@@ -505,6 +515,7 @@ def train_bc(
         "tower_cache": str(Path(tower_cache).resolve()) if tower_cache else None,
         "carry": carry,
         "reinit": list(reinit),
+        "press_weight": press_weight,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

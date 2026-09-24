@@ -190,6 +190,82 @@ def save_checkpoint(path, policy, config, *, auxiliary=None, optimizer=None, pro
     return digest
 
 
+def replace_patiently(source, target, tries=10, wait=1.0):
+    """Rename `source` over `target`, retrying while Windows reports the target in use.
+
+    A scanner opening the freshly written file (or another reader) makes the rename fail
+    with WinError 32 for a moment; on 2026-09-24 that ended a training run at a routine
+    save. A few retries a second apart ride it out; a lasting lock still raises.
+    """
+    for attempt in range(tries):
+        try:
+            Path(source).replace(target)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(wait)
+
+
+class RunLock:
+    """A folder's lock for one run at a time: a second copy of a run refuses to start.
+
+    `run.lock` holds the owner's process id. A lock whose process has gone (a killed run)
+    is taken over. On 2026-09-24 a double launch ran two trainings into one folder, and one
+    died when the other held its progress file.
+    """
+
+    def __init__(self, folder, name="run.lock"):
+        self.path = Path(folder) / name
+
+    def __enter__(self):
+        import os
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                handle = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    owner = int(self.path.read_text().strip() or 0)
+                except (OSError, ValueError):
+                    owner = 0
+                if owner and _alive(owner):
+                    raise RuntimeError(
+                        f"another run (process {owner}) holds {self.path}; one run per folder"
+                    ) from None
+                self.path.unlink(missing_ok=True)
+                continue
+            with os.fdopen(handle, "w") as out:
+                out.write(str(os.getpid()))
+            return self
+        raise RuntimeError(f"could not take {self.path}")
+
+    def __exit__(self, *_):
+        self.path.unlink(missing_ok=True)
+
+
+def _alive(pid):
+    """Whether a process with this id is running (Windows and elsewhere)."""
+    import os
+
+    if os.name == "nt":
+        import ctypes
+
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 class Progress:
     """A training run's position and state, saved as it goes so an interruption costs minutes.
 
@@ -250,7 +326,7 @@ class Progress:
         # Written whole and renamed, so an interruption mid-write leaves the last one.
         temp = self.path.with_suffix(".tmp")
         torch.save(payload, temp)
-        temp.replace(self.path)
+        replace_patiently(temp, self.path)
         self.last = self.clock()
 
     def tick(self, epoch, step, modules, optimizer):

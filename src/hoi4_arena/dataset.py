@@ -229,6 +229,7 @@ def session_labels(
     loser_weight=1.0,
     state=False,
     orders=False,
+    press_weight=1.0,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -348,6 +349,8 @@ def session_labels(
         weight = weight * stored["weight"]
     if loser_weight != 1.0 and player_outcome(manifest) == "loss":
         weight = weight * np.float32(loser_weight)
+    if press_weight != 1.0:
+        weight = weight * np.where(acting(actions), np.float32(press_weight), np.float32(1))
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the
@@ -407,6 +410,23 @@ def recording_splits(root):
     if unknown:
         raise ValueError(f"splits.json names unknown splits: {sorted(unknown)}")
     return chosen
+
+
+def acting(actions, ahead=3):
+    """Per decision, whether it presses a key or a button, or moves onto what the next
+    `ahead` decisions press: the orders, as against waiting or moving the camera, which
+    are over 97% of a scripted game's decisions."""
+    kinds = actions[..., 0]
+    press = np.isin(
+        kinds,
+        [i for i, e in enumerate(VOCAB) if e and e["kind"] in ("key", "button") and e["down"]],
+    )
+    pressed = press.any(-1)
+    moved = (kinds == 1).any(-1)
+    soon = np.zeros_like(pressed)
+    for step in range(1, ahead + 1):
+        soon[:-step] |= pressed[step:]
+    return pressed | (moved & soon)
 
 
 def sequence_starts(valid, length, burn_in):
@@ -609,6 +629,7 @@ class VideoSessions(IterableDataset):
         state=False,
         orders=False,
         tower=None,
+        press_weight=1.0,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -643,6 +664,7 @@ class VideoSessions(IterableDataset):
                     loser_weight=loser_weight,
                     state=state,
                     orders=orders,
+                    press_weight=press_weight,
                 )
             )
         self.tower_stamp = None

@@ -681,13 +681,19 @@ def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
     assert torch.equal(*same), "a demonstration's likelihood does not depend on it"
 
 
+def test_a_reservation_made_ahead_is_not_made_twice(tmp_path, monkeypatch):
+    (tmp_path / "granted").mkdir(parents=True)
+    (tmp_path / "granted" / "early.json").write_text("{}")
+    monkeypatch.setattr(play.time, "sleep", lambda s: None)
+    play.reserve("early", 30, root=tmp_path)
+    assert not (tmp_path / "queue" / "early.json").exists(), "granted already: no new request"
+
+
 def test_what_the_memory_takes_in_does_not_grow_with_the_tower_s_loudness():
     """The Qwen3.5 tower's summary is about 50 in size. Unnormalized, training grew the
     fusion to about 25 and saturated every gate of the memory, which then never changed
     over a game: the policy acted the same everywhere. Normalized, a louder tower (or a
     fovea reader) leaves what the memory takes in as it was."""
-    from test_unroll import _Screen
-
     from hoi4_arena.models import fuse
 
     torch.manual_seed(0)
@@ -699,3 +705,77 @@ def test_what_the_memory_takes_in_does_not_grow_with_the_tower_s_loudness():
     quiet = fuse(policy, summary, cells, centre, previous, speed, hidden)
     loud = fuse(policy, summary * 50 + 3, cells, centre * 20, previous, speed, hidden)
     assert torch.allclose(quiet, loud, atol=1e-4)
+
+
+def test_a_game_s_milestones_count_the_scripted_player_s_steps():
+    def at(t, **event):
+        return {"t_ns": int(t * 1e9), "event": event}
+
+    def move(t, x, y):
+        return at(t, kind="move", x=x / 1919, y=y / 1079)
+
+    def press(t, button=0):
+        return at(t, kind="button", button=button, down=True)
+
+    def key(t, vk):
+        return at(t, kind="key", vk=vk, down=True)
+
+    events = [
+        move(1.0, 826, 58), key(1.2, 0x10), press(1.3),  # The alert, shift+clicked.
+        move(2.0, 988, 1012), press(2.4),  # The create-army +.
+        key(5.0, 0x5A), move(5.2, 900, 500), press(5.6),  # A front line.
+        key(9.0, 0x58), move(9.2, 950, 520), press(9.6, button=1),  # An offensive.
+        key(20.0, 0x51), move(20.2, 400, 400), press(20.5),  # Q, then a click elsewhere.
+    ]  # fmt: skip
+    counts = play.milestones(events)
+    assert counts["alert"] == 1 and counts["plus"] == 1
+    assert counts["front"] == 1 and counts["offensive"] == 1 and counts["q"] == 1
+    assert counts["portrait"] == counts["law_slot"] == counts["confirm"] == 0
+
+
+def test_decisions_that_act_weigh_more_than_waiting_and_the_camera():
+    from hoi4_arena.dataset import acting
+
+    actions = np.zeros((6, SLOTS, 3), np.int64)
+    actions[0, 0] = _token(1, 5, 5)  # A move onto what decision 2 presses.
+    actions[2, 1] = _token(VOCAB.index(CLICK))
+    actions[4, 0] = _token(1, 9, 9)  # The camera looking about: no press follows.
+    actions[5, 0] = _token(VOCAB.index({"kind": "wheel", "delta": 120}))
+    assert acting(actions).tolist() == [True, False, True, False, False, False]
+
+
+def test_a_save_rides_out_a_moment_s_lock_on_its_file(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from hoi4_arena import learning
+
+    calls = []
+    real = Path.replace
+
+    def flaky(self, target):
+        calls.append(target)
+        if len(calls) < 3:
+            raise PermissionError(32, "in use")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky)
+    monkeypatch.setattr(learning.time, "sleep", lambda s: None)
+    (tmp_path / "a.tmp").write_text("new")
+    learning.replace_patiently(tmp_path / "a.tmp", tmp_path / "a.pt")
+    assert (tmp_path / "a.pt").read_text() == "new" and len(calls) == 3
+
+
+def test_a_second_copy_of_a_run_refuses_its_folder_and_a_dead_owner_s_lock_is_taken(tmp_path):
+    import os
+
+    from hoi4_arena.learning import RunLock
+
+    with RunLock(tmp_path):
+        assert (tmp_path / "run.lock").read_text() == str(os.getpid())
+        with pytest.raises(RuntimeError, match="one run per folder"):
+            with RunLock(tmp_path):
+                pass
+    assert not (tmp_path / "run.lock").exists()
+    (tmp_path / "run.lock").write_text("999999")  # A run killed without cleaning up.
+    with RunLock(tmp_path):
+        assert (tmp_path / "run.lock").read_text() == str(os.getpid())
