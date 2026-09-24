@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -565,7 +566,7 @@ def milestones(events, width=1920, height=1080):
 # What a game needs on the second PC: HOI4 takes 5.3-5.9 GB of commit and the stream's
 # encoder about 1 GB; allocations past the commit limit fail and can crash the game.
 GAME_COMMIT_MB = 6.5 * 1024
-COMMIT_SHARE = 0.95
+COMMIT_SHARE = float(os.environ.get("HOI4_COMMIT_SHARE", "0.95"))
 
 
 def room_for_a_game(station, tries=10, wait=30.0):
@@ -725,6 +726,11 @@ def evaluate_policy(
                 log.info("[peer] %s: winner %s after %s s", name, outcome, manifest["seconds"])
             results.append(entry)
             (out_root / "results-peer.json").write_text(json.dumps(results, indent=2))
+            if entry.get("reason") and "no commit room" not in str(entry.get("error", "")):
+                # A game that ended early (the game exited or crashed, the worker was lost)
+                # ends the test: no second game on a PC that just failed one.
+                log.warning("[peer] %s ended early (%s); stopping the test", name, entry["reason"])
+                break
     finally:
         try:
             station.quit()
