@@ -250,10 +250,20 @@ heart. `generation.json` records the preset and seed, its terrain counts, its fr
 (the numbers in the table above), and a state layout over the land box, from which
 `scripted.state_at` names the state under a point on any arena, bulges included.
 
-Live test, `arena-plains-v1` (2026-09-24, second PC, scripted Blue against the AI):
-loaded and ran 15 minutes with no errors, and the scripted player found its fronts on
-the new ground. It ended as a draw, in the supply stall above; v3 adds the lines across
-the border.
+Live tests on the second PC (2026-09-24), the scripted player against the game's AI.
+On the plain arena, 23 such games ended by game day 290-820.
+
+- `plains-v1`, as Blue: loaded with no errors, and the scripted player found its fronts
+  on the new ground. A draw after 15 minutes: the supply stall above.
+- `passes-v3`, as Red: Red won in 541 s. Blue surrendered on day 1236, after a seesaw
+  at the valleys: 22 changes of control, with West 6 taken four times and East 7 three.
+- `marsh-v3` and `v4`: loaded, lakes included, but first Red could not be picked (the
+  capital fix) and then the front line would not draw on dark ground (the colour fix).
+- `marsh-v6`, as Red: loaded with no map errors in the game's log. The AI won in 79 s:
+  the lake splits the front, Red's army held only the southern stretch (89% of its
+  division-days in one state), and Blue walked round the north without a casualty.
+- Close-ups show stock textures, relief lit by the normal map, dense forests, city
+  models among farmland, rivers and railways.
 
 ## The model and its data (2026-09-23)
 
