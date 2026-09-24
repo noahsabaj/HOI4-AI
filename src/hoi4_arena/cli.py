@@ -447,6 +447,13 @@ def main():
         default=[],
         help="Policy layers to start afresh after --init, such as fusion memory",
     )
+    train.add_argument(
+        "--press-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight of decisions that press a key or button, or move onto what is "
+        "pressed next (dataset.acting), against 1 for waiting and the camera",
+    )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
     weigh = sub.add_parser(

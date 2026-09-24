@@ -731,3 +731,14 @@ def test_a_game_s_milestones_count_the_scripted_player_s_steps():
     assert counts["alert"] == 1 and counts["plus"] == 1
     assert counts["front"] == 1 and counts["offensive"] == 1 and counts["q"] == 1
     assert counts["portrait"] == counts["law_slot"] == counts["confirm"] == 0
+
+
+def test_decisions_that_act_weigh_more_than_waiting_and_the_camera():
+    from hoi4_arena.dataset import acting
+
+    actions = np.zeros((6, SLOTS, 3), np.int64)
+    actions[0, 0] = _token(1, 5, 5)  # A move onto what decision 2 presses.
+    actions[2, 1] = _token(VOCAB.index(CLICK))
+    actions[4, 0] = _token(1, 9, 9)  # The camera looking about: no press follows.
+    actions[5, 0] = _token(VOCAB.index({"kind": "wheel", "delta": 120}))
+    assert acting(actions).tolist() == [True, False, True, False, False, False]
