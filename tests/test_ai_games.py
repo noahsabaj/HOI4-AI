@@ -358,12 +358,33 @@ def test_no_new_game_past_the_memory_limit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(telemetry, "open_observer", lambda peer: observer)
     station = ai_games.Station("peer", "peer.json")
-    assert ai_games.memory_pressure(station) == pytest.approx(33000 / 34568)
-    assert ai_games.memory_pressure(station, 500) == pytest.approx(33500 / 34568)
-    assert ai_games.memory_pressure(ai_games.Station("here")) is None
+    reports = []
+
+    class Desk:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def report(self):
+            reports.append(1)
+            return "report:\nnothing about the pagefile"  # A limit that cannot grow.
+
+    monkeypatch.setattr(station, "connect", lambda attach=True: Desk())
+    assert "would be 95% of the 34568 MB" in ai_games.memory_room(station)
+    assert "would be 97% of the 34568 MB" in ai_games.memory_room(station, 500)
+    assert ai_games.memory_room(ai_games.Station("here")) is None
     with pytest.raises(ai_games.MemoryStop):
         ai_games.check_memory(station, ai_games.GAME_MB)
     reading["memory"]["commit_mb"] = 27000  # No game running: room for one.
+    ai_games.check_memory(station, ai_games.GAME_MB)
+    assert len(reports) == 1, "the pagefile is read once"
+    # A pagefile Windows manages, on a drive with room: the same PC has room for games.
+    station = ai_games.Station("peer", "peer.json")
+    monkeypatch.setattr(station, "pagefile", lambda: {"drive": "C:", "max_mb": None})
+    reading["memory"].update(commit_mb=33000, total_mb=32520, available_mb=25000)
+    reading["disks"] = [{"drive": "C:", "free_gb": 700.0, "total_gb": 1023.0}]
     ai_games.check_memory(station, ai_games.GAME_MB)
 
 
@@ -384,3 +405,36 @@ def test_a_start_save_is_loaded_in_game_only_where_its_name_is_calibrated(tmp_pa
         ai_games.shown(rng.integers(0, 255, (1080, 1920, 3), dtype=np.uint8), "save-arenav4red")
         is None
     )
+
+
+def test_the_menu_opens_through_a_win_s_conference_and_its_popups(tmp_path, monkeypatch):
+    # A win leaves more than the four screens the first version cleared: a popup, the
+    # peace conference, two popups after it, then the menu button opens the menu.
+    state = ["popup", "conference", "popup", "popup", "map", "menu"]
+    shows = {"conference-exit": "conference", "menu-load-game": "menu"}
+
+    def click(desk, x, y):
+        done = {
+            "popup": (x, y) == (0.5, 0.6),
+            "conference": (x, y) == ai_games.CONFIRM_OK,
+            "map": (x, y) == ai_games.MENU_BUTTON,
+        }
+        if done.get(state[0]):
+            state.pop(0)
+
+    monkeypatch.setattr(ai_games, "screen", lambda desk: np.zeros((1080, 1920, 3), np.uint8))
+    monkeypatch.setattr(ai_games, "shown", lambda rgb, name, threshold=0.9: (
+        (0.5, 0.5) if shows.get(name) == state[0] else None))  # fmt: skip
+    monkeypatch.setattr(ai_games, "find_template", lambda rgb, template, threshold: (
+        (0.5, 0.6) if state[0] == "popup" else None))  # fmt: skip
+    monkeypatch.setattr(ai_games, "click", click)
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    assert ai_games.open_menu(None, [object()])
+    assert state == ["menu"]
+    # A menu that never opens: given up when the time is up, with the screen kept.
+    state[:] = ["stuck"]
+    clock = iter(range(0, 1000, 5))
+    monkeypatch.setattr(ai_games.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError, match="menu did not open"):
+        ai_games.load_in_game(None, "arenav4blu", [object()], None, tmp_path / "g-start-failed.png")
+    assert (tmp_path / "g-menu-failed.png").exists()

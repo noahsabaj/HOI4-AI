@@ -40,6 +40,7 @@ from .arena_log import ArenaLog
 from .desktop import Desktop, DesktopError, local_control_args
 from .recording import open_recorder, pixels
 from .remote import RemoteDesktop
+from .telemetry import game_fits, pagefile_policy
 from .vision import ScreenRules, country_pixels, find_template
 
 log = logging.getLogger(__name__)
@@ -80,8 +81,9 @@ CENTRED = 0.03
 VIEW_NEAR, VIEW_FAR, ZOOM_TERRAIN, ZOOM_MAX = 9, 20, 22, 26
 # Seconds to wait for a start save to load onto its paused map, from the launch.
 SAVE_LOAD = 150
-# The share of the second PC's commit limit at which no new game is started, and the
-# commit charge a running arena game takes there (about 5.2 GB, 2026-09-24).
+# The share of the commit limit the second PC can grow to (telemetry.commit_ceiling) at
+# which no new game is started, and the commit charge a running arena game takes there
+# (about 5.2 GB, 2026-09-24).
 MEMORY_LIMIT, GAME_MB = 0.95, 5300
 # Loading the next game from inside the running one (load_in_game), 1080p: the menu
 # button at the top right, the menu's Load Game, the winner's peace conference's Confirm
@@ -95,8 +97,9 @@ SCREENS = Path("artifacts/screens-1080p")
 # The least TM_CCOEFF_NORMED at which these screens count as shown: 1.00 where each
 # showed, at most 0.79 on every other screen tried.
 SHOWN = 0.9
-# Games loaded in a row before HOI4 is launched afresh anyway.
-LOADS_PER_LAUNCH = 8
+# Games loaded in a row before HOI4 is launched afresh anyway, and the seconds allowed for
+# clearing the end of a game until the menu opens.
+LOADS_PER_LAUNCH, MENU_SECONDS = 8, 30
 # Seconds between moving onto something and pressing it: longer than one 200 ms decision,
 # so a recorded click is always pressed where the pointer already was, as a player sees
 # the button light up before clicking it.
@@ -193,6 +196,19 @@ class Station:
 
     def __init__(self, name, peer=None):
         self.name, self.peer = name, peer
+        self._pagefile = None
+
+    def pagefile(self):
+        """How this PC's pagefile may grow (pagefile_policy), read once from its worker's
+        report; None where the report cannot be read or does not say."""
+        if self._pagefile is None:
+            self._pagefile = {}
+            try:
+                with self.connect(attach=False) as desk:
+                    self._pagefile = pagefile_policy(desk.report()) or {}
+            except Exception:  # noqa: BLE001 - no reading: the limit as it stands.
+                pass
+        return self._pagefile or None
 
     def connect(self, attach=True):
         if self.peer:
@@ -395,28 +411,42 @@ def can_load(save):
     return bool(save) and (SCREENS / f"save-{save}.png").exists()
 
 
-def load_in_game(desk, save, templates, rules, failure_shot):
-    """The next game from inside the running one: the end-of-game screens cleared (the
-    popups' Ok, the winner's peace conference: Confirm and Exit, then OK), the menu, Load
-    Game, the save picked from the list by its name (scrolling down to it), Load, and the
-    paused map. Raises RuntimeError where a screen does not show."""
-    for _ in range(4):
+def open_menu(desk, templates, seconds=MENU_SECONDS):
+    """Open the game menu over whatever the end of a game left up: each popup's Ok, the
+    winner's peace conference (Confirm and Exit, then OK) and the events after it, as
+    they come, then the menu button, until the menu shows. True if it did in time.
+
+    Four rounds were too few after a win, whose conference comes with its own popups:
+    33 of 36 loads after a win fell back to a launch (2026-09-24)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
         rgb = screen(desk)
+        if shown(rgb, "menu-load-game") is not None:
+            return True
         popup = next((f for t in templates if (f := find_template(rgb, t, OK_MATCH))), None)
         if popup is not None:
             click(desk, *popup)
             time.sleep(0.8)
-            continue
-        if shown(rgb, "conference-exit") is None:
-            break
-        click(desk, *CONFERENCE_EXIT)
-        time.sleep(1)
-        click(desk, *CONFIRM_OK)
-        time.sleep(1)
-    click(desk, *MENU_BUTTON)
-    time.sleep(1)
-    if shown(screen(desk), "menu-load-game") is None:
-        raise RuntimeError("the game menu did not open")
+        elif shown(rgb, "conference-exit") is not None:
+            click(desk, *CONFERENCE_EXIT)
+            time.sleep(1)
+            click(desk, *CONFIRM_OK)
+            time.sleep(1)
+        else:
+            click(desk, *MENU_BUTTON)
+            time.sleep(1)
+    return False
+
+
+def load_in_game(desk, save, templates, rules, failure_shot):
+    """The next game from inside the running one: the end-of-game screens cleared and the
+    menu opened (open_menu), Load Game, the save picked from the list by its name
+    (scrolling down to it), Load, and the paused map. Raises RuntimeError where a screen
+    does not show, keeping a screenshot when it is the menu."""
+    if not open_menu(desk, templates):
+        shot = failure_shot.with_name(failure_shot.name.replace("start-failed", "menu-failed"))
+        Image.fromarray(screen(desk)).save(shot)
+        raise RuntimeError(f"the game menu did not open (screen in {shot.name})")
     click(desk, *MENU_LOAD_GAME)
     time.sleep(1.5)
     if shown(screen(desk), "load-dialog-load") is None:
@@ -1167,33 +1197,33 @@ def parse_saves(specs):
 
 
 class MemoryStop(Exception):
-    """No game started: the second PC's commit charge is too near its limit."""
+    """No game started: it would not fit the second PC's memory."""
 
 
-def memory_pressure(station, need_mb=0):
-    """The share of the second PC's commit limit in use, with `need_mb` more, from its
-    worker's telemetry, or None where there is none to read. Each HOI4 launch there left
-    about 100 MB behind until a reboot (2026-09-24), and a failed allocation could crash
-    a game mid-game."""
+def memory_room(station, need_mb=0):
+    """Why a game needing `need_mb` more would not fit the second PC (game_fits: its
+    commit charge under MEMORY_LIMIT of the limit it can grow to, and RAM for the game),
+    or None if it would or there is nothing to read. Each HOI4 launch there leaves about
+    115 MB of commit charge behind until a sign-out (2026-09-24), and a failed allocation
+    could crash a game mid-game."""
     if not station.peer:
         return None
+    pagefile = station.pagefile()
     try:
         from .telemetry import open_observer
 
         with open_observer(station.peer) as desk:
-            memory = desk.telemetry().get("memory") or {}
+            reply = desk.telemetry()
     except Exception:  # noqa: BLE001 - no reading: carry on as before.
         return None
-    if not memory.get("commit_limit_mb"):
-        return None
-    return (memory["commit_mb"] + need_mb) / memory["commit_limit_mb"]
+    return game_fits(reply, pagefile, need_mb, MEMORY_LIMIT)
 
 
 def check_memory(station, need_mb=0):
-    """Raise MemoryStop if a game would take the second PC past MEMORY_LIMIT."""
-    pressure = memory_pressure(station, need_mb)
-    if pressure is not None and pressure >= MEMORY_LIMIT:
-        raise MemoryStop(f"commit charge would be {pressure:.0%} of the limit")
+    """Raise MemoryStop if a game would not fit the second PC (memory_room)."""
+    reason = memory_room(station, need_mb)
+    if reason:
+        raise MemoryStop(reason)
 
 
 def take_reservation(root, settle=2.0):

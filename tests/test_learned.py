@@ -786,6 +786,9 @@ def test_a_live_game_starts_only_with_commit_room_on_the_second_pc(monkeypatch):
                      {"commit_mb": 29000, "commit_limit_mb": 38000}])  # fmt: skip
 
     class Station:
+        def pagefile(self):
+            return None  # A limit that cannot grow.
+
         def connect(self, attach=True):
             class Desk:
                 def __enter__(self):

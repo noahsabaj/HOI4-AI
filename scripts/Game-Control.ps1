@@ -92,6 +92,35 @@ if ($Action -eq 'report') {
         Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | ForEach-Object {
             "pagefile now: $($_.Name), $($_.AllocatedBaseSize) MB allocated, $($_.CurrentUsage) MB in use, $($_.PeakUsage) MB at peak"
         }
+        # Who holds the commitment, to find what keeps memory after the game exits: each
+        # process's private memory, the kernel's pools, and the GPU driver's allocations
+        # per process (committed memory backs them too, even those in video memory).
+        $memory = Get-CimInstance Win32_PerfRawData_PerfOS_Memory
+        $processes = @(Get-CimInstance Win32_Process)
+        $private = ($processes | Measure-Object PrivatePageCount -Sum).Sum
+        "memory: committed $([math]::Round($memory.CommittedBytes / 1MB)) MB, private $([math]::Round($private / 1MB)) MB in $($processes.Count) processes, paged pool $([math]::Round($memory.PoolPagedBytes / 1MB)) MB, nonpaged pool $([math]::Round($memory.PoolNonpagedBytes / 1MB)) MB, handles $(($processes | Measure-Object HandleCount -Sum).Sum)"
+        'Most private memory (pid, name, MB, handles):'
+        $processes | Sort-Object PrivatePageCount -Descending | Select-Object -First 15 | ForEach-Object {
+            "{0,6} {1,-32} {2,7} {3,7}" -f $_.ProcessId, $_.Name, [math]::Round($_.PrivatePageCount / 1MB), $_.HandleCount
+        }
+        $names = @{}; $processes | ForEach-Object { $names[[int]$_.ProcessId] = $_.Name }
+        $gpu = @{}
+        (Get-Counter '\GPU Process Memory(*)\Dedicated Usage', '\GPU Process Memory(*)\Shared Usage', '\GPU Process Memory(*)\Total Committed' -ErrorAction SilentlyContinue).CounterSamples |
+            ForEach-Object {
+                if ($_.InstanceName -match '^pid_(\d+)_') {
+                    $id = [int]$Matches[1]
+                    if (-not $gpu[$id]) { $gpu[$id] = [ordered]@{ dedicated = 0; shared = 0; committed = 0 } }
+                    $kind = switch -Wildcard ($_.Path) { '*dedicated usage' { 'dedicated' } '*shared usage' { 'shared' } default { 'committed' } }
+                    $gpu[$id][$kind] += $_.RawValue
+                }
+            }
+        $adapter = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage', '\GPU Adapter Memory(*)\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples
+        $sum = { param($kind) [math]::Round((($gpu.Values | ForEach-Object { $_[$kind] }) | Measure-Object -Sum).Sum / 1MB) }
+        "gpu memory: adapter dedicated $([math]::Round((($adapter | Where-Object Path -like '*dedicated usage').RawValue | Measure-Object -Sum).Sum / 1MB)) MB, shared $([math]::Round((($adapter | Where-Object Path -like '*shared usage').RawValue | Measure-Object -Sum).Sum / 1MB)) MB; processes dedicated $(& $sum dedicated) MB, shared $(& $sum shared) MB, committed $(& $sum committed) MB"
+        'Most GPU memory (pid, name, dedicated, shared, committed MB):'
+        $gpu.GetEnumerator() | Sort-Object { $_.Value.committed } -Descending | Select-Object -First 8 | ForEach-Object {
+            "{0,6} {1,-32} {2,7} {3,7} {4,7}" -f $_.Key, $names[$_.Key], [math]::Round($_.Value.dedicated / 1MB), [math]::Round($_.Value.shared / 1MB), [math]::Round($_.Value.committed / 1MB)
+        }
         # Whether this PC signs in by itself after a restart, so the worker starts at logon
         # with nobody there. Only that one value is read.
         $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
