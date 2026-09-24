@@ -464,6 +464,83 @@ inspects HOI4 there through the worker. On the second PC, `Start-Worker.ps1
 -Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
 updates by itself, but only between connections, never mid-match. See the README.
 
+Since 2026-09-24 the bridge there takes one connection that holds the game (a recording,
+a match, a launch) and up to four read-only observers beside it. An observer's worker
+hooks no input and refuses input, launches, jobs and recording, so `hoi4-arena telemetry
+--peer ...` and `control report --peer ...` work while a game is recorded. Before, the
+bridge took one connection at a time, and a report during a game timed out on the TLS
+handshake. A second full connection now waits 8 s for the first to finish, then is told
+`worker_busy`.
+
+`telemetry` reads, once a second: CPU and memory of the PC and of the processes that
+matter (the game, the workers, ffmpeg, the bridge, compute jobs, the busiest others), GPU
+use per process (Windows' GPU Engine counters) and for the card (NVML: busy, video
+encoder, memory, temperature, power), disks, the network, the game window (responding,
+in front, on which screen) and the capture's timing.
+
+## Recording where the game runs (2026-09-24)
+
+Frames used to be pulled one request at a time: every 200 ms the recorder asked the
+worker for a full 1080p frame, the frame crossed the network as lz4 (1.2-3.2x on game
+frames), and this PC encoded it with x264. Anything else on the connection (the camera's
+own screenshots) or on this PC (a busy CPU) made frames late. Over 41 games on the second
+PC, recordings reached 3.8-5.0 fps with up to 36 late ticks a game, and even the 5.0 fps
+games bunched their frames (10-20% of intervals over 300 ms).
+
+Now the worker keeps the clock. With `--codec nvenc` (`record-ai`'s default, and a
+choice for `record`) the worker captures the game 5 times a second on its own timer,
+draws the pointer, and hands the frames to ffmpeg on the same PC, which encodes them on
+that PC's NVIDIA encoder. Only the video and each frame's row (times, pointer, inputs)
+cross the network, and this PC writes them as they come. An older worker, or a PC without
+NVENC, falls back to x264 here, and the manifest says which ran.
+
+One AI game each on the second PC, same camera and worker, 2026-09-24:
+
+| | x264 here, one request a frame | NVENC stream |
+|---|---|---|
+| Frames per second (nominal 5) | 3.34 | 4.99 |
+| Late ticks | 59 | 0 |
+| Frame interval p50 / p95 / p99 | 199 / 859 / 1039 ms | 200.0 / 200.5 / 205.7 ms |
+| Intervals over 300 ms | 25.5% | 0.28% (one stall, since fixed) |
+| Out of the second PC | 148 Mbit/s | 56 Mbit/s: 3.4 video, the rest the camera's screenshots |
+| Encoder on this PC | 0.49 cores, 554 MB | 0.002 cores, 23 MB (a remux) |
+| Recorder process on this PC | 0.68 cores | 0.49 cores, mostly camera and popup image work |
+| Worker, encoder, bridge on the second PC | 0.17, none, 0.04 cores (at 3.3 fps) | 0.14, 0.09, 0.03 cores; 3% of the video encoder |
+
+The game itself took 3.4-3.5 cores, 3.2 GB and 30% of the GPU either way. x264 is now
+capped at 4 threads: its default here took 80 threads and 2 GB for the same 5 fps.
+
+**Is the video as good?** Against 452 lossless 1080p frames (a clip, and screenshots of
+menus, maps and scripted games, each held three frames), each candidate encoded and then
+decoded with the training reader's own command (`scripts/codec_fidelity.py`, run as a
+compute job on the second PC's GPU):
+
+| | KB/frame | PSNR whole / top bar | Worst pixel, 99.9% | Template scores moved | Decode fps |
+|---|---|---|---|---|---|
+| x264 CRF 18, 4:4:4 (before) | 86.9 | 44.83 / 43.47 dB | 80, 9 | 0.0115 | 245 |
+| **NVENC H.264 4:4:4, p7, QP 14** | 88.7 | **45.47 / 43.97 dB** | **50, 7** | **0.0029** | **260** |
+| NVENC QP 16 | 72.1 | 44.21 / 42.59 dB | 64, 9 | 0.0035 | 259 |
+| NVENC HEVC 4:4:4, QP 14 | 82.0 | 45.16 / 43.59 dB | 72, 7 | 0.0042 | 239 |
+| NVENC lossless | 333.3 | 52.63 / 53.28 dB | 2, 2 | 0.0014 | 224 |
+
+That is 151 sightings of 11 templates from `artifacts/screens-1080p`; none moved in any
+candidate, and the screen rules' error changed by 1.80 at most at QP 14 against 3.07 for
+x264. So the stream keeps full-resolution colour and keeps what the policy reads better
+than x264 did. On real games its files are larger (3.4 against 2.2 Mbit/s) and still
+decode faster: 122 against 110 fps through the reader, alternated on this PC.
+
+**Capture is faster.** The worker keeps the desktop image on the GPU, reads back only the
+game's window, and no longer waits up to 8 ms for the next present: a 1920x1080 capture
+went from 14.9 to 4.9 ms p50 on this PC (16 to 4.8 ms on the second PC), still
+pixel-identical to the GDI blit.
+
+Also: the capture thread's own output goes through a queue, so a tick never waits for a
+large reply to cross the network (one did, for 618 ms). `apply` can take a decision's
+events with their offsets (`at_ms`) and apply them on the worker's clock, one request
+instead of eight; offsets of 50 ms came out 50.2 and 50.3 ms apart on the second PC.
+Captures travel raw over the local pipe (lz4 cost 16-21 ms a frame). BGRA to RGB takes
+2.2 ms instead of 18.4.
+
 ## Recording AI games
 
 `hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.
@@ -807,8 +884,8 @@ hand-recorded play.
    the policy that way on the scripted games, and repeat the GRU against Mamba-3 there.
 4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
    with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
-   closed through its worker (`launch`, `quit`) and its frames recorded here: a full
-   1080p frame takes about 86 ms over the network, so 5 Hz fits. Both monitors must stay
+   closed through its worker (`launch`, `quit`) and encoded there on its own clock
+   (`--codec nvenc`, "Recording where the game runs"). Both monitors must stay
    switched on (brightness can be zero): a monitor switched off disconnects on
    DisplayPort, Windows shrinks the desktop to 1024x768, and the capture breaks, which
    the recorder reports. On the second PC the Discord overlay is off: after a
@@ -818,7 +895,8 @@ hand-recorded play.
    camera's inputs as labels, so they teach camera control and popup clearing, and
    serve the encoder, predicting who wins, and a first opponent. On the 12x8 arena the
    first two games took 24.8 and 31.5 minutes, so a match limit of 1800 s is too short
-   there; the recorder's cap is 45 minutes. Recordings are 1080p x264 (CRF 18, 4:4:4).
+   there; the recorder's cap is 45 minutes. Recordings are 1080p H.264 4:4:4: NVENC
+   at QP 14 since 2026-09-24, x264 at CRF 18 before and as the fallback.
    `desync` gets calibrated whenever one happens.
 5. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
    speed used. This is the only source of a player's inputs.

@@ -6,6 +6,8 @@ param(
     [string]$PeerConfig = 'artifacts\pairing\peer.json',
     [string]$Share,
     [switch]$SkipBuild,
+    # The worker to deploy, when not this repo's own release build (which is then not built).
+    [string]$Worker,
     # Arena mods to mirror into the share's mods folder, so the second PC can launch the
     # same map for a two-player match. Start HOI4 there with one of them through the
     # worker: hoi4-arena control launch --mod <folder name> --peer <peer.json>. quit,
@@ -28,7 +30,7 @@ $bundle = Join-Path (Split-Path -Parent (Resolve-Path -LiteralPath $PeerConfig))
 foreach ($name in 'server.json', 'worker.pfx') {
     if (-not (Test-Path -LiteralPath (Join-Path $bundle $name))) { throw "Missing $name in $bundle. Run bundle-peer first." }
 }
-if (-not $SkipBuild) {
+if (-not $SkipBuild -and -not $Worker) {
     $env:CARGO_HOME = Join-Path $PWD '.cache\cargo'
     cargo build --release --locked
     if ($LASTEXITCODE) { throw 'Rust worker build failed' }
@@ -37,7 +39,7 @@ if (-not (Test-Path -LiteralPath $Share)) {
     throw "Cannot reach $Share. Check the share and the saved credentials (README.md, Second PC)."
 }
 $files = [ordered]@{
-    'hoi4-desktop-worker.exe' = 'target\release\hoi4-desktop-worker.exe'
+    'hoi4-desktop-worker.exe' = if ($Worker) { $Worker } else { 'target\release\hoi4-desktop-worker.exe' }
     'Start-Worker.ps1'        = 'scripts\Start-Worker.ps1'
     'Test-ArenaLoad.ps1'      = 'scripts\Test-ArenaLoad.ps1'
     'Game-Control.ps1'        = 'scripts\Game-Control.ps1'
@@ -67,6 +69,19 @@ foreach ($name in $files.Keys) {
     }
     Move-Item -LiteralPath $stage -Destination $live -Force
     Write-Output "deployed $name"
+}
+# The worker encodes recordings where it captures them (its stream operation) with ffmpeg,
+# which it finds in compute\tools. Copied once; -Compute keeps it current.
+$tools = Join-Path $Share 'compute\tools'
+if (-not (Test-Path -LiteralPath (Join-Path $tools 'ffmpeg.exe'))) {
+    $ffmpeg = (Get-Command ffmpeg -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $shim = [IO.Path]::ChangeExtension($ffmpeg, '.shim')
+    if (Test-Path -LiteralPath $shim) {
+        $ffmpeg = (Get-Content -LiteralPath $shim | Select-String '^path\s*=\s*"?([^"]+)"?').Matches[0].Groups[1].Value
+    }
+    New-Item -ItemType Directory -Force -Path $tools | Out-Null
+    Copy-Item -LiteralPath $ffmpeg -Destination (Join-Path $tools 'ffmpeg.exe') -Force
+    Write-Output 'deployed ffmpeg'
 }
 foreach ($path in $Mod) {
     $source = (Resolve-Path -LiteralPath $path).Path

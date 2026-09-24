@@ -43,6 +43,14 @@ class DesktopError(RuntimeError):
     pass
 
 
+def bgra_to_rgb(bgra):
+    """A new contiguous RGB array from a BGRA one. OpenCV's conversion gives the same bytes
+    as numpy's index swizzle, eight times faster: 2.2 ms against 18.4 ms at 1080p."""
+    import cv2
+
+    return cv2.cvtColor(np.ascontiguousarray(bgra), cv2.COLOR_BGRA2RGB)
+
+
 class EmergencyStop(DesktopError):
     """The player pressed F12, the worker's stop key: input stops, and so does recording."""
 
@@ -60,6 +68,11 @@ class Frame:
 
 
 class Desktop:
+    # How captures travel. A local worker's pipe moves raw frames at gigabytes a second,
+    # where lz4 cost 16-21 ms a 1080p frame to compress for a 1.2-3.2x ratio on real game
+    # frames; over the network (RemoteDesktop) the saving is worth it.
+    encoding = "raw"
+
     def __init__(
         self,
         command: list[str] | None = None,
@@ -86,6 +99,8 @@ class Desktop:
         self.pending = {}
         self.next_id = 1
         self.reader_error = None
+        # Recording streams by key: where each stream's messages go (WorkerStream).
+        self.streams = {}
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._drain, daemon=True).start()
         self.attached = None
@@ -107,8 +122,14 @@ class Desktop:
         req_id = reply.get("id")
         with self.pending_lock:
             box = self.pending.get(req_id)
+            # A recording stream's messages carry its key instead of a request's id.
+            sink = (
+                None if box is not None else getattr(self, "streams", {}).get(reply.get("stream"))
+            )
         if box is not None:
             box.put(reply)
+        elif sink is not None and req_id is None:
+            sink(reply)
         elif "error" in reply:
             # An error the worker could not tie to a request, such as a line it could not
             # parse. Keep it as evidence rather than dropping it silently.
@@ -121,8 +142,13 @@ class Desktop:
         with self.pending_lock:
             self.reader_error = error
             boxes = list(self.pending.values())
+            sinks = list(getattr(self, "streams", {}).values())
         for box in boxes:
             box.put(error)
+        # A stream ends with its connection: tell whoever is writing it, so it keeps what
+        # it has instead of waiting for messages that cannot come.
+        for sink in sinks:
+            sink({"end": {"reason": f"connection lost: {error}"}})
 
     def _send(self, payload: bytes):
         self.process.stdin.write(payload)
@@ -219,7 +245,7 @@ class Desktop:
             options["regions"] = [[int(v) for v in r] for r in regions]
         if full is not None:
             options["full"] = bool(full)
-        meta = self.request("capture", encoding="lz4", **options)
+        meta = self.request("capture", encoding=self.encoding, **options)
         payload = meta.pop("payload")
         # A worker built before worker-side downscaling accepts these options, ignores
         # them, and sends the whole 33 MB frame back. That is indistinguishable from a
@@ -251,11 +277,7 @@ class Desktop:
         offset = 0
         rgb = None
         if full_bytes:
-            rgb = (
-                buffer[:full_bytes]
-                .reshape(meta["height"], meta["width"], 4)[:, :, [2, 1, 0]]
-                .copy()
-            )
+            rgb = bgra_to_rgb(buffer[:full_bytes].reshape(meta["height"], meta["width"], 4))
             offset = full_bytes
         seen = None
         if meta.get("views_bytes"):
@@ -301,7 +323,7 @@ class Desktop:
         if region_bytes:
             crops = []
             for (x, y, w, h), n in zip(options["regions"], region_bytes, strict=True):
-                crops.append(buffer[offset : offset + n].reshape(h, w, 4)[:, :, [2, 1, 0]].copy())
+                crops.append(bgra_to_rgb(buffer[offset : offset + n].reshape(h, w, 4)))
                 offset += n
         try:
             parse_cursor(meta.get("cursor"))
@@ -312,10 +334,26 @@ class Desktop:
     def arm(self, *, setup=False):
         self.request("arm", mode="setup" if setup else "match")
 
-    def apply(self, events: list[dict]):
+    def apply(self, events: list[dict], at_ms=None):
+        """Give input: `events` now, or each at its offset in `at_ms` (milliseconds from when
+        the worker takes the request, at most 1000), applied on the worker's own clock.
+
+        A timed batch replaces one request per 25 ms slot with one per decision: no slot
+        waits on the network. Workers before protocol 2 would apply a timed batch at once,
+        so it is refused for them here.
+        """
+        kwargs = {}
         # Short on purpose. A slot that blocks longer than this has lost the worker,
         # and the dispatch join is waiting to stop the interval.
-        reply = self.request("apply", timeout=2, events=events)
+        timeout = 2
+        if at_ms is not None:
+            if getattr(self, "_protocol", None) is None:
+                self._protocol = self.protocol()
+            if self._protocol < 2:
+                raise DesktopError("this worker applies every event at once; redeploy it")
+            kwargs["at_ms"] = [float(t) for t in at_ms]
+            timeout += max(kwargs["at_ms"], default=0) / 1000
+        reply = self.request("apply", timeout=timeout, events=events, **kwargs)
         reply.pop("payload", None)
         return reply
 
@@ -329,6 +367,27 @@ class Desktop:
         worker refuses input and capture until it has it. Refused while armed.
         """
         return bool(self.request("focus")["foreground"])
+
+    def protocol(self) -> int:
+        """What the worker speaks: 1, or 2 with telemetry, observers and streams."""
+        return int(self.request("status").get("protocol", 1))
+
+    def telemetry(self, timeout: float = 15) -> dict:
+        """What the worker's PC is doing: CPU, memory, GPU, disks, network, per process,
+        and the game's window and capture timing (protocol 2).
+
+        The first request starts the worker's sampler and waits about a second for it.
+        """
+        reply = self.request("telemetry", timeout=timeout)
+        reply.pop("payload", None)
+        return reply
+
+    def start_stream(self, hz=5, profile="h264_nvenc", quality=None):
+        """Start a recording stream the worker clocks and encodes (protocol 2).
+
+        Not `stream`: RemoteDesktop's socket file is its `stream`.
+        """
+        return WorkerStream(self, hz=hz, profile=profile, quality=quality)
 
     def game_log(self, offset=0):
         """The arena mod's new game.log lines after `offset`, and the offset to pass next.
@@ -432,6 +491,49 @@ class Desktop:
 
     def __exit__(self, *_):
         self.close()
+
+
+class WorkerStream:
+    """A recording the worker clocks and encodes (protocol 2).
+
+    The worker captures the game `hz` times a second on its own timer, draws the pointer,
+    and encodes the frames with ffmpeg on its own PC (`profile` and `quality`, from its
+    fixed list). What arrives here, in order, on `messages`:
+    `{"frame": {...}}` for each frame the video holds (its times, pointer and inputs, as a
+    capture reply has them), `{"data": offset, "payload": bytes}` for the encoded video (NUT),
+    `{"gap": {"reason"}}` for a tick that recorded nothing (the game not in front, say), and
+    `{"end": {...}}` once. A frame's pixels never cross the network.
+    """
+
+    def __init__(self, desk, *, hz, profile, quality=None):
+        import uuid
+
+        self.desk = desk
+        self.key = uuid.uuid4().hex[:16]
+        self.messages = queue.Queue()
+        self.ended = None
+        with desk.pending_lock:
+            desk.streams[self.key] = self.messages.put
+        try:
+            self.info = desk.request(
+                "stream", timeout=20, action="start", key=self.key, hz=int(hz), profile=profile,
+                quality=quality,
+            )  # fmt: skip
+        except Exception:
+            with desk.pending_lock:
+                desk.streams.pop(self.key, None)
+            raise
+        self.info.pop("payload", None)
+
+    def stop(self, timeout=90):
+        """End the stream. By the time this returns every message is on `messages`."""
+        try:
+            reply = self.desk.request("stream", timeout=timeout, action="stop")
+            reply.pop("payload", None)
+            return reply
+        finally:
+            with self.desk.pending_lock:
+                self.desk.streams.pop(self.key, None)
 
 
 def read_reply(stream):
