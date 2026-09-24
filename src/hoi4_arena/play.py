@@ -65,7 +65,9 @@ class Dispatcher:
     and follows the pointer, to notice a press on the speed control's +.
     """
 
-    def __init__(self, desk, width=1920, height=1080, clock=time.monotonic):
+    def __init__(self, desk, width=1920, height=1080, clock=time.perf_counter):
+        # perf_counter, not monotonic: on Windows monotonic ticks in 15.6 ms steps, and the
+        # slots are 25 ms apart, as training bins the inputs.
         self.desk, self.width, self.height, self.clock = desk, width, height, clock
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-dispatch")
         self.future = None
@@ -281,7 +283,7 @@ def play_policy_game(
     `cap_minutes` (a draw). Returns the outcome, the reason it ended early if it did, and
     the manifest.
     """
-    clock = time.monotonic
+    clock = time.perf_counter
     actor.reset_episode()
     first = on_screen(desk.capture(full=True))
     rec = Recorder(root, first, game_speed=speed, source="policy", hz=hz, codec=codec)
@@ -303,7 +305,7 @@ def play_policy_game(
             # about 150 ms after the frame it answers.
             time.sleep(max(0.0, deadline - clock()))
             begin = clock()
-            if begin - deadline > PERIOD / 2:
+            if begin - deadline > 0.005:
                 late += 1
             deadline = begin + 1 / hz
             try:
@@ -330,14 +332,14 @@ def play_policy_game(
                 continue
             away = 0
             frame = on_screen(captured_frame)
-            applied = dispatcher.take()
-            watch.count(applied)
-            watch.look(frame, clock() - start, referee.running)
-            rec.append(frame, scripted_events=applied)
             captured = clock()
             action, _sample = actor.act(frame.rgb, frame.meta["t_ns"], cursor=frame.meta["cursor"])
             acted = clock()
             dispatcher.join()
+            # Every input of the interval that just ended, now that it has: recorded with
+            # this frame, which was taken while they were being applied.
+            applied = dispatcher.take()
+            watch.count(applied)
             if dispatcher.speed_clicks and not referee.running:
                 referee.clicked_speed_up()
             wait = referee.due()
@@ -359,14 +361,21 @@ def play_policy_game(
                     log.info(
                         "[%s] the game stalled; set running again (paused=%s)", station, paused
                     )
+                rec.append(frame, scripted_events=applied)
                 deadline = clock()
                 continue
             cursor = frame.meta["cursor"]
             dispatcher.start(action, clock(), (float(cursor[0]), float(cursor[1])))
+            sent = clock()
+            # The frame goes to the video after the action is on its way.
+            rec.append(frame, scripted_events=applied)
+            watch.look(frame, clock() - start, referee.running)
             timings.append(
                 {
                     "capture_ms": round((captured - begin) * 1e3, 1),
                     "act_ms": round((acted - captured) * 1e3, 1),
+                    "send_ms": round((sent - acted) * 1e3, 1),
+                    "record_ms": round((clock() - sent) * 1e3, 1),
                 }
             )
             now = clock()
@@ -496,6 +505,7 @@ def evaluate_policy(
         actor = Actor(
             checkpoint, model_path, game_speed=5, memory_window=memory_window, point=point
         )
+        actor.lean = True  # Only the action is needed: no training sample, no clip.
         for index in range(games):
             # A game takes about 3 minutes to launch and up to cap_minutes to play.
             if time.monotonic() + (cap_minutes + 4) * 60 > end:

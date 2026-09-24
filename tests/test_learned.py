@@ -255,6 +255,16 @@ def test_a_memory_window_as_long_as_the_game_so_far_is_the_carried_memory(monkey
         short.act(rgb, (t + 10) * 200_000_000, cursor=(5, 5))
     assert torch.allclose(carried.hidden, windowed.hidden, atol=1e-5)
     assert not torch.allclose(carried.hidden, short.hidden, atol=1e-3)
+    # A lean actor (play-policy) returns the same action and no training sample, and keeps
+    # no clip for an encoder that reads none.
+    lean = build(4)
+    lean.lean = True
+    torch.manual_seed(1)
+    action, sample = lean.act(frames[0], 10 * 200_000_000, cursor=(5, 5))
+    torch.manual_seed(1)
+    expected, full = build(4).act(frames[0], 10 * 200_000_000, cursor=(5, 5))
+    assert sample is None and full is not None and not lean.history
+    assert np.array_equal(action, expected)
 
 
 class _Game:
