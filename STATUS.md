@@ -588,6 +588,36 @@ beat (`win-rate`).
   recruiting starts 60 s after the conscription goal is reached. That is late: in the
   games since, no new division deployed before the war ended, so its effect on the win
   rate is not measured yet.
+- **The best plan, a challenger, and exploration (2026-09-24).** Every game since the
+  fixes that held 90 s or more before attacking had won (6 of 6), and three of four
+  that attacked within 60 s had lost. So 40% of games now play the best plan found so
+  far (broad offensives after a hold of 120-240 s, All Adults Serve, no recruiting),
+  30% play it with one change under test (now: the front line executed alone, no
+  offensive line), and 30% draw every choice at random, so the recordings stay
+  varied. `win-rate` reports each apart, and by arena.
+- **A quiet hold.** The first best-plan loss came before its attack: the plan was
+  redrawn every 33 s while the front held, each redraw took 15-30 s, and the
+  conscription steps, checked after the redraws, found few turns between them
+  (Limited at 67 s, Extensive at 146 s, against 41 and 65 s in the wins). Every redraw
+  also deleted the front line under the divisions. The AI broke in while the army was
+  still at 17k. Now nothing is redrawn until the attack, conscription comes first, and
+  the redraw period counts from the end of the last redraw. Since then the laws have
+  come at 38-46, 60-69, 79-94 and 99-117 s, as political power allows.
+- **A plan counts as executing only when its arrow is lit.** In the next game the
+  attack started 65 s late: selecting the army had left the pointer on its card, the
+  general's tooltip covered the execute arrow, neither the idle nor the ready look was
+  found, and that was taken for executing. The arrow's green averages 54-65 idle or
+  ready and 90-105 executing (the dots or the check before it come and go while it
+  executes), so the check now asks for a lit arrow, looked at with the pointer off the
+  bar.
+- **The attack can swing back.** In 2 of 11 long-hold games the attack let the AI
+  into the script's rear: its broad line pulled the army forward while the AI held
+  part of the script's border states, and the AI's last divisions walked into the
+  empty home half. One of them was lost that way (the AI took the victory points
+  first). In the wins the AI held 0-14% of the script's home half when the attack
+  began and none after the push; in that loss it grew to 10%, 17%, then 89%. An
+  optional guard (`guard` in a plan, off in every plan so far) executes the front line
+  alone at a redraw while the enemy holds at least that share.
 
 ## A learned player from the scripted games (2026-09-24)
 
