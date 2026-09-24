@@ -526,6 +526,22 @@ use per process (Windows' GPU Engine counters) and for the card (NVML: busy, vid
 encoder, memory, temperature, power), disks, the network, the game window (responding,
 in front, on which screen) and the capture's timing.
 
+**Each HOI4 launch leaks memory there** (measured 2026-09-24). Over a night of scripted
+games the second PC's committed memory rose about 1 GB an hour, from 29.95 GB to 33.79 GB,
+against a limit of 34.57 GB. Its RAM stayed 21 GB free all along. At the limit, Windows
+refuses allocations unless it can grow the pagefile, so the game or a recording can crash
+mid-game. The game, the worker, ffmpeg and the bridge stayed flat from game to game. What
+grows is left behind by each launch:
+- 20 cycles of connecting, attaching, capturing and closing, each a fresh worker with its
+  own desktop duplication, changed nothing.
+- 5 quit-and-launch cycles added about 100 MB each to the memory committed with no game
+  running, 25 MB of it in dwm.exe.
+
+Only a logoff or a reboot gives it back. Relaunching less often would stop the growth,
+for instance by loading the next start from inside the running game. `telemetry` now
+prints the commit charge and warns above 90% of the limit, and a stream recording logs a
+warning when its PC is past that.
+
 ## Recording where the game runs (2026-09-24)
 
 Frames used to be pulled one request at a time: every 200 ms the recorder asked the

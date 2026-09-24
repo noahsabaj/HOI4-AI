@@ -13,6 +13,7 @@ from pathlib import Path
 from .arena_log import ArenaLog
 from .desktop import Desktop, DesktopError, EmergencyStop
 from .layout import FOVEA_SIZE, parse_cursor, recorded_speed
+from .telemetry import commit_near_limit
 
 log = logging.getLogger(__name__)
 
@@ -358,6 +359,12 @@ class StreamRecorder:
                 }  # fmt: skip
                 out.write(json.dumps(row) + "\n")
                 out.flush()
+                if commit_near_limit(reply.get("memory") or {}):
+                    memory = reply["memory"]
+                    log.warning(
+                        "the recording PC has committed %s of its %s MB of memory",
+                        memory.get("commit_mb"), memory.get("commit_limit_mb"),
+                    )  # fmt: skip
                 self._resync()
 
     def _resync(self):

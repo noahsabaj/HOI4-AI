@@ -14,14 +14,31 @@ def _num(value, digits=1):
     return "-" if value is None else f"{value:.{digits}f}"
 
 
+# Past this share of the commit limit, telemetry warns: Windows refuses allocations at
+# the limit even with RAM free, unless it can grow the pagefile. The second PC's commit
+# climbed about 1 GB an hour over a night of games (2026-09-24).
+COMMIT_WARNING = 0.9
+
+
+def commit_near_limit(memory: dict) -> bool:
+    commit, limit = memory.get("commit_mb"), memory.get("commit_limit_mb")
+    return bool(commit and limit and commit >= COMMIT_WARNING * limit)
+
+
 def summary(reply: dict) -> str:
     """A few lines a person can read: the machine, then the processes that matter."""
     cpu, memory = reply.get("cpu") or {}, reply.get("memory") or {}
     lines = [
         f"CPU {_num(cpu.get('busy_percent'))}% of {cpu.get('logical')} threads "
         f"({_num(cpu.get('busy_cores'), 2)} busy)   RAM {memory.get('available_mb', '-')} MB free "
-        f"of {memory.get('total_mb', '-')} MB",
+        f"of {memory.get('total_mb', '-')} MB   commit {memory.get('commit_mb', '-')} of "
+        f"{memory.get('commit_limit_mb', '-')} MB",
     ]
+    if commit_near_limit(memory):
+        lines.append(
+            "WARNING: memory committed is near its limit; past it, allocations fail and the "
+            "game or the recording can crash, however much RAM is free"
+        )
     for gpu in reply.get("gpu") or []:
         lines.append(
             f"GPU {gpu.get('name')}: {gpu.get('busy_percent')}% busy, video encoder "
