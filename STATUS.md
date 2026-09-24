@@ -609,6 +609,20 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   space and sets speed 5; it does so again if the daily reports stop. Every such step is
   counted in the game's manifest, and the games are recorded as data (source "policy").
   The second PC is reserved from the scripted player's recorder (`--reservation`).
+- **The UI never moves on the second PC.** In all 31 games the unassigned-divisions
+  alert was at (825, 57) and the create-army + at (988, 1013), so the setup clicks are
+  the same pixels every game.
+- **Faster training with a frozen tower.** The imitation starts from the AI-games policy
+  (`--init`), whose tower's last blocks already learned HOI4's screens, and keeps the
+  tower frozen (`--train-last 0`). Then what the tower reads from a frame never changes,
+  so `cache-tower` runs it once over every frame and `--tower-cache` reads the result:
+  the summary, and the patch grid already resized to the 32x32 cells (the policy's 1x1
+  convolution and the resize commute), 1.5 MB a frame. The tower was about a third of a
+  training step. A test holds the cached path to the running tower's outputs.
+- **Memory carried through a game** (`--carry`): each batch slot plays one game window
+  after window in order, and its memory goes on from one window to the next (truncated
+  backpropagation through time). In the memory study on the AI games this was the
+  largest effect: held-out loss 3.109 against 3.169 with each window started empty.
 
 ## Open work
 
