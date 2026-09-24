@@ -249,15 +249,12 @@ def test_the_conscription_ladder_climbs_one_paid_step_at_a_time(monkeypatch):
     assert not game["political"]
 
 
-def test_the_front_line_tool_is_clicked_in_the_enemy_s_own_half():
-    blue = np.zeros((100, 200), bool)
-    red = np.zeros((100, 200), bool)
-    blue[:, :100], red[:, 100:] = True, True
-    # Blue holds a strip of Red's land by the seam: Blue's colour, Red's province.
-    blue[:, 100:115], red[:, 100:115] = True, False
-    box = (0, 0, 100, 200)
-    as_red = Planner("RED", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
-    clicks = as_red.front_clicks(blue, red, box)
-    assert clicks[0] == (50, 50) and all(x < 80 for x, _ in clicks)
-    as_blue = Planner("BLU", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
-    assert all(x > 120 for x, _ in as_blue.front_clicks(blue, red, box))
+def test_a_plan_shows_as_the_army_card_s_red_stop_button():
+    from hoi4_arena.scripted import STOP_BUTTON, plan_shown
+
+    screen = np.full((1080, 1920, 3), 30, np.uint8)
+    assert not plan_shown(screen)
+    x0, y0, x1, y1 = STOP_BUTTON
+    for red in (160, 220):  # Executing (darker) and idle.
+        screen[y0:y1, x0:x1] = (red, 40, 40)
+        assert plan_shown(screen)

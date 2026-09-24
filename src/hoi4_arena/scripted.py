@@ -24,7 +24,10 @@ Calibrated live at 1920x1080 on 2026-09-23:
 - Z is the Front Line tool. A click on the border sets the front along all of it.
 - X is the Offensive Line tool. A right-drag from the front into enemy land draws the
   offensive, which the game routes along its own path.
-- The green arrow above the army card activates the plan. Once active, it changes.
+- The green arrow above the army card activates the plan. It has three looks: idle,
+  executing (lit), and a green check when a plan is drawn for an army that was
+  executing, which starts it at once. The red stop button beside it shows with any
+  plan and not without one.
 - The Battle Plans bar shows while an army is selected.
 - Q opens the political screen. Its first law slot is conscription: a click lists the
   laws, a click on one asks "Replace Idea?", and OK changes it for political power (150
@@ -106,8 +109,10 @@ BROAD_DEPTH = 1 / 3
 # inside Blue is red. Without it the first games took them for the front, and drew
 # offensives from Red's far coast or from deep in Blue.
 CLEAN = 5
-# The first army's card in the army bar at the bottom, 1080p fractions.
+# The first army's card in the army bar at the bottom, 1080p fractions, and the red stop
+# button above it (x0, y0, x1, y1 in 1080p pixels), which shows while the army has a plan.
 ARMY_CARD = (947 / 1920, 1010 / 1080)
+STOP_BUTTON = (924, 953, 938, 961)
 # The army bar, where the create-army + shows: the bottom tenth of the screen.
 ARMY_BAR_TOP = 0.88
 # The arena's land grid: 24 province columns (12 a side) by 8 rows, and states of 3 by 4
@@ -307,51 +312,32 @@ class Planner:
         return True
 
     def draw_front(self, desk, tries=4):
-        """A front line along the whole border, checked: the plan's activate arrow shows.
+        """A front line along the whole border, checked: the army card shows a plan.
 
-        The front line tool makes a front against the country that owns the clicked
-        province, along the whole border. The map shows who controls a province, not who
-        owns it, so once the front has moved, land in the enemy's colour by the border
-        may be the player's own, occupied: there the tool offers a defensive line instead,
-        and no plan appears. A redraw on 2026-09-23 failed that way after deleting the old
-        plan, and the army fought the rest of the game without orders. So the click goes
-        into the enemy's own half of the arena, away from the front. (Earlier, clicks on
-        the player's own side drew no front at all.)
+        The front line tool takes a click on the enemy's side of the border, on one of
+        the fronts it highlights ("You cannot draw Front Line here" anywhere else, deep in
+        enemy land included). Its tooltip calls the result a defensive line. On
+        2026-09-23 two games in three as Red drew no front at first: the click had gone
+        to the player's own side, where the tool does nothing.
         """
         rgb, blue, red, box = self.overview(desk)
         if box is None or not self.select_army(desk):
             raise RuntimeError("no arena or army to draw a front line with")
-        clicks = self.front_clicks(blue, red, box)
-        if not clicks:
-            raise RuntimeError("no enemy land on screen")
+        front = self.front(blue, red)
+        if not front:
+            raise RuntimeError("the two countries do not touch on screen")
+        # The border's middle first: the tool follows the whole border from there.
+        middle = sorted(front, key=lambda p: p[1])[len(front) // 2]
         for attempt in range(tries):
-            x, y = clicks[0] if attempt == 0 else self.rng.choice(clicks)
+            x, y = middle if attempt == 0 else self.rng.choice(front)
             act(desk, tap(FRONT_LINE))
             self.click(desk, self.screen_point(rgb, x, y))
             time.sleep(0.8)
-            if self.find(screen(desk), "activate", top=0.8) is not None:
+            if plan_shown(screen(desk)):
                 self.order("front", at=self.box_point(box, x, y), tries=attempt + 1)
                 return
             self.select_army(desk)
-        raise RuntimeError("no front line took: the plan's activate arrow never showed")
-
-    def front_clicks(self, blue, red, box):
-        """Crop pixels of the enemy's colour in the enemy's own half of the arena, a fifth
-        of the way in or more, as (x, y): the one nearest the middle of that half first.
-        Where there are none, any of the enemy's colour."""
-        top, left, bottom, right = box
-        enemy = red if self.enemy == "RED" else blue
-        ys, xs = np.nonzero(enemy)
-        if not len(xs):
-            return []
-        seam, half = (left + right) / 2, max(1.0, (right - left) / 2)
-        depth = (xs - seam) / half if self.enemy == "RED" else (seam - xs) / half
-        middle = np.abs(ys - (top + bottom) / 2) < (bottom - top) / 3
-        pick = (depth > 0.2) & middle
-        if pick.any():
-            xs, ys, depth = xs[pick], ys[pick], depth[pick]
-        order = np.argsort(np.abs(depth - 0.5) + np.abs(ys - (top + bottom) / 2) / half)
-        return [(int(xs[k]), int(ys[k])) for k in order[:2000]]
+        raise RuntimeError("no front line took: the army card never showed a plan")
 
     def front(self, blue, red):
         """Crop pixels on the enemy's side of the border, as (x, y).
@@ -466,10 +452,17 @@ class Planner:
         )
 
     def activate(self, desk):
+        """The plan executed: a click on the card's idle arrow. True once it executes,
+        also when it did already: an army that was executing starts a plan drawn for it
+        at once, and its arrow shows a green check instead."""
         if not self.select_army(desk):
             return False
-        button = self.find(screen(desk), "activate", top=0.8)
+        rgb = screen(desk)
+        button = self.find(rgb, "activate", top=0.8)
         if button is None:
+            if plan_shown(rgb):
+                self.active = True
+                return True
             return False
         self.click(desk, button)
         time.sleep(0.8)
@@ -606,6 +599,19 @@ def green_plus(rgb):
     if len(xs) < GREEN_PLUS:
         return None
     return float(np.median(xs)) / rgb.shape[1], (float(np.median(ys)) + top) / rgb.shape[0]
+
+
+def plan_shown(rgb):
+    """Whether the first army's card shows a plan: its red stop button is lit.
+
+    The execute arrow beside it has three looks (idle, executing, and a green check once a
+    plan is redrawn while executing), but the stop button shows with any plan and not
+    without one: red in 71% (executing) to 96% (idle) of its box, 0% with no plan.
+    """
+    x0, y0, x1, y1 = STOP_BUTTON
+    box = rgb[y0:y1, x0:x1].astype(np.int32)
+    red = (box[..., 0] > 100) & (box[..., 0] - np.maximum(box[..., 1], box[..., 2]) > 50)
+    return bool(red.mean() > 0.3)
 
 
 def pixels(x, y):
