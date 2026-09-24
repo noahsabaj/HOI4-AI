@@ -440,6 +440,24 @@ pub fn next_tick(
     (next, skipped)
 }
 
+/// The status files of the other workers in `dir` (see platform::publish_status): each
+/// one's last report, if it is fresh (written in the last 5 s) and not this worker's own.
+pub fn worker_statuses(dir: &Path, own: u32, now: f64) -> Vec<serde_json::Value> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<serde_json::Value> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|v| v["pid"].as_u64() != Some(own as u64))
+        .filter(|v| v["t"].as_f64().is_some_and(|t| now - t < 5.0))
+        .collect();
+    out.sort_by_key(|v| v["pid"].as_u64());
+    out
+}
+
 /// The script a control operation runs: compute jobs have their own.
 fn control_script(op: &str) -> &'static str {
     if op == "job" {
@@ -2295,7 +2313,62 @@ mod platform {
         });
         value["game"] = game_status();
         value["capture"] = STATS.lock().map(|s| s.report()).unwrap_or_default();
+        // The other workers on this PC: an observer's own capture says little, the one
+        // that holds the game (a recording's stream, say) is what the caller wants.
+        value["workers"] = serde_json::json!(crate::worker_statuses(
+            &status_dir(),
+            std::process::id(),
+            unix_seconds()
+        ));
         Ok((value, vec![]))
+    }
+
+    /// Where each worker on this PC leaves its capture and stream timing, once a second,
+    /// for the others' telemetry: one small file per worker, named by its process id.
+    fn status_dir() -> PathBuf {
+        std::env::temp_dir().join("hoi4-worker-status")
+    }
+
+    fn unix_seconds() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    }
+
+    /// Keep this worker's status file current while it captures, and remove it when the
+    /// worker ends. A worker that never captures writes nothing.
+    fn publish_status() {
+        let dir = status_dir();
+        let path = dir.join(format!("{}.json", std::process::id()));
+        let temp = dir.join(format!("{}.tmp", std::process::id()));
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            let Ok(stats) = STATS.lock() else {
+                continue;
+            };
+            if stats.captures == 0 && stats.failures == 0 {
+                continue;
+            }
+            let body = serde_json::json!({
+                "pid": std::process::id(),
+                "t": unix_seconds(),
+                "observer": OBSERVER.load(Ordering::Relaxed),
+                "streaming": STREAMING.load(Ordering::SeqCst),
+                "capture": stats.report(),
+            });
+            drop(stats);
+            let _ = std::fs::create_dir_all(&dir);
+            if std::fs::write(&temp, body.to_string()).is_ok() {
+                let _ = std::fs::rename(&temp, &path);
+            }
+        });
+    }
+
+    struct RemoveStatus;
+    impl Drop for RemoveStatus {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(status_dir().join(format!("{}.json", std::process::id())));
+        }
     }
 
     pub fn run(options: Options) -> Result<(), String> {
@@ -2317,6 +2390,8 @@ mod platform {
         }
         ORIGIN.get_or_init(Instant::now);
         OBSERVER.store(options.observer, Ordering::Relaxed);
+        publish_status();
+        let _remove_status = RemoveStatus;
         // An observer gives no input and records no player, so it hooks nothing: the
         // connection that holds the game keeps the only hooks, and F12 stays theirs.
         if !options.observer {
@@ -3230,6 +3305,23 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+    #[test]
+    fn workers_see_each_others_fresh_status_and_not_their_own() {
+        let dir = std::env::temp_dir().join(format!("worker-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 1000.0;
+        for (pid, t) in [(1u32, 999.0), (2, 990.0), (3, 999.5)] {
+            let body = serde_json::json!({"pid": pid, "t": t, "capture": {"captures": pid}});
+            std::fs::write(dir.join(format!("{pid}.json")), body.to_string()).unwrap();
+        }
+        std::fs::write(dir.join("4.tmp"), "{").unwrap();
+        let seen = worker_statuses(&dir, 3, now);
+        // 2 is stale, 3 is the asking worker itself, and a half-written file is skipped.
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["pid"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(worker_statuses(&dir, 0, now).is_empty());
     }
     #[test]
     fn stream_keys_are_short_and_plain() {
