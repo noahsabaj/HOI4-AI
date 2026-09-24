@@ -81,6 +81,22 @@ if ($Action -eq 'report') {
         Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | ForEach-Object { "battery status $($_.BatteryStatus), charge $($_.EstimatedChargeRemaining)%" }
         Add-Type -AssemblyName System.Windows.Forms
         "power line: $([Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus)"
+        # Memory past RAM: at the commit limit allocations fail, unless Windows may grow the
+        # pagefile. Each HOI4 launch leaves about 100 MB committed (2026-09-24).
+        $os = Get-CimInstance Win32_OperatingSystem
+        "commit: $([math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1KB)) of $([math]::Round($os.TotalVirtualMemorySize / 1KB)) MB"
+        "pagefile managed by Windows: $((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile)"
+        Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | ForEach-Object {
+            "pagefile setting: $($_.Name), initial $($_.InitialSize) MB, maximum $($_.MaximumSize) MB (0 = managed)"
+        }
+        Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | ForEach-Object {
+            "pagefile now: $($_.Name), $($_.AllocatedBaseSize) MB allocated, $($_.CurrentUsage) MB in use, $($_.PeakUsage) MB at peak"
+        }
+        # Whether this PC signs in by itself after a restart, so the worker starts at logon
+        # with nobody there. Only that one value is read.
+        $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        $auto = try { Get-ItemPropertyValue -LiteralPath $winlogon -Name AutoAdminLogon -ErrorAction Stop } catch { $null }
+        "signs in by itself after a restart: $(if ($auto -eq '1') { 'yes' } else { 'no' })"
         # Every visible titled window, including dialogs a process's main window hides.
         Add-Type @'
 using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
