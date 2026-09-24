@@ -373,6 +373,7 @@ def test_behaviour_cloning_on_scripted_games_learns_the_true_state_beside_the_ac
         )
         path = data / name / "manifest.json"
         meta = {**json.loads(path.read_text()), "players": ["BLU"], "winner": "RED"}
+        meta["orders"] = [{"frame": 4, "order": "army"}, {"frame": 30, "order": "run"}]
         path.write_text(json.dumps(meta))
         _log(data / name, [(3, _day("BLU", "24:00, 1 January, 1936", 8, {7: 4})),
                            (3, _day("RED", "24:00, 1 January, 1936", 8, {15: 4}))])  # fmt: skip
@@ -381,14 +382,15 @@ def test_behaviour_cloning_on_scripted_games_learns_the_true_state_beside_the_ac
     train.train_bc(
         data, "model", tmp_path / "out", sources=("scripted",), sequence=2, burn_in=1,
         workers=0, lead_in=0, drop_keys=(0x20,), state_weight=0.5, loser_weight=0.5,
-        look_before_click=True,
+        look_before_click=True, order_weight=0.2,
     )  # fmt: skip
     rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
     steps = [row for row in rows if "step" in row]
-    assert steps and all(row["state"] > 0 for row in steps)
+    assert steps and all(row["state"] > 0 and row["orders"] > 0 for row in steps)
     report = rows[-1]
     assert report["validation_nll"] > 0 and report["validation_presses"] >= 1
     assert set(report["validation_state_r2"]) >= {"own", "enemy", "at", "year"}
+    assert 0 <= report["validation_next_order_accuracy"] <= 1
     assert (tmp_path / "out" / "state-head-0000.pt").exists()
     config = json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]
     assert config["lead_in"] == 0 and config["drop_keys"] == [0x20]
@@ -407,3 +409,20 @@ def test_an_aimed_move_is_one_a_press_follows_before_any_other_move():
     assert not aimed(actions, 1), "no move"
     assert not aimed(actions, 3)
     assert aimed(actions, 4)
+
+
+def test_the_next_order_is_the_first_stamped_after_the_frame_read():
+    from hoi4_arena.privileged import ORDER_KINDS, decision_orders
+
+    manifest = {
+        "nominal_fps": 5,
+        "orders": [{"frame": 30, "order": "army"}, {"frame": 10, "order": "run"},
+                   {"frame": 40, "order": "retreat"}],
+    }  # fmt: skip
+    kinds, eta = decision_orders(manifest, np.array([0, 10, 29, 39, 45]))
+    names = [ORDER_KINDS[k] for k in kinds]
+    assert names == ["run", "army", "army", "other", "none"]
+    assert eta[0] == pytest.approx(np.log1p(2.0)) and eta[2] == pytest.approx(np.log1p(0.2))
+    assert np.isnan(eta[-1])
+    kinds, eta = decision_orders({}, np.array([0, 1]))
+    assert (kinds == -1).all() and np.isnan(eta).all(), "no orders, no targets"

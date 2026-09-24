@@ -315,6 +315,13 @@ def main():
         help="Weight of the privileged-state loss: the memory predicts the arena's true state "
         "(from its log) at each decision. Training only; 0 is off.",
     )
+    train.add_argument(
+        "--order-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the next-order loss: the memory predicts the scripted player's next "
+        "order and the time until it, from the manifest's orders. Training only; 0 is off.",
+    )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
     weigh = sub.add_parser(

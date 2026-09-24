@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .dataset import VideoSessions, batch_to_device, window_loader
@@ -148,6 +149,38 @@ def state_r2(predicted, truth):
     return report
 
 
+class OrderHead(torch.nn.Module):
+    """Reads the scripted player's next order and the time until it from the memory."""
+
+    def __init__(self, memory_dim):
+        from .privileged import ORDER_KINDS
+
+        super().__init__()
+        self.kind = torch.nn.Linear(memory_dim, len(ORDER_KINDS))
+        self.eta = torch.nn.Linear(memory_dim, 1)
+
+    def forward(self, memory):
+        return self.kind(memory.float()), self.eta(memory.float()).squeeze(-1)
+
+
+def order_loss(head, memory, kind, eta):
+    """Cross-entropy of the next order's kind plus half the squared error of its log time.
+
+    Over the decisions that have them (privileged.decision_orders): -1 kinds and NaN
+    times are left out, and a batch with neither costs nothing.
+    """
+    logits, guess = head(memory.flatten(0, 1))
+    kind, eta = kind.flatten(), eta.flatten().float()
+    loss = logits.sum() * 0
+    known = kind >= 0
+    if known.any():
+        loss = loss + F.cross_entropy(logits[known], kind[known])
+    timed = torch.isfinite(eta)
+    if timed.any():
+        loss = loss + 0.5 * (guess[timed] - eta[timed]).square().mean()
+    return loss
+
+
 def state_loss(head, memory, target):
     """Squared error of the true state (privileged.NAMES) read from the memory.
 
@@ -197,6 +230,7 @@ def train_bc(
     drop_keys=(),
     loser_weight=1.0,
     state_weight=0.0,
+    order_weight=0.0,
     lr=1e-4,
     init=None,
 ):
@@ -225,8 +259,9 @@ def train_bc(
     `state_weight` > 0 adds the privileged-state loss: a linear read-out of the memory
     predicts the arena's true state at each decision (privileged.NAMES), from the
     arena log, weighted by it; the read-out is saved beside the policy and never used to
-    act. `init` starts the policy from a checkpoint's weights (fine-tuning), `lr` sets
-    the learning rate.
+    act. `order_weight` > 0 likewise has the memory predict the scripted player's next
+    order and the time until it (privileged.decision_orders). `init` starts the policy
+    from a checkpoint's weights (fine-tuning), `lr` sets the learning rate.
     """
     if not 0 < idm_weight <= 1:
         raise ValueError("idm_weight must be in (0, 1]")
@@ -251,6 +286,7 @@ def train_bc(
         "drop_keys": tuple(drop_keys),
         "loser_weight": loser_weight,
         "state": state_weight > 0,
+        "orders": order_weight > 0,
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
@@ -282,9 +318,12 @@ def train_bc(
     from .privileged import DIM as STATE_DIM
 
     state_head = torch.nn.Linear(policy.memory_dim, STATE_DIM).to(device)
+    order_head = OrderHead(policy.memory_dim).to(device)
     trained = [*policy.parameters(), *aux.parameters()]
     if state_weight > 0:
         trained += list(state_head.parameters())
+    if order_weight > 0:
+        trained += list(order_head.parameters())
     params = [p for p in trained if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=lr)
     config = {
@@ -312,12 +351,18 @@ def train_bc(
         "drop_keys": list(drop_keys),
         "loser_weight": loser_weight,
         "state_weight": state_weight,
+        "order_weight": order_weight,
         "lr": lr,
         "init": str(Path(init).resolve()) if init else None,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)
-    modules = {"policy": policy, "auxiliary": aux, "state_head": state_head}
+    modules = {
+        "policy": policy,
+        "auxiliary": aux,
+        "state_head": state_head,
+        "order_head": order_head,
+    }
     first_epoch, skip = progress.start(modules, optimizer)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
     with (output / "metrics.jsonl").open("a") as log:
@@ -345,6 +390,14 @@ def train_bc(
                     if state_weight > 0:
                         truth = state_loss(state_head, memory, batch["state"][:, burn_in:])
                         loss = loss + state_weight * truth
+                    if order_weight > 0:
+                        plan = order_loss(
+                            order_head,
+                            memory,
+                            batch["order_kind"][:, burn_in:],
+                            batch["order_eta"][:, burn_in:],
+                        )
+                        loss = loss + order_weight * plan
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training objective")
                 loss.backward()
@@ -359,11 +412,14 @@ def train_bc(
                 }
                 if state_weight > 0:
                     row["state"] = truth.item()
+                if order_weight > 0:
+                    row["orders"] = plan.item()
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 progress.tick(epoch, step + 1, modules, optimizer)
             policy.eval()
             validation_losses, acting, predicted, truths = [], [], [], []
+            order_right, order_known = 0, 0
             with torch.no_grad():
                 for batch in window_loader(validation, batch_size, workers=workers, device=device):
                     batch = batch_to_device(batch, device)
@@ -380,6 +436,11 @@ def train_bc(
                         if state_weight > 0:
                             predicted.append(state_head(memory.float()).flatten(0, 1).cpu())
                             truths.append(batch["state"][:, burn_in:].flatten(0, 1).cpu())
+                        if order_weight > 0:
+                            logits, _ = order_head(memory.flatten(0, 1))
+                            kind = batch["order_kind"][:, burn_in:].flatten()
+                            order_right += int((logits.argmax(-1) == kind)[kind >= 0].sum())
+                            order_known += int((kind >= 0).sum())
             report = {
                 "epoch": epoch,
                 "validation_nll": sum(validation_losses) / len(validation_losses),
@@ -394,10 +455,14 @@ def train_bc(
                 report["validation_presses"] = len(pressed)
             if predicted:
                 report["validation_state_r2"] = state_r2(torch.cat(predicted), torch.cat(truths))
+            if order_known:
+                report["validation_next_order_accuracy"] = order_right / order_known
             log.write(json.dumps(report) + "\n")
             log.flush()
             if state_weight > 0:
                 torch.save(state_head.state_dict(), output / f"state-head-{epoch:04d}.pt")
+            if order_weight > 0:
+                torch.save(order_head.state_dict(), output / f"order-head-{epoch:04d}.pt")
             save_checkpoint(
                 output / f"epoch-{epoch:04d}.pt",
                 policy,

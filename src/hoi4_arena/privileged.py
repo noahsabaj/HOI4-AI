@@ -89,6 +89,41 @@ def state_rows(stamped, player):
     return rows
 
 
+ORDERS = ("army", "general", "front", "offensive", "run", "law", "clear", "activate", "recruit")
+# The next order's kind: one of ORDERS, "other" for a kind added since, or "none" once the
+# game's last order is given.
+ORDER_KINDS = (*ORDERS, "other", "none")
+
+
+def decision_orders(manifest, frame_ids):
+    """The scripted player's next order at each decision: its kind and the seconds until.
+
+    The manifest's `orders` stamp each order with the number of frames recorded when it
+    was complete. A decision reading frame f is working toward the first order stamped
+    after f. Kinds index ORDER_KINDS; -1 where the recording has no orders (a learned
+    policy's game, an AI game). The time is log(1 + seconds), NaN when unknown or after
+    the last order. A training target only: it asks the memory to know where in its
+    procedure the player is and what comes next, which the next click alone does not.
+    """
+    frame_ids = np.asarray(frame_ids)
+    kinds = np.full(len(frame_ids), -1, np.int64)
+    eta = np.full(len(frame_ids), np.nan, np.float32)
+    orders = sorted(manifest.get("orders") or [], key=lambda o: o["frame"])
+    if not orders:
+        return kinds, eta
+    stamps = np.array([o["frame"] for o in orders])
+    names = [o["order"] if o["order"] in ORDERS else "other" for o in orders]
+    hz = manifest.get("nominal_fps") or 5
+    upcoming = np.searchsorted(stamps, frame_ids, side="right")
+    for i, k in enumerate(upcoming):
+        if k >= len(orders):
+            kinds[i] = ORDER_KINDS.index("none")
+            continue
+        kinds[i] = ORDER_KINDS.index(names[k])
+        eta[i] = math.log1p((stamps[k] - frame_ids[i]) / hz)
+    return kinds, eta
+
+
 def recording_player(manifest):
     players = manifest.get("players") or []
     player = players[0] if len(players) == 1 else manifest.get("started_as")

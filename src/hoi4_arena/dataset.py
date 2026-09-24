@@ -272,6 +272,7 @@ def session_labels(
     drop_keys=(),
     loser_weight=1.0,
     state=False,
+    orders=False,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -302,7 +303,9 @@ def session_labels(
     policy plays), so they are left out of the labels rather than invalidating the
     decision. `loser_weight` scales every decision of a game the player did not win
     (player_outcome). `state` adds each decision's true state from the arena log
-    (privileged.state_targets), which the agent never sees: a target for training only.
+    (privileged.decision_states), and `orders` the scripted player's next order and the
+    time until it (privileged.decision_orders), which the agent never sees: targets for
+    training only.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -412,6 +415,10 @@ def session_labels(
         from .privileged import decision_states
 
         extra["state"] = decision_states(source, manifest, frame_ids)
+    if orders:
+        from .privileged import decision_orders
+
+        extra["order_kind"], extra["order_eta"] = decision_orders(manifest, frame_ids)
     return {
         **extra,
         "root": source,
@@ -527,8 +534,9 @@ class _Stream:
             "outcome": torch.from_numpy(labels["outcome"][start : start + n].copy()),
             "start": start,
         }
-        if "state" in labels:
-            window["state"] = torch.from_numpy(labels["state"][start : start + n].copy())
+        for key in ("state", "order_kind", "order_eta"):
+            if key in labels:
+                window[key] = torch.from_numpy(labels[key][start : start + n].copy())
         if self.clips:
             window["clips"] = torch.stack(
                 [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]
@@ -602,7 +610,7 @@ class VideoSessions(IterableDataset):
 
     A `splits.json` in `root`, {recording folder name: split}, overrides the split each
     recording's manifest drew, so a study can choose its held-out games without touching
-    the recordings. `lead_in`, `drop_keys`, `loser_weight` and `state` pass to
+    the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state` and `orders` pass to
     session_labels; a lead-in shorter than a clip needs `clips` off.
     """
 
@@ -629,6 +637,7 @@ class VideoSessions(IterableDataset):
         drop_keys=(),
         loser_weight=1.0,
         state=False,
+        orders=False,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -662,6 +671,7 @@ class VideoSessions(IterableDataset):
                     drop_keys=drop_keys,
                     loser_weight=loser_weight,
                     state=state,
+                    orders=orders,
                 )
             )
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)
