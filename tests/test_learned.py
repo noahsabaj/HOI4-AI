@@ -660,3 +660,22 @@ def test_a_timed_dispatch_sends_the_slots_in_one_request_at_their_offsets():
     dispatcher.join()
     assert desk.batches[-1] == ([], None), "an idle decision still feeds the watchdog"
     dispatcher.close()
+
+
+def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
+    from hoi4_arena.models import CELL_DIM, ActionHead
+
+    torch.manual_seed(0)
+    head = ActionHead(memory_dim=8).eval()
+    with torch.no_grad():
+        head.kinds.bias.zero_()
+        head.kinds.bias[0] = 1.0  # "none" likeliest, a move next.
+        head.kinds.bias[1] = 0.5
+    memory, cells = torch.randn(64, 8), torch.randn(64, GRID, CELL_DIM)
+    with torch.no_grad():
+        warm = (head(memory, cells)[0][:, 0, 0] == 0).float().mean()
+        cold = (head(memory, cells, temperature=0.2)[0][:, 0, 0] == 0).float().mean()
+        actions = torch.zeros(64, SLOTS, 3, dtype=torch.long)
+        same = head(memory, cells, actions)[1], head(memory, cells, actions, temperature=0.2)[1]
+    assert cold > warm, "the likeliest input gains"
+    assert torch.equal(*same), "a demonstration's likelihood does not depend on it"

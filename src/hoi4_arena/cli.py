@@ -207,6 +207,12 @@ def main():
         action="store_true",
         help="Place each move on its likeliest spot while still sampling what to do",
     )
+    live.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Below 1 sharpens what the policy does each slot (its likeliest input gains)",
+    )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
     heat = sub.add_parser(

@@ -130,6 +130,7 @@ class Actor:
         game_speed,
         memory_window=None,
         point=False,
+        temperature=1.0,
     ):
         """`memory_window` N runs the memory afresh over the last N decisions' perception
         at every decision, from an empty state, instead of carrying it from the game's
@@ -140,6 +141,7 @@ class Actor:
         samples."""
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
         self.point = point
+        self.temperature = temperature
         self.memory_window = memory_window
         self.recent = deque(maxlen=memory_window) if memory_window else None
         # The policy is told the speed the match runs at: the same clip is a different
@@ -220,6 +222,7 @@ class Actor:
                         noise=torch.zeros(1, self.policy.actor.noise_dim, device=self.device),
                         deterministic=self.deterministic,
                         point=getattr(self, "point", False),
+                        temperature=getattr(self, "temperature", 1.0),
                     )
         torch.cuda.synchronize()
 
@@ -297,6 +300,7 @@ class Actor:
                 noise=noise,
                 deterministic=self.deterministic,
                 point=getattr(self, "point", False),
+                temperature=getattr(self, "temperature", 1.0),
             )
         if lean:
             self.previous = action[0].cpu().numpy()

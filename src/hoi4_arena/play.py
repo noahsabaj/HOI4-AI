@@ -564,6 +564,7 @@ def evaluate_policy(
     setup_seconds=90.0,
     memory_window=None,
     point=False,
+    temperature=1.0,
     model_path=None,
     seed=None,
 ):
@@ -588,7 +589,12 @@ def evaluate_policy(
     end = time.monotonic() + minutes * 60
     try:
         actor = Actor(
-            checkpoint, model_path, game_speed=5, memory_window=memory_window, point=point
+            checkpoint,
+            model_path,
+            game_speed=5,
+            memory_window=memory_window,
+            point=point,
+            temperature=temperature,
         )
         actor.lean = True  # Only the action is needed: no training sample, no clip.
         for index in range(games):
