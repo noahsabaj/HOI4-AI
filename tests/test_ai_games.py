@@ -438,3 +438,131 @@ def test_the_menu_opens_through_a_win_s_conference_and_its_popups(tmp_path, monk
     with pytest.raises(RuntimeError, match="menu did not open"):
         ai_games.load_in_game(None, "arenav4blu", [object()], None, tmp_path / "g-start-failed.png")
     assert (tmp_path / "g-menu-failed.png").exists()
+
+
+class ToyMap:
+    """A 1080p view of a toy arena for the camera, 2400 x 800 world units: Blue's land to
+    the left of FRONT_X, Red's to its right, sea around. Wheel notches zoom about the
+    pointer, 1.105 times a notch (the arena fills half the screen at 0, a third of it the
+    screen at 18, as measured), and an arrow key pans a screen a second."""
+
+    FRONT_X = 1200
+
+    def __init__(self, cx, cy, zoom):
+        self.cx, self.cy, self.zoom, self.pointer, self.down = cx, cy, zoom, (0.5, 0.5), {}
+        self.seen = []  # (zoom, the front's x on screen) at each capture
+
+    def scale(self):
+        return 0.4 * 1.105**self.zoom
+
+    def world(self, x, y):
+        return self.cx + (x - 0.5) * 1920 / self.scale(), self.cy + (y - 0.5) * 1080 / self.scale()
+
+    def arm(self, setup=False):
+        pass
+
+    def release(self):
+        pass
+
+    def focus(self):
+        return True
+
+    def apply(self, events):
+        import time
+
+        for e in events:
+            if e["kind"] == "move":
+                self.pointer = (e["x"], e["y"])
+            elif e["kind"] == "wheel":
+                wx, wy = self.world(*self.pointer)
+                self.zoom = max(0, min(26, self.zoom + (1 if e["delta"] > 0 else -1)))
+                self.cx = wx - (self.pointer[0] - 0.5) * 1920 / self.scale()
+                self.cy = wy - (self.pointer[1] - 0.5) * 1080 / self.scale()
+            elif e["kind"] == "key" and e["down"]:
+                self.down[e["vk"]] = time.monotonic()
+            elif e["kind"] == "key" and e["vk"] in self.down:
+                seconds = time.monotonic() - self.down.pop(e["vk"])
+                across = {0x25: -1, 0x27: 1}.get(e["vk"], 0)
+                down = {0x26: -1, 0x28: 1}.get(e["vk"], 0)
+                self.cx += across * seconds * 1920 / self.scale()
+                self.cy += down * seconds * 1080 / self.scale()
+
+    def capture(self, full=True):
+        from types import SimpleNamespace
+
+        wx, _ = self.world(np.arange(1920) / 1920, 0)
+        _, wy = self.world(0, np.arange(1080) / 1080)
+        land = ((0 <= wy) & (wy < 800))[:, None] & ((0 <= wx) & (wx < 2400))[None]
+        blue = land & (wx < self.FRONT_X)[None]
+        rgb = np.empty((1080, 1920, 3), np.uint8)
+        rgb[:] = SEA
+        rgb[blue] = BLUE_LAND
+        rgb[land & ~blue] = RED_LAND
+        self.seen.append((self.zoom, 0.5 + (self.FRONT_X - self.cx) * self.scale() / 1920))
+        return SimpleNamespace(rgb=rgb, meta={})
+
+
+def test_the_camera_finds_the_front_and_keeps_it_in_the_middle():
+    import threading
+
+    # Close in over Blue's far west, where the front is off screen.
+    world = ToyMap(cx=300, cy=400, zoom=16)
+    stop = threading.Event()
+
+    class NoPopups:
+        def due(self):
+            return None
+
+    run = threading.Thread(target=ai_games.camera, args=(world, stop, "toy", NoPopups()),
+                           kwargs={"rng": random.Random(1)})  # fmt: skip
+    run.start()
+    stop.wait(8)
+    stop.set()
+    run.join(10)
+    assert not run.is_alive()
+    low, high = ai_games.FRONT_ZOOM
+    settled = [x for zoom, x in world.seen if low <= zoom <= high and abs(x - 0.5) < 0.12]
+    assert settled, "the front, centred, at the zoom that shows its counters"
+    assert max(zoom for zoom, _ in world.seen) < ai_games.ZOOM_TERRAIN, "never past the counters"
+    zoom, x = world.seen[-1]
+    assert 0 <= x <= 1, "the front on screen at the end"
+
+
+def test_a_plan_line_is_no_front_and_battles_are_the_green_badges_on_it():
+    import cv2
+
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = SEA
+    frame[300:700, 700:1152] = BLUE_LAND
+    # A battle plan's red line across Blue's land, as on 2026-09-24: not a front.
+    frame[495:499, 750:1100] = RED_LAND
+    assert ai_games.front_points(frame) == []
+    frame[300:700, 1152:1604] = RED_LAND
+    front = ai_games.front_points(frame)
+    assert front and min(x for x, _ in front) * 1920 >= 1150
+    # A battle badge on the front, and a green ring away from it.
+    cv2.circle(frame, (1152, 450), 16, (3, 158, 3), 5)
+    cv2.circle(frame, (800, 600), 16, (3, 158, 3), 5)
+    battles = ai_games.battle_points(frame, front)
+    assert len(battles) == 1 and abs(battles[0][0] * 1920 - 1152) < 3
+    assert len(ai_games.battle_points(frame)) == 2
+    # Counters crowd on the front, a lone one away from it.
+    for x, y in ((1120, 400), (1170, 420), (1140, 470), (760, 650)):
+        frame[y : y + 12, x : x + 22] = (40, 60, 220)
+    counters = ai_games.counter_points(frame)
+    assert len(counters) == 4
+    x, y = ai_games.busiest(ai_games.near_front(counters, front))
+    assert 1120 <= x * 1920 <= 1192 and 400 <= y * 1080 <= 482
+
+
+def test_a_game_loaded_in_game_reads_the_log_from_its_end():
+    # The worker returns at most a chunk a request: here 3 lines, and a 10-line log.
+    log = [f"line {i}" for i in range(10)]
+
+    class Desk:
+        def game_log(self, offset=0):
+            return log[offset : offset + 3], min(len(log), offset + 3)
+
+    assert ai_games.log_end(Desk()) == 10
+    log.clear()
+    assert ai_games.log_end(Desk()) == 0

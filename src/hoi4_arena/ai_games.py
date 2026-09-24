@@ -79,6 +79,13 @@ CENTRED = 0.03
 # Camera zoom in mouse-wheel notches in from fully out, measured at 1080p (see camera).
 # Unit counters show from 9; past 22 the map is terrain; 26 is the closest.
 VIEW_NEAR, VIEW_FAR, ZOOM_TERRAIN, ZOOM_MAX = 9, 20, 22, 26
+# The camera's view of the front (camera): the zooms it keeps the front at, with its
+# counters shown and most of a 12x8 arena's front on screen; the notches a close look at
+# a battle adds; how far the front's middle may sit from the map's before the camera pans
+# to it, as a fraction of the screen; and the fewest front points that count as a front.
+FRONT_ZOOM, INSPECT, OFF_CENTRE, MIN_FRONT = (10, 13), (4, 7), 0.12, 40
+# The middle of the map between the top bar and the bottom panels, as a screen fraction.
+MAP_MIDDLE = (MAP_TOP + 1080 - MAP_BOTTOM) / 2 / 1080
 # Seconds to wait for a start save to load onto its paused map, from the launch.
 SAVE_LOAD = 150
 # The share of the commit limit the second PC can grow to (telemetry.commit_ceiling) at
@@ -727,7 +734,9 @@ def front_points(rgb):
     """Where Blue's land meets Red's, as (x, y) screen fractions: the front line.
 
     Occupied land takes its occupier's colour, so this follows the fighting, not the
-    starting border. Empty when the two do not touch on screen.
+    starting border. Empty when the two do not touch on screen. A thin line is not land:
+    the battle plan's red lines over Blue's land read as a front until 2026-09-24, and
+    held the camera on empty land for most of a game.
     """
     import cv2
 
@@ -735,7 +744,10 @@ def front_points(rgb):
     blue, red = country_pixels(rgb[top:bottom])
     if blue is None or not blue.any() or not red.any():
         return []
-    near_blue = cv2.dilate(blue.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    solid = np.ones((9, 9), np.uint8)
+    blue = cv2.morphologyEx(blue.astype(np.uint8), cv2.MORPH_OPEN, solid)
+    red = cv2.morphologyEx(red.astype(np.uint8), cv2.MORPH_OPEN, solid).astype(bool)
+    near_blue = cv2.dilate(blue, solid).astype(bool)
     ys, xs = np.nonzero(near_blue & red)
     return [(x / rgb.shape[1], (y + top) / rgb.shape[0]) for y, x in zip(ys, xs, strict=True)]
 
@@ -750,29 +762,106 @@ def land_points(rgb):
     return [(x / rgb.shape[1], (y + top) / rgb.shape[0]) for y, x in zip(ys, xs, strict=True)]
 
 
-def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, planner=None):
-    """Watch the war like a player: close in on the front, look around, step back.
+def front_middle(front):
+    """The middle of the front's points: the median, so a pocket does not pull it off."""
+    points = np.asarray(front)
+    return float(np.median(points[:, 0])), float(np.median(points[:, 1]))
 
-    Measured at 1080p on 2026-09-23, in wheel notches in from fully out: the whole arena
-    fills the middle half of the screen at 0, unit counters appear from 9 (the game hides
-    them beyond a camera distance of 900), about a third of the arena shows at 18, the map
-    turns to terrain past about 22, and 26 is as close as it goes. So the camera spends
-    its time between VIEW_NEAR and VIEW_FAR, where the counters are, zooming in and out
-    and panning, and every 20 to 60 seconds zooms fully out for a few seconds to see the
-    whole map, recentres, and picks somewhere new to look: mostly a point on the front,
-    where Blue's land meets Red's, sometimes anywhere on the land. Zooming is toward the
-    pointer, as in the game, so it closes in on what it points at. Fully zoomed out the
-    counters vanish, which is also a view players use, but only in passing. It shares
-    the recorder's connection: the second PC's bridge accepts only one.
+
+def _blobs(mask, top, shape, fits):
+    import cv2
+
+    n, _, stats, centres = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    found = [
+        (int(stats[k, 4]), (centres[k][0] / shape[1], (centres[k][1] + top) / shape[0]))
+        for k in range(1, n)
+        if fits(stats[k, 2], stats[k, 3], stats[k, 4])
+    ]
+    return [at for _, at in sorted(found, reverse=True)]
+
+
+def battle_points(rgb, front=None, reach=0.05):
+    """Battles on screen, largest first, as (x, y) screen fractions: the game's round badges
+    on the front, whose ring is pure green (about 3, 158, 3 at 1080p, 2026-09-24), a colour
+    nothing else on the map has. With `front` points, only badges within `reach` of one.
+    """
+    import cv2
+
+    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+    area = rgb[top:bottom].astype(np.int16)
+    green = (area[..., 1] > 120) & (area[..., 0] < 50) & (area[..., 2] < 50)
+    # The number printed over the ring cuts it into pieces: join them first.
+    ring = cv2.dilate(green.astype(np.uint8), np.ones((7, 7), np.uint8))
+    points = _blobs(ring, top, rgb.shape, lambda w, h, a: 22 <= w <= 70 and 22 <= h <= 70
+                    and 0.6 <= w / h <= 1.7)  # fmt: skip
+    if front is not None and len(front):
+        f = np.asarray(front)
+        points = [p for p in points if np.hypot(*(f - p).T).min() < reach]
+    return points
+
+
+def counter_points(rgb):
+    """Unit counters on screen, as (x, y) screen fractions: their flags, small boxes of
+    saturated blue or red, where the land around them is pastel."""
+    top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+    area = rgb[top:bottom].astype(np.int16)
+    r, g, b = area[..., 0], area[..., 1], area[..., 2]
+    blue = (b > 150) & (b - r > 90) & (b - g > 60)
+    red = (r > 150) & (r - g > 110) & (r - b > 90)
+
+    def fits(w, h, a):
+        return 60 <= a <= 900 and 8 <= w <= 60 and 6 <= h <= 30 and a >= 0.5 * w * h
+
+    return _blobs(blue, top, rgb.shape, fits) + _blobs(red, top, rgb.shape, fits)
+
+
+def busiest(points, radius=0.08):
+    """The point with the most others within `radius`: where the counters crowd."""
+    p = np.asarray(points)
+    near = (np.hypot(*(p[:, None] - p[None]).transpose(2, 0, 1)) < radius).sum(1)
+    return tuple(p[int(near.argmax())])
+
+
+def near_front(points, front, reach=0.06):
+    """The `points` within `reach` of the front, as screen fractions."""
+    if not points or not len(front):
+        return []
+    f = np.asarray(front)
+    return [p for p in points if np.hypot(*(f - p).T).min() < reach]
+
+
+def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, planner=None):
+    """Watch the war like a commander: the front in view with its counters, close looks at
+    its battles, and the whole map now and then.
+
+    Zoom is in wheel notches in from fully out, measured at 1080p on 2026-09-23: the whole
+    arena fills the middle half of the screen at 0, unit counters appear from 9 (the game
+    hides them beyond a camera distance of 900), about a third of the arena shows at 18,
+    the map turns to terrain past about 22, and 26 is as close as it goes.
+
+    The camera keeps the front, where Blue's land meets Red's, in the middle of the map at
+    FRONT_ZOOM, where the counters show and most of the front fits. It pans back when the
+    front's middle drifts OFF_CENTRE away, and when the front leaves the screen it zooms
+    out until the front shows and closes in on it again, never panning blind. From that
+    view it looks closer: in by INSPECT notches on a battle (or where the counters crowd),
+    the pointer on it to read it, and back out by as many, which returns to the same view
+    since zooming keeps the point under the pointer; or it runs the pointer along the
+    front. Every 40 to 80 seconds it zooms fully out for a few seconds and comes straight
+    back in on the front. Every move follows from what is on screen, so a policy trained on
+    these recordings can learn it: the camera before 2026-09-24 moved at random, and sat
+    on empty land or sea for seconds at a time. It shares the recorder's connection: the
+    second PC's bridge accepts only one.
 
     With a scripted player's `planner`, the planner first sets the paused game up and
     starts it, then gives its later orders between the camera's moves. A setup that fails
     is left in `planner.error`, which ends the game; a later order that fails is retried.
     """
     rng = rng or random.Random()
-    arrows = [0x25, 0x26, 0x27, 0x28]
     zoom = 0
-    next_overview = time.monotonic()
+    next_overview = time.monotonic() + rng.uniform(*overview_every)
+    # Screen fractions an arrow key pans the camera in a second, across and down, learnt
+    # from each pan; and the last pan, to learn from.
+    speed, last_pan = [1.25, 1.25], None
 
     def do(events, pause=0.08):
         # The worker disarms after 750 ms without input, so arm for each burst.
@@ -780,6 +869,11 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
         for event in events:
             desk.apply([event])
             time.sleep(pause)
+
+    def point(at):
+        # Clear of the screen's edges, where the pointer would scroll the map.
+        x, y = min(0.94, max(0.06, at[0])), min(0.9, max(0.1, at[1]))
+        return {"kind": "move", "x": float(x), "y": float(y)}
 
     def clear_popup():
         at = popups.due()
@@ -791,51 +885,106 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
             stop.wait(rng.uniform(*LOOK))
             do(press)
 
+    def wait(seconds):
+        """Wait, clearing popups as they come due. True once the game has ended."""
+        end = time.monotonic() + seconds
+        while (left := end - time.monotonic()) > 0:
+            if stop.wait(min(left, 0.5)):
+                return True
+            clear_popup()
+        return stop.is_set()
+
     def wheel(notches, at):
         nonlocal zoom
         step = 120 if notches > 0 else -120
         notches = max(-zoom, min(ZOOM_MAX - zoom, notches))
-        do(
-            [{"kind": "move", "x": at[0], "y": at[1]}]
-            + [{"kind": "wheel", "delta": step}] * abs(notches),
-            rng.uniform(0.04, 0.12),
-        )
+        do([point(at)] + [{"kind": "wheel", "delta": step}] * abs(notches), rng.uniform(0.04, 0.1))
         zoom += notches
 
-    def linger(low=0.6, high=1.8, times=(1, 3)):
-        # Point around while looking, like a player reading the map.
-        for _ in range(rng.randint(*times)):
-            if stop.wait(rng.uniform(low, high)):
-                return
-            clear_popup()
-            do([{"kind": "move", "x": rng.uniform(0.1, 0.9), "y": rng.uniform(0.15, 0.85)}])
+    def close_in(front):
+        """Zoom toward the front's middle, into the view of the front."""
+        wheel(rng.randint(*FRONT_ZOOM) - zoom, front_middle(front))
 
-    def interest(rgb):
-        """Somewhere worth looking on screen: mostly the front, else any land."""
-        points = front_points(rgb) if rng.random() < 0.75 else []
-        points = points or land_points(rgb)
-        return rng.choice(points) if points else None
+    def find_front():
+        """Zoom out toward the map's middle until the front shows, then back in on it.
+        False if it shows not even on the whole map."""
+        nonlocal zoom
+        while zoom > 0:
+            wheel(-min(zoom, 4), (0.5, MAP_MIDDLE))
+            front = front_points(screen(desk))
+            if len(front) >= MIN_FRONT:
+                close_in(front)
+                return True
+        recentre(desk)
+        zoom = 0
+        front = front_points(screen(desk))
+        if len(front) < MIN_FRONT:
+            return False
+        close_in(front)
+        return True
 
-    def pan():
-        # Towards something worth looking at, most of the time; a player does not scroll
-        # out over the sea for long. Otherwise anywhere.
-        target = interest(screen(desk)) if rng.random() < 0.7 else None
-        if target is None:
-            hold(desk, rng.choice(arrows), rng.uniform(0.1, 0.4))
-            return
-        dx, dy = target[0] - 0.5, target[1] - 0.5
-        if abs(dx) >= abs(dy):
-            key, offset = (0x27 if dx > 0 else 0x25), dx
-        else:
-            key, offset = (0x28 if dy > 0 else 0x26), dy
-        hold(desk, key, min(0.4, max(0.08, abs(offset) * 0.8)))
+    def pan_to(middle):
+        """Hold the arrow keys that bring `middle` to the map's middle, an axis at a time."""
+        nonlocal last_pan
+        held = [0.0, 0.0]
+        offsets = (middle[0] - 0.5, middle[1] - MAP_MIDDLE)
+        for axis, keys in ((0, (0x25, 0x27)), (1, (0x26, 0x28))):
+            if abs(offsets[axis]) > OFF_CENTRE / 2:
+                held[axis] = min(0.6, max(0.06, abs(offsets[axis]) / speed[axis]))
+                hold(desk, keys[offsets[axis] > 0], held[axis])
+        last_pan = (middle, held, zoom)
+
+    def learn(middle):
+        """The pan speed, from how far the front moved on screen after the last pan."""
+        nonlocal last_pan
+        if last_pan is not None and last_pan[2] == zoom:
+            for axis in (0, 1):
+                if last_pan[1][axis] >= 0.1:
+                    moved = abs(last_pan[0][axis] - middle[axis]) / last_pan[1][axis]
+                    if 0.2 <= moved <= 5:
+                        speed[axis] = 0.5 * speed[axis] + 0.5 * moved
+        last_pan = None
 
     def overview():
         nonlocal zoom
         recentre(desk)
         zoom = 0
-        linger(1.0, 2.5, (1, 2))
-        wheel(rng.randint(VIEW_NEAR + 1, VIEW_FAR), interest(screen(desk)) or (0.5, 0.5))
+        front = front_points(screen(desk))
+        if front:
+            do([point(rng.choice(front))])  # A glance over the whole map, at the front.
+        if wait(rng.uniform(1.5, 3.0)):
+            return
+        front = front_points(screen(desk))
+        if len(front) >= MIN_FRONT:
+            close_in(front)
+
+    def inspect(rgb, front):
+        """In on a battle, or where the counters crowd on the front, read it, and back
+        out to this view."""
+        battles = battle_points(rgb, front)
+        crowd = near_front(counter_points(rgb), front)
+        if battles:
+            at = rng.choice(battles[:3])
+        else:
+            at = busiest(crowd) if crowd else rng.choice(front)
+        notches = min(rng.randint(*INSPECT), ZOOM_TERRAIN - 1 - zoom)
+        if notches <= 0:
+            return
+        wheel(notches, at)
+        for _ in range(rng.randint(1, 3)):
+            # The pointer on it and just around it, as a player reads its tooltip.
+            do([point((at[0] + rng.uniform(-0.01, 0.01), at[1] + rng.uniform(-0.01, 0.01)))])
+            if wait(rng.uniform(0.6, 1.5)):
+                return
+        wheel(-notches, at)
+
+    def sweep(front):
+        """Run the pointer along the front, reading its provinces."""
+        picks = rng.sample(front, min(len(front), rng.randint(3, 6)))
+        for at in sorted(picks, key=lambda p: p[1]):
+            do([point(at)])
+            if wait(rng.uniform(0.3, 0.8)):
+                return
 
     try:
         if planner is not None:
@@ -844,9 +993,8 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
             except Exception as error:  # noqa: BLE001 - play() ends the game with it.
                 planner.error = error
                 return
-            # Setup left the camera fully zoomed out over the arena.
-            zoom, next_overview = 0, time.monotonic() + rng.uniform(*overview_every)
-        while not stop.wait(rng.uniform(0.8, 2.5)):
+            zoom = 0  # Setup left the camera fully zoomed out over the arena.
+        while not stop.wait(rng.uniform(0.3, 0.9)):
             try:
                 clear_popup()
                 if planner is not None and planner.due():
@@ -859,32 +1007,35 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
                         planner.failures.append({"frame": planner.frame(), "error": str(error)})
                         moved = True
                     if moved:
-                        zoom = 0
-                        wheel(
-                            rng.randint(VIEW_NEAR + 1, VIEW_FAR),
-                            interest(screen(desk)) or (0.5, 0.5),
-                        )
+                        zoom = 0  # The planner's moves end fully zoomed out.
                     continue
                 if time.monotonic() >= next_overview:
                     overview()
                     next_overview = time.monotonic() + rng.uniform(*overview_every)
                     continue
-                roll = rng.random()
-                here = (rng.uniform(0.25, 0.75), rng.uniform(0.3, 0.7))
-                if 0.35 <= roll < 0.8 and rng.random() < 0.5:
-                    here = interest(screen(desk)) or here
-                if roll < 0.35:
-                    pan()
-                elif roll < 0.55:
-                    wheel(rng.randint(1, 4), here)
-                elif roll < 0.75:
-                    wheel(-rng.randint(1, 4), here)
-                elif roll < 0.8:
-                    wheel(ZOOM_TERRAIN - zoom + rng.randint(0, 2), here)  # A close look.
-                linger()
-                if zoom < VIEW_NEAR or zoom > VIEW_FAR + 2:
-                    # Drifted out of the counters' range: come back into it.
-                    wheel(rng.randint(VIEW_NEAR + 1, VIEW_FAR) - zoom, here)
+                rgb = screen(desk)
+                front = front_points(rgb)
+                if len(front) < MIN_FRONT:
+                    if not find_front():
+                        wait(rng.uniform(2, 4))  # No front, even on the whole map.
+                    continue
+                middle = front_middle(front)
+                learn(middle)
+                if not FRONT_ZOOM[0] <= zoom <= FRONT_ZOOM[1]:
+                    close_in(front)
+                elif max(abs(middle[0] - 0.5), abs(middle[1] - MAP_MIDDLE)) > OFF_CENTRE:
+                    pan_to(middle)
+                else:
+                    roll = rng.random()
+                    if roll < 0.45:
+                        inspect(rgb, front)
+                    elif roll < 0.65:
+                        sweep(front)
+                    else:
+                        # A rest, the pointer by the front's middle.
+                        do([point((middle[0] + rng.uniform(-0.05, 0.05),
+                                   middle[1] + rng.uniform(-0.05, 0.05)))])  # fmt: skip
+                        wait(rng.uniform(0.8, 2.0))
             except (ValueError, OSError):
                 return  # The game ended and its connection closed.
             except DesktopError as error:
@@ -1393,6 +1544,19 @@ def test_result(request, entry, root, stages):
     return result
 
 
+def log_end(desk):
+    """Where the game log ends now, as an offset for desk.game_log. The worker reads at
+    most 1 MiB a request, so a session's log past that takes several: until 2026-09-24 a
+    game loaded in-game read from the first 1 MiB, found the last game's surrender, and
+    ended after 5 s, as did every load after it until a launch (seven in a row once)."""
+    offset = 0
+    while True:
+        _, after = desk.game_log(offset)
+        if after <= offset:
+            return offset
+        offset = after
+
+
 def run_station(station, out_root, rules, templates, settings, end):
     from .scripted import best_plan, choose_plan
 
@@ -1494,7 +1658,7 @@ def run_station(station, out_root, rules, templates, settings, end):
                 if not focus(desk):
                     raise RuntimeError("could not bring the game window to the front")
                 # Where this game's log lines begin, before its declaration is logged.
-                log_from = desk.game_log(0)[1] if reused else None
+                log_from = log_end(desk) if reused else None
                 try:
                     start_game(
                         desk, rules, failure_shot, country, speed,
