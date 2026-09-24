@@ -8,7 +8,9 @@ re-encodes it as HLS (H.264, which Safari on an iPhone or iPad plays natively) b
 snapshot of the screen each second (latest.jpg), and serves both on 127.0.0.1 with a page
 that shows the game and its run's record. `tailscale serve --bg --https=8443
 http://127.0.0.1:8765` publishes the page to the tailnet alone. It plays at the
-recording's 5 frames a second, a few seconds behind the game.
+recording's 5 frames a second, a few seconds behind the game. The page is also an app:
+added to an iPhone's or iPad's home screen (Share, Add to Home Screen) it opens full
+screen with its own icon (install_app).
 """
 
 from __future__ import annotations
@@ -47,8 +49,13 @@ SERVED = {
     ".ts": "video/mp2t",
     ".jpg": "image/jpeg",
     ".json": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".png": "image/png",
 }
-NAME = re.compile(r"^(index\.html|live\.m3u8|seg\d+\.ts|latest\.jpg|status\.json)$")
+NAME = re.compile(
+    r"^(index\.html|live\.m3u8|seg\d+\.ts|latest\.jpg|status\.json|manifest\.webmanifest"
+    r"|icon-\d+\.png|apple-touch-icon\.png)$"
+)
 
 
 def live_game(runs, now=None):
@@ -84,21 +91,24 @@ def live_game(runs, now=None):
 def hls_command(ffmpeg, video, out, start=0.0, number=0, stall=STALL):
     """ffmpeg following `video` as it grows, from `start` seconds in: an HLS playlist
     whose segments are numbered from `number`, after a discontinuity (the game before
-    had its own clock), and latest.jpg once a second."""
+    had its own clock), and latest.jpg once a second. Every output is overwritten (-y):
+    without it the second game's ffmpeg refused the first one's latest.jpg and the stream
+    stopped. Segments stay on disk a while after leaving the playlist, for a player that
+    lags."""
     graph = (
         f"[0:v]select='gte(t\\,{start:.2f})',setpts=PTS-STARTPTS,split=2[v][s];"
         "[v]format=yuv420p[hls];[s]fps=1[jpg]"
     )
     flags = "append_list+delete_segments+discont_start+omit_endlist+independent_segments"
     return [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-follow", "1", "-rw_timeout", str(stall * 1_000_000), "-i", str(video),
         "-filter_complex", graph,
         "-map", "[hls]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
         "-maxrate", "3M", "-bufsize", "6M", "-fps_mode", "cfr", "-r", str(FPS),
         "-g", str(SEGMENT * FPS), "-keyint_min", str(SEGMENT * FPS), "-sc_threshold", "0",
         "-f", "hls", "-hls_time", str(SEGMENT), "-hls_list_size", str(SEGMENTS),
-        "-hls_flags", flags, "-start_number", str(number),
+        "-hls_delete_threshold", "5", "-hls_flags", flags, "-start_number", str(number),
         "-hls_segment_filename", str(Path(out) / "seg%06d.ts"), str(Path(out) / "live.m3u8"),
         "-map", "[jpg]", "-q:v", "4", "-update", "1", str(Path(out) / "latest.jpg"),
     ]  # fmt: skip
@@ -196,7 +206,7 @@ def read_shared(path):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     """The page's files from the live folder (self.server.out), by name alone, never
-    cached; nothing else."""
+    cached, and status.json from memory (self.server.status); nothing else."""
 
     def do_HEAD(self):
         self.do_GET(head=True)
@@ -206,11 +216,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not NAME.match(name):
             self.send_error(404)
             return
-        try:
-            body = read_shared(self.server.out / name)
-        except OSError:
-            self.send_error(404)
-            return
+        if name == "status.json":
+            body = json.dumps(self.server.status).encode()
+        else:
+            body = None
+            for _ in range(3):
+                try:
+                    body = read_shared(self.server.out / name)
+                    break
+                except PermissionError:
+                    time.sleep(0.02)  # Mid-rename by ffmpeg, or a scanner's moment.
+                except OSError:
+                    break
+            if body is None:
+                self.send_error(404)
+                return
         self.send_response(200)
         self.send_header("Content-Type", SERVED[Path(name).suffix])
         self.send_header("Content-Length", str(len(body)))
@@ -228,26 +248,25 @@ def serve(out, port=PORT):
     one asked for, or the one given for port 0."""
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.out = Path(out)
+    server.status = {"live": False}
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
-def write_json(path, value):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value))
-    os.replace(temporary, path)
-
-
 def watch(runs=("artifacts/*",), out=None, port=PORT, poll=2.0, ffmpeg=None, rounds=None):
     """Follow each game as it is recorded, until stopped (or for `rounds` polls): the
-    page, the playlist, latest.jpg and status.json in `out` (by default the system's temp
-    folder's hoi4-live), served on `port`."""
+    page, the playlist and latest.jpg in `out` (by default the system's temp folder's
+    hoi4-live), and the status, served on `port`. Returns the last status.
+
+    Nothing that goes wrong in a round stops it: on 2026-09-24 a status file that Windows
+    held for a moment ended the whole view, and the page went blank. The status is kept
+    in memory since."""
     out = Path(out) if out else Path(tempfile.gettempdir()) / "hoi4-live"
     out.mkdir(parents=True, exist_ok=True)
     for old in [*out.glob("seg*.ts"), out / "live.m3u8"]:
         old.unlink(missing_ok=True)
-    (out / "index.html").write_text(PAGE, encoding="utf-8")
+    install_app(out)
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("the live view needs ffmpeg")
@@ -257,67 +276,158 @@ def watch(runs=("artifacts/*",), out=None, port=PORT, poll=2.0, ffmpeg=None, rou
     try:
         while rounds is None or rounds > 0:
             rounds = None if rounds is None else rounds - 1
-            found = live_game(runs)
-            game = found[0] if found else None
-            if proc is not None and (proc.poll() is not None or game != current):
-                if proc.poll() is None:
-                    proc.terminate()  # A new game began while the last one's file lay still.
-                    proc.wait(timeout=10)
-                elif game == current:
-                    retry_at = time.monotonic() + 10  # It failed mid-game: not at once.
-                proc = None
-            if game is not None and proc is None and time.monotonic() >= retry_at:
-                started = (found[1].get("recorder") or {}).get("started_unix") or time.time()
-                start = max(0.0, time.time() - started - LEAD)
-                command = hls_command(ffmpeg, game / "screen.mkv", out, start, next_segment(out))
-                proc = subprocess.Popen(command, stdin=subprocess.DEVNULL)
-                current = game
-                log.info("following %s from %.0f s", game, start)
-            write_json(out / "status.json", status(found, runs))
+            try:
+                found = live_game(runs)
+                game = found[0] if found else None
+                if proc is not None and (proc.poll() is not None or game != current):
+                    if proc.poll() is None:
+                        proc.terminate()  # A new game began while the last one's lay still.
+                        proc.wait(timeout=10)
+                    elif game == current:
+                        retry_at = time.monotonic() + 10  # It failed mid-game: not at once.
+                        log.warning("ffmpeg stopped (exit %s); again in 10 s", proc.returncode)
+                    proc = None
+                if game is not None and proc is None and time.monotonic() >= retry_at:
+                    started = (found[1].get("recorder") or {}).get("started_unix") or time.time()
+                    start = max(0.0, time.time() - started - LEAD)
+                    video = game / "screen.mkv"
+                    command = hls_command(ffmpeg, video, out, start, next_segment(out))
+                    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+                    current = game
+                    log.info("following %s from %.0f s", game, start)
+                server.status = status(found, runs)
+            except Exception:  # noqa: BLE001 - the view goes on; the next round tries again.
+                log.exception("live view round failed")
             time.sleep(poll)
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()
         server.shutdown()
+    return server.status
+
+
+def draw_icon(size):
+    """The home-screen icon: the arena's two countries, Blue and Red, halves of a disc
+    round a play mark, on the page's dark ground; drawn large and shrunk for smooth
+    edges. iOS rounds the corners itself; the disc keeps inside a maskable icon's safe
+    zone (the middle 80%)."""
+    from PIL import Image, ImageDraw
+
+    big = size * 4
+    image = Image.new("RGB", (big, big), (16, 18, 20))
+    draw = ImageDraw.Draw(image)
+    middle, radius = big / 2, big * 0.36
+    disc = (middle - radius, middle - radius, middle + radius, middle + radius)
+    draw.pieslice(disc, 90, 270, fill=(59, 111, 214))
+    draw.pieslice(disc, 270, 90, fill=(214, 69, 69))
+    mark = radius * 0.55
+    draw.polygon(
+        [
+            (middle - mark * 0.45, middle - mark * 0.6),
+            (middle - mark * 0.45, middle + mark * 0.6),
+            (middle + mark * 0.62, middle),
+        ],
+        fill=(245, 245, 245),
+    )
+    return image.resize((size, size), Image.LANCZOS)
+
+
+MANIFEST = {
+    "name": "HOI4 Live",
+    "short_name": "HOI4 Live",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#101214",
+    "theme_color": "#101214",
+    "icons": [
+        {"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"},
+        {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    ],
+}
+
+
+def install_app(out):
+    """The page, and what makes it an app on a home screen: its manifest (standalone,
+    without the browser's bars) and icons, 180 px for iOS and 192 and 512 px for the
+    rest."""
+    out = Path(out)
+    (out / "index.html").write_text(PAGE, encoding="utf-8")
+    (out / "manifest.webmanifest").write_text(json.dumps(MANIFEST), encoding="utf-8")
+    for size, name in ((180, "apple-touch-icon.png"), (192, "icon-192.png"), (512, "icon-512.png")):
+        draw_icon(size).save(out / name)
 
 
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HOI4 live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HOI4 Live">
+<meta name="theme-color" content="#101214">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>HOI4 Live</title>
 <style>
 :root { color-scheme: dark; --bg: #101214; --panel: #1b1e22; --fg: #e8e8e8;
-  --muted: #9aa0a6; --win: #66bb6a; --loss: #ef5350; --draw: #ffca28; }
-body { margin: 0; background: var(--bg); color: var(--fg);
-  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-video { display: block; width: 100%; max-height: 82vh; background: #000; }
-main { padding: 10px 16px 24px; }
-#now { font-size: 17px; margin: 4px 0 10px; }
-#now .muted, .muted { color: var(--muted); }
+  --muted: #9aa0a6; --win: #66bb6a; --loss: #ef5350; --draw: #ffca28; --live: #e53935; }
+html, body { background: var(--bg); overscroll-behavior: none; }
+body { margin: 0; color: var(--fg); -webkit-text-size-adjust: 100%;
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left); }
+header { display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px; -webkit-user-select: none; user-select: none; }
+header h1 { margin: 0; font-size: 18px; font-weight: 650; }
+.badge { font-size: 12px; font-weight: 700; letter-spacing: 0.6px; padding: 3px 10px;
+  border-radius: 999px; background: var(--panel); color: var(--muted); }
+.badge.on { background: var(--live); color: #fff; }
+.badge.on::before { content: ""; display: inline-block; width: 7px; height: 7px;
+  margin-right: 6px; border-radius: 50%; background: #fff; vertical-align: 1px;
+  animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.25; } }
+video { display: block; width: 100%; max-height: 78vh; background: #000; }
+main { padding: 12px 16px 8px; }
+#now { font-size: 17px; margin: 0 0 10px; }
+.muted { color: var(--muted); }
 #record { display: flex; flex-wrap: wrap; gap: 6px; }
 #record span { background: var(--panel); border-radius: 6px; padding: 3px 8px; font-size: 13px; }
 .win { color: var(--win); } .loss { color: var(--loss); } .timeout { color: var(--draw); }
+footer { padding: 8px 16px 16px; font-size: 12px; }
 </style></head>
 <body>
+<header><h1>HOI4 Live</h1><span id="badge" class="badge">OFF AIR</span></header>
 <video id="video" poster="latest.jpg" autoplay muted playsinline controls></video>
 <main>
 <div id="now">Waiting for a game&hellip;</div>
 <div id="record"></div>
-<p class="muted">5 frames a second, a few seconds behind the game.</p>
 </main>
+<footer class="muted">5 frames a second, a few seconds behind the game.</footer>
 <script>
 const video = document.getElementById("video");
-let hls = null, playing = null;
+const badge = document.getElementById("badge");
+let hls = null, playing = null, lastTime = -1, still = 0;
+// Safari, and every browser on an iPhone or iPad, plays HLS itself; elsewhere hls.js does
+// (Chromium answers "maybe" for HLS without playing it).
+const ua = navigator.userAgent;
+const apple = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) &&
+  (navigator.maxTouchPoints > 1 || !/Chrome|Chromium|Firefox|Edg/.test(ua)));
 function load() {
   const src = "live.m3u8?" + Date.now();
-  if (video.canPlayType("application/vnd.apple.mpegurl")) {
-    video.src = src; video.play().catch(() => {});
-  } else if (window.Hls && Hls.isSupported()) {
+  still = 0;
+  if (!apple && window.Hls && Hls.isSupported()) {
     if (hls) hls.destroy();
     hls = new Hls({ liveSyncDurationCount: 2 }); hls.loadSource(src); hls.attachMedia(video);
+  } else {
+    video.src = src;
   }
+  video.play().catch(() => {});
 }
 video.addEventListener("error", () => setTimeout(load, 3000));
+// Back in the app after a while away: straight to the live edge.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
 const side = { BLU: "Blue", RED: "Red" };
 function arena(name) { return (name || "").replace(/^arena-/, "").replace(/-v\\d+$/, ""); }
 function clock(s) { return s == null ? "" : Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
@@ -325,10 +435,20 @@ async function tick() {
   let s;
   try { s = await (await fetch("status.json?" + Date.now())).json(); } catch (e) { return; }
   const now = document.getElementById("now");
+  badge.className = s.live ? "badge on" : "badge";
+  badge.textContent = s.live ? "LIVE" : "BETWEEN GAMES";
   if (s.live) {
     now.innerHTML = (s.arena ? arena(s.arena) + " as " + (side[s.side] || s.side) : s.game) +
-      ' <span class="muted">' + clock(s.elapsed) + " in &middot; " + (s.plan || "") + " plan &middot; " + s.run + "</span>";
-    if (s.game !== playing) { playing = s.game; setTimeout(load, 5000); }
+      ' <span class="muted">' + clock(s.elapsed) + " in &middot; " +
+      (s.plan ? s.plan + " plan &middot; " : "") + s.run + "</span>";
+    // A new game: from its start, once a few segments of it are out. The first status
+    // only notes the game (reloading then cut every view off after 5 s).
+    if (playing !== null && s.game !== playing) setTimeout(load, 6000);
+    playing = s.game;
+    // The same frame for 20 s while it should play: start again at the live edge.
+    if (!video.paused && video.currentTime === lastTime) { if (++still >= 4) load(); }
+    else still = 0;
+    lastTime = video.currentTime;
   } else {
     now.innerHTML = 'Between games <span class="muted">' + (s.run || "") + "</span>";
   }
@@ -337,11 +457,11 @@ async function tick() {
     (g.result === "win" ? "won" : g.result === "loss" ? "lost" : "timed out") + " " + clock(g.seconds) + "</span>"
   ).join("");
 }
-if (!video.canPlayType("application/vnd.apple.mpegurl")) {
+if (apple) { load(); } else {
   const script = document.createElement("script");
   script.src = "https://cdn.jsdelivr.net/npm/hls.js@1";
-  script.onload = load; document.head.appendChild(script);
-} else { load(); }
+  script.onload = load; script.onerror = load; document.head.appendChild(script);
+}
 setInterval(tick, 5000); tick();
 </script>
 </body></html>

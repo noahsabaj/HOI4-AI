@@ -38,6 +38,7 @@ def test_the_stream_follows_the_file_from_near_its_end_and_numbers_on(tmp_path):
     command = live.hls_command("ffmpeg", tmp_path / "screen.mkv", tmp_path, start=12.5, number=40)
     joined = " ".join(command)
     assert "-follow 1" in joined and "gte(t\\,12.50)" in joined
+    assert "-y" in command  # The last game's latest.jpg is overwritten, not refused.
     assert command[command.index("-start_number") + 1] == "40"
     assert "discont_start" in command[command.index("-hls_flags") + 1]
     assert str(tmp_path / "live.m3u8") in command and command[-1].endswith("latest.jpg")
@@ -84,6 +85,10 @@ def test_the_server_gives_the_page_s_files_and_nothing_else(tmp_path):
         head = urllib.request.Request(base + "/live.m3u8", method="HEAD")
         with urllib.request.urlopen(head) as probed:
             assert probed.headers["Content-Length"] == "7" and probed.read() == b""
+        # The status comes from memory, not a file Windows may hold while it is replaced.
+        server.status = {"live": True, "game": "scripted-peer-9"}
+        with urllib.request.urlopen(base + "/status.json") as shown:
+            assert json.loads(shown.read()) == server.status
         for path in ("/notes.txt", "/../live.m3u8", "/latest.jpg"):
             with pytest.raises(urllib.error.HTTPError) as refused:
                 urllib.request.urlopen(base + path)
@@ -94,9 +99,50 @@ def test_the_server_gives_the_page_s_files_and_nothing_else(tmp_path):
 
 def test_the_watcher_says_when_no_game_is_being_recorded(tmp_path):
     runs = [str(tmp_path / "runs" / "*")]
-    live.watch(runs, out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=1)
-    assert json.loads((tmp_path / "out" / "status.json").read_text())["live"] is False
-    assert "HOI4 live" in (tmp_path / "out" / "index.html").read_text()
+    shown = live.watch(runs, out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=1)
+    assert shown["live"] is False
+    assert "HOI4 Live" in (tmp_path / "out" / "index.html").read_text()
+
+
+def test_the_page_installs_as_an_app_with_its_icons(tmp_path):
+    from PIL import Image
+
+    live.install_app(tmp_path)
+    page = (tmp_path / "index.html").read_text()
+    assert 'rel="manifest"' in page and 'rel="apple-touch-icon"' in page
+    assert "apple-mobile-web-app-capable" in page and "viewport-fit=cover" in page
+    manifest = json.loads((tmp_path / "manifest.webmanifest").read_text())
+    assert manifest["display"] == "standalone" and manifest["start_url"] == "/"
+    for icon in manifest["icons"]:
+        size = int(icon["sizes"].split("x")[0])
+        assert Image.open(tmp_path / icon["src"]).size == (size, size)
+    touch = Image.open(tmp_path / "apple-touch-icon.png")
+    assert touch.size == (180, 180)
+    # Blue on the left, Red on the right, the play mark white in the middle.
+    blue, red = touch.getpixel((50, 90)), touch.getpixel((130, 90))
+    assert blue[2] > blue[0] and red[0] > red[2] and min(touch.getpixel((90, 90))) > 200
+    server = live.serve(tmp_path, port=0)
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        with urllib.request.urlopen(base + "/manifest.webmanifest") as served:
+            assert served.headers["Content-Type"] == "application/manifest+json"
+        with urllib.request.urlopen(base + "/apple-touch-icon.png") as served:
+            assert served.headers["Content-Type"] == "image/png"
+    finally:
+        server.shutdown()
+
+
+def test_the_watcher_goes_on_past_a_round_that_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def flaky(runs, now=None):
+        calls.append(runs)
+        if len(calls) == 1:
+            raise PermissionError("held by a scanner for a moment")
+
+    monkeypatch.setattr(live, "live_game", flaky)
+    shown = live.watch(["runs/*"], out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=2)
+    assert len(calls) == 2 and shown["live"] is False
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
