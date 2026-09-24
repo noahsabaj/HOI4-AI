@@ -19,6 +19,7 @@ NO_TORCH = {
     "salvage",
     # Its Gaussian process imports torch itself, on the CPU; the GPU is left alone.
     "tune",
+    "live",
 }
 
 
@@ -274,6 +275,19 @@ def main():
     tune.add_argument("action", choices=["ask", "seed", "show"])
     tune.add_argument("roots", nargs="*", help="seed: run folders whose games to add")
     tune.add_argument("--skip", nargs="+", default=[], help="seed: arenas to leave out")
+    live = sub.add_parser(
+        "live",
+        help="Watch the games from a phone: follow the game being recorded and serve it "
+        "as a live stream on 127.0.0.1 (publish it with tailscale serve), until stopped",
+    )
+    live.add_argument(
+        "--runs",
+        nargs="+",
+        default=["artifacts/*"],
+        help="Globs of run folders whose games to follow (the newest being recorded).",
+    )
+    live.add_argument("--out", help="Where the stream is written (default: temp/hoi4-live).")
+    live.add_argument("--port", type=int, default=8765)
     check = sub.add_parser(
         "check-session",
         help="Check that a recording can train, and count its decisions. Training reads "
@@ -967,6 +981,10 @@ def _dispatch(command, args):
             result = {"added": tuning.seed(args["study"], args["roots"], set(args["skip"]))}
         else:
             result = tuning.show(args["study"])
+    elif command == "live":
+        from .live import watch
+
+        result = watch(args["runs"], out=args["out"], port=args["port"])
     elif command == "salvage":
         from .recording import recordings, salvage, unsalvage
 

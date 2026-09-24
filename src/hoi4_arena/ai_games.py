@@ -1723,6 +1723,11 @@ def run_station(station, out_root, rules, templates, settings, end):
                     for k, path in enumerate(closeups(desk, root), 1):
                         stages["shots"][f"closeup_{k}"] = path
                 say(station.name, "recording", name, "as", country, "at speed", speed)
+                try:
+                    # The game about to be recorded, for the live view (live.py).
+                    (out_root / "live.json").write_text(json.dumps(entry))
+                except (OSError, TypeError, ValueError):
+                    pass
                 outcome, reason, manifest = play(
                     desk,
                     out_root / name,
