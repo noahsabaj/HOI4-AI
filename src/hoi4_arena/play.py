@@ -523,15 +523,20 @@ def reserve(name, minutes, *, root=EVAL, wait_minutes=90.0, clock=time.monotonic
     """Ask the scripted player's agent for the second PC, and wait until it grants it.
 
     Writes queue/<name>.json; that agent quits HOI4 between its games and answers with
-    granted/<name>.json. Raises TimeoutError after `wait_minutes`.
+    granted/<name>.json. A request already queued or granted under that name (made ahead,
+    so the grant's wait overlaps other work) is not made again. Raises TimeoutError after
+    `wait_minutes`.
     """
     root = Path(root)
     for folder in ("queue", "granted", "done"):
         (root / folder).mkdir(parents=True, exist_ok=True)
     granted = root / "granted" / f"{name}.json"
-    (root / "queue" / f"{name}.json").write_text(
-        json.dumps({"minutes": minutes, "requested": time.strftime("%Y-%m-%d %H:%M:%S")})
-    )
+    queued = root / "queue" / f"{name}.json"
+    taken = root / "queue" / f"{name}.taken"
+    if not (granted.exists() or queued.exists() or taken.exists()):
+        queued.write_text(
+            json.dumps({"minutes": minutes, "requested": time.strftime("%Y-%m-%d %H:%M:%S")})
+        )
     until = clock() + wait_minutes * 60
     while not granted.exists():
         if clock() > until:

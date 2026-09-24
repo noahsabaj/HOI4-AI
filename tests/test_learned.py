@@ -679,3 +679,11 @@ def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
         same = head(memory, cells, actions)[1], head(memory, cells, actions, temperature=0.2)[1]
     assert cold > warm, "the likeliest input gains"
     assert torch.equal(*same), "a demonstration's likelihood does not depend on it"
+
+
+def test_a_reservation_made_ahead_is_not_made_twice(tmp_path, monkeypatch):
+    (tmp_path / "granted").mkdir(parents=True)
+    (tmp_path / "granted" / "early.json").write_text("{}")
+    monkeypatch.setattr(play.time, "sleep", lambda s: None)
+    play.reserve("early", 30, root=tmp_path)
+    assert not (tmp_path / "queue" / "early.json").exists(), "granted already: no new request"
