@@ -177,7 +177,13 @@ every rule below came from a crash dump or the stock files.
   to its holder's capital, and nobody in the arena can build one. With no line across
   the border, a captured hub never supplied its captor: on the first terrain arena Blue
   took three states, then stood for four years five provinces from Red's capital,
-  against a single Red division. The plain arena still has no crossing lines.
+  against a single Red division. The plain arena still has no crossing lines. The audit
+  checks that every hub is joined by rail to its country's others and, on a preset, that
+  at least two lines cross the border.
+- **Dark ground must still read as land.** The scripted player counts a pixel as land
+  only above a brightness sum of 250 at full zoom-out. Forest and marsh filling the
+  middle of the marsh arena's front drew at about 220 (plains about 330), and its
+  front-line click fell in the hole, on the lake. They are drawn lighter now.
 - **Rivers run along province borders.** Only a river on a border is crossed (86% of
   stock river pixels are on one). A river starts at a green source pixel at its free
   end, is one pixel wide and edge-connected, and a tributary ends on a red join pixel.
@@ -222,6 +228,11 @@ What a preset paints, all with stock assets:
   computed from the heights, so the relief is lit.
 - **Cities:** each victory point is an urban province, 60% of it painted as city (stock
   city models and night lights). Forests have stock European trees (85% cover).
+- **A trunk railway:** per side, the cheapest tree joining the capital, cities and
+  hubs, routed round mountains and marsh, plus two loops, and two lines across the
+  border; 58-70 links in all, against 513 for a line on every adjacency. Each state's
+  hub stands on its city or on the easiest ground near its middle, so taking a junction
+  cuts off the hubs beyond it. On the passes arena the lines cross in the two valleys.
 - **Borders that wander:** province seeds stray up to 22% of a province, and the Voronoi
   is taken through a displacement that turns with the map, so coasts, state borders and
   the front are no longer ruled lines.

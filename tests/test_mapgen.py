@@ -458,3 +458,52 @@ def test_the_layout_names_a_bulge_for_the_scripted_player(preset_arenas):
     assert 9 <= state_at(0.465, 0.75, layout) <= 16
     # Every state of both sides shows somewhere in the layout.
     assert set(range(1, 17)) <= set(np.unique(layout))
+
+
+def _rail_links(root):
+    links = set()
+    for line in (root / "map/railways.txt").read_text().splitlines():
+        cells = [int(c) for c in line.split()][2:]
+        links |= {tuple(sorted(pair)) for pair in zip(cells, cells[1:])}
+    return links
+
+
+def test_a_preset_railway_is_a_mirrored_trunk_that_reaches_every_hub(preset_arenas):
+    """A trunk network, not a line on every adjacency: taking a junction cuts off the
+    hubs beyond it. Every hub still reaches its capital, two lines cross the border,
+    and Red's network is Blue's turned round."""
+    for name, (root, report, checked) in preset_arenas.items():
+        assert checked["problems"] == [], name
+        links = _rail_links(root)
+        rows = _definitions(root)
+        land = {i for i, r in rows.items() if r[4] == "land"}
+        half = report["provinces"] // 2
+
+        def twin(province):
+            return (province + half - 1) % (2 * half) + 1
+
+        assert {tuple(sorted((twin(a), twin(b)))) for a, b in links} == links, name
+        assert all(a in land and b in land for a, b in links), name
+        blue = set().union(*(_state_provinces(root, s) for s in range(1, 9)))
+        across = [(a, b) for a, b in links if (a in blue) != (b in blue)]
+        assert len(across) >= 2, name
+        # Far fewer than the plain arena's line on every adjacency (513 on these maps).
+        assert len(links) < 150, (name, len(links))
+
+
+def test_the_audit_catches_a_hub_cut_off_from_its_capital(preset_arenas):
+    from hoi4_arena.mapgen import audit
+
+    root, _, _ = preset_arenas["bay"]
+    path = root / "map/railways.txt"
+    original = path.read_text()
+    hubs = [int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]]
+    # Lift every line into one hub: it is still a hub, but nothing joins it any more.
+    lonely = hubs[0]
+    kept = [line for line in original.splitlines() if str(lonely) not in line.split()[2:]]
+    path.write_text("\n".join(kept) + "\n")
+    try:
+        problems = audit(root)["problems"]
+    finally:
+        path.write_text(original)
+    assert any("no railway joins" in p for p in problems), problems

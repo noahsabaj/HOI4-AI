@@ -883,35 +883,87 @@ def generate(
             for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
         ),
     )
-    # Ordinary supply hubs and rail lines following actual bitmap adjacency. On a preset
-    # the lines also cross the border, as they do on the stock map. A hub supplies only
-    # while a railway joins it to its holder's capital, and nobody in the arena can build
-    # one, so without them a captured hub never served its captor: on the first terrain
-    # arena Blue took three states and then stood for four years, five provinces short
-    # of Red's capital, against a single Red division.
-    rails = [
-        f"1 2 {a} {b}"
-        for a, sides in sorted(neighbours.items())
-        for b in sorted(sides)
-        if a < b
-        and land[a - 1]
-        and land[b - 1]
-        and (design is not None or owner[a - 1] == owner[b - 1])
-    ]
-    write("map/railways.txt", "\n".join(rails) + "\n")
 
     def state_centre(province_list):
         """The province nearest the middle of a state, used to anchor its hub and slots."""
         middle = anchor[np.array(province_list) - 1].mean(axis=0)
         return min(province_list, key=lambda i: np.linalg.norm(anchor[i - 1] - middle))
 
+    def twin(province):
+        return (province + half_count - 1) % total_provinces + 1
+
     centres = {state: state_centre(listed) for state, listed in states.items()}
+    if design:
+        # A preset's hub stands on the state's city if it has one, or on the easiest
+        # ground near its middle: a hub in the mountains supplies little. Red's are
+        # Blue's turned round.
+        for state in range(1, states_per_country + 1):
+            listed = states[state]
+            middle = anchor[np.array(listed) - 1].mean(axis=0)
+            towns_here = [i for i in listed if terrain_types[i - 1] == "urban"]
+            centres[state] = (
+                towns_here[0]
+                if towns_here
+                else min(
+                    listed,
+                    key=lambda i: (
+                        np.linalg.norm(anchor[i - 1] - middle) / step_x
+                        + 3 * (arenas.RAIL_COST[terrain_types[i - 1]] - 1)
+                    ),
+                )
+            )
+            centres[state + states_per_country] = twin(centres[state])
     # A hub in every state rather than one per country. Supply flow falls off per province
     # travelled and runs out after about two hops, so a single mid-front hub left the ends
     # of the border column out of supply, which caps a division's organisation below the
     # level the AI requires before it will attack with it at all.
     hubs = sorted(set(centres.values()) | set(capitals))
     write("map/supply_nodes.txt", "\n".join(f"1 {hub}" for hub in hubs) + "\n")
+    if design:
+        # A trunk network, as on the stock map, rather than a line on every adjacency: the
+        # cheapest tree joining Blue's capital, cities and hubs, round mountains and marsh
+        # where it can, two loops where the tree forces the longest detours, and lines
+        # across the border; Red's is Blue's turned round. Taking a junction now cuts the
+        # hubs beyond it off. The lines across the border matter: a hub supplies only while
+        # a railway joins it to its holder's capital, and nobody in the arena can build
+        # one, so without them a captured hub never served its captor. On the first
+        # terrain arena, which had none, Blue took three states and then stood for four
+        # years, five provinces short of Red's capital, against a single Red division.
+        blue_land = set(left_land)
+        pairs = [
+            (a, b)
+            for a in sorted(blue_land)
+            for b in sorted(neighbours[a])
+            if land[b - 1] and owner[b - 1] == RED
+        ]
+        crossings = []
+        for x, y in design.crossings:
+            target = np.array(to_pixel(x, y))
+            crossings.append(
+                min(
+                    pairs,
+                    key=lambda ab: np.linalg.norm(anchor[[ab[0] - 1, ab[1] - 1]].mean(0) - target),
+                )
+            )
+        blue_hubs = [h for h in hubs if h in blue_land]
+        links = arenas.trunk_rails(
+            blue_land,
+            neighbours,
+            {i: arenas.RAIL_COST[terrain_types[i - 1]] for i in blue_land},
+            blue_hubs + [capitals[0]] + [c + 1 for c in city_cells],
+            crossings,
+            twin,
+        )
+        rails = [f"1 2 {a} {b}" for a, b in links]
+    else:
+        # The plain arena: a line on every adjacency within each country.
+        rails = [
+            f"1 2 {a} {b}"
+            for a, sides in sorted(neighbours.items())
+            for b in sorted(sides)
+            if a < b and land[a - 1] and land[b - 1] and owner[a - 1] == owner[b - 1]
+        ]
+    write("map/railways.txt", "\n".join(rails) + "\n")
     # One placement wherever the stock database supplies one: per state slot, per land
     # province and per coastal province. A building the engine can place but has no
     # position for leaves it holding province 0, which is the null province.
@@ -1271,6 +1323,46 @@ def _audit_pixels(root, rows, graphical, heights):
     return problems
 
 
+def _audit_railways(root, holder):
+    """Every hub joined by rail, through its own country's land, to all its country's
+    other hubs, the capital among them: a hub supplies only while a railway joins it to
+    its holder's capital. A preset also needs lines across the border, or a captured hub
+    never serves its captor."""
+    problems = []
+    links = []
+    for line in (root / "map/railways.txt").read_text().splitlines():
+        cells = [int(c) for c in line.split()]
+        if len(cells) > 3:
+            links += list(zip(cells[2:-1], cells[3:]))
+    hubs = [int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]]
+    for tag in sorted(set(holder.values())):
+        own = [(a, b) for a, b in links if holder.get(a) == tag and holder.get(b) == tag]
+        reach = {}
+        for a, b in own:
+            reach.setdefault(a, set()).add(b)
+            reach.setdefault(b, set()).add(a)
+        mine = [h for h in hubs if holder.get(h) == tag]
+        if not mine:
+            continue
+        seen, todo = {mine[0]}, [mine[0]]
+        while todo:
+            for step in reach.get(todo.pop(), ()):
+                if step not in seen:
+                    seen.add(step)
+                    todo.append(step)
+        cut = [h for h in mine if h not in seen]
+        if cut:
+            problems.append(
+                f"{tag} has {len(cut)} hubs no railway joins to the rest, first {cut[0]}"
+            )
+    report = root / "generation.json"
+    if report.exists() and json.loads(report.read_text()).get("preset"):
+        across = sum(1 for a, b in links if holder.get(a) != holder.get(b))
+        if across < 2:
+            problems.append(f"{across} railways cross the border, so captured hubs stay dead")
+    return problems
+
+
 def _audit_rivers(rivers, ids, wet):
     """Rivers the engine can trace, and that are crossed where they run.
 
@@ -1419,7 +1511,7 @@ def audit(root):
         if not {"small", "big"} <= sizes.get(region, set()):
             problems.append(f"strategic region {region} lacks a small or big weather object")
 
-    states, owner_points = {}, {}
+    states, owner_points, holder = {}, {}, {}
     for path in sorted((root / "history/states").glob("*.txt")):
         text = path.read_text()
         states[int(re.search(r"id\s*=\s*(\d+)", text).group(1))] = _block(text, "provinces")
@@ -1429,6 +1521,8 @@ def audit(root):
             owner_points[owner.group(1)] += len(
                 re.findall(r"victory_points\s*=\s*\{\s*\d+\s+\d+", text)
             )
+            holder.update(dict.fromkeys(_block(text, "provinces"), owner.group(1)))
+    problems += _audit_railways(root, holder)
     # Per country, not per state: most stock states hold no victory point at all, but a
     # country with none can never be made to capitulate, so the match has no way to end.
     for tag, owned in sorted(owner_points.items()):
@@ -1677,6 +1771,16 @@ def preview(root, output, width=1800):
         x, y = anchors[province]
         return (x - x0) * scale, (y - y0) * scale
 
+    # Railways between province centres, and the supply hubs on them.
+    for line in (root / "map/railways.txt").read_text().splitlines():
+        cells = [int(c) for c in line.split()][2:]
+        for a, b in zip(cells, cells[1:]):
+            if a in anchors and b in anchors:
+                draw.line([at(a), at(b)], fill=(90, 60, 40), width=3)
+    for hub in [int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]]:
+        if hub in anchors:
+            x, y = at(hub)
+            draw.rectangle((x - 5, y - 5, x + 5, y + 5), fill=(240, 240, 240), outline=(60, 40, 30))
     for path in sorted((root / "history/units").glob("*.txt")):
         for province in re.findall(r"location\s*=\s*(\d+)", path.read_text()):
             x, y = at(int(province))

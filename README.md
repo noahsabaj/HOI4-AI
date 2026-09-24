@@ -164,7 +164,7 @@ Dense and sparse predictive objectives use separate projection modules. Sparse t
 .\scripts\Test-ArenaLoad.ps1 -Mod artifacts/mods/infantry-arena
 ```
 
-`--preset` picks a named arena instead of the plain one, and `preview-map` draws it from its files. There are six, all 12x8 provinces a side in 8 states, each an exact half-turn mirror, painted with stock terrain, relief, rivers on province borders, trees, cities holding the victory points, and borders that wander: `plains` (open farmland), `river` (a large river behind each border), `passes` (a mountain range on the border crossed by two valleys), `marsh` (a marsh and lake in the middle, forests on the wings), `bay` (the sea cuts in at the border, leaving an isthmus) and `salient` (the border bends round a bulge on each side). STATUS.md says what each changes.
+`--preset` picks a named arena instead of the plain one, and `preview-map` draws it from its files. There are six, all 12x8 provinces a side in 8 states, each an exact half-turn mirror, painted with stock terrain, relief, rivers on province borders, trees, cities holding the victory points, a trunk railway, and borders that wander: `plains` (open farmland), `river` (a large river behind each border), `passes` (a mountain range on the border crossed by two valleys), `marsh` (a marsh and lake in the middle, forests on the wings), `bay` (the sea cuts in at the border, leaving an isthmus) and `salient` (the border bends round a bulge on each side). STATUS.md says what each changes.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe generate-map artifacts/mods/arena-river-v3 --preset river --game 'C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV'
