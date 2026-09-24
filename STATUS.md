@@ -516,6 +516,13 @@ beat (`win-rate`).
   keep every mod line with the frame it was read at. `train-state-value` fits a win
   predictor on that state, and `advantage --state-value` values a recording's decisions
   from it. Training may read the state; the agent never does.
+- **Who declares was not random.** Red declared in 36 of the 44 speed-5 AI games, in
+  all 13 started as Red on the second PC, and in all 8 of the first scripted games: the
+  game's random draw at startup comes out the same for the same setup. Since arena v4
+  the recorder flips the coin itself and fires the result from the console
+  (`event arena.1` or `arena.2`), then closes the event window that opens. The game's
+  own flip remains only where no one fires either, after the first day. The first v4
+  game drew Blue, and Blue declared.
 - **First complete game**, 2026-09-23 on the second PC. It played Red (near offensive,
   26 s wait, redraw every 51 s) and lost to the AI in 141 s. The game logged 596 daily
   reports and 14 changes of control. The recording trains: 697 decisions, 84 windows,

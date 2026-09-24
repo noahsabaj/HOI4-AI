@@ -739,6 +739,7 @@ def generate(
         'BLU = { history = "ARENA_BLU_HISTORY" ideology = neutrality } '
         'RED = { history = "ARENA_RED_HISTORY" ideology = neutrality } } }',
     )
+
     # Besides the war, the arena reports itself in game.log, which changes no rule: each
     # line starts "ARENA " so the worker's game_log request can pick them out. A surrender
     # names both sides, so a match ends without reading pixels, and the weekly counts
@@ -748,10 +749,32 @@ def generate(
     # A coin flip picks who declares the war. With Blue always declaring, Red won all six
     # AI games on the 12x8 arena (2026-09-23) on a map that is a true mirror, so the side
     # that declares is logged, as is each human player's country.
-    declare = "".join(
-        f" 50 = {{ {tag} = {{ declare_war_on = {{ target = {enemy} type = annex_everything }} }}"
-        f' log = "ARENA declare {tag}" }}'
-        for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
+    #
+    # Since v4 the recorder flips that coin itself and fires the result from the console
+    # (`event arena.1`, Blue declares; `arena.2`, Red), because the game's own random
+    # draw at startup comes out the same for the same setup: Red declared in 36 of 44 AI
+    # games. Where nobody fires either (a player's own game, multiplayer, where the
+    # console is off), the game's flip still starts the war after the first day.
+    def declares(tag, enemy):
+        return (
+            f"{tag} = {{ declare_war_on = {{ target = {enemy} type = annex_everything }} }}"
+            f' set_global_flag = arena_declared log = "ARENA declare {tag}"'
+        )
+
+    sides = [("BLU", "RED"), ("RED", "BLU")]
+    declare = "".join(f" 50 = {{ {declares(tag, enemy)} }}" for tag, enemy in sides)
+    write(
+        "events/arena.txt",
+        "add_namespace = arena\n"
+        + "".join(
+            f"country_event = {{ id = arena.{i} hidden = yes is_triggered_only = yes"
+            f" immediate = {{ {declares(tag, enemy)} }} }}\n"
+            for i, (tag, enemy) in enumerate(sides, 1)
+        ),
+    )
+    fallback = (
+        " if = { limit = { NOT = { has_global_flag = arena_declared } }"
+        f" random_list = {{{declare} }} }}"
     )
     # Every day each side also reports what a player can only estimate from the screen:
     # its divisions in every state, the game's own estimate of its army's strength
@@ -773,13 +796,14 @@ def generate(
     write(
         "common/on_actions/arena.txt",
         "on_actions = {\n"
-        f"\ton_startup = {{ effect = {{ random_list = {{{declare} }}"
+        "\ton_startup = { effect = {"
         ' log = "ARENA start [GetDateText]"'
         ' every_country = { limit = { is_ai = no } log = "ARENA player [THIS.GetTag]" } } }\n'
         '\ton_weekly = { effect = { log = "ARENA week [GetDateText] [ROOT.GetTag] states'
         " [?num_controlled_states] owned [?num_owned_controlled_states] divisions"
         ' [?num_divisions] surrender [?surrender_progress]" } }\n'
-        + "".join(f"\ton_daily_{tag} = {{ effect = {{{daily} }} }}\n" for tag in ("BLU", "RED"))
+        + f"\ton_daily_BLU = {{ effect = {{{fallback}{daily} }} }}\n"
+        + f"\ton_daily_RED = {{ effect = {{{daily} }} }}\n"
         + '\ton_capitulation = { effect = { log = "ARENA capitulated [ROOT.GetTag] winner'
         ' [FROM.GetTag] [GetDateText]" } }\n'
         '\ton_state_control_changed = { effect = { log = "ARENA control [ROOT.GetTag] from'
