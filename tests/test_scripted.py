@@ -27,6 +27,10 @@ def test_most_games_play_the_best_plan_and_the_rest_explore():
     # The challenger is the best plan with one change.
     challengers = [p for p in plans if p["variant"] == CHALLENGER["variant"]]
     assert abs(len(challengers) / len(plans) - SHARES["challenger"]) < 0.05
+    shared = {"best": 0.5, "challenger": 0.2, "explore": 0.3}
+    challengers = [choose_plan(random.Random(i), shared) for i in range(300)]
+    challengers = [p for p in challengers if p["variant"] == CHALLENGER["variant"]]
+    assert challengers
     base = best_plan(random.Random(0))
     changed = {k for p in challengers for k in p if p[k] != base.get(k)}
     assert changed - {"wait", "redraw", "best", "variant"} <= set(CHALLENGER) - {"variant"}
