@@ -624,6 +624,13 @@ One AI game each on the second PC, same camera and worker, 2026-09-24:
 The game itself took 3.4-3.5 cores, 3.2 GB and 30% of the GPU either way. x264 is now
 capped at 4 threads: its default here took 80 threads and 2 GB for the same 5 fps.
 
+**In production.** The scripted player's 14 games from 03:45 to 05:30 each held 5.0 fps
+with no late or skipped tick. Tick lateness was 0.6-0.7 ms p95 (2.5 ms at worst), and
+frame intervals were 201 ms p95. The whole scripted player process on this PC used 0.24
+cores. `record --peer --codec nvenc`, the human path, was checked live for 30 s: 153 rows
+and 153 video frames, rows arriving 1.2 / 3.6 ms p50 / p95 after capture, and intervals of
+203 ms p95.
+
 **Is the video as good?** Against 452 lossless 1080p frames (a clip, and screenshots of
 menus, maps and scripted games, each held three frames), each candidate encoded and then
 decoded with the training reader's own command (`scripts/codec_fidelity.py`, run as a
