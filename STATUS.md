@@ -682,6 +682,35 @@ beat (`win-rate`).
   began and none after the push; in that loss it grew to 10%, 17%, then 89%. An
   optional guard (`guard` in a plan, off in every plan so far) executes the front line
   alone at a redraw while the enemy holds at least that share.
+- **Games an hour (2026-09-24).** Filmed on the second PC, every menu answered within a
+  second of its click, while the recorder slept 25, 8, 40, 40 and 20 s through them; the
+  map came 3.5-4.5 s after Start. Those waits are now a few seconds. Better, a game can
+  launch straight into a start save (`--start-save ARENA:COUNTRY:SAVE`), made with the
+  console's `savegame <name>` while paused at the start of a new game: it reaches the
+  paused map 7 s after the launch returns, and recording starts 13-22 s after the
+  launch, against about 145 s before. A game on another arena that comes through the
+  menus saves its own start for the next one there. After a save loads, the arena logs
+  no `player` line (on_startup does not fire), so the manifest takes the save's country,
+  checked by the flag at the top left.
+- **Games that started alike played alike.** With the same side and the same declarer,
+  games' daily reports were identical to the hour until the script's first law change,
+  about 100 days in: the game's random draws repeat from the same start, so there were
+  only four openings. Each game now runs 0-14 s at speed 1 (about half a game hour a
+  second) before the war is declared (`--opening`), so its war starts at its own hour.
+- **Services beside the games.** `--arena-queue` plays each arena test request once,
+  between the station's own games, to the best plan, and answers it in `results/`:
+  whether it loaded and started, the outcome, planner errors, the map errors the game
+  logged (counted by the worker's report, and once a run on the main arena to compare),
+  and screenshots: the start, a full view mid-game, the end, and eight close-ups zoomed
+  into the terrain view over both countries. Arenas that pass join the rotation in every
+  other pair of games, newest versions only. `--eval-dir` lends the second PC between
+  games to a live evaluation that reserves it (queue, granted, done). A claim names its
+  process, and a recorder that starts offers the claims of dead ones again. A `DRAIN`
+  file in the output folder ends a run between games. Popups are searched on their own
+  thread at half size, confirmed at full size: two full-frame searches had taken about
+  350 ms on the capture thread and cost frames. Each run writes its own results file.
+- **The country picker** closes in on Blue's capital; on an arena with the capitals in
+  the rear no Red land showed. It is zoomed out until the country shows.
 
 ## A learned player from the scripted games (2026-09-24)
 
