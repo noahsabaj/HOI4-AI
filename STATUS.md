@@ -193,6 +193,13 @@ The policy was rebuilt so it can read the screen and point at what it sees:
   around each demonstrated point rather than the point, and `--look-before-click`
   presses only where the pointer already was, after the fovea has seen it (GUI-Actor,
   arXiv 2506.03143, points the same way, with an attention map over the screen).
+  The first heat maps (the policy after one epoch on 34 speed-5 AI games, 10 decisions
+  of a held-out game) are a near-even wash over the whole screen: a move scored about 2%
+  and no cell above 0.5%; the demonstrated point was a median 374 px away and never
+  among the hottest 1% of cells. That is right for those games: the scripted camera
+  picks where it pans and zooms at random, so nothing on screen says where it will
+  point. AI games cannot teach pointing; games whose clicks follow the screen, the
+  scripted player's (buttons found by template, fronts drawn on the border), can.
 - **Speed** is an input, so recordings at different speeds train together.
 - **Data** is read straight from the recordings' video; nothing is prepared, which at 448
   px would have been about 43 GB per hour. AI games now keep the scripted camera's
@@ -537,6 +544,33 @@ beat (`win-rate`).
   and it was stronger than the AI's army by the game's own estimate (1.6 to 1) from
   September to April. It still lost, in 249 s: the AI took the map's top and bottom
   edges while the script's divisions were split between its front and its offensives.
+- **What else was wrong**, each found in the daily reports and a few frames, and fixed:
+  - The AI's army has a general (each side has three, skill 3); the script's had none.
+    It now takes one from the army panel.
+  - Redraws added offensives to the old ones and split the army. A redraw now deletes
+    every order first (the Battle Plans bar's bin, right-click, OK).
+  - Thin lines on the map were read as land (the blue glow on Red's coast, red arrows
+    in Blue), so fronts and offensives started in the wrong places. The land masks are
+    now opened by 5 px.
+  - After a law change the political screen stayed open for the rest of one game. Every
+    click on it is now made only after checking that it shows.
+  - A plan redrawn for divisions already in place shows a green check and does not
+    execute until clicked; taken for executing, it left one army holding its line for
+    five years. The camera also glides on after zooming out, so orders placed from a
+    screen taken too early missed. The script now clicks the check too, checks the
+    arrow lights up, and waits for the camera to come to rest.
+  - Single-state arrows ("near", "deep") lost the flanks or the rear in every game
+    with them. A "broad" offensive draws the line across the whole front, a third of
+    the way to the enemy's far edge, redrawn every 30 to 90 s; most games use it.
+  - Divisions start at 31% strength, and Extensive conscription still left them at
+    81% after five years, with 2,000 political power unspent. The script now climbs
+    to Service by Requirement or All Adults Serve (150 power a step). Some games hold
+    for up to 240 s before attacking, and games stop at 15 minutes as a draw.
+- **First win, 2026-09-23**, after 16 losses and 2 draws. As Blue, the script held
+  for 142 s with Extensive conscription; its deployed manpower rose to 41k while the
+  AI's stayed near 14.5k, and the AI lost 29k men against the held line to Blue's
+  10k. Then broad offensives, redrawn every 67 s, took Red's states one by one, and
+  Red surrendered in January 1938, after 344 s.
 
 ## Open work
 
