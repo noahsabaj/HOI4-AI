@@ -1951,6 +1951,39 @@ mod platform {
         }
     }
 
+    /// The capture thread's output, written by a thread of its own, in order.
+    ///
+    /// Output is one pipe, and a reply carrying a full frame holds it until the frame has
+    /// crossed to the other PC. A tick that wrote its frame's row itself waited behind that:
+    /// once for 618 ms in the first streamed game, costing three frames. Posting never
+    /// waits, so the clock does not either.
+    static OUTBOX: OnceLock<mpsc::Sender<(serde_json::Value, Vec<u8>)>> = OnceLock::new();
+
+    fn post(message: serde_json::Value, bytes: Vec<u8>) {
+        let outbox = OUTBOX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<(serde_json::Value, Vec<u8>)>();
+            thread::spawn(move || {
+                for (message, bytes) in rx {
+                    push(message, &bytes);
+                }
+            });
+            tx
+        });
+        let _ = outbox.send((message, bytes));
+    }
+
+    /// `respond`, through the outbox: for the capture thread.
+    fn reply(cmd: &serde_json::Value, result: Result<(serde_json::Value, Vec<u8>), String>) {
+        let (mut response, bytes) = match result {
+            Ok(value) => value,
+            Err(error) => (serde_json::json!({"error": error}), Vec::new()),
+        };
+        if let Some(id) = cmd.get("id").filter(|id| !id.is_null()) {
+            response["id"] = id.clone();
+        }
+        post(response, bytes);
+    }
+
     /// A recording stream: the worker captures the attached game on its own clock and
     /// encodes it here, and the caller receives the video and each frame's times, pointer
     /// and inputs as they come.
@@ -2060,9 +2093,9 @@ mod platform {
                 *s.gaps.entry(reason.to_string()).or_default() += 1;
             }
         }
-        push(
+        post(
             serde_json::json!({"stream": stream.key, "gap": {"reason": reason, "t_ns": ns()}}),
-            &[],
+            Vec::new(),
         );
     }
 
@@ -2127,9 +2160,9 @@ mod platform {
             .unwrap_or(0);
         s.last_t_ns = Some(grabbed.end_ns);
         let (cx, cy) = grabbed.cursor;
-        push(
+        post(
             serde_json::json!({"stream": s.key, "frame": {"index": index, "seq": moment.seq, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "scheduled_ns": scheduled_ns, "cursor": [cx, cy], "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn, "width": grabbed.width, "height": grabbed.height}}),
-            &[],
+            Vec::new(),
         );
         (Ok(grabbed), None)
     }
@@ -2157,7 +2190,7 @@ mod platform {
             }
             Err(error) => {
                 disarm(shared);
-                respond(cmd, Err(error));
+                reply(cmd, Err(error));
             }
         }
     }
@@ -2524,7 +2557,7 @@ mod platform {
                     if result.is_err() {
                         disarm(&shared);
                     }
-                    respond(&cmd, result);
+                    reply(&cmd, result);
                 }
                 "capture" => {
                     let pointer = cmd["pointer"].as_bool().unwrap_or(true);
@@ -2544,18 +2577,18 @@ mod platform {
                         }
                         Err(error) => {
                             disarm(&shared);
-                            respond(&cmd, Err(error));
+                            reply(&cmd, Err(error));
                         }
                     }
                 }
                 "stream" => match cmd["action"].as_str().unwrap_or("") {
-                    "start" if stream.is_some() => respond(&cmd, Err("stream_active".into())),
+                    "start" if stream.is_some() => reply(&cmd, Err("stream_active".into())),
                     "start" => match start_stream(&cmd, hwnd, &exe_dir) {
-                        Ok((started, reply)) => {
+                        Ok((started, started_reply)) => {
                             stream = Some(started);
-                            respond(&cmd, Ok((reply, vec![])));
+                            reply(&cmd, Ok((started_reply, vec![])));
                         }
-                        Err(error) => respond(&cmd, Err(error)),
+                        Err(error) => reply(&cmd, Err(error)),
                     },
                     "stop" => match stream.take() {
                         Some(s) => {
@@ -2565,20 +2598,20 @@ mod platform {
                                 serve(&cmd, &Err(String::new()), &mut capturer, &replies, &shared);
                             }
                         }
-                        None => respond(&cmd, Err("no_stream".into())),
+                        None => reply(&cmd, Err("no_stream".into())),
                     },
                     "status" => {
                         let report = STATS.lock().map(|s| s.report()).unwrap_or_default();
-                        respond(&cmd, Ok((report, vec![])));
+                        reply(&cmd, Ok((report, vec![])));
                     }
-                    _ => respond(&cmd, Err("invalid_stream_action".into())),
+                    _ => reply(&cmd, Err("invalid_stream_action".into())),
                 },
                 _ => {
                     let result = fast_op(&shared, &cmd);
                     if result.is_err() {
                         disarm(&shared);
                     }
-                    respond(&cmd, result);
+                    reply(&cmd, result);
                 }
             }
         }
