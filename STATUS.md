@@ -610,6 +610,24 @@ second PC with `focus` every third frame and a full capture every seventh: tick 
   and 71 ms p95 with views on, over the network. NVENC hands each frame over at once
   (`-delay 0`), and the video is written in clusters of at most a second.
 
+**Video on disk sooner.** On a live scripted game the video on disk trailed the rows by
+1.7 s p50 and 4.3 s p95 (5.2 s at worst). Before `-delay 0` and the 1 s clusters it trailed
+by 10.7 / 14.1 / 15.7 s. Without views, rows arrived within a millisecond of the capture
+at the median and 18 ms at p95.
+
+**Killed recordings can be salvaged.** A recorder killed before it closed its recording
+(a run stopped by hand, say) leaves it incomplete, and training skips every incomplete
+recording. On 2026-09-24, 13 such recordings in artifacts/ held 16,774 usable rows, 56
+minutes of play. `hoi4-arena salvage` finishes them. It keeps the frames the video holds
+whole, drops the rows past them, and marks the manifest complete, with `salvaged` saying
+so. A killed x264 can leave its last frames out of order, so only the unbroken run
+counts. What the recorder left is kept beside it, and `--undo` puts it back. It never
+touches a recording that may still be going: one written in the last 10 minutes, one
+whose recorder still runs (manifests now name it), or one whose files a process holds
+open. It also leaves alone one its recorder closed as unusable. Salvaged copies of a
+scripted game and an AI game loaded for training with as many decisions per frame as
+complete games.
+
 ## Recording AI games
 
 `hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.
