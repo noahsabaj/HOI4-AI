@@ -185,6 +185,50 @@ class Referee:
         self.last_day = self.clock()
 
 
+class Watch:
+    """What a game in progress shows someone following it: a small picture of the screen
+    every `every` seconds (snaps/, written off the decision thread) and a log line of the
+    policy's presses so far."""
+
+    def __init__(self, root, station, every=30.0, clock=time.monotonic):
+        self.folder = Path(root) / "snaps"
+        self.station, self.every, self.clock = station, every, clock
+        self.next = clock()
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snaps")
+        self.presses = {}
+
+    def count(self, events):
+        for item in events:
+            event = item["event"]
+            if event["kind"] == "key" and event["down"]:
+                name = chr(event["vk"]) if 0x41 <= event["vk"] <= 0x5A else str(event["vk"])
+            elif event["kind"] == "button" and event["down"]:
+                name = f"b{event['button']}"
+            else:
+                continue
+            self.presses[name] = self.presses.get(name, 0) + 1
+
+    def look(self, frame, seconds, running):
+        if not self.every or self.clock() < self.next:
+            return
+        self.next = self.clock() + self.every
+        self.pool.submit(self._save, frame.rgb, int(seconds))
+        log.info(
+            "[%s] %d s, running %s, presses so far %s", self.station, seconds, running,
+            json.dumps(self.presses, sort_keys=True),
+        )  # fmt: skip
+
+    def _save(self, rgb, seconds):
+        from PIL import Image
+
+        self.folder.mkdir(parents=True, exist_ok=True)
+        image = Image.fromarray(rgb).resize((960, 540), Image.BILINEAR)
+        image.save(self.folder / f"{seconds:04d}.jpg", quality=80)
+
+    def close(self):
+        self.pool.shutdown(wait=True)
+
+
 def run_game(desk, pointer, rules=None, space=True):
     """Unpause (space) and set speed 5 with clicks on +, then put the pointer back.
 
@@ -228,6 +272,7 @@ def play_policy_game(
     codec="x264",
     arena_name=None,
     after_surrender=5.0,
+    snap_every=30.0,
 ):
     """Record one game in which `actor` plays `country` against the game's AI.
 
@@ -244,6 +289,7 @@ def play_policy_game(
     dispatcher = Dispatcher(desk, width, height)
     referee = Referee(setup_seconds, stall_seconds)
     arena = ArenaLog(desk)
+    watch = Watch(root, station, snap_every)
     stamped, timings = [], []
     outcome, reason, ending = "timeout", None, None
     late = away = 0
@@ -284,7 +330,10 @@ def play_policy_game(
                 continue
             away = 0
             frame = on_screen(captured_frame)
-            rec.append(frame, scripted_events=dispatcher.take())
+            applied = dispatcher.take()
+            watch.count(applied)
+            watch.look(frame, clock() - start, referee.running)
+            rec.append(frame, scripted_events=applied)
             captured = clock()
             action, _sample = actor.act(frame.rgb, frame.meta["t_ns"], cursor=frame.meta["cursor"])
             acted = clock()
@@ -342,6 +391,7 @@ def play_policy_game(
         log.warning("[%s] game ended early: %s", station, reason)
     finally:
         dispatcher.close()
+        watch.close()
         try:
             desk.release()
         except DesktopError:
@@ -369,6 +419,7 @@ def play_policy_game(
             station=station,
             checkpoint=actor.digest,
             harness={"starts": referee.starts, "restarts": referee.restarts},
+            presses=watch.presses,
         )
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest

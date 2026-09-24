@@ -341,11 +341,13 @@ def test_a_policy_game_starts_when_the_policy_clicks_plus_and_ends_on_the_surren
     game = _Game()
     outcome, reason, manifest = play.play_policy_game(
         game, _Actor(), tmp_path / "game", rules=None, country="BLU", codec="ffv1",
-        cap_minutes=1, setup_seconds=30, after_surrender=0.5,
+        cap_minutes=1, setup_seconds=30, after_surrender=0.5, snap_every=0.5,
     )  # fmt: skip
     assert reason is None and outcome == "BLU"
     assert manifest["source"] == "policy" and manifest["harness"] == {"starts": 1, "restarts": 0}
     assert manifest["complete"] and manifest["frames"] > 5
+    assert manifest["presses"].get("b0") == 1, "its one click, on +"
+    assert list((tmp_path / "game" / "snaps").glob("*.jpg")), "pictures for whoever follows it"
     assert any(e["kind"] == "key" and e["vk"] == 0x20 for e in game.setup_applied)
     assert not any(e["kind"] == "key" for e in game.applied), "the policy sent no keys"
     stamped = [json.loads(line) for line in (tmp_path / "game" / "arena-log.jsonl").open()]
