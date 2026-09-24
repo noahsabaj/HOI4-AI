@@ -590,7 +590,8 @@ async function tick() {
   if (s.live) {
     now.innerHTML = (s.arena ? arena(s.arena) + " as " + (side[s.side] || s.side) : s.game) +
       ' <span class="muted">' + clock(s.elapsed) + " in &middot; " +
-      (s.plan ? s.plan + " plan &middot; " : "") + s.run + "</span>";
+      (s.plan === "learned" ? "learned player &middot; " : s.plan ? s.plan + " plan &middot; " : "") +
+      s.run + "</span>";
     // A new game: from its start, once a few segments of it are out. The first status
     // only notes the game (reloading then cut every view off after 5 s).
     if (playing !== null && s.game !== playing) setTimeout(load, 6000);

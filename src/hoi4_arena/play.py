@@ -687,6 +687,7 @@ def evaluate_policy(
             country = countries[index % len(countries)]
             name = time.strftime("policy-peer-%Y%m%d-%H%M%S")
             entry = {"game": name, "station": "peer", "started_as": country, "speed": 5}
+            entry.update(arena=mod, plan={"variant": "learned"})
             entry["declare_drawn"] = rng.choice(("BLU", "RED"))
             entry["checkpoint"] = actor.digest
             save = (saves or {}).get(country)
@@ -706,6 +707,11 @@ def evaluate_policy(
                         observe=False, declarer=entry["declare_drawn"], saved=bool(save),
                     )  # fmt: skip
                     log.info("[peer] %s: the policy plays %s", name, country)
+                    try:
+                        # The game about to be played, for the live view (live.py).
+                        (out_root / "live.json").write_text(json.dumps(entry))
+                    except OSError:
+                        pass
                     outcome, reason, manifest = play_policy_game(
                         desk, actor, out_root / name, rules=screen_rules, country=country,
                         cap_minutes=cap_minutes, setup_seconds=setup_seconds, arena_name=mod,

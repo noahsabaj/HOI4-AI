@@ -72,6 +72,20 @@ def test_the_status_names_the_game_and_the_run_s_record_newest_first(tmp_path):
     assert not idle["live"] and idle["run"] == "scripted-f12" and len(idle["record"]) == 3
 
 
+def test_the_learned_player_s_live_games_are_followed_too(tmp_path):
+    """play-policy records one level down (artifacts/learned/<test>/<game>) and names its
+    game in live.json as record-ai does, so the page says LIVE for it, not between games."""
+    run = tmp_path / "learned" / "live-bc4c-e1"
+    game = recording(run, "policy-peer-1", started_ago=40)
+    entry = {"game": game.name, "arena": "arena-12x8-v4", "started_as": "BLU"}
+    (run / "live.json").write_text(json.dumps({**entry, "plan": {"variant": "learned"}}))
+    assert live.live_game([str(tmp_path / "*")]) is None, "a level above the games"
+    runs = [str(tmp_path / "*"), str(tmp_path / "learned" / "*")]
+    shown = live.status(live.live_game(runs), runs)
+    assert shown["live"] and shown["run"] == "live-bc4c-e1" and shown["plan"] == "learned"
+    assert shown["arena"] == "arena-12x8-v4" and shown["side"] == "BLU"
+
+
 def test_the_server_gives_the_page_s_files_and_nothing_else(tmp_path):
     for name, body in {"index.html": "<p>", "live.m3u8": "#EXTM3U", "notes.txt": "x"}.items():
         (tmp_path / name).write_text(body)

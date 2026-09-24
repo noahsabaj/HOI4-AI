@@ -295,8 +295,9 @@ def main():
     live.add_argument(
         "--runs",
         nargs="+",
-        default=["artifacts/*"],
-        help="Globs of run folders whose games to follow (the newest being recorded).",
+        default=["artifacts/*", "artifacts/learned/*"],
+        help="Globs of run folders whose games to follow (the newest being recorded): "
+        "record-ai's runs and play-policy's live tests by default.",
     )
     live.add_argument("--out", help="Where the stream is written (default: temp/hoi4-live).")
     live.add_argument("--port", type=int, default=8765)
