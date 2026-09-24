@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .dataset import VideoSessions, batch_to_device, window_loader
+from .dataset import GameSequences, VideoSessions, batch_to_device, window_loader
 from .learning import Progress, save_checkpoint
 from .models import (
     CHUNK,
@@ -86,6 +86,59 @@ def unroll(policy, batch, burn_in=2, training=True, checkpoint=False, chunk=CHUN
         summary[:, burn_in:],
         cells[:, burn_in:],
     )
+
+
+def unroll_carried(policy, batch, hidden, *, training=True, checkpoint=False, chunk=CHUNK):
+    """Run the policy over a batch of windows from a memory carried in (`hidden`).
+
+    No burn-in: the memory arrives as the previous window of the same game left it
+    (dataset.GameSequences). Returns the memories, the summaries, the cells and the last
+    memory, to carry into the next window.
+    """
+    clips = batch.get("clips")
+    dtype = batch["quadrants"].dtype
+    cached = "tower_grid" in batch
+    with torch.set_grad_enabled(training):
+        summary, cells, centre = policy.perceive_window(
+            clips,
+            batch["quadrants"],
+            batch["fovea"],
+            checkpoint=checkpoint,
+            chunk=chunk,
+            tower=(batch["tower_summary"], batch["tower_grid"]) if cached else None,
+        )
+        memories = []
+        for t in range(summary.shape[1]):
+            hidden, _ = policy.recall(
+                summary[:, t],
+                cells[:, t],
+                centre[:, t],
+                batch["previous"][:, t],
+                batch["speed"][:, t],
+                hidden,
+                dtype,
+            )
+            memories.append(hidden)
+    return torch.stack(memories, 1), summary, cells, hidden
+
+
+def carried_in(store, slots, fresh, width, device):
+    """Each batch slot's memory as its game's previous window left it; empty for a slot
+    that starts a new game."""
+    empty = torch.zeros(width, device=device)
+    return torch.stack(
+        [empty if new or slot not in store else store[slot] for slot, new in zip(slots, fresh)]
+    )
+
+
+def scored(batch):
+    """The labels and weights to score: an invalid decision's label becomes no input and
+    its weight 0, since in a carried game it is still seen, only not learned from."""
+    valid = batch["valid"]
+    labels = torch.where(
+        valid[..., None, None], batch["actions"], torch.zeros_like(batch["actions"])
+    )
+    return labels, batch["weight"] * valid
 
 
 def imitation_score(policy, memory, cells, actions, objective, xm=None, sigma=0.0):
@@ -277,6 +330,7 @@ def train_bc(
     init=None,
     train_last=None,
     tower_cache=None,
+    carry=False,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -310,7 +364,14 @@ def train_bc(
     None); 0 freezes the tower, which then runs once without a graph. With the tower
     frozen, `tower_cache` (cache-tower) reads what it saw from disk instead of running it:
     the cache must have been made from this very tower.
+
+    `carry` trains the memory carried through each game, window after window in order,
+    `batch_size` games side by side (dataset.GameSequences), by truncated
+    backpropagation through time, instead of from empty in shuffled windows after a
+    burn-in; validation is carried through each held-out game the same way.
     """
+    if carry:
+        burn_in = 0
     if not 0 < idm_weight <= 1:
         raise ValueError("idm_weight must be in (0, 1]")
     torch.manual_seed(seed)
@@ -343,10 +404,25 @@ def train_bc(
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
-    # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
-    loader = window_loader(
-        dataset, batch_size, workers=workers, device=device, drop_last=auxiliary != "none"
-    )
+    trainset = dataset
+    if carry:
+        if auxiliary != "none" or objective != "bc":
+            raise ValueError("a carried memory trains with plain behaviour cloning")
+        trainset = GameSequences(
+            dataset, sequence, batch_size, seed=seed, device=common["device"], clips=common["clips"]
+        )
+        loader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=None,
+            num_workers=workers,
+            pin_memory=bool(workers) and device == "cuda",
+            persistent_workers=bool(workers),
+        )
+    else:
+        # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
+        loader = window_loader(
+            dataset, batch_size, workers=workers, device=device, drop_last=auxiliary != "none"
+        )
     if len(dataset) < (2 if auxiliary != "none" else 1):
         raise ValueError("Need at least two sequences for independent-batch regularization")
     if variant == "tiny":
@@ -421,6 +497,7 @@ def train_bc(
         "init": str(Path(init).resolve()) if init else None,
         "train_last": train_last,
         "tower_cache": str(Path(tower_cache).resolve()) if tower_cache else None,
+        "carry": carry,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)
@@ -437,22 +514,33 @@ def train_bc(
             policy.train()
             aux.train()
             # Workers iterate copies of the dataset, so its epoch is set here, not counted.
-            dataset.epoch = epoch
+            trainset.epoch = epoch
+            store = {}  # A carried game's memory, by batch slot.
             for step, batch in enumerate(loader):
                 if epoch == first_epoch and step < skip:
                     continue  # Trained before the run was interrupted.
                 wait_while_paused(output)
+                slots = batch.pop("slot").tolist() if carry else None
+                fresh = batch.pop("fresh").tolist() if carry else None
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
-                    memory, _, features, cells = unroll(
-                        policy, batch, burn_in, checkpoint=recompute, chunk=chunk
-                    )
-                    actions = batch["actions"][:, burn_in:]
+                    if carry:
+                        start = carried_in(store, slots, fresh, policy.memory_dim, device)
+                        memory, features, cells, last = unroll_carried(
+                            policy, batch, start, checkpoint=recompute, chunk=chunk
+                        )
+                        actions, weight = scored(batch)
+                    else:
+                        memory, _, features, cells = unroll(
+                            policy, batch, burn_in, checkpoint=recompute, chunk=chunk
+                        )
+                        actions = batch["actions"][:, burn_in:]
+                        weight = batch["weight"][:, burn_in:]
                     score = imitation_score(
                         policy, memory, cells, actions, objective, xm, sigma=pointer_sigma
                     )
-                    bc = imitation_loss(score, batch["weight"][:, burn_in:])
+                    bc = imitation_loss(score, weight)
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
                     loss = bc + 0.1 * predictive
                     if state_weight > 0:
@@ -471,6 +559,9 @@ def train_bc(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
+                if carry:
+                    for slot, value in zip(slots, last.detach().float(), strict=True):
+                        store[slot] = value
                 row = {
                     "epoch": epoch,
                     "step": step,
@@ -489,18 +580,40 @@ def train_bc(
             validation_losses, acting, predicted, truths = [], [], [], []
             order_right, order_known = 0, 0
             with torch.no_grad():
-                for batch in window_loader(validation, batch_size, workers=workers, device=device):
+                if carry:
+                    # Each held-out game in order, the memory carried, in this process.
+                    held = GameSequences(
+                        validation, sequence, 1, seed=seed, device=device, clips=common["clips"]
+                    )
+                    batches, memories = held, {}
+                else:
+                    batches = window_loader(validation, batch_size, workers=workers, device=device)
+                for batch in batches:
+                    slots = batch.pop("slot").tolist() if carry else None
+                    fresh = batch.pop("fresh").tolist() if carry else None
                     batch = batch_to_device(batch, device)
                     with torch.autocast(**autocast):
-                        memory, _, _, cells = unroll(
-                            policy, batch, burn_in, training=False, chunk=chunk
-                        )
-                        labels = batch["actions"][:, burn_in:]
+                        if carry:
+                            start = carried_in(memories, slots, fresh, policy.memory_dim, device)
+                            memory, _, cells, last = unroll_carried(
+                                policy, batch, start, training=False, chunk=chunk
+                            )
+                            memories.update(zip(slots, last.float()))
+                            labels, _ = scored(batch)
+                            keep = batch["valid"].flatten().cpu().tolist()
+                        else:
+                            memory, _, _, cells = unroll(
+                                policy, batch, burn_in, training=False, chunk=chunk
+                            )
+                            labels = batch["actions"][:, burn_in:]
+                            keep = [True] * (labels.shape[0] * labels.shape[1])
                         # For xm, the same choice among candidates the training loss
                         # makes, not a score of candidates the optimizer never saw.
                         score = imitation_score(policy, memory, cells, labels, objective, xm)
-                        validation_losses.extend((-score).float().cpu().tolist())
-                        acting.extend(presses(labels.flatten(0, 1)).cpu().tolist())
+                        losses = (-score).float().cpu().tolist()
+                        pressing = presses(labels.flatten(0, 1)).cpu().tolist()
+                        validation_losses.extend(x for x, k in zip(losses, keep) if k)
+                        acting.extend(a for a, k in zip(pressing, keep) if k)
                         if state_weight > 0:
                             predicted.append(state_head(memory.float()).flatten(0, 1).cpu())
                             truths.append(batch["state"][:, burn_in:].flatten(0, 1).cpu())

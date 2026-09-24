@@ -752,6 +752,91 @@ class VideoSessions(IterableDataset):
                 stream.close()
 
 
+class GameSequences(IterableDataset):
+    """Each game's decisions in order, in windows of `length`, `slots` games side by side.
+
+    For a memory carried through whole games, trained by truncated backpropagation
+    through time: batch slot b plays one recording from its first decision on, window
+    after window; when the recording ends, the slot starts the next one and marks that
+    window `fresh`, so the trainer empties that slot's memory. The memory study
+    (2026-09-24, 44 AI games, 5 seeds) found carrying the memory between 16-decision
+    windows the largest effect it measured: held-out loss 3.109 against 3.169 for windows
+    started empty, which is how train-bc trained.
+
+    Every decision is in a window, valid or not: an invalid one is still seen by the
+    memory, and train_bc scores it with weight 0. A game's last partial window is left
+    out. Items are whole batches, with `slot` (unique across DataLoader workers) and
+    `fresh`; `sessions` is a VideoSessions, for its recordings and their labels.
+    """
+
+    def __init__(self, sessions, length=16, slots=2, *, seed=0, device="cpu", clips=True):
+        self.sessions = sessions.sessions
+        self.length, self.slots, self.seed = length, slots, seed
+        self.device, self.clips = device, clips
+        self.windows = sum(
+            max(0, int(labels["readable"].sum())) // length for labels in self.sessions
+        )
+        self.epoch = 0
+
+    def __len__(self):
+        """Batches in an epoch, about: windows over slots."""
+        return -(-self.windows // self.slots)
+
+    def _open(self, labels):
+        count = int(labels["readable"].sum())
+        starts = list(range(0, count - self.length + 1, self.length))
+        if not starts:
+            return None
+        return _Stream(labels, self.length, 0, self.device, starts=starts, clips=self.clips)
+
+    def __iter__(self):
+        rng = random.Random(f"{self.seed}:{self.epoch}")
+        self.epoch += 1
+        order = list(self.sessions)
+        rng.shuffle(order)
+        worker = get_worker_info()
+        base = 0
+        if worker is not None and worker.num_workers > 1:
+            order = order[worker.id :: worker.num_workers]
+            base = worker.id * self.slots
+        streams = [None] * self.slots
+        fresh = [True] * self.slots
+        # Windows a stream finished together (after a capture gap), in order.
+        pending = [[] for _ in range(self.slots)]
+        try:
+            while True:
+                windows, ids, starts = [], [], []
+                for b in range(self.slots):
+                    while not pending[b]:
+                        if streams[b] is None:
+                            if not order:
+                                break
+                            streams[b], fresh[b] = self._open(order.pop()), True
+                            continue
+                        done = streams[b].advance()
+                        if done is None:
+                            streams[b] = None
+                            continue
+                        pending[b].extend(done)
+                    if not pending[b]:
+                        continue
+                    window = pending[b].pop(0)
+                    windows.append(window)
+                    ids.append(base + b)
+                    starts.append(fresh[b])
+                    fresh[b] = False
+                if not windows:
+                    return
+                batch = torch.utils.data.default_collate(windows)
+                batch["slot"] = torch.tensor(ids)
+                batch["fresh"] = torch.tensor(starts)
+                yield batch
+        finally:
+            for stream in streams:
+                if stream is not None:
+                    stream.close()
+
+
 def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=False):
     """Batches of VideoSessions' windows, prepared by `workers` background processes.
 

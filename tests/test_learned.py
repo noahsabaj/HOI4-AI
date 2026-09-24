@@ -566,3 +566,58 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="frozen tower"):
         train.train_bc(data, "model", tmp_path / "unfrozen", init=checkpoint,
                        tower_cache=tmp_path / "cache", **common)  # fmt: skip
+
+
+@needs_ffmpeg
+def test_games_play_in_order_with_their_memory_started_once_a_game(tmp_path):
+    from hoi4_arena.dataset import GameSequences
+
+    for name in ("a", "b"):
+        _scripted(tmp_path / name)
+    sessions = VideoSessions(
+        tmp_path, sources=("scripted",), length=4, burn_in=0, device="cpu", clips=False, lead_in=0
+    )
+    games = GameSequences(sessions, 4, 1, device="cpu", clips=False)
+    batches = list(games)
+    # 40 frames at 10 Hz are 20 decisions of 0.2 s, less the last: 4 whole windows a game.
+    assert len(batches) == 8 == len(games)
+    starts = [int(b["start"][0]) for b in batches]
+    fresh = [bool(b["fresh"][0]) for b in batches]
+    assert starts == [0, 4, 8, 12] * 2
+    assert fresh == [True, False, False, False] * 2
+    two = list(GameSequences(sessions, 4, 2, device="cpu", clips=False))
+    assert len(two) == 4 and all(b["slot"].tolist() == [0, 1] for b in two)
+    assert [b["fresh"].tolist() for b in two] == [[True, True]] + [[False, False]] * 3
+
+
+@needs_ffmpeg
+def test_a_carried_memory_trains_and_validates_game_by_game(tmp_path, monkeypatch):
+    from test_unroll import _Screen
+
+    import hoi4_arena.train as train
+
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("game", "other", "held-out"):
+        _recording(
+            data / name,
+            [8, 6],
+            source="scripted",
+            events=[(300_000_000, CLICK), (900_000_000, SPACE)],
+        )
+    (data / "splits.json").write_text(
+        json.dumps({"game": "train", "other": "train", "held-out": "validation"})
+    )
+    monkeypatch.setattr(train, "build_encoder", lambda path, variant: _Screen())
+    train.train_bc(
+        data, "model", tmp_path / "out", sources=("scripted",), sequence=4, workers=0,
+        lead_in=0, look_before_click=True, carry=True,
+    )  # fmt: skip
+    rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
+    steps = [row for row in rows if "step" in row]
+    # Two games side by side, 4 windows each: 4 batches. Space is outside the vocabulary,
+    # so its decision is invalid: seen by the memory, scored with weight 0.
+    assert len(steps) == 4 and all(np.isfinite(row["bc"]) for row in steps)
+    assert rows[-1]["validation_nll"] > 0 and rows[-1]["validation_decisions"] == 15
+    config = json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]
+    assert config["carry"] and config["burn_in"] == 0

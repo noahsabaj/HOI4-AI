@@ -353,6 +353,12 @@ def main():
         help="Read the frozen tower's output from this cache (cache-tower) instead of "
         "running it; needs --train-last 0.",
     )
+    train.add_argument(
+        "--carry",
+        action="store_true",
+        help="Carry the memory through each game, window after window in order "
+        "(truncated backpropagation through time), instead of from empty per window.",
+    )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
     weigh = sub.add_parser(
