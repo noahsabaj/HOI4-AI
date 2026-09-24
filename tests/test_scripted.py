@@ -6,14 +6,12 @@ import pytest
 from hoi4_arena.scripted import ATTACKS, Planner, choose_plan, state_at, wilson, win_rate
 
 
-def test_plans_cover_every_attack_and_never_redraw_without_one():
+def test_plans_cover_every_attack_and_always_redraw():
     rng = random.Random(0)
     plans = [choose_plan(rng) for _ in range(400)]
     assert {p["attack"] for p in plans} == set(ATTACKS)
-    assert all(p["redraw"] is None for p in plans if p["attack"] == "none")
     assert all(6 <= p["wait"] <= 240 for p in plans) and any(p["wait"] > 60 for p in plans)
-    assert all(p["redraw"] for p in plans if p["attack"] == "broad")
-    assert any(p["redraw"] is None for p in plans if p["attack"] in ("near", "deep"))
+    assert all(30 <= p["redraw"] <= 90 for p in plans)
 
 
 def test_points_map_to_the_states_mapgen_numbers():

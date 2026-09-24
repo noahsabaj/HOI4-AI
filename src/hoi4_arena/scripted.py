@@ -134,7 +134,7 @@ def choose_plan(rng):
     its rear. `wait` is how long the front holds, with the offensive drawn, before the
     plan is executed: preparation raises the plan's bonus, and a longer hold lets the
     divisions fill up, while the enemy may strike first. `redraw` is how often the plan
-    is drawn afresh (every order deleted, then a new front and offensive), or None.
+    is drawn afresh: every order deleted, then a new front and offensive.
     """
     attack = rng.choices(list(ATTACKS), weights=list(ATTACKS.values()))[0]
     return {
@@ -144,14 +144,9 @@ def choose_plan(rng):
         # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5; some games
         # hold for up to a game year and a half first.
         "wait": round(rng.uniform(6, 60) if rng.random() < 0.6 else rng.uniform(60, 240)),
-        # A broad offensive stops at its line, so it is always drawn again, further on.
-        "redraw": (
-            round(rng.uniform(30, 90))
-            if attack == "broad"
-            else None
-            if rng.random() < 0.5
-            else round(rng.uniform(40, 120))
-        ),
+        # An offensive stops at its line, so it is always drawn again, further on: a single
+        # push took one state and then stood for four years (2026-09-23).
+        "redraw": round(rng.uniform(30, 90)),
     }
 
 
