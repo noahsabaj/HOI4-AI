@@ -201,7 +201,7 @@ every rule below came from a crash dump or the stock files.
 
 ## Arena maps (2026-09-24)
 
-`generate-map --preset <name>` writes one of six named arenas (`arenas.PRESETS`), and
+`generate-map --preset <name>` writes one of seven named arenas (`arenas.PRESETS`), and
 `preview-map` draws one from its files. Every one keeps the playable grid (12×8
 provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
@@ -216,12 +216,13 @@ checks that, province by province and pixel by pixel.
 | `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
 | `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
 | `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+| `ford` | A large river runs along the whole border, except at one ford in the middle | 15 | -56% |
 
 "Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
 mean penalty for attacking into the defender's province there: the stock terrain
 penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
 -60% where a river runs along that border. On `passes` 73% of the front costs 40% or
-more. Measured on the v6 files.
+more, on `ford` 93%. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 
@@ -250,20 +251,37 @@ heart. `generation.json` records the preset and seed, its terrain counts, its fr
 (the numbers in the table above), and a state layout over the land box, from which
 `scripted.state_at` names the state under a point on any arena, bulges included.
 
-Live tests on the second PC (2026-09-24), the scripted player against the game's AI.
-On the plain arena, 23 such games ended by game day 290-820.
+Live tests on the second PC (2026-09-24): the scripted player against the game's AI,
+one game an arena, so no arena can yet be said to favour either side. Every v6 arena
+loaded with no map errors in the game's log. "Captures" counts the states that changed
+hands before the surrender; most plain-arena games were a single sweep of 8.
 
-- `plains-v1`, as Blue: loaded with no errors, and the scripted player found its fronts
-  on the new ground. A draw after 15 minutes: the supply stall above.
-- `passes-v3`, as Red: Red won in 541 s. Blue surrendered on day 1236, after a seesaw
-  at the valleys: 22 changes of control, with West 6 taken four times and East 7 three.
-- `marsh-v3` and `v4`: loaded, lakes included, but first Red could not be picked (the
-  capital fix) and then the front line would not draw on dark ground (the colour fix).
-- `marsh-v6`, as Red: loaded with no map errors in the game's log. The AI won in 79 s:
-  the lake splits the front, Red's army held only the southern stretch (89% of its
-  division-days in one state), and Blue walked round the north without a casualty.
+| Arena | Scripted side | Winner | Surrender on day | Captures | Casualties, Blue / Red |
+|---|---|---|---|---|---|
+| plain, 23 games | both | scripted 10 of 21, 2 draws | 277–822 | mostly 8 | |
+| `plains` | Red | scripted | 772 | 8 | 61k / 10k |
+| `river` | Red | scripted | 751 | 8 | 71k / 12k |
+| `passes` | Blue | scripted | 726 | 8 | 8k / 77k |
+| `passes` (v3) | Red | scripted | 1236 | 22 | 104k / 13k |
+| `marsh` | Red | AI | 100 | 8 | 1k / 2k |
+| `bay` | Red | AI | 1026 | 20 | 111k / 15k |
+| `salient` | Red | AI | 259 | 8 | 9k / 7k |
+| `ford` | Blue | scripted | 803 | 8 | 8k / 86k |
+
+- `river`: Red took Blue's border states in May 1937 and the river states by June, then
+  stood seven months at the river before breaking through in January 1938.
+- `bay`: Red broke through the isthmus first and took six of Blue's eight states by
+  April 1938. Blue's counteroffensive retook them all, then took Red's homeland.
+- `marsh`: the lake splits the front. Red's army held only the southern stretch (89% of
+  its division-days in one state), and Blue walked round the north.
+- `salient`: Red's army sat in its own bulge (77% of its division-days) while Blue went
+  round it.
+- `plains`: v1 stood four years after three states, for want of railways across the
+  border; v6, with them, went on to a surrender.
 - Close-ups show stock textures, relief lit by the normal map, dense forests, city
-  models among farmland, rivers and railways.
+  models among farmland, rivers and single railway lines.
+- Also fixed on the way: `marsh-v3` could not pick Red (the capital was off the picker's
+  screen), and `marsh-v4` could not draw a front on dark ground.
 
 ## The model and its data (2026-09-23)
 
