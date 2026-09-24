@@ -1656,6 +1656,50 @@ mod platform {
         Ok((serde_json::json!({"output": text, "exit": exit}), vec![]))
     }
 
+    /// Bring the attached game window to the front, for setup only. A windowed game
+    /// started by a background process does not take focus, and nobody may be at the
+    /// second PC to click it. Windows only lets a process that has just sent input change
+    /// the foreground window, so this taps Alt first; the tap goes to whatever window had
+    /// focus, before the game has it.
+    ///
+    /// It waits 150 ms for the switch, on its own thread and without the input lock:
+    /// holding the lock through the wait held up a stream's ticks, which read the window
+    /// under it, by up to 150 ms each time a script focused the game (11% of the ticks of
+    /// the first scripted game recorded as a stream).
+    fn focus_window(shared: &Arc<Mutex<InputState>>, cmd: serde_json::Value) {
+        let armed = shared.lock().map(|state| state.armed).unwrap_or(true);
+        if armed {
+            respond(&cmd, Err("focus_refused_while_armed".into()));
+            return;
+        }
+        let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
+        if hwnd.is_null() {
+            respond(&cmd, Err("focus_before_attach".into()));
+            return;
+        }
+        thread::spawn(move || {
+            let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                let mut alt: [INPUT; 2] = zeroed();
+                for (i, up) in [false, true].into_iter().enumerate() {
+                    alt[i].r#type = INPUT_KEYBOARD;
+                    alt[i].Anonymous.ki.wVk = VK_MENU;
+                    alt[i].Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
+                }
+                SendInput(2, alt.as_ptr(), size_of::<INPUT>() as i32);
+                SetForegroundWindow(hwnd);
+            }
+            thread::sleep(Duration::from_millis(150));
+            respond(
+                &cmd,
+                Ok((serde_json::json!({"foreground": foreground()}), vec![])),
+            );
+        });
+    }
+
     fn fast_op(
         shared: &Arc<Mutex<InputState>>,
         cmd: &serde_json::Value,
@@ -1692,30 +1736,6 @@ mod platform {
             // at the second PC to click it. Windows only lets a process that has just sent
             // input change the foreground window, so this taps Alt first; the tap goes to
             // whatever window had focus, before the game has it.
-            "focus" => {
-                if *armed {
-                    return Err("focus_refused_while_armed".into());
-                }
-                let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
-                if hwnd.is_null() {
-                    return Err("focus_before_attach".into());
-                }
-                unsafe {
-                    if IsIconic(hwnd) != 0 {
-                        ShowWindow(hwnd, SW_RESTORE);
-                    }
-                    let mut alt: [INPUT; 2] = zeroed();
-                    for (i, up) in [false, true].into_iter().enumerate() {
-                        alt[i].r#type = INPUT_KEYBOARD;
-                        alt[i].Anonymous.ki.wVk = VK_MENU;
-                        alt[i].Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
-                    }
-                    SendInput(2, alt.as_ptr(), size_of::<INPUT>() as i32);
-                    SetForegroundWindow(hwnd);
-                }
-                thread::sleep(Duration::from_millis(150));
-                Ok((serde_json::json!({"foreground": foreground()}), vec![]))
-            }
             "events" => {
                 // While a stream records, the player's inputs go with its frames, and its
                 // end hands over the rest; taking them here would leave holes in its rows.
@@ -2196,7 +2216,7 @@ mod platform {
         let scheduled = s.next;
         let (next, skipped) = crate::next_tick(scheduled, s.period, Instant::now());
         s.next = next;
-        let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+        let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
         let grabbed = capturer.grab(hwnd, true);
         let scheduled_ns = scheduled
             .checked_duration_since(*ORIGIN.get_or_init(Instant::now))
@@ -2283,7 +2303,7 @@ mod platform {
         let grabbed = match frame {
             Ok(g) => Ok(Arc::clone(g)),
             Err(_) => {
-                let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+                let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
                 capturer.grab(hwnd, true).map(Arc::new)
             }
         };
@@ -2606,6 +2626,10 @@ mod platform {
                     }
                     continue;
                 }
+                if op == "focus" {
+                    focus_window(&reader_state, cmd);
+                    continue;
+                }
                 // Telemetry waits about a second for its first window of measurements;
                 // on its own thread that holds up nothing else.
                 if op == "telemetry" {
@@ -2706,7 +2730,7 @@ mod platform {
                 }
                 continue;
             };
-            let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+            let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
             match cmd["op"].as_str().unwrap_or("") {
                 "attach" => {
                     let result = if stream.is_some() {
