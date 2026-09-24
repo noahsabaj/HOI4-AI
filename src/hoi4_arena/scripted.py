@@ -262,18 +262,31 @@ class Planner:
             time.sleep(0.8)
         return self.selected(desk)
 
-    def overview(self, desk):
-        """Zoomed fully out over the arena: the land masks and their box, or Nones."""
+    def overview(self, desk, tries=8):
+        """Zoomed fully out over the arena: the land masks and their box, or Nones.
+
+        Taken once the camera has come to rest, when two looks 0.3 s apart find the same
+        land box. The zoom out glides on after `recentre` returns while a game runs, and
+        orders placed from a screen taken during the glide missed: one redraw's four front
+        clicks landed off the border, the fourth on a state, which opened its panel.
+        """
         recentre(desk)
-        rgb = screen(desk)
-        top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
-        blue, red = country_pixels(rgb[top:bottom])
-        if blue is None:
-            return rgb, None, None, None
-        blue, red = clean(blue), clean(red)
-        if not blue.any() or not red.any():
-            return rgb, None, None, None
-        return rgb, blue, red, land_box(blue, red)
+        last = None
+        for _ in range(tries):
+            time.sleep(0.3)
+            rgb = screen(desk)
+            top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
+            blue, red = country_pixels(rgb[top:bottom])
+            if blue is None:
+                return rgb, None, None, None
+            blue, red = clean(blue), clean(red)
+            if not blue.any() or not red.any():
+                return rgb, None, None, None
+            box = land_box(blue, red)
+            if last is not None and max(abs(int(a) - int(b)) for a, b in zip(box, last)) <= 2:
+                break
+            last = box
+        return rgb, blue, red, box
 
     def assign_general(self, desk, tries=3):
         """A commander for the army, as the AI gives its own. True once it has one."""
@@ -316,15 +329,16 @@ class Planner:
         2026-09-23 two games in three as Red drew no front at first: the click had gone
         to the player's own side, where the tool does nothing.
         """
-        rgb, blue, red, box = self.overview(desk)
-        if box is None or not self.select_army(desk):
-            raise RuntimeError("no arena or army to draw a front line with")
-        front = self.front(blue, red)
-        if not front:
-            raise RuntimeError("the two countries do not touch on screen")
-        # The border's middle first: the tool follows the whole border from there.
-        middle = sorted(front, key=lambda p: p[1])[len(front) // 2]
         for attempt in range(tries):
+            # A fresh look each time: the camera may have moved since the last.
+            rgb, blue, red, box = self.overview(desk)
+            if box is None or not self.select_army(desk):
+                raise RuntimeError("no arena or army to draw a front line with")
+            front = self.front(blue, red)
+            if not front:
+                raise RuntimeError("the two countries do not touch on screen")
+            # The border's middle first: the tool follows the whole border from there.
+            middle = sorted(front, key=lambda p: p[1])[len(front) // 2]
             x, y = middle if attempt == 0 else self.rng.choice(front)
             act(desk, tap(FRONT_LINE))
             self.click(desk, self.screen_point(rgb, x, y))
