@@ -84,6 +84,18 @@ for _qp in (12, 14, 16, 18):
         "-g",
         "100",
     ]
+# The slowest preset spends more of the encoder on each frame for fewer bits at the same
+# QP; B-frames save bits between frames. Both cost nothing on this PC's CPU.
+for _qp in (12, 14, 16):
+    CANDIDATES[f"h264nv-p7-qp{_qp}"] = [
+        "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-profile:v", "high444p",
+        "-pix_fmt", "yuv444p", "-rc", "constqp", "-qp", str(_qp), "-bf", "0", "-g", "100",
+    ]  # fmt: skip
+    CANDIDATES[f"h264nv-p7-bf3-qp{_qp}"] = [
+        "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-profile:v", "high444p",
+        "-pix_fmt", "yuv444p", "-rc", "constqp", "-qp", str(_qp), "-bf", "3",
+        "-b_ref_mode", "middle", "-g", "100",
+    ]  # fmt: skip
 CANDIDATES["h264nv-lossless"] = [
     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "lossless", "-profile:v", "high444p",
     "-pix_fmt", "yuv444p", "-bf", "0", "-g", "100",
