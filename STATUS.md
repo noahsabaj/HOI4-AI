@@ -207,14 +207,21 @@ provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n")
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
 checks that, province by province and pixel by pixel.
 
-| Preset | What changes the fight |
-|---|---|
-| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front |
-| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across |
-| `passes` | Mountains two provinces deep on each side of the whole border (-50% attack), crossed by two one-province valleys |
-| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings |
-| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus |
-| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south |
+| Preset | What changes the fight | Front | Attack across it |
+|---|---|---|---|
+| none | The plain arena, for comparison | 15 | -3% |
+| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front | 15 | -8% |
+| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across | 15 | -2% |
+| `passes` | Mountains two provinces deep on each side of the whole border, crossed by two one-province valleys | 15 | -37% |
+| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
+| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
+| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+
+"Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
+mean penalty for attacking into the defender's province there: the stock terrain
+penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
+-60% where a river runs along that border. On `passes` 73% of the front costs 40% or
+more. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 
