@@ -129,6 +129,11 @@ def main():
         type=int,
         help="Run the memory afresh over the last N decisions at each one, as in training",
     )
+    live.add_argument(
+        "--point",
+        action="store_true",
+        help="Place each move on its likeliest spot while still sampling what to do",
+    )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
     heat = sub.add_parser(

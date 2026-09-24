@@ -426,3 +426,22 @@ def test_the_next_order_is_the_first_stamped_after_the_frame_read():
     assert np.isnan(eta[-1])
     kinds, eta = decision_orders({}, np.array([0, 1]))
     assert (kinds == -1).all() and np.isnan(eta).all(), "no orders, no targets"
+
+
+def test_greedy_pointing_takes_the_likeliest_place_and_still_samples_the_kind():
+    from hoi4_arena.models import CELL_DIM, ActionHead
+
+    torch.manual_seed(0)
+    head = ActionHead(memory_dim=8).eval()
+    with torch.no_grad():
+        head.kinds.bias.zero_()
+        head.kinds.bias[1] = 50.0  # Always a move.
+    memory, cells = torch.randn(1, 8), torch.randn(1, GRID, CELL_DIM)
+    greedy = {tuple(head(memory, cells, point=True)[0][0, 0].tolist()) for _ in range(8)}
+    sampled = {tuple(head(memory, cells)[0][0, 0].tolist()) for _ in range(8)}
+    assert len(greedy) == 1 and len(sampled) > 1
+    with torch.no_grad():
+        head.kinds.bias[1] = 0.0
+        head.kinds.bias[0] = 0.5
+    kinds = {int(head(memory, cells, point=True)[0][0, 0, 0]) for _ in range(40)}
+    assert len(kinds) > 1, "what to do is still sampled"

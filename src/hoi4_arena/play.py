@@ -77,6 +77,11 @@ class Dispatcher:
         # loop refocuses it, and gives up on the game if it never comes back.
         self.refused = 0
         self.error = None
+        # Input is armed once and kept armed by an apply every slot, empty ones too (the
+        # worker disarms after 750 ms without one). Anything that releases it, such as
+        # the harness's own input, clears this so the next interval arms again. Arming
+        # each interval would also clear an F12 the capture had not yet reported.
+        self.armed = False
 
     def start(self, action, begin, pointer):
         self.pointer = pointer
@@ -84,7 +89,9 @@ class Dispatcher:
 
     def _run(self, action, begin):
         try:
-            self.desk.arm()
+            if not self.armed:
+                self.desk.arm()
+                self.armed = True
             for index, token in enumerate(action):
                 time.sleep(max(0.0, begin + index * PERIOD / SLOTS - self.clock()))
                 events = decode(token)
@@ -104,6 +111,7 @@ class Dispatcher:
         except DesktopError as error:
             self.refused += 1
             self.error = str(error)
+            self.armed = False
             return
         self.refused = 0
 
@@ -244,28 +252,9 @@ def play_policy_game(
         rec.append(first)
         frame = first
         while clock() - start < cap_minutes * 60:
-            dispatcher.join()
-            if dispatcher.speed_clicks and not referee.running:
-                referee.clicked_speed_up()
-            wait = referee.due()
-            if wait is not None:
-                pointer = None
-                cursor = frame.meta.get("cursor")
-                if cursor:
-                    pointer = (cursor[0] / width, cursor[1] / height)
-                desk.release()
-                if wait == "start":
-                    run_game(desk, pointer)
-                    referee.started()
-                    log.info("[%s] the game runs, %.0f s after the start", station, clock() - start)
-                else:
-                    paused = is_paused(desk, rules) if rules is not None else True
-                    run_game(desk, pointer, space=paused)
-                    referee.restarted()
-                    log.info(
-                        "[%s] the game stalled; set running again (paused=%s)", station, paused
-                    )
-                deadline = clock()
+            # The interval in flight keeps applying while the next frame is taken and
+            # read, as in ArenaEnv.step: the loop holds 5 Hz, and an action goes out
+            # about 150 ms after the frame it answers.
             time.sleep(max(0.0, deadline - clock()))
             begin = clock()
             if begin - deadline > PERIOD / 2:
@@ -287,7 +276,9 @@ def play_policy_game(
                 away += 1
                 if away > 25 * hz:
                     raise RuntimeError(f"the game was out of reach for 25 s ({dispatcher.error})")
+                dispatcher.join()
                 desk.release()
+                dispatcher.armed = False
                 focus(desk, tries=2)
                 dispatcher.refused = 0
                 continue
@@ -297,6 +288,30 @@ def play_policy_game(
             captured = clock()
             action, _sample = actor.act(frame.rgb, frame.meta["t_ns"], cursor=frame.meta["cursor"])
             acted = clock()
+            dispatcher.join()
+            if dispatcher.speed_clicks and not referee.running:
+                referee.clicked_speed_up()
+            wait = referee.due()
+            if wait is not None:
+                # The harness's own input, while no interval is in flight; the action
+                # just chosen answered a screen this changes, so it is dropped.
+                pointer = dispatcher.pointer or frame.meta["cursor"]
+                pointer = (pointer[0] / width, pointer[1] / height)
+                desk.release()
+                dispatcher.armed = False
+                if wait == "start":
+                    run_game(desk, pointer)
+                    referee.started()
+                    log.info("[%s] the game runs, %.0f s after the start", station, clock() - start)
+                else:
+                    paused = is_paused(desk, rules) if rules is not None else True
+                    run_game(desk, pointer, space=paused)
+                    referee.restarted()
+                    log.info(
+                        "[%s] the game stalled; set running again (paused=%s)", station, paused
+                    )
+                deadline = clock()
+                continue
             cursor = frame.meta["cursor"]
             dispatcher.start(action, clock(), (float(cursor[0]), float(cursor[1])))
             timings.append(
@@ -403,6 +418,7 @@ def evaluate_policy(
     cap_minutes=15.0,
     setup_seconds=90.0,
     memory_window=None,
+    point=False,
     model_path=None,
     seed=None,
 ):
@@ -426,7 +442,9 @@ def evaluate_policy(
     station = Station("peer", peer)
     end = time.monotonic() + minutes * 60
     try:
-        actor = Actor(checkpoint, model_path, game_speed=5, memory_window=memory_window)
+        actor = Actor(
+            checkpoint, model_path, game_speed=5, memory_window=memory_window, point=point
+        )
         for index in range(games):
             # A game takes about 3 minutes to launch and up to cap_minutes to play.
             if time.monotonic() + (cap_minutes + 4) * 60 > end:

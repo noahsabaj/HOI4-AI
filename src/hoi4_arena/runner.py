@@ -129,12 +129,17 @@ class Actor:
         *,
         game_speed,
         memory_window=None,
+        point=False,
     ):
         """`memory_window` N runs the memory afresh over the last N decisions' perception
         at every decision, from an empty state, instead of carrying it from the game's
         start: the memory then sees what it saw in training, where windows are a few
-        decisions long (train-bc's burn-in plus sequence). None carries it, as always."""
+        decisions long (train-bc's burn-in plus sequence). None carries it, as always.
+        `point` places each move on its likeliest spot while still sampling what to do
+        (models.ActionHead): for evaluation, not for self-play, whose likelihoods must be of
+        samples."""
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
+        self.point = point
         self.memory_window = memory_window
         self.recent = deque(maxlen=memory_window) if memory_window else None
         # The policy is told the speed the match runs at: the same clip is a different
@@ -214,6 +219,7 @@ class Actor:
                         cells,
                         noise=torch.zeros(1, self.policy.actor.noise_dim, device=self.device),
                         deterministic=self.deterministic,
+                        point=getattr(self, "point", False),
                     )
         torch.cuda.synchronize()
 
@@ -279,7 +285,11 @@ class Actor:
                 getattr(self.policy.actor, "latents", None),
             )
             action, logp, entropy = self.policy.actor(
-                self.hidden, cells, noise=noise, deterministic=self.deterministic
+                self.hidden,
+                cells,
+                noise=noise,
+                deterministic=self.deterministic,
+                point=getattr(self, "point", False),
             )
         # One host transfer for the whole sample. Four separate .cpu()/.item() calls
         # each waited for the GPU, on the same thread that has to start the next capture.
