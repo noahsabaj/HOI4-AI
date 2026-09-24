@@ -24,10 +24,10 @@ Calibrated live at 1920x1080 on 2026-09-23:
 - Z is the Front Line tool. A click on the border sets the front along all of it.
 - X is the Offensive Line tool. A right-drag from the front into enemy land draws the
   offensive, which the game routes along its own path.
-- The green arrow above the army card activates the plan. It has three looks: idle,
-  executing (lit), and a green check when a plan is drawn for an army that was
-  executing, which starts it at once. The red stop button beside it shows with any
-  plan and not without one.
+- The green arrow above the army card activates the plan. It has three looks: idle
+  (dots), ready (a green check, once the divisions are in place, as after a redraw)
+  and executing (lit, on a green ground). Idle and ready both need a click. The red
+  stop button beside it shows with any plan and not without one.
 - The Battle Plans bar shows while an army is selected.
 - Q opens the political screen. Its first law slot is conscription: a click lists the
   laws, a click on one asks "Replace Idea?", and OK changes it for political power (150
@@ -78,6 +78,8 @@ FOUND = {
     "trash": 0.8,
     # The open law list's title: 1.00 open, at most 0.51 on other screens.
     "law_list": 0.8,
+    # The plan's arrow with a green check (ready, not executing): 1.00 where it showed.
+    "ready": 0.8,
 }
 # The create-army + glows while divisions are selected, so no fixed picture of it holds:
 # the first live game's frames scored 0.17 against a template taken a minute earlier.
@@ -120,8 +122,7 @@ ARMY_BAR_TOP = 0.88
 COLUMNS, ROWS, STATE_WIDTH, STATE_HEIGHT, STATE_ROWS = 24, 8, 3, 4, 2
 ENEMY = {"BLU": "RED", "RED": "BLU"}
 # Arrows toward one state lost the front's flanks or its rear in every game with them
-# (2026-09-23), so most games attack broad. None holds only: a held front with a general
-# and Extensive conscription stood unbroken for five years, a draw.
+# (2026-09-23), so most games attack broad.
 ATTACKS = {"broad": 0.7, "near": 0.15, "deep": 0.15}
 
 
@@ -452,23 +453,35 @@ class Planner:
         )
 
     def activate(self, desk):
-        """The plan executed: a click on the card's idle arrow. True once it executes,
-        also when it did already: an army that was executing starts a plan drawn for it
-        at once, and its arrow shows a green check instead."""
+        """The plan executed: a click on the card's arrow while it is idle (dots) or
+        ready (a green check), checked. True once the arrow is lit, that is executing.
+
+        The check shows when a plan is redrawn for divisions already in place, and it
+        does not execute: taken for executing, it left one game's army holding its line
+        for five years after the first redraw, from 1936 to the 15-minute cap.
+        """
         if not self.select_army(desk):
             return False
         rgb = screen(desk)
-        button = self.find(rgb, "activate", top=0.8)
+        button = self.find(rgb, "activate", top=0.8) or self.find(rgb, "ready", top=0.8)
         if button is None:
-            if plan_shown(rgb):
-                self.active = True
-                return True
-            return False
+            return plan_shown(rgb) and self.lit(desk)
         self.click(desk, button)
         time.sleep(0.8)
-        self.active = True
+        # Off the button, so that it is not drawn hovered.
+        act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}])
+        time.sleep(0.3)
+        if not self.lit(desk):
+            return False
         self.order("activate")
         return True
+
+    def lit(self, desk):
+        """Whether the army's plan is executing: a plan shows, neither idle nor ready."""
+        rgb = screen(desk)
+        waiting = self.find(rgb, "activate", top=0.8) or self.find(rgb, "ready", top=0.8)
+        self.active = plan_shown(rgb) and waiting is None
+        return self.active
 
     def setup(self, desk):
         """While paused: the army, its general, its front, its offensive; then run."""
@@ -636,6 +649,7 @@ TEMPLATES = {
     "no_commander": "artifacts/screens-1080p/no-commander.png",
     "trash": "artifacts/screens-1080p/plan-trash.png",
     "law_list": "artifacts/screens-1080p/law-list-title.png",
+    "ready": "artifacts/screens-1080p/plan-ready.png",
 }
 
 

@@ -258,3 +258,28 @@ def test_a_plan_shows_as_the_army_card_s_red_stop_button():
     for red in (160, 220):  # Executing (darker) and idle.
         screen[y0:y1, x0:x1] = (red, 40, 40)
         assert plan_shown(screen)
+
+
+def test_a_plan_executes_only_once_its_arrow_is_neither_idle_nor_ready(monkeypatch):
+    from hoi4_arena import scripted
+
+    noise = np.random.default_rng(2)
+    shapes = {n: noise.integers(0, 255, (20, 32, 3), dtype=np.uint8) for n in ("activate", "ready")}
+    background = noise.integers(0, 255, (1080, 1920, 3), dtype=np.uint8)
+    looks = {"arrow": None, "plan": True}
+
+    def fake_screen(desk):
+        rgb = background.copy()
+        x0, y0, x1, y1 = scripted.STOP_BUTTON
+        rgb[y0:y1, x0:x1] = (200, 40, 40) if looks["plan"] else (30, 30, 30)
+        if looks["arrow"]:
+            rgb[949:969, 953:985] = shapes[looks["arrow"]]
+        return rgb
+
+    monkeypatch.setattr(scripted, "screen", fake_screen)
+    planner = Planner("BLU", choose_plan(random.Random(1)), shapes, None, 5, frame=lambda: 0)
+    for arrow, executing in (("activate", False), ("ready", False), (None, True)):
+        looks["arrow"] = arrow
+        assert planner.lit(None) is executing
+    looks["plan"] = False
+    assert planner.lit(None) is False
