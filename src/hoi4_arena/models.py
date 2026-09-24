@@ -407,7 +407,9 @@ class ActionHead(nn.Module):
         self.fine = nn.Sequential(nn.Linear(256 + cell_dim, 256), nn.GELU(), nn.Linear(256, GRID))
         self.scale = 1 / math.sqrt(cell_dim)
 
-    def forward(self, memory, cells, actions=None, noise=None, deterministic=False, sigma=0.0):
+    def forward(
+        self, memory, cells, actions=None, noise=None, deterministic=False, sigma=0.0, point=False
+    ):
         """Sample (or score, given `actions`) the eight slots.
 
         `cells` is (B, GRID, cell_dim): the screen's CELLS x CELLS map, row-major, as
@@ -420,6 +422,11 @@ class ActionHead(nn.Module):
         each (`soft_pointer`). A click anywhere on a button is right, and one 3 px off
         the demonstrated pixel should not be scored as wrong as one across the screen.
         The returned score is then that negative cross-entropy, not a likelihood.
+
+        `point`, when sampling, takes the likeliest place of a move (its cell, then the
+        position inside it) while the kind is still sampled: greedy pointing, sampled
+        acting. A sampled place lands on a wrong button as often as the head leaves mass
+        there. The likelihood returned is then of the place taken, not of a sample.
 
         The entropy of a slot is the kind's, plus, weighted by the chance of a move, the
         cell's and the position's within one cell. That last term is exact only for the
@@ -453,11 +460,12 @@ class ActionHead(nn.Module):
             elif deterministic:
                 kind, place = kinds.argmax(-1), places.argmax(-1)
             else:
-                kind, place = gumbel_argmax(kinds), gumbel_argmax(places)
+                kind = gumbel_argmax(kinds)
+                place = places.argmax(-1) if point else gumbel_argmax(places)
             chosen = cells[rows, place].to(state.dtype)
             fine = categorical(self.fine(torch.cat([state, chosen], -1)).float())
             if actions is None:
-                offset = fine.argmax(-1) if deterministic else gumbel_argmax(fine)
+                offset = fine.argmax(-1) if deterministic or point else gumbel_argmax(fine)
             kind_p, place_p, fine_p = kinds.softmax(-1), places.softmax(-1), fine.softmax(-1)
             move = (kind == 1).float()
             moved = moved | (kind == 1)
