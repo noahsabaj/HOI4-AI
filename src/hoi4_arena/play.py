@@ -567,12 +567,15 @@ def evaluate_policy(
     temperature=1.0,
     model_path=None,
     seed=None,
+    saves=None,
 ):
     """Play up to `games` games (or until `minutes` run out) on the second PC and record them.
 
     With `reservation`, the second PC is first reserved from the scripted player's agent
     (reserve) and handed back when done, with HOI4 closed. Countries alternate. Returns
-    the results, as record-ai writes them, so win-rate reads them too.
+    the results, as record-ai writes them, so win-rate reads them too. `saves`, {country:
+    save name}, launches each game straight into a save made paused at the start of a new
+    game as that country, as record-ai does, skipping the menus.
     """
     from .runner import Actor
     from .scripted import win_rate
@@ -606,16 +609,19 @@ def evaluate_policy(
             entry = {"game": name, "station": "peer", "started_as": country, "speed": 5}
             entry["declare_drawn"] = rng.choice(("BLU", "RED"))
             entry["checkpoint"] = actor.digest
+            save = (saves or {}).get(country)
+            entry["start_save"] = save
             try:
                 station.quit()
-                station.launch(mod)
-                time.sleep(25)
+                station.launch(mod, save=save)
+                if not save:
+                    time.sleep(25)
                 with station.connect() as desk:
                     if not focus(desk):
                         raise RuntimeError("could not bring the game window to the front")
                     start_game(
                         desk, screen_rules, out_root / f"{name}-start-failed.png", country, 5,
-                        observe=False, declarer=entry["declare_drawn"],
+                        observe=False, declarer=entry["declare_drawn"], saved=bool(save),
                     )  # fmt: skip
                     log.info("[peer] %s: the policy plays %s", name, country)
                     outcome, reason, manifest = play_policy_game(

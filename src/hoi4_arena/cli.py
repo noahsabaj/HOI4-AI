@@ -213,6 +213,13 @@ def main():
         default=1.0,
         help="Below 1 sharpens what the policy does each slot (its likeliest input gains)",
     )
+    live.add_argument(
+        "--start-save",
+        nargs="+",
+        metavar="COUNTRY:SAVE",
+        help="Launch games as COUNTRY straight into SAVE, a save made paused at the start of a "
+        "new game (as record-ai --start-save), skipping the menus",
+    )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
     heat = sub.add_parser(
@@ -879,6 +886,7 @@ def _dispatch(command, args):
         from .play import evaluate_policy
 
         args["countries"] = tuple(args["countries"])
+        args["saves"] = dict(item.split(":", 1) for item in args.pop("start_save") or [])
         result = evaluate_policy(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "heatmap":
         from .heatmap import draw_heatmaps
