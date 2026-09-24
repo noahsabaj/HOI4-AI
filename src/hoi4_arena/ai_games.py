@@ -625,7 +625,7 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
 def play(desk, root, popups, settings, station, country="BLU", speed=4, player=None):
     """Record one game to its end. With `player` (a plan, templates and screen rules), the
     scripted player fights it from its paused start; without, the game's AI plays both."""
-    from .scripted import Planner
+    from .scripted import Planner, arena_layout
 
     stop = threading.Event()
     inputs = Logged(desk)
@@ -638,7 +638,7 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4, player=N
     if player:
         planner = Planner(
             country, player["plan"], player["templates"], player["rules"], speed,
-            frame=lambda: rec.manifest["frames"],
+            frame=lambda: rec.manifest["frames"], layout=arena_layout(settings["mod"]),
         )  # fmt: skip
     mover = threading.Thread(
         target=camera,

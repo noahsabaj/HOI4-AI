@@ -61,9 +61,11 @@ Calibrated live at 1920x1080 on 2026-09-23:
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -224,13 +226,39 @@ def choose_plan(rng, shares=None):
     }
 
 
-def state_at(u, v):
+def arena_layout(mod):
+    """Which state lies where in a generated arena, as a grid over its land box, or None.
+
+    mapgen samples it into generation.json (since the terrain arenas), so a border that
+    bends round a bulge, or a bay, is read off the arena itself rather than the grid.
+    """
+    try:
+        found = json.loads((Path(mod) / "generation.json").read_text()).get("layout")
+    except (OSError, ValueError):
+        return None
+    if not found:
+        return None
+    return np.array([[int(s) for s in row.split()] for row in found["states"]])
+
+
+def state_at(u, v, layout=None):
     """The arena state under a point at (u, v), fractions of the arena's land box.
 
-    The box is both countries' land fully zoomed out, Blue's on the left. Red's half is
-    Blue's turned half a turn, so its columns count from the east and its rows from the
-    bottom. Provinces are hexagons, so a point near a state's edge can be off by one.
+    The box is both countries' land fully zoomed out, Blue's on the left. With the
+    arena's `layout` (arena_layout) the state is looked up there, and a point over water
+    takes the nearest land's. Without one, Red's half is Blue's turned half a turn, so its
+    columns count from the east and its rows from the bottom. Provinces are irregular, so
+    a point near a state's edge can be off by one.
     """
+    if layout is not None:
+        rows, columns = layout.shape
+        row = min(rows - 1, max(0, int(v * rows)))
+        column = min(columns - 1, max(0, int(u * columns)))
+        if layout[row, column]:
+            return int(layout[row, column])
+        ys, xs = np.nonzero(layout)
+        nearest = np.argmin((ys - row) ** 2 + (xs - column) ** 2)
+        return int(layout[ys[nearest], xs[nearest]])
     column = min(COLUMNS - 1, max(0, int(u * COLUMNS)))
     row = min(ROWS - 1, max(0, int(v * ROWS)))
     first = 1
@@ -264,8 +292,10 @@ class Planner:
     game runs. `frame` returns the number of frames recorded so far, to stamp orders.
     """
 
-    def __init__(self, country, plan, templates, rules, speed, frame, rng=None):
+    def __init__(self, country, plan, templates, rules, speed, frame, rng=None, layout=None):
         self.country, self.enemy = country, ENEMY[country]
+        # The arena's state layout, when its mod has one (arena_layout).
+        self.layout = layout
         self.plan, self.templates, self.rules, self.speed = plan, templates, rules, speed
         self.frame = frame
         self.rng = rng or random.Random()
@@ -523,7 +553,7 @@ class Planner:
                 "offensive",
                 attack="broad",
                 line=points,
-                target_states=sorted({state_at(u, v) for u, v in points}),
+                target_states=sorted({state_at(u, v, self.layout) for u, v in points}),
             )
             return
         # How far each enemy pixel lies from the seam, as a fraction of the enemy's width:
@@ -549,7 +579,7 @@ class Planner:
             attack=self.plan["attack"],
             start=self.box_point(box, *start),
             target=[u, v],
-            target_state=state_at(u, v),
+            target_state=state_at(u, v, self.layout),
         )
 
     def activate(self, desk):

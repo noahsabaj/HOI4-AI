@@ -115,6 +115,23 @@ def test_points_map_to_the_states_mapgen_numbers():
     )
 
 
+def test_a_layout_names_states_off_the_arena_itself(tmp_path):
+    import json
+
+    from hoi4_arena.scripted import arena_layout
+
+    # A 4x2 layout with water (0) in its top right corner, as a bay leaves.
+    (tmp_path / "generation.json").write_text(
+        json.dumps({"layout": {"box": [0, 0, 8, 4], "states": ["1 7 16 0", "2 8 15 9"]}})
+    )
+    layout = arena_layout(tmp_path)
+    assert state_at(0.1, 0.1, layout) == 1 and state_at(0.6, 0.9, layout) == 15
+    # Over water the nearest land's state: the bay's corner is next to state 16 and 9.
+    assert state_at(0.95, 0.1, layout) in (16, 9)
+    # An arena from before the layouts has none, and the grid is used.
+    assert arena_layout(tmp_path / "missing") is None
+
+
 def test_the_front_is_where_the_two_countries_touch():
     blue = np.zeros((10, 20), bool)
     red = np.zeros((10, 20), bool)
