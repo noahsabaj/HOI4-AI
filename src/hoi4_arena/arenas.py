@@ -897,3 +897,62 @@ def trunk_rails(blue, neighbours, cost, terminals, crossings, twin, loops=2):
         across.add(tuple(sorted((b, r))))
         across.add(tuple(sorted((twin(b), twin(r)))))
     return sorted(links | turned | across)
+
+
+# ---------------------------------------------------------------------------------------
+# What the front is like.
+
+# The attack penalty for attacking into each terrain, from the stock
+# common/terrain/00_terrain.txt (units = { attack = ... }), and for crossing a small or
+# large river, from NMilitary.RIVER_CROSSING_PENALTY and RIVER_CROSSING_PENALTY_LARGE.
+ATTACK = {
+    "plains": 0.0,
+    "forest": -0.15,
+    "hills": -0.25,
+    "urban": -0.30,
+    "marsh": -0.40,
+    "mountain": -0.50,
+}
+RIVER_ATTACK = {False: -0.30, True: -0.60}
+
+
+def river_borders(ids, rivers):
+    """The largest river index along each shared province border, as {(a, b): index}
+    with a < b: a river pixel on either side of a shared edge marks the pair."""
+    found = {}
+    for a, b, ra, rb in (
+        (ids[:-1], ids[1:], rivers[:-1], rivers[1:]),
+        (ids[:, :-1], ids[:, 1:], rivers[:, :-1], rivers[:, 1:]),
+    ):
+        edge = a != b
+        for side, other, index in ((a, b, ra), (b, a, rb)):
+            hit = edge & (index >= 0)
+            low = np.minimum(side[hit], other[hit]).tolist()
+            high = np.maximum(side[hit], other[hit]).tolist()
+            for x, y, value in zip(low, high, index[hit].tolist()):
+                found[(x, y)] = max(found.get((x, y), -1), value)
+    return found
+
+
+def front_report(neighbours, owner, terrain, rivers):
+    """How many Blue and Red provinces touch, and what attacking across costs there:
+    the defender's terrain penalty plus the river's, as the combat screen adds them."""
+    penalties, rivered = [], 0
+    for a, sides in neighbours.items():
+        for b in sides:
+            if a < b and owner[a - 1] and owner[b - 1] and owner[a - 1] != owner[b - 1]:
+                defender = a if owner[a - 1] == 2 else b
+                penalty = ATTACK[terrain[defender - 1]]
+                river = rivers.get((a, b), -1)
+                if river >= 0:
+                    rivered += 1
+                    penalty += RIVER_ATTACK[river >= 7]
+                penalties.append(max(penalty, -0.9))
+    return {
+        "pairs": len(penalties),
+        "mean_attack": round(float(np.mean(penalties)), 3) if penalties else 0.0,
+        "share_at_40_or_worse": round(float(np.mean(np.array(penalties) <= -0.4)), 2)
+        if penalties
+        else 0.0,
+        "river_borders": rivered,
+    }

@@ -203,6 +203,7 @@ def generate(
     output,
     *,
     preset=None,
+    seed=None,
     undefended=None,
     victory_points_on_border=False,
     columns_per_half=COLUMNS_PER_HALF,
@@ -215,7 +216,8 @@ def generate(
     """Write an arena. Apart from `preset`, the keyword arguments build diagnostics.
 
     `preset` names a design in `arenas.PRESETS`, which also sets the grid (12 by 8
-    provinces a side in 8 states) unless the grid arguments override it.
+    provinces a side in 8 states) unless the grid arguments override it. `seed` redraws
+    its noise, province shapes and river courses: the same design, another map.
 
     `undefended` fields no divisions for one side. `victory_points_on_border` moves every
     victory point onto the border column. That does not produce a surrender: capitulation
@@ -293,7 +295,9 @@ def generate(
             for y in range(rows)
         ]
     )
-    rng = np.random.default_rng(design.seed) if design else None
+    if design:
+        seed = design.seed if seed is None else int(seed)
+    rng = np.random.default_rng(seed) if design else None
     # Design units: 24 by 8 across both countries' land, whatever the actual grid.
     scale_x = arenas.DESIGN_COLUMNS / (2 * land_columns)
     scale_y = arenas.DESIGN_ROWS / land_rows
@@ -469,6 +473,7 @@ def generate(
         lookup[1:] = owner
         river_paths, joined = arenas.draw_rivers(design.rivers, ids, kind_px, lookup[ids], to_pixel)
         river_px = arenas.river_pixels(river_paths, joined, ids.shape)
+        river_borders = arenas.river_borders(ids, river_px)
         heights = arenas.relief(rng, types_px, kind_px, river_px)
         cities_both = [c + 1 for c in city_cells] + [c + 1 + half_count for c in city_cells]
         urban_px, style_px, lights_px = arenas.city_layers(rng, ids, cities_both, anchor)
@@ -1220,7 +1225,8 @@ def generate(
         blue = [i for i in range(1, half_count + 1) if land[i - 1]]
         report["design"] = {
             "title": design.title,
-            "seed": design.seed,
+            "seed": seed,
+            "front": arenas.front_report(neighbours, owner, terrain_types, river_borders),
             "terrain": {
                 name: sum(1 for i in blue if terrain_types[i - 1] == name)
                 for name in arenas.LAND_TYPES

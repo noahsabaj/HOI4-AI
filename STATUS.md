@@ -244,9 +244,11 @@ What a preset paints, all with stock assets:
   is taken through a displacement that turns with the map, so coasts, state borders and
   the front are no longer ruled lines.
 
-A preset takes 13–17 s to generate. `generation.json` records the preset, its terrain
-counts, and a state layout over the land box, from which `scripted.state_at` names the
-state under a point on any arena, bulges included.
+A preset takes 13–17 s to generate. `--seed` redraws its noise, province shapes and
+river courses: the same design, another map, so an agent need not learn one map by
+heart. `generation.json` records the preset and seed, its terrain counts, its front
+(the numbers in the table above), and a state layout over the land box, from which
+`scripted.state_at` names the state under a point on any arena, bulges included.
 
 Live test, `arena-plains-v1` (2026-09-24, second PC, scripted Blue against the AI):
 loaded and ran 15 minutes with no errors, and the scripted player found its fronts on

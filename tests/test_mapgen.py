@@ -248,7 +248,8 @@ def preset_arenas(tmp_path_factory):
     built = {}
     # marsh: lakes and a large river; salient: a bent border; bay: sea cut into the land.
     for name in ("marsh", "salient", "bay"):
-        report = generate(game, base / name, preset=name)
+        # The salient is drawn from another seed: the same design, another map.
+        report = generate(game, base / name, preset=name, seed=11 if name == "salient" else None)
         built[name] = (base / name, report, audit(base / name))
     return built
 
@@ -521,3 +522,17 @@ def test_ground_colours_stay_bright_and_neutral_enough_to_read_as_land():
         # No warmer than the plain arena's grass (red minus blue 16), which it was
         # calibrated on.
         assert r - b <= 18, index
+
+
+def test_a_seed_redraws_a_preset_and_the_report_measures_its_front(preset_arenas):
+    """The report says what attacking across each arena's border costs: the bay leaves
+    a narrow isthmus, the marsh puts much of its front at -40% or worse, and the bent
+    border of the salient is longer than a straight one."""
+    from hoi4_arena.arenas import PRESETS
+
+    fronts = {name: report["design"]["front"] for name, (_, report, _) in preset_arenas.items()}
+    assert preset_arenas["salient"][1]["design"]["seed"] == 11 != PRESETS["salient"].seed
+    assert preset_arenas["marsh"][1]["design"]["seed"] == PRESETS["marsh"].seed
+    assert fronts["bay"]["pairs"] < fronts["marsh"]["pairs"] < fronts["salient"]["pairs"]
+    assert fronts["marsh"]["share_at_40_or_worse"] >= 0.25
+    assert fronts["bay"]["mean_attack"] > fronts["marsh"]["mean_attack"]
