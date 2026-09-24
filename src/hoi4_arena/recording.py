@@ -340,6 +340,9 @@ class StreamRecorder:
         self._manifest()
 
     def _sample(self):
+        # Once a recording: near its limit Windows grows a managed pagefile, and the second
+        # PC's games ran there for hours (2026-09-24); telemetry.jsonl keeps every reading.
+        warned = False
         with (self.root / "telemetry.jsonl").open("a", encoding="utf8") as out:
             while not self.stopping.wait(TELEMETRY_EVERY):
                 try:
@@ -359,8 +362,8 @@ class StreamRecorder:
                 }  # fmt: skip
                 out.write(json.dumps(row) + "\n")
                 out.flush()
-                if commit_near_limit(reply.get("memory") or {}):
-                    memory = reply["memory"]
+                if not warned and commit_near_limit(reply.get("memory") or {}):
+                    warned, memory = True, reply["memory"]
                     log.warning(
                         "the recording PC has committed %s of its %s MB of memory",
                         memory.get("commit_mb"), memory.get("commit_limit_mb"),

@@ -7,6 +7,7 @@ through an observer connection, so it works while a recording holds the game the
 from __future__ import annotations
 
 import json
+import re
 import time
 
 
@@ -25,6 +26,69 @@ def commit_near_limit(memory: dict) -> bool:
     return bool(commit and limit and commit >= COMMIT_WARNING * limit)
 
 
+# Room kept free on the pagefile's drive, and RAM kept free beside a game.
+DISK_RESERVE_MB, RAM_RESERVE_MB = 20 * 1024, 1024
+
+
+def pagefile_policy(report: str) -> dict | None:
+    """How a PC's pagefile may grow, from its worker's report (Game-Control.ps1):
+    {"drive": "C:", "max_mb": None} where Windows sizes it, a number where it is set by
+    hand, or None where the report does not say."""
+    managed = re.search(r"^pagefile managed by Windows: (\w+)", report, re.M)
+    now = re.search(r"^pagefile now: ([A-Za-z]:)", report, re.M)
+    setting = re.search(
+        r"^pagefile setting: ([A-Za-z]:)\S*, initial \d+ MB, maximum (\d+) MB", report, re.M
+    )
+    where = now or setting
+    if not managed or not where:
+        return None
+    drive = where.group(1).upper()
+    if managed.group(1) == "True" or (setting and setting.group(2) == "0"):
+        return {"drive": drive, "max_mb": None}
+    return {"drive": drive, "max_mb": int(setting.group(2))} if setting else None
+
+
+def commit_ceiling(memory: dict, disks: list, pagefile: dict | None) -> int:
+    """The commit limit a PC can reach: today's, plus what Windows may still add to its
+    pagefile. Windows grows a pagefile it manages when the commit charge nears the limit,
+    up to three times the RAM and an eighth of its drive, while the drive has room. On
+    2026-09-24 the second PC's limit grew 34.6 -> 40.3 GB with games running at 97% of it.
+    """
+    limit, ram = memory["commit_limit_mb"], memory.get("total_mb") or 0
+    disk = next((d for d in disks or [] if pagefile and d.get("drive") == pagefile["drive"]), None)
+    if not disk or not ram:
+        return limit
+    cap = pagefile["max_mb"]
+    if cap is None:
+        cap = min(3 * ram, disk["total_gb"] * 1024 / 8)
+    now = max(0, limit - ram)
+    room = disk["free_gb"] * 1024 - DISK_RESERVE_MB
+    return int(limit + max(0, min(cap - now, room)))
+
+
+def game_fits(reply: dict, pagefile: dict | None, need_mb: float, share: float) -> str | None:
+    """Why a game needing `need_mb` more would not fit a PC, from its telemetry `reply`,
+    or None if it would: its commit charge must stay under `share` of the limit it can
+    reach (commit_ceiling), and its free RAM must hold the game.
+
+    The commit charge is memory promised, not used: each HOI4 launch on the second PC left
+    about 115 MB of it promised to the compositor (dwm.exe) for good, while 25 of its 32 GB
+    of RAM stayed free (2026-09-24). So the limit that matters is the one it can grow to.
+    """
+    memory = reply.get("memory") or {}
+    commit, limit = memory.get("commit_mb"), memory.get("commit_limit_mb")
+    if not commit or not limit:
+        return None
+    ceiling = commit_ceiling(memory, reply.get("disks"), pagefile)
+    if commit + need_mb >= share * ceiling:
+        share_now = (commit + need_mb) / ceiling
+        return f"commit charge would be {share_now:.0%} of the {ceiling} MB it can reach"
+    free = memory.get("available_mb")
+    if free is not None and free < need_mb + RAM_RESERVE_MB:
+        return f"only {free} MB of RAM free"
+    return None
+
+
 def summary(reply: dict) -> str:
     """A few lines a person can read: the machine, then the processes that matter."""
     cpu, memory = reply.get("cpu") or {}, reply.get("memory") or {}
@@ -37,7 +101,8 @@ def summary(reply: dict) -> str:
     if commit_near_limit(memory):
         lines.append(
             "WARNING: memory committed is near its limit; past it, allocations fail and the "
-            "game or the recording can crash, however much RAM is free"
+            "game or the recording can crash, however much RAM is free, unless Windows can "
+            "grow the pagefile"
         )
     for gpu in reply.get("gpu") or []:
         lines.append(

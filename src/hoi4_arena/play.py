@@ -41,6 +41,7 @@ from .arena_log import ArenaLog
 from .dataset import DETAIL_SIZE, FOVEA_SIZE, VIEW_SIZE
 from .desktop import DesktopError, EmergencyStop
 from .recording import STREAM_CODECS, Recorder, StreamRecorder, StreamUnavailable
+from .telemetry import game_fits
 
 log = logging.getLogger(__name__)
 
@@ -570,22 +571,25 @@ COMMIT_SHARE = float(os.environ.get("HOI4_COMMIT_SHARE", "0.95"))
 
 
 def room_for_a_game(station, tries=10, wait=30.0):
-    """Whether the second PC's commit, with HOI4 closed, leaves room for a game: its commit
-    plus GAME_COMMIT_MB under COMMIT_SHARE of the limit. Waits and looks again a few times
-    (the recorder that lent the PC may still be closing its game). The reading, logged."""
-    reading = {}
+    """Whether the second PC, with HOI4 closed, has room for a game (game_fits: its commit
+    plus GAME_COMMIT_MB under COMMIT_SHARE of the limit it can grow to, and RAM for it).
+    Waits and looks again a few times (the recorder that lent the PC may still be closing
+    its game). The reading, logged."""
+    pagefile = station.pagefile()
     for _ in range(tries):
         try:
             with station.connect(attach=False) as desk:
-                reading = desk.telemetry(timeout=15).get("memory") or {}
+                reply = desk.telemetry(timeout=15)
         except Exception as error:  # noqa: BLE001 - no reading is no room.
             log.warning("[peer] telemetry failed: %s", error)
-            reading = {}
-        commit, limit = reading.get("commit_mb"), reading.get("commit_limit_mb")
-        if commit and limit and commit + GAME_COMMIT_MB < COMMIT_SHARE * limit:
+            reply = {}
+        memory = reply.get("memory") or {}
+        commit, limit = memory.get("commit_mb"), memory.get("commit_limit_mb")
+        why = game_fits(reply, pagefile, GAME_COMMIT_MB, COMMIT_SHARE) if commit else "no reading"
+        if not why:
             log.info("[peer] room for a game: commit %s of %s MB", commit, limit)
             return True
-        log.warning("[peer] no room for a game yet: commit %s of %s MB", commit, limit)
+        log.warning("[peer] no room for a game yet: %s (commit %s of %s MB)", why, commit, limit)
         time.sleep(wait)
     return False
 
