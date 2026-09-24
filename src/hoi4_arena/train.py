@@ -341,6 +341,8 @@ def _train_bc(
     carry=False,
     reinit=(),
     press_weight=1.0,
+    drop_parking=False,
+    setup_weight=1.0,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -363,7 +365,8 @@ def _train_bc(
     exactly the order training has always seen. Clips are read only for an encoder that
     reads them: the default Qwen3.5 tower reads the quadrants alone.
 
-    `lead_in`, `drop_keys` and `loser_weight` pass to dataset.session_labels.
+    `lead_in`, `drop_keys`, `loser_weight`, `press_weight`, `drop_parking` and
+    `setup_weight` pass to dataset.session_labels.
     `state_weight` > 0 adds the privileged-state loss: a linear read-out of the memory
     predicts the arena's true state at each decision (privileged.NAMES), from the
     arena log, weighted by it; the read-out is saved beside the policy and never used to
@@ -410,6 +413,8 @@ def _train_bc(
         "orders": order_weight > 0,
         "tower": tower_cache,
         "press_weight": press_weight,
+        "drop_parking": drop_parking,
+        "setup_weight": setup_weight,
     }
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
@@ -516,6 +521,8 @@ def _train_bc(
         "carry": carry,
         "reinit": list(reinit),
         "press_weight": press_weight,
+        "drop_parking": drop_parking,
+        "setup_weight": setup_weight,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

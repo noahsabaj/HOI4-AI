@@ -261,6 +261,18 @@ def main():
         help="Spread over every move, or only the aimed ones: moves onto something pressed",
     )
     heat.add_argument("--model")
+    aim = sub.add_parser(
+        "setup-pointing",
+        help="How near a policy points to the setup's clicks (the unassigned-divisions alert, "
+        "the create-army +, the commander portrait, the first front line) in recordings, its "
+        "memory carried from each one's start: miss in pixels and the chance of a hit",
+    )
+    aim.add_argument("checkpoint")
+    aim.add_argument("data", help="A recording, or a folder of them (with splits.json)")
+    aim.add_argument("--split", default="validation", help="Which of a folder's recordings")
+    aim.add_argument("--radius", type=float, default=30.0, help="A hit's distance in pixels")
+    aim.add_argument("--output", help="Also write the report to this JSON file")
+    aim.add_argument("--model")
     rate = sub.add_parser(
         "win-rate",
         help="The scripted player's record against the game's AI, from record-ai results",
@@ -301,6 +313,18 @@ def main():
     )
     check.add_argument("source")
     check.add_argument("--sources", nargs="+", default=["human", "ai"])
+    check.add_argument("--lead-in", type=int, help="Decision intervals before the first one")
+    check.add_argument(
+        "--drop-keys",
+        nargs="+",
+        default=[],
+        type=lambda text: int(text, 0),
+        help="Key codes left out of the labels (0x20: space)",
+    )
+    check.add_argument(
+        "--drop-parking", action="store_true", help="Leave out the pointer's parking moves"
+    )
+    check.add_argument("--look-before-click", action="store_true")
     rescue = sub.add_parser(
         "salvage",
         help="Finish recordings whose recorder was killed before it closed them, so training "
@@ -502,6 +526,19 @@ def main():
         default=1.0,
         help="Loss weight of decisions that press a key or button, or move onto what is "
         "pressed next (dataset.acting), against 1 for waiting and the camera",
+    )
+    train.add_argument(
+        "--drop-parking",
+        action="store_true",
+        help="Leave out the moves that only park the pointer so the scripted player can read "
+        "the screen (dataset.parking_moves)",
+    )
+    train.add_argument(
+        "--setup-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight of the setup's decisions, before the scripted player's run order "
+        "(dataset.setup_end), on top of --press-weight",
     )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
@@ -973,6 +1010,26 @@ def _dispatch(command, args):
             model_path=args["model"],
             targets=args["targets"],
         )
+    elif command == "setup-pointing":
+        from .dataset import recording_splits
+        from .heatmap import setup_pointing
+
+        data = Path(args["data"])
+        if (data / "manifest.json").exists():
+            chosen = [data]
+        else:
+            splits = recording_splits(data)
+            chosen = [
+                path.parent
+                for path in sorted(data.glob("*/manifest.json"))
+                if splits.get(path.parent.name, json.loads(path.read_text()).get("split"))
+                == args["split"]
+            ]
+        result = setup_pointing(
+            args["checkpoint"], chosen, model_path=args["model"], radius=args["radius"]
+        )
+        if args["output"]:
+            Path(args["output"]).write_text(json.dumps(result, indent=2))
     elif command == "win-rate":
         from .scripted import win_rate
 
@@ -1002,9 +1059,19 @@ def _dispatch(command, args):
         else:
             result = [salvage(root, dry_run=args["dry_run"]) for root in found]
     elif command == "check-session":
-        from .dataset import sequence_starts, session_labels
+        from .dataset import sequence_starts, session_labels, setup_end
 
-        labels = session_labels(args["source"], sources=tuple(args["sources"]))
+        labels = session_labels(
+            args["source"],
+            sources=tuple(args["sources"]),
+            lead_in=args["lead_in"],
+            drop_keys=tuple(args["drop_keys"]),
+            drop_parking=args["drop_parking"],
+            look_before_click=args["look_before_click"],
+        )
+        kinds = labels["actions"][..., 0]
+        valid = labels["valid"]
+        setup = labels["decisions"] < setup_end(labels["manifest"], labels["times"])
         result = {
             "decisions": len(labels["decisions"]),
             "excluded": len(labels["excluded"]),
@@ -1012,6 +1079,19 @@ def _dispatch(command, args):
             "split": labels["manifest"]["split"],
             "source": labels["label_source"],
             "game_speed": labels["speed"],
+            "parking_dropped": labels["parking"],
+            # What the labels hold, over the valid decisions: moves, and the moves to
+            # the screen's centre point, in the whole game and in its setup.
+            "moves": int((kinds[valid] == 1).sum()),
+            "moves_to_centre": int(
+                (
+                    (kinds == 1)
+                    & (labels["actions"][..., 1] == 512)
+                    & (labels["actions"][..., 2] == 512)
+                )[valid].sum()
+            ),
+            "setup_decisions": int((setup & valid).sum()),
+            "setup_moves": int((kinds[setup & valid] == 1).sum()),
         }
     elif command == "train-bc":
         from .train import train_bc

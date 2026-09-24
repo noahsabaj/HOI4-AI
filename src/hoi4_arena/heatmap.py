@@ -57,8 +57,10 @@ def heat_maps(policy, labels, device, decisions, window=64):
     """(decision, slot, kind probabilities, (GRID, GRID) map) for each of `decisions`.
 
     The slot is the decision's first demonstrated move, with the slots before it
-    teacher-forced, or slot 0 when the decision has no move.
+    teacher-forced, or slot 0 when the decision has no move. `decisions` may instead map
+    each decision to the slot to draw.
     """
+    slots = dict(decisions) if isinstance(decisions, dict) else {}
     wanted = set(int(d) for d in decisions)
     last = max(wanted)
     clips = reads_clip(policy.encoder)
@@ -90,7 +92,7 @@ def heat_maps(policy, labels, device, decisions, window=64):
                         d = start + t
                         if d in wanted:
                             actions = batch["actions"][:, t]
-                            slot = first_move(labels["actions"][d]) or 0
+                            slot = slots.get(d, first_move(labels["actions"][d]) or 0)
                             kind_p, grid = policy.actor.pointer_map(
                                 hidden, cells[:, t], actions, slot
                             )
@@ -170,6 +172,27 @@ def aimed(actions, decision, ahead=3):
     return False
 
 
+def trained_labels(config, recording, manifest):
+    """A recording's labels cut as a checkpoint's training cut them (`config`: its lead-in,
+    dropped keys and parking moves), with its frozen tower's cache when it has one."""
+    labels = session_labels(
+        recording,
+        sources=(manifest["source"],),
+        lead_in=config.get("lead_in"),
+        drop_keys=tuple(config.get("drop_keys") or ()),
+        drop_parking=bool(config.get("drop_parking")),
+    )
+    if config.get("tower_cache"):
+        # A policy trained on the frozen tower's cache reads it here too, when the
+        # recording is in it: the same numbers, without running the tower.
+        from .tower_cache import tower_paths
+
+        found = tower_paths(config["tower_cache"], recording)
+        if found is not None:
+            labels["tower"] = found
+    return labels
+
+
 def draw_heatmaps(
     checkpoint, recording, output, *, decisions=None, count=24, model_path=None, targets="moves"
 ):
@@ -188,20 +211,7 @@ def draw_heatmaps(
     recording, output = Path(recording), Path(output)
     manifest = json.loads((recording / "manifest.json").read_text())
     config = json.loads(Path(checkpoint).with_suffix(".json").read_text())["config"]
-    labels = session_labels(
-        recording,
-        sources=(manifest["source"],),
-        lead_in=config.get("lead_in"),
-        drop_keys=tuple(config.get("drop_keys") or ()),
-    )
-    if config.get("tower_cache"):
-        # A policy trained on the frozen tower's cache reads it here too, when the
-        # recording is in it: the same numbers, without running the tower.
-        from .tower_cache import tower_paths
-
-        found = tower_paths(config["tower_cache"], recording)
-        if found is not None:
-            labels["tower"] = found
+    labels = trained_labels(config, recording, manifest)
     moves = [
         d
         for d in np.flatnonzero(labels["valid"] & labels["readable"])
@@ -246,3 +256,110 @@ def draw_heatmaps(
     }
     (output / "heatmaps.json").write_text(json.dumps({"summary": summary, "maps": rows}, indent=2))
     return summary
+
+
+# The setup's first clicks, at the places the second PC's interface always shows them
+# (play.MILESTONES), and its first front line: the pointing that must work before the
+# army forms and takes a plan. No learned policy made the first click live (2026-09-24).
+SETUP_TARGETS = ("alert", "plus", "portrait", "front")
+FRONT_KEY = 0x5A
+
+
+def setup_targets(actions, width, height, within=15):
+    """{name: (decision, slot, (x, y) pixels)}: the move before the first left press on
+    the unassigned-divisions alert, the create-army +, the commander portrait, and the
+    first front-line click (a left press within `within` decisions after Z), from a
+    recording's labels (N, SLOTS, 3). A target the recording never clicked is absent.
+    """
+    from .actions import VOCAB
+    from .play import MILESTONES
+
+    front_key = VOCAB.index({"kind": "key", "vk": FRONT_KEY, "down": True})
+    found, last_move, key_at = {}, None, None
+    for d in range(len(actions)):
+        for slot in range(actions.shape[1]):
+            kind = int(actions[d, slot, 0])
+            if kind == 1:
+                last_move = (d, slot, target_pixel(actions[d], slot, width, height))
+            elif kind == front_key:
+                key_at = d
+            elif kind in PRESSES and VOCAB[kind]["button"] == 0 and last_move is not None:
+                x, y = last_move[2]
+                for name in SETUP_TARGETS[:3]:
+                    (cx, cy), (dx, dy) = MILESTONES[name]
+                    if name not in found and abs(x - cx) <= dx and abs(y - cy) <= dy:
+                        found[name] = last_move
+                if "front" not in found and key_at is not None and d - key_at <= within:
+                    found["front"] = last_move
+        if len(found) == len(SETUP_TARGETS):
+            break
+    return found
+
+
+def near_mass(grid, target, width, height, radius):
+    """The pointer's probability of landing within `radius` px of `target` (pixels)."""
+    lattice = np.arange(GRID) / (GRID - 1)
+    dx = (lattice * (width - 1) - target[0]) ** 2
+    dy = (lattice * (height - 1) - target[1]) ** 2
+    return float(grid[(dy[:, None] + dx[None, :]) <= radius * radius].sum())
+
+
+def setup_pointing(checkpoint, recordings, *, model_path=None, radius=30.0):
+    """How well a policy points at the setup's targets (setup_targets) in each recording.
+
+    The policy plays each recording from its start with its memory carried, as it plays
+    live, and at the scripted player's move onto each target gives its pointer map. Per
+    target: `miss_px`, from the map's hottest point to the target; `near`, the chance a
+    sampled move lands within `radius` px; `move`, the chance the slot moves at all. The
+    summary gives each target's median miss and mean chances over the recordings, and
+    `miss_px` the median over every target in every recording.
+    """
+    from .runner import load_policy
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config = json.loads(Path(checkpoint).with_suffix(".json").read_text())["config"]
+    policy, _, digest = load_policy(checkpoint, model_path, device)
+    policy.eval()
+    games, rows = [], []
+    for recording in recordings:
+        recording = Path(recording)
+        manifest = json.loads((recording / "manifest.json").read_text())
+        labels = trained_labels(config, recording, manifest)
+        width, height = manifest["width"], manifest["height"]
+        targets = setup_targets(labels["actions"], width, height)
+        wanted = {d: slot for d, slot, _ in targets.values() if labels["valid"][d]}
+        maps = (
+            {d: (kind_p, grid) for d, _, kind_p, grid in heat_maps(policy, labels, device, wanted)}
+            if wanted
+            else {}
+        )
+        game = {"recording": recording.name}
+        for name, (d, slot, target) in targets.items():
+            if d not in maps:
+                continue
+            kind_p, grid = maps[d]
+            hot_y, hot_x = np.unravel_index(int(np.argmax(grid)), grid.shape)
+            hot = (hot_x / (GRID - 1) * (width - 1), hot_y / (GRID - 1) * (height - 1))
+            row = {
+                "decision": int(d),
+                "miss_px": round(float(np.hypot(hot[0] - target[0], hot[1] - target[1])), 1),
+                "near": round(near_mass(grid, target, width, height, radius), 4),
+                "move": round(float(kind_p[1]), 4),
+            }
+            game[name] = row
+            rows.append((name, row))
+        games.append(game)
+    summary = {"checkpoint": digest, "games": len(games), "radius_px": radius}
+    for name in SETUP_TARGETS:
+        mine = [row for n, row in rows if n == name]
+        if mine:
+            summary[name] = {
+                "miss_px": float(np.median([r["miss_px"] for r in mine])),
+                "near": float(np.mean([r["near"] for r in mine])),
+                "move": float(np.mean([r["move"] for r in mine])),
+                "count": len(mine),
+            }
+    if rows:
+        summary["miss_px"] = float(np.median([row["miss_px"] for _, row in rows]))
+        summary["near"] = float(np.mean([row["near"] for _, row in rows]))
+    return {"summary": summary, "games": games}
