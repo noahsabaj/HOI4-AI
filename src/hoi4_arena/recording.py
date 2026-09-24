@@ -11,8 +11,8 @@ import uuid
 from pathlib import Path
 
 from .arena_log import ArenaLog
-from .dataset import FOVEA_SIZE, parse_cursor, recorded_speed
 from .desktop import Desktop, DesktopError, EmergencyStop
+from .layout import FOVEA_SIZE, parse_cursor, recorded_speed
 
 log = logging.getLogger(__name__)
 

@@ -6,6 +6,18 @@ import logging
 import sys
 from pathlib import Path
 
+# Commands that never touch a model, so they run without importing torch.
+NO_TORCH = {
+    "record",
+    "record-ai",
+    "control",
+    "telemetry",
+    "job",
+    "probe-peer",
+    "capture",
+    "win-rate",
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description="Screen-only HOI4 research prototype")
@@ -743,10 +755,13 @@ def main():
     tf32 = args.pop("tf32")
     gpu_memory = args.pop("gpu_memory")
     try:
-        from .models import configure_precision, limit_gpu_memory
+        # Recording, control and telemetry need no torch; importing it costs them 4 s and
+        # about 1.5 GB for the whole of a recording.
+        if command not in NO_TORCH:
+            from .models import configure_precision, limit_gpu_memory
 
-        configure_precision(tf32)
-        limit_gpu_memory(gpu_memory)
+            configure_precision(tf32)
+            limit_gpu_memory(gpu_memory)
         result = _dispatch(command, args)
     except KeyboardInterrupt:
         logging.getLogger(__name__).error("interrupted")
