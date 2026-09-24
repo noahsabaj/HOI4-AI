@@ -708,8 +708,19 @@ def fuse(module, summary, cells, centre, previous, speed, hidden, dtype=None):
     and the game speed. `module` holds the layers: a Policy, or features.MemoryHead,
     which trains the same layers on cached perception. `dtype` is what the parts are
     joined in, the clip's for a Policy, as it always was.
+
+    The summary and the fovea's reading are normalized first (a layer norm with no
+    parameters). The Qwen3.5 tower's summary is the mean of its last block's raw output,
+    about 50 in size; unnormalized, it drove the fusion to about 25 and every gate of the
+    memory into saturation, so the memory stood still: over a whole game its state did not
+    change (a standard deviation of 0.0 over time, 60-76% of its units at +-1, measured on
+    2026-09-24 for the scripted-game and AI-game policies alike) and the policy chose what
+    to do with the same probabilities at every decision. LeVJEPA's summary is already
+    normalized, so for it this changes little.
     """
     dtype = dtype or summary.dtype
+    summary = F.layer_norm(summary.float(), summary.shape[-1:]).to(summary.dtype)
+    centre = F.layer_norm(centre.float(), centre.shape[-1:]).to(centre.dtype)
     scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
     prior = module.previous_action((previous / scales).flatten(1).to(dtype))
     attention = torch.einsum("bnc,bc->bn", cells, module.read(hidden).to(cells.dtype))

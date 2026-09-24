@@ -939,6 +939,22 @@ beat (`win-rate`).
 The goal: a policy that reads only the screen and beats the game's AI in at least half
 of 20 live games. It learns by imitating the scripted player's recorded games.
 
+- **Every policy trained with the Qwen tower so far had a dead memory** (found
+  2026-09-24). The tower's summary is the mean of its last block's raw output, about 50
+  in size, and it went into the memory unnormalized. Training grew the fused vector to
+  about 25 and saturated every gate of the GRU: over a whole game its state did not
+  change (standard deviation 0.0 over time, 60-76% of its units at +-1), in the AI-games
+  policy `bc-v2s5` and in the scripted-games policy trained from it. Both chose what to
+  do with the same probabilities at every decision: at the scripted player's button
+  presses the policy gave a press p=0.0022, the same on training and held-out games. So
+  the flat heat maps of the AI-games policy were not only the random camera, and results
+  that used its memory are suspect. The first live games of the scripted-games policy
+  lost both (in 203 and 219 s, against 152 s for a player that does nothing), without
+  one setup click. The summary and the fovea's reading now go through a layer norm with
+  no parameters before the memory; with the same weights the memory moves again (0.032
+  over time, 2% of units at their bounds), and a test holds the fusion's output to the
+  same value whatever the summary's scale. On the first 150 steps of a new run the
+  imitation loss fell to 2.0, where the dead-memory run was near 3.7.
 - **What there is to imitate.** A whole scripted win has about 35 mouse presses and 10
   key presses that matter: the army, its general, the front (Z and a click), the
   offensive (X and a right-drag), the speed, each law step (Q, the slot, the law, OK),
