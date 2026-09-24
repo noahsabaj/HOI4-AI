@@ -107,8 +107,9 @@ FRONT_LINE, OFFENSIVE_LINE, SHIFT, POLITICS, SPACE = 0x5A, 0x58, 0x10, 0x51, 0x2
 # Seconds a plan redrawn while paused is left planning before it executes: its bonus
 # grows 2% a day to 30%, 15 days, about 6 s at speed 5.
 PLANNING = 6
-# Seconds between the guard's looks at the home land while the front holds (guard_hold).
-HOLD_CHECK = 30
+# Seconds between the guard's looks at the home land: while the front holds (guard_hold),
+# and between the attack's redraws (guard_attack).
+GUARD_CHECK = 30
 # The political screen at 1080p: the conscription slot (its icon's box), each law's row
 # in the list it opens, the confirmation's OK and Cancel, and the list's close button.
 LAW_SLOT = (38, 571, 82, 615)
@@ -323,7 +324,7 @@ class Planner:
         self.activate_at = self.redraw_at = self.law_at = self.reinforce_at = math.inf
         self.recruit_at = self.check_at = math.inf
         self.recruit_tries = 0
-        # Whether the army is counter-attacking an incursion while the front holds.
+        # Whether the army's front is drawn round an incursion, to clear it (the guard).
         self.defending = False
         # Whether the plan executes now (lit), the game runs, and the hold is over.
         self.active = self.running = self.attacking = False
@@ -336,9 +337,8 @@ class Planner:
         self.error = None
         self.failures = []
         # Where to keep each settled full view of the map, if anywhere (arena tests), and
-        # the land masks of the last one.
-        self.overview_dir = None
-        self.last_view = self.home = None
+        # the player's land in the first, before the game runs (incursion).
+        self.overview_dir = self.home = None
         # Where to keep the planner's view when an order fails (keep), and how many kept.
         self.debug_dir, self.kept = None, 0
         # Whether water cut the border in two at the start (draw_front).
@@ -448,11 +448,9 @@ class Planner:
             from PIL import Image
 
             Image.fromarray(rgb).save(self.overview_dir / f"{self.frame():06d}.png")
-        if blue is not None:
-            self.last_view = (blue, red)
-            if self.home is None and not self.running:
-                # The land held at the start, before the war moves the border.
-                self.home = blue if self.country == "BLU" else red
+        if blue is not None and self.home is None and not self.running:
+            # The land held at the start, before the war moves the border.
+            self.home = blue if self.country == "BLU" else red
         return rgb, blue, red, box
 
     def assign_general(self, desk, tries=3):
@@ -788,18 +786,25 @@ class Planner:
             time.sleep(0.5)
         return False
 
-    def guarding(self):
-        """Whether the home half needs the army: with a plan's `guard`, a redraw during the
-        attack executes the front line alone (it pushes along the whole border, the
-        enemy's incursion included) instead of pushing on, while the enemy holds at
-        least that share of the home half (incursion)."""
-        guard = self.plan.get("guard")
-        if not guard or self.last_view is None:
-            return False
-        held = incursion(*self.last_view, self.country, self.home)
-        if held >= guard:
-            self.order("guard", held=round(held, 3))
-        return held >= guard
+    def guard_attack(self, desk):
+        """The guard between the attack's redraws, which come 30 to 90 s apart: when the AI
+        holds the plan's `guard` share of the land held at the start, the plan is redrawn
+        at once, round the incursion (the redraw's draw_front); once it holds under half
+        that, at once again, back to the push. True: the camera moved.
+
+        In the loss of 2026-09-24 14:01 Blue's army stood on its offensive's line in Red's
+        land while the AI's last two divisions took two of Blue's home states, 58 s into
+        the attack. The guard, which then looked only at redraws, first saw them 41 s
+        later, when the AI held 53% of Blue's home land, and Blue capitulated 40 s after.
+        """
+        _, blue, red, _ = self.overview(desk)
+        if blue is None or self.home is None or not self.plan.get("redraw"):
+            return True
+        held = incursion(blue, red, self.country, self.home)
+        guard = self.plan["guard"]
+        if (held >= guard) if not self.defending else (held < guard / 2):
+            self.redraw_at = time.monotonic()
+        return True
 
     def setup(self, desk):
         """While paused: the army, its general, its front, its offensive; then run."""
@@ -824,7 +829,7 @@ class Planner:
         if self.plan.get("recruit") and self.law_at == math.inf:
             self.recruit_at = now + RECRUIT_AFTER
         if self.plan.get("guard"):
-            self.check_at = now + HOLD_CHECK
+            self.check_at = now + GUARD_CHECK
 
     def due(self):
         now = time.monotonic()
@@ -863,9 +868,8 @@ class Planner:
                 self.recruit_at = now + RECRUIT_AFTER
             return False
         if now >= self.check_at:
-            # While the front holds; during the attack the redraws guard the home land.
-            self.check_at = math.inf if self.attacking else now + HOLD_CHECK
-            return False if self.attacking else self.guard_hold(desk)
+            self.check_at = now + GUARD_CHECK
+            return self.guard_attack(desk) if self.attacking else self.guard_hold(desk)
         if now >= self.redraw_at:
             # Soon again, should the redraw fail part way.
             self.redraw_at = now + 5
@@ -873,9 +877,13 @@ class Planner:
             # 20-24 s from clearing the orders to executing the new plan, about 55 game days
             # at speed 5 in which the army has no plan, a third of an attack's time.
             paused = bool(self.plan.get("pause_redraw")) and self.pause(desk, True)
+            guard = self.plan.get("guard")
+            if guard and self.defending:
+                guard /= 2  # Round the incursion until it is cleared (guard_attack).
             try:
                 self.clear_orders(desk)
-                rear = self.draw_front(desk, guard=self.plan.get("guard"))
+                rear = self.draw_front(desk, guard=guard)
+                self.defending = bool(rear)
                 if self.plan["attack"] in OFFENSIVES and not rear:
                     self.draw_offensive(desk)
             finally:
