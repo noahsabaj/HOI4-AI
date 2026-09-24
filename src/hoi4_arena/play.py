@@ -229,8 +229,10 @@ class Watch:
         self.next = clock()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snaps")
         self.presses = {}
+        self.events = []
 
     def count(self, events):
+        self.events.extend(events)
         for item in events:
             event = item["event"]
             if event["kind"] == "key" and event["down"]:
@@ -466,6 +468,7 @@ def play_policy_game(
             out.writelines(json.dumps(entry) + "\n" for entry in timings)
         act_ms = [t["act_ms"] for t in timings]
         rec.manifest.update(
+            milestones=milestones(watch.events),
             live={"streamed": streamed, "timed_applies": timed},
             winner=outcome,
             surrendered=arena.surrendered,
@@ -517,6 +520,46 @@ def record(rec, frame, applied, streamed):
         rec.append(scripted_events=applied)
     else:
         rec.append(frame, scripted_events=applied)
+
+
+# The scripted player's setup and orders at 1080p on the second PC, whose interface never
+# moved in 31 games: where each press lands, with how far off it may be (x, y) in pixels.
+MILESTONES = {
+    "alert": ((825, 57), (25, 20)),  # Unassigned divisions, shift+click: select them.
+    "plus": ((988, 1013), (25, 25)),  # Create the army.
+    "portrait": ((30, 140), (30, 30)),  # The army's commander slot.
+    "commander": ((950, 352), (180, 25)),  # The first commander in the list.
+    "law_slot": ((60, 593), (25, 25)),  # The conscription law.
+    "confirm": ((1054, 677), (70, 18)),  # OK on "Replace idea?" or "Delete all orders?".
+    "trash": ((1265, 885), (18, 18)),  # Delete orders (a right-click).
+    "army_card": ((947, 1010), (35, 30)),
+    "arrow": ((947, 957), (40, 12)),  # Execute the plan.
+}
+
+
+def milestones(events, width=1920, height=1080):
+    """Which of the scripted player's steps a game's inputs made: presses near each place in
+    MILESTONES, a Z followed by a left press within 3 s (a front line), an X followed by a
+    right press within 3 s (an offensive), Q presses. Counts, from `scripted_events` rows."""
+    counts = {name: 0 for name in MILESTONES}
+    counts.update(front=0, offensive=0, q=0)
+    pointer, last_key = None, {}
+    for item in sorted(events, key=lambda e: e["t_ns"]):
+        event, t = item["event"], item["t_ns"] / 1e9
+        if event["kind"] == "move":
+            pointer = (event["x"] * (width - 1), event["y"] * (height - 1))
+        elif event["kind"] == "key" and event["down"]:
+            last_key[event["vk"]] = t
+            counts["q"] += event["vk"] == 0x51
+        elif event["kind"] == "button" and event["down"] and pointer is not None:
+            if event["button"] == 0 and t - last_key.get(0x5A, -99) < 3:
+                counts["front"] += 1
+            if event["button"] == 1 and t - last_key.get(0x58, -99) < 3:
+                counts["offensive"] += 1
+            for name, ((x, y), (dx, dy)) in MILESTONES.items():
+                if abs(pointer[0] - x) <= dx and abs(pointer[1] - y) <= dy:
+                    counts[name] += 1
+    return counts
 
 
 def reserve(name, minutes, *, root=EVAL, wait_minutes=90.0, clock=time.monotonic):
@@ -646,6 +689,7 @@ def evaluate_policy(
                     complete=manifest["complete"],
                     reason=reason,
                     harness=manifest["harness"],
+                    milestones=manifest.get("milestones"),
                     act_ms_p50=manifest["act_ms_p50"],
                     late_ticks=manifest["late_ticks"],
                 )

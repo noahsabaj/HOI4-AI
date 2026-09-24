@@ -705,3 +705,29 @@ def test_what_the_memory_takes_in_does_not_grow_with_the_tower_s_loudness():
     quiet = fuse(policy, summary, cells, centre, previous, speed, hidden)
     loud = fuse(policy, summary * 50 + 3, cells, centre * 20, previous, speed, hidden)
     assert torch.allclose(quiet, loud, atol=1e-4)
+
+
+def test_a_game_s_milestones_count_the_scripted_player_s_steps():
+    def at(t, **event):
+        return {"t_ns": int(t * 1e9), "event": event}
+
+    def move(t, x, y):
+        return at(t, kind="move", x=x / 1919, y=y / 1079)
+
+    def press(t, button=0):
+        return at(t, kind="button", button=button, down=True)
+
+    def key(t, vk):
+        return at(t, kind="key", vk=vk, down=True)
+
+    events = [
+        move(1.0, 826, 58), key(1.2, 0x10), press(1.3),  # The alert, shift+clicked.
+        move(2.0, 988, 1012), press(2.4),  # The create-army +.
+        key(5.0, 0x5A), move(5.2, 900, 500), press(5.6),  # A front line.
+        key(9.0, 0x58), move(9.2, 950, 520), press(9.6, button=1),  # An offensive.
+        key(20.0, 0x51), move(20.2, 400, 400), press(20.5),  # Q, then a click elsewhere.
+    ]  # fmt: skip
+    counts = play.milestones(events)
+    assert counts["alert"] == 1 and counts["plus"] == 1
+    assert counts["front"] == 1 and counts["offensive"] == 1 and counts["q"] == 1
+    assert counts["portrait"] == counts["law_slot"] == counts["confirm"] == 0
