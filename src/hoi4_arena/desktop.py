@@ -190,26 +190,37 @@ class Desktop:
         Capture and apply are in flight together: the dispatch thread applies the
         eight slots while this thread captures. Replies carry the request id, so
         they can complete in either order. The write lock only covers the send.
+
+        A request that cannot be sent is explained (_detail) only once both locks are
+        let go: explaining asks a remote worker for its log, another request, and asking
+        from under the write lock waited on that lock forever. That hung a recorder
+        twice on 2026-09-24, closing a connection the second PC's bridge had dropped.
         """
         box = queue.Queue()
+        refused = None
         with self.write_lock:
             if not self._alive():
-                raise DesktopError(self._detail("Desktop worker exited"))
-            req_id = self.next_id
-            self.next_id += 1
-            # Strict JSON: the worker rejects NaN, and its reply to an unparseable line
-            # cannot carry the id this request waits on.
-            message = json.dumps({"op": op, "id": req_id, **kwargs}, allow_nan=False)
-            with self.pending_lock:
-                if self.reader_error is not None:
-                    raise DesktopError(self._detail(f"Desktop reader stopped: {self.reader_error}"))
-                self.pending[req_id] = box
-            try:
-                self._send((message + "\n").encode())
-            except Exception:
+                refused = "Desktop worker exited"
+            else:
+                req_id = self.next_id
+                self.next_id += 1
+                # Strict JSON: the worker rejects NaN, and its reply to an unparseable line
+                # cannot carry the id this request waits on.
+                message = json.dumps({"op": op, "id": req_id, **kwargs}, allow_nan=False)
                 with self.pending_lock:
-                    self.pending.pop(req_id, None)
-                raise
+                    if self.reader_error is not None:
+                        refused = f"Desktop reader stopped: {self.reader_error}"
+                    else:
+                        self.pending[req_id] = box
+                if refused is None:
+                    try:
+                        self._send((message + "\n").encode())
+                    except Exception:
+                        with self.pending_lock:
+                            self.pending.pop(req_id, None)
+                        raise
+        if refused is not None:
+            raise DesktopError(self._detail(refused))
         try:
             reply = box.get(timeout=timeout)
         except queue.Empty:

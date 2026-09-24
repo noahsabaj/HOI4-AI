@@ -116,8 +116,9 @@ class RemoteDesktop(Desktop):
     def worker_log(self) -> list[str]:
         # A failed request asks for the log to explain itself (Desktop._detail), and a
         # failed log request would ask again: on a worker that stopped answering, that
-        # recursed every 2 s for as long as anyone waited. Ask once.
-        if getattr(self, "_asking_for_log", False):
+        # recursed every 2 s for as long as anyone waited. Ask once, and not at all once
+        # the connection is gone: nothing asked on it can be answered.
+        if getattr(self, "_asking_for_log", False) or getattr(self, "reader_error", None):
             return list(self.diagnostics)
         self._asking_for_log = True
         try:
