@@ -1,14 +1,23 @@
 #Requires -Version 7.5
 # Compute jobs on this PC's GPU for the coordinator. The desktop worker runs this for its
-# `job` operation (`hoi4-arena job`), approved by the user on 2026-09-23 so the second
-# PC's GPU can train and act, with arguments it has already checked. They are checked
-# again here. Nothing else can run: the kinds and the commands they may start are fixed
-# below, and every argument is a flag, a value or a path inside this folder.
+# `job` operation (`hoi4-arena job`, and `peer run` from any project), approved by the
+# user on 2026-09-23 so the second PC's GPU can train and act, with arguments it has
+# already checked. They are checked again here. HOI4's own kinds are fixed below, and
+# every argument of theirs is a flag, a value or a path inside this folder.
 #
-# -Action start -Id <id> -Spec <hex of {"kind", "args"}>
+# A `project` job is another project's own command. The user asked on 2026-09-24 for "a
+# universal bus", so that every project on the coordinator can train here, and gave
+# "full permission for the bridge access": its program and arguments are anything, and
+# it runs in that project's folder, compute\projects\<project>, which `peer push` fills
+# through the share. Only the coordinator can reach this script (the worker's pinned
+# certificate and token), and every job leaves its command, log and end in jobs\.
+#
+# -Action start -Id <id> -Spec <hex of {"kind", "args"[, "project"]}>
 #   setup    Build the Python environment in compute\ with uv (compute\tools\uv.exe).
 #   run      compute\.venv's python -m hoi4_arena <one of $Commands> <args>.
 #   script   compute\.venv's python compute\scripts\<one of $Scripts> <args>.
+#   project  <program> <args> in compute\projects\<project>, with compute\tools (uv) on
+#            the PATH: usually `uv run ...`, whose environment is the project's own.
 #   The job runs hidden and detached; its output goes to jobs\<id>.log and its state
 #   (starting, running, done, failed, stopped) to jobs\<id>.json, both readable through
 #   the share.
@@ -17,7 +26,7 @@
 param(
     [Parameter(Mandatory)][ValidateSet('start', 'stop', 'status', 'inner')][string]$Action,
     [ValidatePattern('^[A-Za-z0-9_-]{1,40}$')][string]$Id,
-    [ValidatePattern('^[0-9a-f]{0,20000}$')][string]$Spec
+    [ValidatePattern('^[0-9a-f]{0,30000}$')][string]$Spec
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -25,6 +34,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $compute = Join-Path $PSScriptRoot 'compute'
 $tools = Join-Path $compute 'tools'
+$projects = Join-Path $compute 'projects'
 $jobs = Join-Path $PSScriptRoot 'jobs'
 $python = Join-Path $compute '.venv\Scripts\python.exe'
 New-Item -ItemType Directory -Force -Path $jobs | Out-Null
@@ -48,8 +58,23 @@ function Read-Spec {
     [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -AsHashtable
 }
 
+function Get-ProjectFolder($JobSpec) {
+    # A folder name, never a path: compute\projects\<project> and nowhere else.
+    if ($JobSpec.project -cnotmatch '^[A-Za-z0-9_-]{1,40}$') { throw "project not allowed: $($JobSpec.project)" }
+    $folder = Join-Path $projects $JobSpec.project
+    if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+        throw "no project $($JobSpec.project) here: push it first (peer push)"
+    }
+    $folder
+}
+
 function Get-JobCommand($JobSpec) {
     $arguments = @($JobSpec.args | Where-Object { $null -ne $_ })
+    if ($JobSpec.kind -eq 'project') {
+        [void](Get-ProjectFolder $JobSpec)
+        if (-not $arguments -or -not $arguments[0]) { throw 'a project job needs a command' }
+        return , $arguments
+    }
     foreach ($argument in $arguments) {
         # No drive, no leading slash and no `..`: a path stays inside this folder.
         if ($argument -cnotmatch '^[A-Za-z0-9_.=+-][A-Za-z0-9_./=+-]{0,199}$' -or $argument.Contains('..')) {
@@ -78,8 +103,8 @@ switch ($Action) {
         $jobSpec = Read-Spec
         [void](Get-JobCommand $jobSpec)  # Refuse now, not in the detached process.
         Write-Job ([ordered]@{
-                id = $Id; kind = $jobSpec.kind; args = @($jobSpec.args); state = 'starting'
-                started = (Get-Date).ToString('o')
+                id = $Id; kind = $jobSpec.kind; project = $jobSpec.project; args = @($jobSpec.args)
+                state = 'starting'; started = (Get-Date).ToString('o')
             })
         $shell = (Get-Process -Id $PID).Path
         $inner = @('-NoProfile', '-NonInteractive', '-File', "`"$PSCommandPath`"", '-Action', 'inner', '-Id', $Id, '-Spec', $Spec)
@@ -89,15 +114,21 @@ switch ($Action) {
     'inner' {
         # The detached job itself: run the command, keep its output, record how it ended.
         $job = Read-Job $Id
-        $command = Get-JobCommand (Read-Spec)
+        $jobSpec = Read-Spec
+        $command = Get-JobCommand $jobSpec
         $job.state = 'running'
         $job.pid = $PID
         Write-Job $job
         $env:PATH = "$tools;$env:PATH"
+        # Shared by every project: Python builds and wheels (torch's too) download once.
         $env:UV_CACHE_DIR = Join-Path $compute '.cache\uv'
         $env:UV_PYTHON_INSTALL_DIR = Join-Path $compute '.cache\python'
         $env:PYTHONUNBUFFERED = '1'
-        Set-Location -LiteralPath $compute
+        if ($jobSpec.kind -eq 'project') {
+            Set-Location -LiteralPath (Get-ProjectFolder $jobSpec)
+        } else {
+            Set-Location -LiteralPath $compute
+        }
         $log = Join-Path $jobs "$Id.log"
         $program, $rest = $command
         try {
@@ -115,6 +146,9 @@ switch ($Action) {
         }
         $job.exit = $code
         $job.ended = (Get-Date).ToString('o')
+        # The log's whole length: a reader through the share sees a growing file's size
+        # seconds late, and reads on until it has this many bytes (peer).
+        $job.log_bytes = if (Test-Path -LiteralPath $log) { (Get-Item -LiteralPath $log).Length } else { 0 }
         Write-Job $job
     }
     'stop' {
@@ -133,7 +167,7 @@ switch ($Action) {
             if ($job.state -eq 'running' -and -not (Get-Process -Id $job.pid -ErrorAction SilentlyContinue)) {
                 $job.state = 'lost'
             }
-            [pscustomobject]@{ id = $job.id; kind = $job.kind; state = $job.state; exit = $job.exit; started = $job.started; ended = $job.ended }
+            [pscustomobject]@{ id = $job.id; kind = $job.kind; project = $job.project; state = $job.state; exit = $job.exit; started = $job.started; ended = $job.ended }
         }
         $rows | Sort-Object started | Format-Table -AutoSize | Out-String -Width 200
         if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {

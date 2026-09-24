@@ -35,8 +35,8 @@ jobs:
       # --frozen resolves from uv.lock, which pins torch to the CUDA 12.8 index. The
       # tests themselves run on CPU; torch.cuda.is_available() is simply false here.
       - run: uv sync --python 3.12 --extra dev --frozen
-      - run: uv run ruff check src tests scripts
-      - run: uv run ruff format --check src tests scripts
+      - run: uv run ruff check src tests scripts tools
+      - run: uv run ruff format --check src tests scripts tools
       # The crash is a hard fault, so pytest prints no summary and -q leaves only a row of
       # dots: the run that prompted this showed 25 of them and no test name. -v names the
       # test that was executing, which is the one thing needed to tell a torch dispatch
