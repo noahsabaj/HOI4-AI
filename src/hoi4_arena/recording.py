@@ -170,10 +170,10 @@ class Recorder:
 
 # Codecs encoded on the PC that captures, by the worker's ffmpeg (a stream), with the
 # worker's encoder profile and quality for each. "nvenc" is H.264 in full-resolution colour
-# (High 4:4:4) on that PC's NVIDIA video encoder, at a constant QP the fidelity sweep chose:
-# its frames keep what the policy reads at least as well as x264 at CRF 18 (STATUS.md).
+# (High 4:4:4) on that PC's NVIDIA video encoder at QP 14, where its frames keep what the
+# policy reads better than x264 at CRF 18 did, at about the same size (STATUS.md).
 STREAM_CODECS = {
-    "nvenc": ("h264_nvenc", 16),
+    "nvenc": ("h264_nvenc", 14),
     "nvenc-hevc": ("hevc_nvenc", 16),
     "x264-source": ("x264", 18),
     "ffv1-source": ("ffv1", 0),
@@ -237,7 +237,7 @@ class StreamRecorder:
         self.desk = desk
         self.root.mkdir(parents=True, exist_ok=False)
         try:
-            self.stream = desk.stream(hz=hz, profile=profile, quality=quality)
+            self.stream = desk.start_stream(hz=hz, profile=profile, quality=quality)
         except DesktopError as error:
             shutil.rmtree(self.root, ignore_errors=True)
             raise StreamUnavailable(str(error)) from error

@@ -17,6 +17,8 @@ log = logging.getLogger(__name__)
 
 
 class RemoteDesktop(Desktop):
+    encoding = "lz4"
+
     def __init__(self, config, *, attach: bool = True, observer: bool = False):
         """Connect to the second PC's worker. `attach=False` as for Desktop: the control
         operations need no game running there.

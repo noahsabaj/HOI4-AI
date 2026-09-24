@@ -70,7 +70,7 @@ class _Desk:
     def protocol(self):
         return self.version
 
-    def stream(self, hz, profile, quality=None):
+    def start_stream(self, hz, profile, quality=None):
         if isinstance(self.made, Exception):
             raise self.made
         return self.made

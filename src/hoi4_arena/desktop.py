@@ -68,6 +68,11 @@ class Frame:
 
 
 class Desktop:
+    # How captures travel. A local worker's pipe moves raw frames at gigabytes a second,
+    # where lz4 cost 16-21 ms a 1080p frame to compress for a 1.2-3.2x ratio on real game
+    # frames; over the network (RemoteDesktop) the saving is worth it.
+    encoding = "raw"
+
     def __init__(
         self,
         command: list[str] | None = None,
@@ -240,7 +245,7 @@ class Desktop:
             options["regions"] = [[int(v) for v in r] for r in regions]
         if full is not None:
             options["full"] = bool(full)
-        meta = self.request("capture", encoding="lz4", **options)
+        meta = self.request("capture", encoding=self.encoding, **options)
         payload = meta.pop("payload")
         # A worker built before worker-side downscaling accepts these options, ignores
         # them, and sends the whole 33 MB frame back. That is indistinguishable from a
@@ -361,8 +366,11 @@ class Desktop:
         reply.pop("payload", None)
         return reply
 
-    def stream(self, hz=5, profile="h264_nvenc", quality=None):
-        """Start a recording stream the worker clocks and encodes (protocol 2)."""
+    def start_stream(self, hz=5, profile="h264_nvenc", quality=None):
+        """Start a recording stream the worker clocks and encodes (protocol 2).
+
+        Not `stream`: RemoteDesktop's socket file is its `stream`.
+        """
         return WorkerStream(self, hz=hz, profile=profile, quality=quality)
 
     def game_log(self, offset=0):

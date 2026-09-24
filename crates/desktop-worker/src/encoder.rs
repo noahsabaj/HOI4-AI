@@ -48,12 +48,13 @@ pub struct Profile {
 }
 
 pub const PROFILES: [Profile; 4] = [
-    // NVENC H.264 in full-resolution colour (High 4:4:4), constant QP, no B-frames. The
-    // same codec family as the x264 recordings, so the training reader decodes it as
-    // fast; the default QP is the one the fidelity sweep chose (STATUS.md).
+    // NVENC H.264 in full-resolution colour (High 4:4:4), the slowest preset, constant QP,
+    // no B-frames. At QP 14 it keeps more of every frame than x264 at CRF 18 (PSNR 45.47
+    // against 44.83 dB, templates scoring 4x closer to lossless) at 2% more bytes, and the
+    // training reader decodes it 6% faster (scripts/codec_fidelity.py, second PC, 2026-09-24).
     Profile {
         name: "h264_nvenc",
-        quality: (0, 16, 51),
+        quality: (0, 14, 51),
         hardware: true,
     },
     // NVENC HEVC, 4:4:4 (Range Extensions): smaller, but slower to decode.
@@ -98,7 +99,7 @@ pub fn arguments(name: &str, quality: Option<u32>, hz: u32) -> Result<(Vec<Strin
             "-c:v",
             "h264_nvenc",
             "-preset",
-            "p5",
+            "p7",
             "-tune",
             "hq",
             "-profile:v",
@@ -389,9 +390,9 @@ mod tests {
     #[test]
     fn profiles_take_only_a_checked_quality() {
         let (args, q) = arguments("h264_nvenc", None, 5).unwrap();
-        assert_eq!(q, 16);
+        assert_eq!(q, 14);
         let at = args.iter().position(|a| a == "-qp").unwrap();
-        assert_eq!(args[at + 1], "16");
+        assert_eq!(args[at + 1], "14");
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv444p"]));
         assert!(args.windows(2).any(|w| w == ["-g", "100"]));
         let (args, _) = arguments("x264", Some(18), 5).unwrap();
