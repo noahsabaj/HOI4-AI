@@ -1,6 +1,7 @@
 """Recordings the worker clocks and encodes (StreamRecorder): the same files as before."""
 
 import json
+import os
 import queue
 import subprocess
 import threading
@@ -111,6 +112,7 @@ def test_a_stream_recording_writes_the_files_training_reads(tmp_path):
     assert [r["index"] for r in rows] == list(range(40))
     assert np.all(np.diff([r["t_ns"] for r in rows]) > 0)
     assert manifest["encoder"]["where"] == "worker" and manifest["clock"] == "worker"
+    assert manifest["recorder"]["pid"] == os.getpid()
     assert manifest["gaps"] == {"game_not_foreground": 1}
     assert sum(len(r.get("scripted_events", [])) for r in rows) == 1
     assert json.loads((root / "trailing-events.json").read_text())["events"][0]["t_ns"] == 1
