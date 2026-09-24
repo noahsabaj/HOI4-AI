@@ -37,8 +37,9 @@ import numpy as np
 from .actions import GRID, PERIOD, SLOTS, decode
 from .ai_games import SPEED_UP, Station, act, focus, on_screen, start_game, tap
 from .arena_log import ArenaLog
+from .dataset import DETAIL_SIZE, FOVEA_SIZE, VIEW_SIZE
 from .desktop import DesktopError, EmergencyStop
-from .recording import Recorder
+from .recording import STREAM_CODECS, Recorder, StreamRecorder, StreamUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -62,10 +63,15 @@ class Dispatcher:
     """Applies a decision's eight slots across one interval, on a thread of its own.
 
     Keeps each applied event with the worker's time of it, as the recorder stores inputs,
-    and follows the pointer, to notice a press on the speed control's +.
+    and follows the pointer, to notice a press on the speed control's +. With `timed` (a
+    worker of protocol 2), the slots go in one request, each at its offset on the worker's
+    own clock, and the reply gives each event's time; before, each slot was a request of
+    its own, sent as its time came, and a slot waited on the network.
     """
 
-    def __init__(self, desk, width=1920, height=1080, clock=time.monotonic):
+    def __init__(self, desk, width=1920, height=1080, clock=time.perf_counter, timed=False):
+        # perf_counter, not monotonic: on Windows monotonic ticks in 15.6 ms steps, and the
+        # slots are 25 ms apart, as training bins the inputs.
         self.desk, self.width, self.height, self.clock = desk, width, height, clock
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-dispatch")
         self.future = None
@@ -82,6 +88,7 @@ class Dispatcher:
         # the harness's own input, clears this so the next interval arms again. Arming
         # each interval would also clear an F12 the capture had not yet reported.
         self.armed = False
+        self.timed = timed
 
     def start(self, action, begin, pointer):
         self.pointer = pointer
@@ -92,16 +99,14 @@ class Dispatcher:
             if not self.armed:
                 self.desk.arm()
                 self.armed = True
+            if self.timed:
+                self._timed(action)
+                self.refused = 0
+                return
             for index, token in enumerate(action):
                 time.sleep(max(0.0, begin + index * PERIOD / SLOTS - self.clock()))
                 events = decode(token)
-                for event in events:
-                    if event["kind"] == "move":
-                        self.pointer = lattice_to_pixels(
-                            int(token[1]), int(token[2]), self.width, self.height
-                        )
-                    elif event["kind"] == "button" and event["down"] and self.on_speed_up():
-                        self.speed_clicks += 1
+                self._follow(token, events)
                 reply = self.desk.apply(events)
                 if events:
                     with self.lock:
@@ -114,6 +119,34 @@ class Dispatcher:
             self.armed = False
             return
         self.refused = 0
+
+    def _follow(self, token, events):
+        """Where the pointer goes, and whether a press lands on the speed control's +."""
+        for event in events:
+            if event["kind"] == "move":
+                self.pointer = lattice_to_pixels(
+                    int(token[1]), int(token[2]), self.width, self.height
+                )
+            elif event["kind"] == "button" and event["down"] and self.on_speed_up():
+                self.speed_clicks += 1
+
+    def _timed(self, action):
+        events, offsets = [], []
+        for index, token in enumerate(action):
+            decoded = decode(token)
+            self._follow(token, decoded)
+            events += decoded
+            offsets += [index * PERIOD / SLOTS * 1000] * len(decoded)
+        if not events:
+            # An empty apply still feeds the worker's watchdog, which disarms after 750 ms.
+            self.desk.apply([])
+            return
+        reply = self.desk.apply(events, at_ms=offsets)
+        times = reply.get("times_ns") or [reply["t_ns"]] * len(events)
+        with self.lock:
+            self.applied.extend(
+                {"t_ns": int(t), "event": e} for t, e in zip(times, events, strict=True)
+            )
 
     def on_speed_up(self):
         if self.pointer is None:
@@ -185,6 +218,51 @@ class Referee:
         self.last_day = self.clock()
 
 
+class Watch:
+    """What a game in progress shows someone following it: a small picture of the screen
+    every `every` seconds (snaps/, written off the decision thread) and a log line of the
+    policy's presses so far."""
+
+    def __init__(self, root, station, every=30.0, clock=time.monotonic):
+        self.folder = Path(root) / "snaps"
+        self.station, self.every, self.clock = station, every, clock
+        self.next = clock()
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snaps")
+        self.presses = {}
+
+    def count(self, events):
+        for item in events:
+            event = item["event"]
+            if event["kind"] == "key" and event["down"]:
+                name = chr(event["vk"]) if 0x41 <= event["vk"] <= 0x5A else str(event["vk"])
+            elif event["kind"] == "button" and event["down"]:
+                name = f"b{event['button']}"
+            else:
+                continue
+            self.presses[name] = self.presses.get(name, 0) + 1
+
+    def look(self, frame, seconds, running):
+        if not self.every or self.clock() < self.next:
+            return
+        self.next = self.clock() + self.every
+        rgb = frame.rgb if frame.rgb is not None else frame.views.global_view
+        self.pool.submit(self._save, rgb, int(seconds))
+        log.info(
+            "[%s] %d s, running %s, presses so far %s", self.station, seconds, running,
+            json.dumps(self.presses, sort_keys=True),
+        )  # fmt: skip
+
+    def _save(self, rgb, seconds):
+        from PIL import Image
+
+        self.folder.mkdir(parents=True, exist_ok=True)
+        image = Image.fromarray(rgb).resize((960, 540), Image.BILINEAR)
+        image.save(self.folder / f"{seconds:04d}.jpg", quality=80)
+
+    def close(self):
+        self.pool.shutdown(wait=True)
+
+
 def run_game(desk, pointer, rules=None, space=True):
     """Unpause (space) and set speed 5 with clicks on +, then put the pointer back.
 
@@ -225,9 +303,10 @@ def play_policy_game(
     cap_minutes=15.0,
     setup_seconds=90.0,
     stall_seconds=8.0,
-    codec="x264",
+    codec="nvenc",
     arena_name=None,
     after_surrender=5.0,
+    snap_every=30.0,
 ):
     """Record one game in which `actor` plays `country` against the game's AI.
 
@@ -236,32 +315,52 @@ def play_policy_game(
     `cap_minutes` (a draw). Returns the outcome, the reason it ended early if it did, and
     the manifest.
     """
-    clock = time.monotonic
+    clock = time.perf_counter
     actor.reset_episode()
     first = on_screen(desk.capture(full=True))
-    rec = Recorder(root, first, game_speed=speed, source="policy", hz=hz, codec=codec)
+    # With a worker of protocol 2 the game is recorded where it runs, on the worker's own
+    # 5 Hz clock, and each frame of that stream carries the policy's views, so one clock
+    # paces both the video and the policy (open_stream); its slots go in one timed request.
+    rec = open_stream(desk, root, first, speed=speed, hz=hz, codec=codec)
+    streamed = bool(getattr(rec, "streamed", False))
     height, width = first.rgb.shape[:2]
-    dispatcher = Dispatcher(desk, width, height)
+    timed = _protocol(desk) >= 2
+    dispatcher = Dispatcher(desk, width, height, timed=timed)
     referee = Referee(setup_seconds, stall_seconds)
     arena = ArenaLog(desk)
+    watch = Watch(root, station, snap_every)
     stamped, timings = [], []
     outcome, reason, ending = "timeout", None, None
     late = away = 0
+    last_index = None
     start = deadline = next_poll = clock()
     try:
-        rec.append(first)
+        if not streamed:
+            rec.append(first)
         frame = first
         while clock() - start < cap_minutes * 60:
             # The interval in flight keeps applying while the next frame is taken and
             # read, as in ArenaEnv.step: the loop holds 5 Hz, and an action goes out
             # about 150 ms after the frame it answers.
-            time.sleep(max(0.0, deadline - clock()))
+            if not streamed:
+                time.sleep(max(0.0, deadline - clock()))
             begin = clock()
-            if begin - deadline > PERIOD / 2:
+            if not streamed and begin - deadline > 0.005:
                 late += 1
             deadline = begin + 1 / hz
             try:
-                captured_frame = desk.capture(full=True)
+                if streamed:
+                    # The stream's next frame, or its newest if the loop fell behind (then
+                    # the frames between are skipped, and counted).
+                    captured_frame = rec.next_frame(timeout=10)
+                    index = captured_frame.meta.get("index")
+                    if index is not None and last_index is not None and index > last_index + 1:
+                        late += index - last_index - 1
+                    last_index = index if index is not None else last_index
+                    if captured_frame.views is None and captured_frame.meta.get("foreground"):
+                        captured_frame = desk.capture(views=VIEW_SIZE)
+                else:
+                    captured_frame = desk.capture(full=True)
             except EmergencyStop:
                 raise
             except DesktopError as error:
@@ -284,11 +383,16 @@ def play_policy_game(
                 continue
             away = 0
             frame = on_screen(captured_frame)
-            rec.append(frame, scripted_events=dispatcher.take())
             captured = clock()
-            action, _sample = actor.act(frame.rgb, frame.meta["t_ns"], cursor=frame.meta["cursor"])
+            action, _sample = actor.act(
+                frame.rgb, frame.meta["t_ns"], precomputed=frame.views, cursor=frame.meta["cursor"]
+            )
             acted = clock()
             dispatcher.join()
+            # Every input of the interval that just ended, now that it has: recorded with
+            # this frame, which was taken while they were being applied.
+            applied = dispatcher.take()
+            watch.count(applied)
             if dispatcher.speed_clicks and not referee.running:
                 referee.clicked_speed_up()
             wait = referee.due()
@@ -310,14 +414,21 @@ def play_policy_game(
                     log.info(
                         "[%s] the game stalled; set running again (paused=%s)", station, paused
                     )
+                record(rec, frame, applied, streamed)
                 deadline = clock()
                 continue
             cursor = frame.meta["cursor"]
             dispatcher.start(action, clock(), (float(cursor[0]), float(cursor[1])))
+            sent = clock()
+            # The frame goes to the video after the action is on its way.
+            record(rec, frame, applied, streamed)
+            watch.look(frame, clock() - start, referee.running)
             timings.append(
                 {
                     "capture_ms": round((captured - begin) * 1e3, 1),
                     "act_ms": round((acted - captured) * 1e3, 1),
+                    "send_ms": round((sent - acted) * 1e3, 1),
+                    "record_ms": round((clock() - sent) * 1e3, 1),
                 }
             )
             now = clock()
@@ -342,6 +453,7 @@ def play_policy_game(
         log.warning("[%s] game ended early: %s", station, reason)
     finally:
         dispatcher.close()
+        watch.close()
         try:
             desk.release()
         except DesktopError:
@@ -354,6 +466,7 @@ def play_policy_game(
             out.writelines(json.dumps(entry) + "\n" for entry in timings)
         act_ms = [t["act_ms"] for t in timings]
         rec.manifest.update(
+            live={"streamed": streamed, "timed_applies": timed},
             winner=outcome,
             surrendered=arena.surrendered,
             started_as=country,
@@ -369,9 +482,41 @@ def play_policy_game(
             station=station,
             checkpoint=actor.digest,
             harness={"starts": referee.starts, "restarts": referee.restarts},
+            presses=watch.presses,
         )
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
+
+
+def open_stream(desk, root, first, *, speed, hz, codec):
+    """A recording clocked and encoded by the worker whose frames carry the policy's views
+    (StreamRecorder), when the worker can; else the classic recording, here, in x264."""
+    if codec in STREAM_CODECS and _protocol(desk) >= 2:
+        try:
+            return StreamRecorder(
+                root, desk, game_speed=speed, source="policy", hz=hz, codec=codec,
+                views=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE,
+            )  # fmt: skip
+        except StreamUnavailable as error:
+            log.warning("no recording stream (%s); recording here in x264", error)
+    codec = "x264" if codec in STREAM_CODECS else codec
+    return Recorder(root, first, game_speed=speed, source="policy", hz=hz, codec=codec)
+
+
+def _protocol(desk):
+    try:
+        return int(desk.protocol())
+    except (AttributeError, DesktopError, TypeError, ValueError):
+        return 1
+
+
+def record(rec, frame, applied, streamed):
+    """The policy's inputs into the recording: beside the worker's own frames when it
+    records them (a stream), else with the frame taken here."""
+    if streamed:
+        rec.append(scripted_events=applied)
+    else:
+        rec.append(frame, scripted_events=applied)
 
 
 def reserve(name, minutes, *, root=EVAL, wait_minutes=90.0, clock=time.monotonic):
@@ -419,6 +564,7 @@ def evaluate_policy(
     setup_seconds=90.0,
     memory_window=None,
     point=False,
+    temperature=1.0,
     model_path=None,
     seed=None,
 ):
@@ -443,8 +589,14 @@ def evaluate_policy(
     end = time.monotonic() + minutes * 60
     try:
         actor = Actor(
-            checkpoint, model_path, game_speed=5, memory_window=memory_window, point=point
+            checkpoint,
+            model_path,
+            game_speed=5,
+            memory_window=memory_window,
+            point=point,
+            temperature=temperature,
         )
+        actor.lean = True  # Only the action is needed: no training sample, no clip.
         for index in range(games):
             # A game takes about 3 minutes to launch and up to cap_minutes to play.
             if time.monotonic() + (cap_minutes + 4) * 60 > end:

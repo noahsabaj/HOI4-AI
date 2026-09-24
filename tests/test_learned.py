@@ -255,6 +255,16 @@ def test_a_memory_window_as_long_as_the_game_so_far_is_the_carried_memory(monkey
         short.act(rgb, (t + 10) * 200_000_000, cursor=(5, 5))
     assert torch.allclose(carried.hidden, windowed.hidden, atol=1e-5)
     assert not torch.allclose(carried.hidden, short.hidden, atol=1e-3)
+    # A lean actor (play-policy) returns the same action and no training sample, and keeps
+    # no clip for an encoder that reads none.
+    lean = build(4)
+    lean.lean = True
+    torch.manual_seed(1)
+    action, sample = lean.act(frames[0], 10 * 200_000_000, cursor=(5, 5))
+    torch.manual_seed(1)
+    expected, full = build(4).act(frames[0], 10 * 200_000_000, cursor=(5, 5))
+    assert sample is None and full is not None and not lean.history
+    assert np.array_equal(action, expected)
 
 
 class _Game:
@@ -319,7 +329,7 @@ class _Actor:
     def reset_episode(self):
         self.steps = 0
 
-    def act(self, rgb, t_ns, cursor=None):
+    def act(self, rgb, t_ns, precomputed=None, cursor=None):
         self.steps += 1
         action = np.zeros((SLOTS, 3), np.int64)
         if self.steps == 3:
@@ -341,11 +351,13 @@ def test_a_policy_game_starts_when_the_policy_clicks_plus_and_ends_on_the_surren
     game = _Game()
     outcome, reason, manifest = play.play_policy_game(
         game, _Actor(), tmp_path / "game", rules=None, country="BLU", codec="ffv1",
-        cap_minutes=1, setup_seconds=30, after_surrender=0.5,
+        cap_minutes=1, setup_seconds=30, after_surrender=0.5, snap_every=0.5,
     )  # fmt: skip
     assert reason is None and outcome == "BLU"
     assert manifest["source"] == "policy" and manifest["harness"] == {"starts": 1, "restarts": 0}
     assert manifest["complete"] and manifest["frames"] > 5
+    assert manifest["presses"].get("b0") == 1, "its one click, on +"
+    assert list((tmp_path / "game" / "snaps").glob("*.jpg")), "pictures for whoever follows it"
     assert any(e["kind"] == "key" and e["vk"] == 0x20 for e in game.setup_applied)
     assert not any(e["kind"] == "key" for e in game.applied), "the policy sent no keys"
     stamped = [json.loads(line) for line in (tmp_path / "game" / "arena-log.jsonl").open()]
@@ -394,6 +406,14 @@ def test_behaviour_cloning_on_scripted_games_learns_the_true_state_beside_the_ac
     assert (tmp_path / "out" / "state-head-0000.pt").exists()
     config = json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]
     assert config["lead_in"] == 0 and config["drop_keys"] == [0x20]
+    # Fine-tuning from it starts from its weights and its read-outs.
+    train.train_bc(
+        data, "model", tmp_path / "tuned", sources=("scripted",), sequence=2, burn_in=1,
+        workers=0, lead_in=0, drop_keys=(0x20,), state_weight=0.5, order_weight=0.2,
+        look_before_click=True, init=tmp_path / "out" / "epoch-0000.pt", lr=1e-5,
+    )  # fmt: skip
+    tuned = json.loads((tmp_path / "tuned" / "epoch-0000.json").read_text())["config"]
+    assert tuned["init"].endswith("epoch-0000.pt") and tuned["lr"] == 1e-5
 
 
 def test_an_aimed_move_is_one_a_press_follows_before_any_other_move():
@@ -461,3 +481,201 @@ def test_training_holds_while_its_pause_file_is_there(tmp_path):
             flag.unlink()
 
     assert wait_while_paused(tmp_path, poll=2.0, sleep=sleep) and polls == [2.0] * 3
+
+
+def test_a_frozen_tower_trains_nothing_of_the_encoder():
+    from hoi4_arena.models import ScreenEncoder
+    from hoi4_arena.train import train_blocks
+
+    encoder = ScreenEncoder(pretrained=False)
+    assert any(p.requires_grad for p in encoder.parameters())
+    train_blocks(encoder, 0)
+    assert not any(p.requires_grad for p in encoder.parameters())
+    train_blocks(encoder, 1)
+    trainable = [n for n, p in encoder.named_parameters() if p.requires_grad]
+    last = len(encoder.model.blocks) - 1
+    assert trainable and all(n.startswith(f"model.blocks.{last}.") for n in trainable)
+
+
+@needs_ffmpeg
+def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch):
+    """Cached and run, the tower gives the policy the same summary and cells, and a run
+    trained from the cache refuses one made from another tower."""
+    import hoi4_arena.models as models
+    import hoi4_arena.train as train
+    from hoi4_arena.dataset import batch_to_device
+    from hoi4_arena.models import ScreenEncoder
+    from hoi4_arena.tower_cache import cache_tower
+
+    def small(path=None, variant="screen", **_):
+        return ScreenEncoder(pretrained=False, size=(32, 64))
+
+    monkeypatch.setattr(models, "build_encoder", small)
+    monkeypatch.setattr(train, "build_encoder", small)
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("game", "held-out"):
+        _scripted(data / name, players=["BLU"], winner="BLU")
+    (data / "splits.json").write_text(json.dumps({"game": "train", "held-out": "validation"}))
+    torch.manual_seed(0)
+    policy = Policy(small(), memory_dim=512)
+    checkpoint = tmp_path / "start.pt"
+    torch.save(
+        {"policy": policy.state_dict(), "config": {"model_path": "x", "variant": "screen"}},
+        checkpoint,
+    )
+    report = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
+    assert report["recordings"] == 2 and report["frames"] == 80
+    again = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
+    assert again["skipped"] == 2 and again["recordings"] == 0, "a finished recording stays"
+    # A drive that would keep too little free sends the recordings to the spill folder.
+    from hoi4_arena.tower_cache import tower_paths
+
+    full = cache_tower(
+        data, checkpoint, tmp_path / "full", device="cpu", spill=tmp_path / "spill",
+        keep_free_gb=1e9,
+    )  # fmt: skip
+    assert full["spilled"] == 2
+    assert tower_paths(tmp_path / "full", "game")["grid"].parent.parent == tmp_path / "spill"
+
+    common = {"sources": ("scripted",), "length": 3, "burn_in": 1, "device": "cpu",
+              "clips": False, "lead_in": 0, "shuffle": 0}  # fmt: skip
+    plain = next(iter(VideoSessions(data, **common)))
+    cached = next(iter(VideoSessions(data, tower=tmp_path / "cache", **common)))
+    assert cached["tower_grid"].shape == (4, 768, 32, 32)
+    policy.eval().requires_grad_(False)
+    batch = batch_to_device(torch.utils.data.default_collate([plain]), "cpu")
+    stored = batch_to_device(torch.utils.data.default_collate([cached]), "cpu")
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        run = policy.perceive_window(None, batch["quadrants"], batch["fovea"])
+        read = policy.perceive_window(
+            None, stored["quadrants"], stored["fovea"],
+            tower=(stored["tower_summary"], stored["tower_grid"]),
+        )  # fmt: skip
+    for a, b in zip(run, read, strict=True):
+        assert torch.allclose(a.float(), b.float(), atol=0.1, rtol=0.05)
+
+    common = {"sources": ("scripted",), "sequence": 2, "burn_in": 1, "workers": 0, "lead_in": 0}
+    train.train_bc(data, "model", tmp_path / "out", train_last=0, init=checkpoint,
+                   tower_cache=tmp_path / "cache", **common)  # fmt: skip
+    rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
+    assert rows[-1]["validation_nll"] > 0
+    with pytest.raises(ValueError, match="another tower"):
+        train.train_bc(data, "model", tmp_path / "other", train_last=0,
+                       tower_cache=tmp_path / "cache", **common)  # fmt: skip
+    with pytest.raises(ValueError, match="frozen tower"):
+        train.train_bc(data, "model", tmp_path / "unfrozen", init=checkpoint,
+                       tower_cache=tmp_path / "cache", **common)  # fmt: skip
+
+
+@needs_ffmpeg
+def test_games_play_in_order_with_their_memory_started_once_a_game(tmp_path):
+    from hoi4_arena.dataset import GameSequences
+
+    for name in ("a", "b"):
+        _scripted(tmp_path / name)
+    sessions = VideoSessions(
+        tmp_path, sources=("scripted",), length=4, burn_in=0, device="cpu", clips=False, lead_in=0
+    )
+    games = GameSequences(sessions, 4, 1, device="cpu", clips=False)
+    batches = list(games)
+    # 40 frames at 10 Hz are 20 decisions of 0.2 s, less the last: 4 whole windows a game.
+    assert len(batches) == 8 == len(games)
+    starts = [int(b["start"][0]) for b in batches]
+    fresh = [bool(b["fresh"][0]) for b in batches]
+    assert starts == [0, 4, 8, 12] * 2
+    assert fresh == [True, False, False, False] * 2
+    two = list(GameSequences(sessions, 4, 2, device="cpu", clips=False))
+    assert len(two) == 4 and all(b["slot"].tolist() == [0, 1] for b in two)
+    assert [b["fresh"].tolist() for b in two] == [[True, True]] + [[False, False]] * 3
+
+
+@needs_ffmpeg
+def test_a_carried_memory_trains_and_validates_game_by_game(tmp_path, monkeypatch):
+    from test_unroll import _Screen
+
+    import hoi4_arena.train as train
+
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("game", "other", "held-out"):
+        _recording(
+            data / name,
+            [8, 6],
+            source="scripted",
+            events=[(300_000_000, CLICK), (900_000_000, SPACE)],
+        )
+    (data / "splits.json").write_text(
+        json.dumps({"game": "train", "other": "train", "held-out": "validation"})
+    )
+    monkeypatch.setattr(train, "build_encoder", lambda path, variant: _Screen())
+    train.train_bc(
+        data, "model", tmp_path / "out", sources=("scripted",), sequence=4, workers=0,
+        lead_in=0, look_before_click=True, carry=True,
+    )  # fmt: skip
+    rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
+    steps = [row for row in rows if "step" in row]
+    # Two games side by side, 4 windows each: 4 batches. Space is outside the vocabulary,
+    # so its decision is invalid: seen by the memory, scored with weight 0.
+    assert len(steps) == 4 and all(np.isfinite(row["bc"]) for row in steps)
+    assert rows[-1]["validation_nll"] > 0 and rows[-1]["validation_decisions"] == 15
+    config = json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]
+    assert config["carry"] and config["burn_in"] == 0
+
+
+class _TimedDesk(_Desk):
+    """A worker of protocol 2: a decision's slots in one request, each at its offset."""
+
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+
+    def protocol(self):
+        return 2
+
+    def apply(self, events, at_ms=None):
+        self.batches.append((list(events), at_ms))
+        self.applied.extend(events)
+        if at_ms is None:
+            return {"t_ns": 1}
+        return {"t_ns": 9, "times_ns": [1000 + int(t) for t in at_ms]}
+
+
+def test_a_timed_dispatch_sends_the_slots_in_one_request_at_their_offsets():
+    desk = _TimedDesk()
+    dispatcher = play.Dispatcher(desk, clock=lambda: 0.0, timed=True)
+    plus = [1, round(play.SPEED_UP[0] * (GRID - 1)), round(play.SPEED_UP[1] * (GRID - 1))]
+    action = np.zeros((SLOTS, 3), np.int64)
+    action[1] = plus
+    action[3] = _token(VOCAB.index(CLICK))
+    dispatcher.start(action, 0.0, (100.0, 100.0))
+    dispatcher.join()
+    ((events, offsets),) = desk.batches
+    assert [e["kind"] for e in events] == ["move", "button"] and events[1] == CLICK
+    assert events[0]["x"] == pytest.approx(play.SPEED_UP[0], abs=1e-3)
+    assert offsets == pytest.approx([25.0, 75.0])
+    assert [e["t_ns"] for e in dispatcher.take()] == [1025, 1075], "each event at its own time"
+    assert dispatcher.speed_clicks == 1
+    dispatcher.start(np.zeros((SLOTS, 3), np.int64), 0.0, (5.0, 5.0))
+    dispatcher.join()
+    assert desk.batches[-1] == ([], None), "an idle decision still feeds the watchdog"
+    dispatcher.close()
+
+
+def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
+    from hoi4_arena.models import CELL_DIM, ActionHead
+
+    torch.manual_seed(0)
+    head = ActionHead(memory_dim=8).eval()
+    with torch.no_grad():
+        head.kinds.bias.zero_()
+        head.kinds.bias[0] = 1.0  # "none" likeliest, a move next.
+        head.kinds.bias[1] = 0.5
+    memory, cells = torch.randn(64, 8), torch.randn(64, GRID, CELL_DIM)
+    with torch.no_grad():
+        warm = (head(memory, cells)[0][:, 0, 0] == 0).float().mean()
+        cold = (head(memory, cells, temperature=0.2)[0][:, 0, 0] == 0).float().mean()
+        actions = torch.zeros(64, SLOTS, 3, dtype=torch.long)
+        same = head(memory, cells, actions)[1], head(memory, cells, actions, temperature=0.2)[1]
+    assert cold > warm, "the likeliest input gains"
+    assert torch.equal(*same), "a demonstration's likelihood does not depend on it"

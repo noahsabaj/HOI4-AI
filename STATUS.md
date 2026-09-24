@@ -201,7 +201,7 @@ every rule below came from a crash dump or the stock files.
 
 ## Arena maps (2026-09-24)
 
-`generate-map --preset <name>` writes one of six named arenas (`arenas.PRESETS`), and
+`generate-map --preset <name>` writes one of seven named arenas (`arenas.PRESETS`), and
 `preview-map` draws one from its files. Every one keeps the playable grid (12×8
 provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
@@ -216,12 +216,13 @@ checks that, province by province and pixel by pixel.
 | `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
 | `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
 | `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+| `ford` | A large river runs along the whole border, except at one ford in the middle | 15 | -56% |
 
 "Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
 mean penalty for attacking into the defender's province there: the stock terrain
 penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
 -60% where a river runs along that border. On `passes` 73% of the front costs 40% or
-more. Measured on the v6 files.
+more, on `ford` 93%. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 
@@ -250,20 +251,37 @@ heart. `generation.json` records the preset and seed, its terrain counts, its fr
 (the numbers in the table above), and a state layout over the land box, from which
 `scripted.state_at` names the state under a point on any arena, bulges included.
 
-Live tests on the second PC (2026-09-24), the scripted player against the game's AI.
-On the plain arena, 23 such games ended by game day 290-820.
+Live tests on the second PC (2026-09-24): the scripted player against the game's AI,
+one game an arena, so no arena can yet be said to favour either side. Every v6 arena
+loaded with no map errors in the game's log. "Captures" counts the states that changed
+hands before the surrender; most plain-arena games were a single sweep of 8.
 
-- `plains-v1`, as Blue: loaded with no errors, and the scripted player found its fronts
-  on the new ground. A draw after 15 minutes: the supply stall above.
-- `passes-v3`, as Red: Red won in 541 s. Blue surrendered on day 1236, after a seesaw
-  at the valleys: 22 changes of control, with West 6 taken four times and East 7 three.
-- `marsh-v3` and `v4`: loaded, lakes included, but first Red could not be picked (the
-  capital fix) and then the front line would not draw on dark ground (the colour fix).
-- `marsh-v6`, as Red: loaded with no map errors in the game's log. The AI won in 79 s:
-  the lake splits the front, Red's army held only the southern stretch (89% of its
-  division-days in one state), and Blue walked round the north without a casualty.
+| Arena | Scripted side | Winner | Surrender on day | Captures | Casualties, Blue / Red |
+|---|---|---|---|---|---|
+| plain, 23 games | both | scripted 10 of 21, 2 draws | 277–822 | mostly 8 | |
+| `plains` | Red | scripted | 772 | 8 | 61k / 10k |
+| `river` | Red | scripted | 751 | 8 | 71k / 12k |
+| `passes` | Blue | scripted | 726 | 8 | 8k / 77k |
+| `passes` (v3) | Red | scripted | 1236 | 22 | 104k / 13k |
+| `marsh` | Red | AI | 100 | 8 | 1k / 2k |
+| `bay` | Red | AI | 1026 | 20 | 111k / 15k |
+| `salient` | Red | AI | 259 | 8 | 9k / 7k |
+| `ford` | Blue | scripted | 803 | 8 | 8k / 86k |
+
+- `river`: Red took Blue's border states in May 1937 and the river states by June, then
+  stood seven months at the river before breaking through in January 1938.
+- `bay`: Red broke through the isthmus first and took six of Blue's eight states by
+  April 1938. Blue's counteroffensive retook them all, then took Red's homeland.
+- `marsh`: the lake splits the front. Red's army held only the southern stretch (89% of
+  its division-days in one state), and Blue walked round the north.
+- `salient`: Red's army sat in its own bulge (77% of its division-days) while Blue went
+  round it.
+- `plains`: v1 stood four years after three states, for want of railways across the
+  border; v6, with them, went on to a surrender.
 - Close-ups show stock textures, relief lit by the normal map, dense forests, city
-  models among farmland, rivers and railways.
+  models among farmland, rivers and single railway lines.
+- Also fixed on the way: `marsh-v3` could not pick Red (the capital was off the picker's
+  screen), and `marsh-v4` could not draw a front on dark ground.
 
 ## The model and its data (2026-09-23)
 
@@ -857,6 +875,39 @@ beat (`win-rate`).
   350 ms on the capture thread and cost frames. Each run writes its own results file.
 - **The country picker** closes in on Blue's capital; on an arena with the capitals in
   the rear no Red land showed. It is zoomed out until the country shows.
+- **The arena's front is not always one straight line (2026-09-24).** On the new arenas
+  the best plan lost in ways the v4 arena never showed. HOI4 spreads a held front's
+  divisions along it by frontage and never shifts them: on the salient arena Red's stood
+  6 to 2 across its two border states all game, the AI massed on the thin side, walked
+  through Red's interior and took its victory points before the attack (137 s); on the
+  marsh arena a lake cuts the border, and the short stretch got 1 division of 8 (lost in
+  79 s). And the attack could pull the whole army far forward while a few of the AI's
+  divisions took the empty home half's victory points: on v4 (the share of the home land
+  the AI held grew 10%, 17%, then 89%) and on the bay arena, where one Blue division
+  walked through Red's homeland while Red's army stood deep in Blue's west.
+- **The guard.** The best plan now watches the land it held at the start. While the front
+  holds, it looks every 30 s; during the attack, at each redraw. When the AI holds 15%
+  or more of it, the front line is drawn round what the AI holds there and executed, so
+  the army turns back and clears it; under half that, the army returns to its front and
+  offensive. In the wins the AI never held more than 14% of the home land at a redraw.
+- **Redraws while paused.** A redraw during the attack (clear, front, offensive, execute)
+  left the army without an executing plan for 20-24 s, about 55 game days, and came
+  every 30-90 s: a third of the attack stood idle. The best plan now pauses the game for
+  the redraw, checked by the pause mark, and executes the new plan once its planning
+  bonus has built (6 s, 15 days). It has done so cleanly in every game since.
+- **Lakes and split borders.** On the marsh arena parts of the grey lake read as Blue
+  land, so every front-line click fell in the lake ("You cannot draw Front Line here"),
+  and a refused click leaves the tool on, so every second try pressed Z onto it and turned
+  it off. Now Blue's land must lean green over red (the lake does not), clicks keep clear
+  of water, the tool's "N divisions will be assigned" is looked for and switched off
+  after a refused click, and a border that water cuts in two at the start gets a front
+  line on each stretch. The divisions still split by frontage (above).
+- **Full views without a tooltip.** Recentring left the pointer mid-map, where a
+  province's tooltip covered part of the border in every planner view; it now waits on
+  the top bar. With it gone, the v4 border reads as one stretch.
+- **Tests of new arenas draw their side at random** (all of the first eight had been
+  Red), and `win-rate` counts each arena by side. The best plan so far on the v6 arenas:
+  river, plains and passes won; marsh, bay and salient lost (before the guard).
 
 ## A learned player from the scripted games (2026-09-24)
 
@@ -890,6 +941,20 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   space and sets speed 5; it does so again if the daily reports stop. Every such step is
   counted in the game's manifest, and the games are recorded as data (source "policy").
   The second PC is reserved from the scripted player's recorder (`--reservation`).
+- **The UI never moves on the second PC.** In all 31 games the unassigned-divisions
+  alert was at (825, 57) and the create-army + at (988, 1013), so the setup clicks are
+  the same pixels every game.
+- **Faster training with a frozen tower.** The imitation starts from the AI-games policy
+  (`--init`), whose tower's last blocks already learned HOI4's screens, and keeps the
+  tower frozen (`--train-last 0`). Then what the tower reads from a frame never changes,
+  so `cache-tower` runs it once over every frame and `--tower-cache` reads the result:
+  the summary, and the patch grid already resized to the 32x32 cells (the policy's 1x1
+  convolution and the resize commute), 1.5 MB a frame. The tower was about a third of a
+  training step. A test holds the cached path to the running tower's outputs.
+- **Memory carried through a game** (`--carry`): each batch slot plays one game window
+  after window in order, and its memory goes on from one window to the next (truncated
+  backpropagation through time). In the memory study on the AI games this was the
+  largest effect: held-out loss 3.109 against 3.169 with each window started empty.
 
 ## The memory study (2026-09-24)
 

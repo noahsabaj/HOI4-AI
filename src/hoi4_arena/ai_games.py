@@ -804,13 +804,14 @@ def play(
             country, player["plan"], player["templates"], player["rules"], speed,
             frame=lambda: rec.manifest["frames"], layout=arena_layout(settings["mod"]),
         )  # fmt: skip
+        planner.debug_dir = Path(root)
         if player.get("shots"):
             # An arena under test: keep the planner's full views of the map, and the
             # first and last frames, for whoever built it.
             planner.overview_dir = Path(root) / "overviews"
             planner.overview_dir.mkdir(parents=True, exist_ok=True)
             shots["start"] = Path(root) / "start.png"
-            Image.fromarray(first.rgb).save(shots["start"])
+            Image.fromarray(pixels(desk, first)).save(shots["start"])
     mover = threading.Thread(
         target=camera,
         args=(inputs, stop, station, popups),
@@ -862,7 +863,7 @@ def play(
                 stamped.extend({"frame": frames, "line": line} for line in arena.lines[seen:])
                 if arena.winner and ending is None:
                     # Keep a few seconds of the surrender on screen, then stop.
-                    ending = now + 5
+                    ending = now + 2
                     Image.fromarray(pixels(desk, frame)).save(Path(root) / "capitulation.png")
             if ending is not None and now >= ending:
                 outcome = arena.winner
@@ -873,7 +874,7 @@ def play(
         reason = f"{type(error).__name__}: {error}"
     finally:
         stop.set()
-        mover.join(timeout=10)
+        mover.join(timeout=3)  # A planner step cut short fails harmlessly once the game ends.
         if planner is not None and planner.overview_dir is not None:
             shots["end"] = Path(root) / "capitulation.png"
             if not shots["end"].exists():
@@ -1266,6 +1267,10 @@ def run_station(station, out_root, rules, templates, settings, end):
         kind = "scripted" if scripted else "ai"
         name = time.strftime(f"{kind}-{station.name}-%Y%m%d-%H%M%S")
         country, speed = game_plan(station.name, len(results), settings["speeds"])
+        if request:
+            # Tests come every other game, which game_plan's turns would always give the
+            # same side: all of the first eight were played as Red (2026-09-24).
+            country = rng.choice(("BLU", "RED"))
         entry = {"game": name, "station": station.name, "started_as": country, "speed": speed}
         entry["arena"] = Path(mod).name
         # A fair coin for who declares, independent of the side played (start_game).
