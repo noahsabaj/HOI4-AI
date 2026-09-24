@@ -124,6 +124,13 @@ Since v4 (`arena-12x8-v4`) the recorder decides who declares the war with a fair
 .venv\Scripts\hoi4-arena.exe advantage --state-value artifacts/state-value.pt artifacts/scripted-games/scripted-peer-20260923-185544
 ```
 
+A learned policy imitates the scripted player's games and then plays them itself. `--lead-in 0` starts a recording's decisions at its first frame (the Qwen tower reads no clip, and the scripted player forms its army in the first 2.5 s), and `--drop-keys 0x20` leaves the space bar out of the labels, since the harness presses it. `--state-weight` and `--order-weight` add training-only losses: the memory predicts the arena's true state from its log and the scripted player's next order. A `splits.json` in the data folder chooses the held-out games. `play-policy` then has a checkpoint play on the second PC against the game's AI, from the screen, recorded; it reserves that PC from the scripted player's recorder first (`artifacts/eval`), and `--point` places each move on its likeliest spot.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe train-bc data/scripted artifacts/bc-scripted --sources scripted --lead-in 0 --drop-keys 0x20 --look-before-click --state-weight 0.5 --order-weight 0.2
+.venv\Scripts\hoi4-arena.exe play-policy artifacts/bc-scripted/epoch-0000.pt artifacts/live --peer artifacts/pairing/peer.json --games 2 --minutes 40 --reservation first-look --point
+```
+
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
 
 ```powershell

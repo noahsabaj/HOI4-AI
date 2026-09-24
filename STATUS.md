@@ -577,6 +577,39 @@ beat (`win-rate`).
   and the AI lost 2 to 4 men for each of the script's. Most plans now hold 90-240 s
   before attacking, from the first win; too few games yet to say which part matters.
 
+## A learned player from the scripted games (2026-09-24)
+
+The goal: a policy that reads only the screen and beats the game's AI in at least half
+of 20 live games. It learns by imitating the scripted player's recorded games.
+
+- **What there is to imitate.** A whole scripted win has about 35 mouse presses and 10
+  key presses that matter: the army, its general, the front (Z and a click), the
+  offensive (X and a right-drag), the speed, each law step (Q, the slot, the law, OK),
+  each redraw (the army card, the bin, OK, then front and offensive again) and each
+  activation. Everything else is the camera. Over 30 games (41,400 decisions), 2.3% of
+  decisions press a mouse button.
+- **Two labels were being lost.** The scripted player forms its army 0.9 to 2.5 s into
+  each game, but training started its decisions after a 1.8 s lead-in that only the
+  clip-reading encoder needs; 23 of 31 games never showed that click. `train-bc --lead-in
+  0` keeps it. And the space bar that starts the game is outside the policy's inputs, so
+  its decision, and every training window around it, was thrown away with the speed
+  clicks beside it. `--drop-keys 0x20` leaves only the key out.
+- **Only 35 of 934 pressing decisions press after a move in the same decision**, so
+  `--look-before-click` costs under 1% of the training windows.
+- **Privileged targets.** Two training-only losses shape what the memory keeps: the
+  arena's true state from its daily report, 65 numbers from the player's side
+  (`--state-weight`; divisions, strength, manpower, casualties, surrender progress, who
+  holds each state, divisions in each state, the date), and the scripted player's next
+  order and the time until it (`--order-weight`). Neither is seen when the policy plays.
+- **Live play** (`play-policy`): the policy plays on the second PC from its screen, at
+  5 decisions a second, through the worker in match mode. The harness launches the game,
+  picks the country and fires the fair coin for who declares, as record-ai does. Space
+  is not an input the policy has, so when it clicks the speed control's + while the game
+  is paused (the scripted player's last setup step), or after 90 s, the harness presses
+  space and sets speed 5; it does so again if the daily reports stop. Every such step is
+  counted in the game's manifest, and the games are recorded as data (source "policy").
+  The second PC is reserved from the scripted player's recorder (`--reservation`).
+
 ## Open work
 
 In order. Since 2026-09-23 the scripted player comes first: it gives a win rate to beat
