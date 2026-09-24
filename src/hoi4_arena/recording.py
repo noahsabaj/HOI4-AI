@@ -365,7 +365,8 @@ class StreamRecorder:
                         "the recording PC has committed %s of its %s MB of memory",
                         memory.get("commit_mb"), memory.get("commit_limit_mb"),
                     )  # fmt: skip
-                self._resync()
+                if not self.stopping.is_set():
+                    self._resync()
 
     def _resync(self):
         """Map the worker's clock onto this one again. Only a quick round trip is trusted:
@@ -508,6 +509,10 @@ class StreamRecorder:
 
     def close(self, *, complete=True, reason=None, trailing_events=None):
         self.stopping.set()
+        # A telemetry sample or clock mapping in flight finishes first: once the caller
+        # closes the connection, it would fail and ask a closed worker for its log.
+        if self.sampler.is_alive():
+            self.sampler.join(timeout=20)
         end = None
         try:
             end = self.stream.stop()
