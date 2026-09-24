@@ -19,8 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import queue
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -79,11 +81,34 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
     decoder = subprocess.Popen(
         [shutil.which("ffmpeg"), "-v", "error", "-i", str(Path(root) / "screen.mkv"),
          "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-        stdout=subprocess.PIPE,
+        stdout=subprocess.PIPE, bufsize=0,
     )  # fmt: skip
     size = width * height * 3
-    pending, index = [], 0
     autocast = {"device_type": torch.device(device).type, "dtype": torch.bfloat16}
+    # Frames are read and cut into views on a thread of their own while the tower runs:
+    # read one after the other, the pipe and the views took about 20 ms of each 60.
+    frames = queue.Queue(maxsize=32)
+
+    def read():
+        try:
+            for index in range(count):
+                buffer = bytearray(size)
+                view, got = memoryview(buffer), 0
+                while got < size:
+                    part = decoder.stdout.readinto(view[got:])
+                    if not part:
+                        raise ValueError(f"{root}: video ends at frame {index} of {count}")
+                    got += part
+                frame = np.frombuffer(buffer, np.uint8).reshape(height, width, 3)
+                cursor = parse_cursor(rows[index].get("cursor"))
+                frames.put((index, views(frame, None, device=device, cursor=cursor).quadrants))
+        except Exception as error:  # noqa: BLE001 - handed to the tower's thread to raise.
+            frames.put(error)
+        frames.put(None)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    pending = []
 
     def flush():
         nonlocal pending
@@ -98,15 +123,10 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
         pending = []
 
     try:
-        while index < count:
-            buffer = decoder.stdout.read(size)
-            if len(buffer) != size:
-                raise ValueError(f"{root}: video ends at frame {index} of {count}")
-            frame = np.frombuffer(buffer, np.uint8).reshape(height, width, 3)
-            cursor = parse_cursor(rows[index].get("cursor"))
-            seen = views(frame, None, device=device, cursor=cursor)
-            pending.append((index, seen.quadrants))
-            index += 1
+        while (item := frames.get()) is not None:
+            if isinstance(item, Exception):
+                raise item
+            pending.append(item)
             if len(pending) == batch:
                 flush()
         flush()
@@ -114,6 +134,7 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
         if decoder.poll() is None:
             decoder.kill()
         decoder.wait()
+        reader.join(timeout=10)
     grids.flush()
     summaries.flush()
     (target / DONE).write_text(json.dumps({"frames": count, "tower": stamp}))
