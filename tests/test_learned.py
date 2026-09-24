@@ -329,7 +329,7 @@ class _Actor:
     def reset_episode(self):
         self.steps = 0
 
-    def act(self, rgb, t_ns, cursor=None):
+    def act(self, rgb, t_ns, precomputed=None, cursor=None):
         self.steps += 1
         action = np.zeros((SLOTS, 3), np.int64)
         if self.steps == 3:
@@ -621,3 +621,42 @@ def test_a_carried_memory_trains_and_validates_game_by_game(tmp_path, monkeypatc
     assert rows[-1]["validation_nll"] > 0 and rows[-1]["validation_decisions"] == 15
     config = json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]
     assert config["carry"] and config["burn_in"] == 0
+
+
+class _TimedDesk(_Desk):
+    """A worker of protocol 2: a decision's slots in one request, each at its offset."""
+
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+
+    def protocol(self):
+        return 2
+
+    def apply(self, events, at_ms=None):
+        self.batches.append((list(events), at_ms))
+        self.applied.extend(events)
+        if at_ms is None:
+            return {"t_ns": 1}
+        return {"t_ns": 9, "times_ns": [1000 + int(t) for t in at_ms]}
+
+
+def test_a_timed_dispatch_sends_the_slots_in_one_request_at_their_offsets():
+    desk = _TimedDesk()
+    dispatcher = play.Dispatcher(desk, clock=lambda: 0.0, timed=True)
+    plus = [1, round(play.SPEED_UP[0] * (GRID - 1)), round(play.SPEED_UP[1] * (GRID - 1))]
+    action = np.zeros((SLOTS, 3), np.int64)
+    action[1] = plus
+    action[3] = _token(VOCAB.index(CLICK))
+    dispatcher.start(action, 0.0, (100.0, 100.0))
+    dispatcher.join()
+    ((events, offsets),) = desk.batches
+    assert [e["kind"] for e in events] == ["move", "button"] and events[1] == CLICK
+    assert events[0]["x"] == pytest.approx(play.SPEED_UP[0], abs=1e-3)
+    assert offsets == pytest.approx([25.0, 75.0])
+    assert [e["t_ns"] for e in dispatcher.take()] == [1025, 1075], "each event at its own time"
+    assert dispatcher.speed_clicks == 1
+    dispatcher.start(np.zeros((SLOTS, 3), np.int64), 0.0, (5.0, 5.0))
+    dispatcher.join()
+    assert desk.batches[-1] == ([], None), "an idle decision still feeds the watchdog"
+    dispatcher.close()
