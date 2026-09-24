@@ -247,3 +247,17 @@ def test_the_conscription_ladder_climbs_one_paid_step_at_a_time(monkeypatch):
     assert planner.raise_conscription(None) is True and game["law"] == 3
     assert [o["law"] for o in planner.orders] == ["limited", "extensive", "service"]
     assert not game["political"]
+
+
+def test_the_front_line_tool_is_clicked_in_the_enemy_s_own_half():
+    blue = np.zeros((100, 200), bool)
+    red = np.zeros((100, 200), bool)
+    blue[:, :100], red[:, 100:] = True, True
+    # Blue holds a strip of Red's land by the seam: Blue's colour, Red's province.
+    blue[:, 100:115], red[:, 100:115] = True, False
+    box = (0, 0, 100, 200)
+    as_red = Planner("RED", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    clicks = as_red.front_clicks(blue, red, box)
+    assert clicks[0] == (50, 50) and all(x < 80 for x, _ in clicks)
+    as_blue = Planner("BLU", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    assert all(x > 120 for x, _ in as_blue.front_clicks(blue, red, box))
