@@ -11,8 +11,8 @@ import uuid
 from pathlib import Path
 
 from .arena_log import ArenaLog
-from .dataset import FOVEA_SIZE, parse_cursor, recorded_speed
 from .desktop import Desktop, DesktopError, EmergencyStop
+from .layout import FOVEA_SIZE, parse_cursor, recorded_speed
 
 log = logging.getLogger(__name__)
 
@@ -224,6 +224,8 @@ class StreamRecorder:
         split=None,
         codec="nvenc",
         first_data_timeout=15.0,
+        views=None,
+        **sizes,
     ):
         import threading
 
@@ -237,7 +239,9 @@ class StreamRecorder:
         self.desk = desk
         self.root.mkdir(parents=True, exist_ok=False)
         try:
-            self.stream = desk.start_stream(hz=hz, profile=profile, quality=quality)
+            self.stream = desk.start_stream(
+                hz=hz, profile=profile, quality=quality, views=views, **sizes
+            )
         except DesktopError as error:
             shutil.rmtree(self.root, ignore_errors=True)
             raise StreamUnavailable(str(error)) from error
@@ -273,11 +277,21 @@ class StreamRecorder:
         # NUT from the worker, remuxed without decoding into the Matroska file training reads.
         self.muxer = subprocess.Popen(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "nut", "-i", "pipe:0",
-             "-c", "copy", "-f", "matroska", str(self.root / "screen.mkv")],
+             "-c", "copy", "-f", "matroska", "-cluster_time_limit", "1000",
+             str(self.root / "screen.mkv")],
             stdin=subprocess.PIPE,
             stderr=self.log,
         )  # fmt: skip
         self.changed = threading.Condition()
+        # How long each frame's row took from the worker's capture to this process: the
+        # worker's clock mapped onto this one through a few status round trips.
+        self.delivery_ms = []
+        try:
+            self.offset_ns, rtt = desk.clock_offset()
+            self.manifest["clock_rtt_ms"] = round(rtt / 1e6, 3)
+        except (DesktopError, AttributeError, TypeError, KeyError):
+            self.offset_ns = None
+        self.views = None  # The newest frame's views, when the stream brings them.
         self.extras = {}
         self.held = None  # The newest row: written when the next one arrives, or at close.
         self.seen = 0  # Rows next_frame has handed out.
@@ -342,8 +356,20 @@ class StreamRecorder:
         while True:
             message = self.stream.messages.get()
             if "frame" in message:
+                arrived = time.perf_counter_ns()
                 row = {**message["frame"], "received_ns": time.monotonic_ns()}
+                if self.offset_ns is not None and "t_ns" in row:
+                    self.delivery_ms.append((arrived - row["t_ns"] - self.offset_ns) / 1e6)
+                try:
+                    seen = self.stream.frame_views(message)
+                except DesktopError as error:
+                    self.write_error = self.write_error or f"views: {error}"
+                    seen = None
+                # The views travel with the frame to next_frame(), not into the rows.
+                for key in ("views_bytes", "view_size", "detail_size", "fovea_size", "encoding"):
+                    row.pop(key, None)
                 with self.changed:
+                    self.views = seen
                     if self.held is not None:
                         self._write(self.held)
                     for key, value in self.extras.items():
@@ -417,7 +443,7 @@ class StreamRecorder:
             if self.seen < self.manifest["frames"]:
                 self.seen = self.manifest["frames"]
                 self.gaps_seen = self.gap_count
-                return Frame(None, dict(self.held), self.held["received_ns"])
+                return Frame(None, dict(self.held), self.held["received_ns"], views=self.views)
             if self.gaps_seen < self.gap_count:
                 self.gaps_seen = self.gap_count
                 gap = self.last_gap or {}
@@ -493,6 +519,7 @@ class StreamRecorder:
             complete=complete and rc == 0 and problem is None,
             reason=reason or problem,
             rows_cut=cut,
+            delivery_ms=_spread(self.delivery_ms),
             encoder_exit=end.get("exit"),
             muxer_exit=rc,
             video_frames=video,
@@ -501,6 +528,18 @@ class StreamRecorder:
             stream=end.get("stats"),
         )
         self._manifest()
+
+
+def _spread(values):
+    """p50, p95 and the largest of `values`, rounded, or None when there are none."""
+    if not values:
+        return None
+    ordered = sorted(values)
+
+    def at(q):
+        return round(ordered[min(len(ordered) - 1, round(q * (len(ordered) - 1)))], 2)
+
+    return {"p50": at(0.5), "p95": at(0.95), "max": round(ordered[-1], 2), "n": len(ordered)}
 
 
 def count_frames(path):
@@ -655,7 +694,9 @@ def record(
                         ended = "F12"
                         break
                     except DesktopError as error:
-                        if "not_foreground" not in str(error):
+                        # A screen switched off leaves the window off the desktop: wait for
+                        # it as for a game out of focus.
+                        if "not_foreground" not in str(error) and "off_screen" not in str(error):
                             raise
                         frame = None
                 usable = (

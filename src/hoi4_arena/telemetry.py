@@ -37,23 +37,30 @@ def summary(reply: dict) -> str:
         )
     else:
         lines.append(f"Game: not running ({game.get('windows', 0)} windows)")
-    capture = reply.get("capture") or {}
-    if capture.get("captures"):
-        lines.append(
-            f"Capture: {capture['captures']} ({capture.get('failures', 0)} failed), "
-            f"{_num(capture.get('capture_ms_p50'))} ms p50, {_num(capture.get('capture_ms_p95'))} ms "
-            f"p95, {capture.get('backend')}"
-        )
-    stream = capture.get("stream")
-    if stream:
-        lines.append(
-            f"Stream: {stream['frames']} frames in {_num(stream.get('seconds'), 0)} s at "
-            f"{stream['hz']} Hz ({stream['profile']} q{stream['quality']}), skipped "
-            f"{stream.get('skipped_ticks')}, gaps {stream.get('gaps')}, late "
-            f"{_num(stream.get('late_ms_p50'))}/{_num(stream.get('late_ms_p95'))}/"
-            f"{_num(stream.get('late_ms_max'))} ms p50/p95/max, interval p95 "
-            f"{_num(stream.get('interval_ms_p95'))} ms, {stream.get('bytes_out', 0) / 1e6:.1f} MB out"
-        )
+    # This worker's own captures, then those of the other workers on that PC: from an
+    # observer, the one holding the game (a recording) is the one that matters.
+    workers = [("this worker", reply.get("capture") or {})]
+    workers += [
+        (f"worker {w.get('pid')}", w.get("capture") or {}) for w in reply.get("workers") or []
+    ]
+    for who, capture in workers:
+        if capture.get("captures"):
+            lines.append(
+                f"Capture ({who}): {capture['captures']} ({capture.get('failures', 0)} failed), "
+                f"{_num(capture.get('capture_ms_p50'))} ms p50, "
+                f"{_num(capture.get('capture_ms_p95'))} ms p95, {capture.get('backend')}"
+            )
+        stream = capture.get("stream")
+        if stream:
+            lines.append(
+                f"Stream ({who}): {stream['frames']} frames in {_num(stream.get('seconds'), 0)} s "
+                f"at {stream['hz']} Hz ({stream['profile']} q{stream['quality']}), skipped "
+                f"{stream.get('skipped_ticks')}, gaps {stream.get('gaps')}, late "
+                f"{_num(stream.get('late_ms_p50'))}/{_num(stream.get('late_ms_p95'))}/"
+                f"{_num(stream.get('late_ms_max'))} ms p50/p95/max, interval p95 "
+                f"{_num(stream.get('interval_ms_p95'))} ms, "
+                f"{stream.get('bytes_out', 0) / 1e6:.1f} MB out"
+            )
     lines.append(
         f"{'process':<26}{'pid':>7}{'cores':>7}{'RAM MB':>8}{'GPU %':>7}{'enc %':>7}{'VRAM':>7}"
     )

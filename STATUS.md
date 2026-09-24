@@ -571,6 +571,27 @@ instead of eight; offsets of 50 ms came out 50.2 and 50.3 ms apart on the second
 Captures travel raw over the local pipe (lz4 cost 16-21 ms a frame). BGRA to RGB takes
 2.2 ms instead of 18.4.
 
+**The first scripted games as streams** (2026-09-24, after the scripted player moved to
+`--codec nvenc`) held 5.0 fps, but 6.9% of their ticks began over 20 ms late, up to 150 ms.
+The scripted player focuses the game before every action, and the worker's `focus` waited
+150 ms for the switch while holding the input lock, which each tick took to find the
+window. Focus now waits on its own thread, and ticks never take that lock. Checked on the
+second PC with `focus` every third frame and a full capture every seventh: tick lateness
+0.75 ms p95, 5.8 ms at worst, and frame intervals 200.0 / 203.0 ms p50 / p95.
+
+- Telemetry through an observer now shows the stream of the worker holding the game:
+  each worker leaves its capture and stream timing in a small file for the others.
+- A game window hanging off the desktop (a monitor switched off shrinks the desktop to
+  1024x768) is never captured, on either backend. A stream records gaps until the screen
+  is back, and `record` waits for it as for a game out of focus.
+- A stream can bring the policy's views with every frame (`views=`), so a live policy acts
+  on exactly the recorded frames without a capture request each tick: 77 of 77 frames came
+  with their views in the check.
+- Each recording's manifest gives `delivery_ms`, how long rows took from the capture to
+  this PC, with the worker's clock mapped through status round trips (1.6 ms): 51 ms p50
+  and 71 ms p95 with views on, over the network. NVENC hands each frame over at once
+  (`-delay 0`), and the video is written in clusters of at most a second.
+
 ## Recording AI games
 
 `hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.
