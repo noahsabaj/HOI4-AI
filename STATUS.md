@@ -177,7 +177,13 @@ every rule below came from a crash dump or the stock files.
   to its holder's capital, and nobody in the arena can build one. With no line across
   the border, a captured hub never supplied its captor: on the first terrain arena Blue
   took three states, then stood for four years five provinces from Red's capital,
-  against a single Red division. The plain arena still has no crossing lines.
+  against a single Red division. The plain arena still has no crossing lines. The audit
+  checks that every hub is joined by rail to its country's others and, on a preset, that
+  at least two lines cross the border.
+- **Dark ground must still read as land.** The scripted player counts a pixel as land
+  only above a brightness sum of 250 at full zoom-out. Forest and marsh filling the
+  middle of the marsh arena's front drew at about 220 (plains about 330), and its
+  front-line click fell in the hole, on the lake. They are drawn lighter now.
 - **Rivers run along province borders.** Only a river on a border is crossed (86% of
   stock river pixels are on one). A river starts at a green source pixel at its free
   end, is one pixel wide and edge-connected, and a tributary ends on a red join pixel.
@@ -201,14 +207,21 @@ provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n")
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
 checks that, province by province and pixel by pixel.
 
-| Preset | What changes the fight |
-|---|---|
-| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front |
-| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across |
-| `passes` | Mountains two provinces deep on each side of the whole border (-50% attack), crossed by two one-province valleys |
-| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings |
-| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus |
-| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south |
+| Preset | What changes the fight | Front | Attack across it |
+|---|---|---|---|
+| none | The plain arena, for comparison | 15 | -3% |
+| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front | 15 | -8% |
+| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across | 15 | -2% |
+| `passes` | Mountains two provinces deep on each side of the whole border, crossed by two one-province valleys | 15 | -37% |
+| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
+| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
+| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+
+"Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
+mean penalty for attacking into the defender's province there: the stock terrain
+penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
+-60% where a river runs along that border. On `passes` 73% of the front costs 40% or
+more. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 
@@ -222,18 +235,35 @@ What a preset paints, all with stock assets:
   computed from the heights, so the relief is lit.
 - **Cities:** each victory point is an urban province, 60% of it painted as city (stock
   city models and night lights). Forests have stock European trees (85% cover).
+- **A trunk railway:** per side, the cheapest tree joining the capital, cities and
+  hubs, routed round mountains and marsh, plus two loops, and two lines across the
+  border; 58-70 links in all, against 513 for a line on every adjacency. Each state's
+  hub stands on its city or on the easiest ground near its middle, so taking a junction
+  cuts off the hubs beyond it. On the passes arena the lines cross in the two valleys.
 - **Borders that wander:** province seeds stray up to 22% of a province, and the Voronoi
   is taken through a displacement that turns with the map, so coasts, state borders and
   the front are no longer ruled lines.
 
-A preset takes 13–17 s to generate. `generation.json` records the preset, its terrain
-counts, and a state layout over the land box, from which `scripted.state_at` names the
-state under a point on any arena, bulges included.
+A preset takes 13–17 s to generate. `--seed` redraws its noise, province shapes and
+river courses: the same design, another map, so an agent need not learn one map by
+heart. `generation.json` records the preset and seed, its terrain counts, its front
+(the numbers in the table above), and a state layout over the land box, from which
+`scripted.state_at` names the state under a point on any arena, bulges included.
 
-Live test, `arena-plains-v1` (2026-09-24, second PC, scripted Blue against the AI):
-loaded and ran 15 minutes with no errors, and the scripted player found its fronts on
-the new ground. It ended as a draw, in the supply stall above; v3 adds the lines across
-the border.
+Live tests on the second PC (2026-09-24), the scripted player against the game's AI.
+On the plain arena, 23 such games ended by game day 290-820.
+
+- `plains-v1`, as Blue: loaded with no errors, and the scripted player found its fronts
+  on the new ground. A draw after 15 minutes: the supply stall above.
+- `passes-v3`, as Red: Red won in 541 s. Blue surrendered on day 1236, after a seesaw
+  at the valleys: 22 changes of control, with West 6 taken four times and East 7 three.
+- `marsh-v3` and `v4`: loaded, lakes included, but first Red could not be picked (the
+  capital fix) and then the front line would not draw on dark ground (the colour fix).
+- `marsh-v6`, as Red: loaded with no map errors in the game's log. The AI won in 79 s:
+  the lake splits the front, Red's army held only the southern stretch (89% of its
+  division-days in one state), and Blue walked round the north without a casualty.
+- Close-ups show stock textures, relief lit by the normal map, dense forests, city
+  models among farmland, rivers and railways.
 
 ## The model and its data (2026-09-23)
 

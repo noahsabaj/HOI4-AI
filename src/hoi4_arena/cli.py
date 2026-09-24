@@ -624,6 +624,12 @@ def main():
         "terrain, rivers, lakes and cities on the 12x8 grid. Without one, the plain arena.",
     )
     generation.add_argument(
+        "--seed",
+        type=int,
+        help="Redraw a preset's noise, province shapes and river courses: the same design, "
+        "another map. Recorded in generation.json.",
+    )
+    generation.add_argument(
         "--undefended",
         choices=["BLU", "RED"],
         help="Field no divisions for this country. A diagnostic, not a playable arena: "
@@ -978,6 +984,7 @@ def _dispatch(command, args):
             args["game"],
             args["output"],
             preset=args["preset"],
+            seed=args["seed"],
             undefended=args["undefended"],
             victory_points_on_border=args["victory_points_on_border"],
             **{key: value for key, value in grid.items() if value is not None},

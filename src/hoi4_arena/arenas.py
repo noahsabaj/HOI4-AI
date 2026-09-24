@@ -107,16 +107,23 @@ CITY_LIGHTS = (200, 110)
 # through the political view, and vision.country_pixels tells Blue's land from Red's by
 # tint (blue minus red above 10, red minus blue above 15, sum above 250), calibrated on
 # those two. Stock Europe is greener and darker: plains (61, 69, 35), forest (43, 57, 20).
+#
+# Forest and marsh are lighter than the plain arena's forest: on the first marsh arena,
+# where both fill the middle of the front, they drew at a brightness sum of about 220 at
+# full zoom-out (plains about 330), below the 250 that counts as land. The scripted
+# player saw holes there, and its front-line click fell in one. On screen the sum came
+# out at about 1.8 times the colour map's minus 84, so these aim at 300 or more, clear
+# of the threshold under fog of war and night shading.
 GROUND = {
     PLAINS: (80, 88, 62),
-    FARMLAND: (88, 88, 60),
-    DARK_FOREST: (56, 68, 46),
-    LIGHT_FOREST: (64, 76, 52),
-    ROLLING_HILLS: (84, 86, 64),
-    RIDGED_HILLS: (88, 88, 66),
+    FARMLAND: (86, 88, 68),
+    DARK_FOREST: (74, 86, 60),
+    LIGHT_FOREST: (78, 90, 62),
+    ROLLING_HILLS: (82, 86, 64),
+    RIDGED_HILLS: (86, 86, 68),
     GREEN_MOUNTAIN: (88, 88, 72),
     ROCK: (104, 102, 94),
-    MARSH: (62, 74, 58),
+    MARSH: (76, 88, 68),
     CITY: (86, 86, 78),
 }
 
@@ -167,6 +174,9 @@ class Preset:
     # Cells on Red's side of the seam that Blue holds instead, each given back by its
     # twin on Blue's side: the border bends round them.
     trades: tuple = ()
+    # Where railways cross the border, each with its half turn: the default puts one
+    # line across on row 2 and its twin on row 5, the passes' rows.
+    crossings: tuple = ((12.0, 2.5),)
     # Blue's cities, capital first: the capital holds 20 victory points and each of the
     # others 5, the 35 a side the plain arena has. The capital stands mid-country, as the
     # plain arena's does: the country picker opens centred on Blue's capital, and the
@@ -734,7 +744,7 @@ def terrain_pixels(rng, types, heights, city_mask):
     plains = np.where(patches > 0.45, FARMLAND, PLAINS)
     variants = {
         "plains": plains,
-        "forest": np.where(clumps > 0.25, LIGHT_FOREST, DARK_FOREST),
+        "forest": np.where(clumps > 0, LIGHT_FOREST, DARK_FOREST),
         "hills": np.where(patches > 0.1, RIDGED_HILLS, ROLLING_HILLS),
         "mountain": np.where(heights >= ROCK_LINE, ROCK, GREEN_MOUNTAIN),
         "marsh": np.full(shape, MARSH),
@@ -804,3 +814,145 @@ def colour_map(rng, graphical, lights, ocean):
     colour[..., :3] = np.where(land[..., None], colour[..., :3] * mottle[..., None], ocean[:3])
     colour[..., 3] = np.where(land, lights[::2, ::2], ocean[3])
     return symmetric(np.clip(np.round(colour), 0, 255).astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------------------
+# Railways.
+
+# What laying track through a province costs, relative to open ground: the stock
+# movement costs (plains 1.0, urban 1.2, forest and hills 1.5, marsh and mountains 2.0)
+# made steeper, since a railway goes a long way round a mountain rather than over it.
+RAIL_COST = {
+    "plains": 1.0,
+    "urban": 1.0,
+    "forest": 1.6,
+    "hills": 1.8,
+    "marsh": 3.5,
+    "mountain": 5.0,
+}
+
+
+def trunk_rails(blue, neighbours, cost, terminals, crossings, twin, loops=2):
+    """A trunk railway: the cheapest tree joining `terminals` through Blue's own land,
+    `loops` more lines where they save the longest detours, and the lines across the
+    border; Red's network is Blue's turned round.
+
+    `blue` holds Blue's land provinces, `cost[p]` the cost of track through p,
+    `crossings` the (Blue, Red) province pairs a line crosses the border between, and
+    `twin(p)` a province's half turn. Returns the rail links as sorted province pairs.
+    """
+    nodes = sorted(blue)
+    index = {p: k for k, p in enumerate(nodes)}
+    first, second, weight = [], [], []
+    for p in nodes:
+        for q in neighbours[p]:
+            if q in index:
+                first.append(index[p])
+                second.append(index[q])
+                weight.append((cost[p] + cost[q]) / 2)
+    graph = csr_matrix((weight, (first, second)), shape=(len(nodes), len(nodes)))
+    # Each crossing joins Blue's network at its own Blue end and at the Blue end of its
+    # twin, so both belong to the tree.
+    ends = sorted(set(terminals) | {b for b, _ in crossings} | {twin(r) for _, r in crossings})
+    ends = [index[p] for p in ends if p in index]
+    cost_between, previous = dijkstra(graph, directed=False, indices=ends, return_predecessors=True)
+    between = cost_between[:, ends]
+
+    def path(i, j):
+        """The province links of the cheapest line from terminal i to terminal j."""
+        links, k = set(), ends[j]
+        while k != ends[i]:
+            back = previous[i, k]
+            links.add(tuple(sorted((nodes[back], nodes[k]))))
+            k = back
+        return links
+
+    # Prim's tree over the terminals, each of its edges laid as the cheapest line.
+    joined, links = {0}, set()
+    while len(joined) < len(ends):
+        _, i, j = min(
+            (between[i, j], i, j) for i in joined for j in range(len(ends)) if j not in joined
+        )
+        links |= path(i, j)
+        joined.add(j)
+
+    def along(links):
+        """Travel costs between terminals using only the laid lines."""
+        a, b = zip(*((index[p], index[q]) for p, q in links))
+        w = [(cost[nodes[x]] + cost[nodes[y]]) / 2 for x, y in zip(a, b)]
+        laid = csr_matrix((w, (a, b)), shape=(len(nodes), len(nodes)))
+        return dijkstra(laid, directed=False, indices=ends)[:, ends]
+
+    # Loops where the tree forces the longest detour compared with a line of their own.
+    for _ in range(loops):
+        detour = along(links) / np.maximum(between, 1e-9)
+        np.fill_diagonal(detour, 0)
+        i, j = np.unravel_index(np.argmax(detour), detour.shape)
+        if detour[i, j] < 1.5:
+            break
+        links |= path(i, j)
+    turned = {tuple(sorted((twin(p), twin(q)))) for p, q in links}
+    across = set()
+    for b, r in crossings:
+        across.add(tuple(sorted((b, r))))
+        across.add(tuple(sorted((twin(b), twin(r)))))
+    return sorted(links | turned | across)
+
+
+# ---------------------------------------------------------------------------------------
+# What the front is like.
+
+# The attack penalty for attacking into each terrain, from the stock
+# common/terrain/00_terrain.txt (units = { attack = ... }), and for crossing a small or
+# large river, from NMilitary.RIVER_CROSSING_PENALTY and RIVER_CROSSING_PENALTY_LARGE.
+ATTACK = {
+    "plains": 0.0,
+    "forest": -0.15,
+    "hills": -0.25,
+    "urban": -0.30,
+    "marsh": -0.40,
+    "mountain": -0.50,
+}
+RIVER_ATTACK = {False: -0.30, True: -0.60}
+
+
+def river_borders(ids, rivers):
+    """The largest river index along each shared province border, as {(a, b): index}
+    with a < b: a river pixel on either side of a shared edge marks the pair."""
+    found = {}
+    for a, b, ra, rb in (
+        (ids[:-1], ids[1:], rivers[:-1], rivers[1:]),
+        (ids[:, :-1], ids[:, 1:], rivers[:, :-1], rivers[:, 1:]),
+    ):
+        edge = a != b
+        for side, other, index in ((a, b, ra), (b, a, rb)):
+            hit = edge & (index >= 0)
+            low = np.minimum(side[hit], other[hit]).tolist()
+            high = np.maximum(side[hit], other[hit]).tolist()
+            for x, y, value in zip(low, high, index[hit].tolist()):
+                found[(x, y)] = max(found.get((x, y), -1), value)
+    return found
+
+
+def front_report(neighbours, owner, terrain, rivers):
+    """How many Blue and Red provinces touch, and what attacking across costs there:
+    the defender's terrain penalty plus the river's, as the combat screen adds them."""
+    penalties, rivered = [], 0
+    for a, sides in neighbours.items():
+        for b in sides:
+            if a < b and owner[a - 1] and owner[b - 1] and owner[a - 1] != owner[b - 1]:
+                defender = a if owner[a - 1] == 2 else b
+                penalty = ATTACK[terrain[defender - 1]]
+                river = rivers.get((a, b), -1)
+                if river >= 0:
+                    rivered += 1
+                    penalty += RIVER_ATTACK[river >= 7]
+                penalties.append(max(penalty, -0.9))
+    return {
+        "pairs": len(penalties),
+        "mean_attack": round(float(np.mean(penalties)), 3) if penalties else 0.0,
+        "share_at_40_or_worse": round(float(np.mean(np.array(penalties) <= -0.4)), 2)
+        if penalties
+        else 0.0,
+        "river_borders": rivered,
+    }
