@@ -201,7 +201,7 @@ every rule below came from a crash dump or the stock files.
 
 ## Arena maps (2026-09-24)
 
-`generate-map --preset <name>` writes one of six named arenas (`arenas.PRESETS`), and
+`generate-map --preset <name>` writes one of seven named arenas (`arenas.PRESETS`), and
 `preview-map` draws one from its files. Every one keeps the playable grid (12×8
 provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
@@ -216,12 +216,13 @@ checks that, province by province and pixel by pixel.
 | `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
 | `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
 | `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+| `ford` | A large river runs along the whole border, except at one ford in the middle | 15 | -56% |
 
 "Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
 mean penalty for attacking into the defender's province there: the stock terrain
 penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
 -60% where a river runs along that border. On `passes` 73% of the front costs 40% or
-more. Measured on the v6 files.
+more, on `ford` 93%. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 

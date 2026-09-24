@@ -246,8 +246,9 @@ def preset_arenas(tmp_path_factory):
     base = tmp_path_factory.mktemp("presets")
     game = _fixture_game(base)
     built = {}
-    # marsh: lakes and a large river; salient: a bent border; bay: sea cut into the land.
-    for name in ("marsh", "salient", "bay"):
+    # marsh: lakes and a large river; salient: a bent border; bay: sea cut into the land;
+    # ford: a river along the border itself.
+    for name in ("marsh", "salient", "bay", "ford"):
         # The salient is drawn from another seed: the same design, another map.
         report = generate(game, base / name, preset=name, seed=11 if name == "salient" else None)
         built[name] = (base / name, report, audit(base / name))
@@ -536,3 +537,15 @@ def test_a_seed_redraws_a_preset_and_the_report_measures_its_front(preset_arenas
     assert fronts["bay"]["pairs"] < fronts["marsh"]["pairs"] < fronts["salient"]["pairs"]
     assert fronts["marsh"]["share_at_40_or_worse"] >= 0.25
     assert fronts["bay"]["mean_attack"] > fronts["marsh"]["mean_attack"]
+
+
+def test_a_river_on_the_border_leaves_one_ford(preset_arenas):
+    """The ford's river runs along the border between the two countries, from each coast
+    to the middle, so every border pair but the ford is a large river crossing."""
+    root, report, checked = preset_arenas["ford"]
+    assert checked["problems"] == []
+    front = report["design"]["front"]
+    assert front["river_borders"] >= front["pairs"] - 2
+    assert front["share_at_40_or_worse"] >= 0.8
+    rivers = np.asarray(Image.open(root / "map/rivers.bmp"))
+    assert ((rivers >= 7) & (rivers <= 11)).any()
