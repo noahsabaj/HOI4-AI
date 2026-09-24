@@ -175,6 +175,11 @@ STREAM_CODECS = {
 }
 
 
+# How often a stream recording notes what its PC spends on it, and on what.
+TELEMETRY_EVERY = 30
+RECORDING_PROCESSES = {"hoi4.exe", "hoi4-desktop-worker.exe", "ffmpeg.exe", "pwsh.exe", "dwm.exe"}
+
+
 class StreamUnavailable(RuntimeError):
     """The worker cannot record a stream: too old, no ffmpeg there, or no such encoder."""
 
@@ -280,6 +285,10 @@ class StreamRecorder:
         self.write_error = None
         self.consumer = threading.Thread(target=self._consume, daemon=True)
         self.consumer.start()
+        # What the recording PC spent on it: the game, the worker and its encoder, the GPU,
+        # the network. A few lines a minute, beside the video (TELEMETRY_EVERY).
+        self.stopping = threading.Event()
+        self.sampler = threading.Thread(target=self._sample, daemon=True)
         # An encoder that cannot start (no NVIDIA encoder on that PC, say) fails on its
         # first frame, after the stream has started: wait for its first bytes. A game out
         # of focus sends gaps instead of frames, which is the recorder's to fix, not a
@@ -294,7 +303,29 @@ class StreamRecorder:
             self._shut()
             shutil.rmtree(self.root, ignore_errors=True)
             raise StreamUnavailable(f"the worker's {profile} encoder gave no video: {detail}")
+        self.sampler.start()
         self._manifest()
+
+    def _sample(self):
+        with (self.root / "telemetry.jsonl").open("a", encoding="utf8") as out:
+            while not self.stopping.wait(TELEMETRY_EVERY):
+                try:
+                    reply = self.desk.telemetry(timeout=15)
+                except Exception as error:  # noqa: BLE001 - telemetry must never end a recording.
+                    log.warning("telemetry: %s", error)
+                    continue
+                row = {
+                    "frame": self.manifest["frames"],
+                    **{k: reply.get(k) for k in ("t_ns", "cpu", "memory", "gpu", "network")},
+                    "processes": [
+                        p for p in reply.get("processes") or []
+                        if p.get("name", "").lower() in RECORDING_PROCESSES
+                    ],
+                    "game": reply.get("game"),
+                    "stream": (reply.get("capture") or {}).get("stream"),
+                }  # fmt: skip
+                out.write(json.dumps(row) + "\n")
+                out.flush()
 
     def _manifest(self):
         temp = self.root / "manifest.tmp"
@@ -406,6 +437,7 @@ class StreamRecorder:
         return rc
 
     def close(self, *, complete=True, reason=None, trailing_events=None):
+        self.stopping.set()
         end = None
         try:
             end = self.stream.stop()
