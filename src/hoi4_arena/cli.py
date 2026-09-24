@@ -69,7 +69,12 @@ def main():
     )
     ai.add_argument("output")
     ai.add_argument("--minutes", type=float, required=True, help="Total time budget.")
-    ai.add_argument("--mod", default="artifacts/mods/arena-12x8-v2")
+    ai.add_argument(
+        "--mod",
+        nargs="+",
+        default=["artifacts/mods/arena-12x8-v2"],
+        help="Arena mod folders, played in turn, each as both countries.",
+    )
     ai.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     ai.add_argument(
         "--ok-button",
@@ -98,6 +103,39 @@ def main():
         help="observe: the game's AI plays both countries. scripted: the scripted player "
         "fights the recorder's country through the interface, with a random strategy each "
         "game, against the AI (needs an arena v3 or later for its daily state reports).",
+    )
+    ai.add_argument(
+        "--arena-queue",
+        help='A folder of arena test requests (<name>.json with {"mod": <folder>}). A scripted '
+        "station plays each once, first, and answers in the sibling results/ folder; arenas "
+        "that pass join the turn (accepted.json).",
+    )
+    ai.add_argument(
+        "--queue-stations",
+        nargs="+",
+        choices=["here", "peer"],
+        help="The stations that serve the arena queue (default: every one).",
+    )
+    ai.add_argument(
+        "--start-save",
+        dest="start_saves",
+        nargs="+",
+        help="ARENA:COUNTRY:SAVE, a save made paused at the start of a new game on that arena "
+        "as that country: games launch straight into it, skipping the menus.",
+    )
+    ai.add_argument(
+        "--opening",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        help="Seconds, drawn per game, that a game runs at speed 1 before the war begins, so "
+        "games that start alike do not play alike.",
+    )
+    ai.add_argument(
+        "--eval-dir",
+        help="Lend the second PC between games to live evaluations that reserve it: "
+        '<dir>/queue/<name>.json ({"minutes": N}) is answered by <dir>/granted/<name>.json '
+        "with HOI4 closed, and play resumes at <dir>/done/<name>.json or after N+15 minutes.",
     )
     live = sub.add_parser(
         "play-policy",

@@ -117,6 +117,15 @@ public static class Windows {
                 Get-Content -LiteralPath $path -Tail 15
             }
         }
+        # Map errors since this launch (error.log is rewritten at each), for whoever builds
+        # arenas: the stock game logs some too, so they are compared with the plain arena's.
+        $errors = Join-Path $logs 'error.log'
+        if (Test-Path -LiteralPath $errors) {
+            $map = @(Select-String -LiteralPath $errors -Pattern 'MAP_ERROR|map[/\\]|\.bmp|definition\.csv|adjacenc|railway|supply_node|strategicregion|unitstack|weatherposition|buildings\.txt')
+            "== map errors in error.log: $($map.Count)"
+            $map | Select-Object -First 10 | ForEach-Object { $_.Line }
+            '== end of map errors'
+        }
     } *>&1
     exit 0
 }
