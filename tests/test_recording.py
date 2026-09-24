@@ -153,3 +153,70 @@ def test_a_silent_peer_is_asked_for_its_log_once(monkeypatch):
 
     peer.request = request
     assert peer.worker_log() == ["last words"] and calls == ["status"]
+
+
+def dropped_connection(kind):
+    """A connection to the second PC whose reader has stopped: its bridge dropped it."""
+    import threading
+    from collections import deque
+
+    class Socket:
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            pass
+
+    desk = kind.__new__(kind)
+    desk.diagnostics = deque(["dropped by the bridge"])
+    desk.write_lock, desk.pending_lock = threading.Lock(), threading.Lock()
+    desk.pending, desk.next_id, desk.streams = {}, 1, {}
+    desk.reader_error = DesktopError("Desktop disconnected")
+    desk.close_error = None
+    desk.socket = desk.stream = Socket()
+    return desk
+
+
+def in_time(action, seconds=5):
+    import threading
+
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = action()
+        except Exception as error:  # noqa: BLE001 - reported to the test.
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "deadlocked"
+    return outcome
+
+
+def test_closing_a_connection_the_bridge_dropped_never_deadlocks():
+    """A recorder hung twice on 2026-09-24 closing such a connection: its release was
+    refused, and explaining why asked the worker for its log from under the write lock
+    the release held."""
+    from hoi4_arena.remote import RemoteDesktop
+
+    desk = dropped_connection(RemoteDesktop)
+    in_time(desk.close)
+    assert "reader stopped" in desk.close_error
+
+    class Asking(RemoteDesktop):
+        """Explains a failure by asking the worker, as worker_log did on any connection."""
+
+        def worker_log(self):
+            if not getattr(self, "asked", False):
+                self.asked = True
+                try:
+                    self.request("status", timeout=1)
+                except DesktopError:
+                    pass
+            return list(self.diagnostics)
+
+    outcome = in_time(lambda: dropped_connection(Asking).request("release"))
+    assert isinstance(outcome.get("error"), DesktopError)
+    assert "dropped by the bridge" in str(outcome["error"])
