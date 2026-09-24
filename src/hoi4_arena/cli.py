@@ -4,7 +4,14 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
+
+
+def local_time(text):
+    """A local time written YYYYMMDD-HHMMSS, as unix seconds."""
+    return time.mktime(time.strptime(text, "%Y%m%d-%H%M%S"))
+
 
 # Commands that never touch a model, so they run without importing torch.
 NO_TORCH = {
@@ -539,6 +546,13 @@ def main():
         default=1.0,
         help="Loss weight of the setup's decisions, before the scripted player's run order "
         "(dataset.setup_end), on top of --press-weight",
+    )
+    train.add_argument(
+        "--camera-since",
+        type=local_time,
+        help="Leave the arrow-key pans out of scripted and AI recordings made before this "
+        "local time, YYYYMMDD-HHMMSS (until #90, 20260924-131000, the recorder's camera "
+        "panned at random: dataset.camera_keys_dropped)",
     )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
