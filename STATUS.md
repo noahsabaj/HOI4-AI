@@ -839,6 +839,39 @@ beat (`win-rate`).
   350 ms on the capture thread and cost frames. Each run writes its own results file.
 - **The country picker** closes in on Blue's capital; on an arena with the capitals in
   the rear no Red land showed. It is zoomed out until the country shows.
+- **The arena's front is not always one straight line (2026-09-24).** On the new arenas
+  the best plan lost in ways the v4 arena never showed. HOI4 spreads a held front's
+  divisions along it by frontage and never shifts them: on the salient arena Red's stood
+  6 to 2 across its two border states all game, the AI massed on the thin side, walked
+  through Red's interior and took its victory points before the attack (137 s); on the
+  marsh arena a lake cuts the border, and the short stretch got 1 division of 8 (lost in
+  79 s). And the attack could pull the whole army far forward while a few of the AI's
+  divisions took the empty home half's victory points: on v4 (the share of the home land
+  the AI held grew 10%, 17%, then 89%) and on the bay arena, where one Blue division
+  walked through Red's homeland while Red's army stood deep in Blue's west.
+- **The guard.** The best plan now watches the land it held at the start. While the front
+  holds, it looks every 30 s; during the attack, at each redraw. When the AI holds 15%
+  or more of it, the front line is drawn round what the AI holds there and executed, so
+  the army turns back and clears it; under half that, the army returns to its front and
+  offensive. In the wins the AI never held more than 14% of the home land at a redraw.
+- **Redraws while paused.** A redraw during the attack (clear, front, offensive, execute)
+  left the army without an executing plan for 20-24 s, about 55 game days, and came
+  every 30-90 s: a third of the attack stood idle. The best plan now pauses the game for
+  the redraw, checked by the pause mark, and executes the new plan once its planning
+  bonus has built (6 s, 15 days). It has done so cleanly in every game since.
+- **Lakes and split borders.** On the marsh arena parts of the grey lake read as Blue
+  land, so every front-line click fell in the lake ("You cannot draw Front Line here"),
+  and a refused click leaves the tool on, so every second try pressed Z onto it and turned
+  it off. Now Blue's land must lean green over red (the lake does not), clicks keep clear
+  of water, the tool's "N divisions will be assigned" is looked for and switched off
+  after a refused click, and a border that water cuts in two at the start gets a front
+  line on each stretch. The divisions still split by frontage (above).
+- **Full views without a tooltip.** Recentring left the pointer mid-map, where a
+  province's tooltip covered part of the border in every planner view; it now waits on
+  the top bar. With it gone, the v4 border reads as one stretch.
+- **Tests of new arenas draw their side at random** (all of the first eight had been
+  Red), and `win-rate` counts each arena by side. The best plan so far on the v6 arenas:
+  river, plains and passes won; marsh, bay and salient lost (before the guard).
 
 ## A learned player from the scripted games (2026-09-24)
 
