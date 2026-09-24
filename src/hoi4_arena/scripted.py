@@ -110,6 +110,11 @@ PLANNING = 6
 # Seconds between the guard's looks at the home land: while the front holds (guard_hold),
 # and between the attack's redraws (guard_attack).
 GUARD_CHECK = 30
+# A pocket the army cannot clear is left behind (guard_attack): once the enemy's share of
+# the home land has stayed within STILL_BAND over STILL_LOOKS of the guard's looks, the
+# army pushes on, and turns back only if the share grows POCKET_GROWTH above the least it
+# has been since.
+STILL_LOOKS, STILL_BAND, POCKET_GROWTH = 3, 0.05, 0.05
 # The political screen at 1080p: the conscription slot (its icon's box), each law's row
 # in the list it opens, the confirmation's OK and Cancel, and the list's close button.
 LAW_SLOT = (38, 571, 82, 615)
@@ -324,8 +329,10 @@ class Planner:
         self.activate_at = self.redraw_at = self.law_at = self.reinforce_at = math.inf
         self.recruit_at = self.check_at = math.inf
         self.recruit_tries = 0
-        # Whether the army's front is drawn round an incursion, to clear it (the guard).
-        self.defending = False
+        # Whether the army's front is drawn round an incursion, to clear it (the guard); the
+        # enemy's share at each of the guard's looks since, and the share of a pocket left
+        # behind (guard_attack).
+        self.defending, self.pocket, self.left_behind = False, [], 0.0
         # Whether the plan executes now (lit), the game runs, and the hold is over.
         self.active = self.running = self.attacking = False
         # Attempts at activating the current plan.
@@ -758,7 +765,7 @@ class Planner:
                     self.draw_offensive(desk)
                 self.defending = False
             else:
-                self.defending = self.draw_front(desk, guard=guard)
+                self.defending, self.pocket = self.draw_front(desk, guard=guard), []
                 if not self.defending and self.plan["attack"] in OFFENSIVES:
                     self.draw_offensive(desk)  # Gone by the fresh look: the plan as it was.
         finally:
@@ -796,15 +803,47 @@ class Planner:
         land while the AI's last two divisions took two of Blue's home states, 58 s into
         the attack. The guard, which then looked only at redraws, first saw them 41 s
         later, when the AI held 53% of Blue's home land, and Blue capitulated 40 s after.
+
+        A pocket the army cannot clear is left behind: once its share has stayed within
+        STILL_BAND over STILL_LOOKS looks, the army pushes on, and turns back only if the
+        share grows POCKET_GROWTH above the least it has been since. Two games of
+        2026-09-24 timed out while an army three times the AI's guarded such a pocket for
+        over a year of game time, about a fifth of the home land on the main arena and on
+        plains: the front the guard draws follows the whole border, and a front line alone
+        never took the pocket back.
         """
         _, blue, red, _ = self.overview(desk)
         if blue is None or self.home is None or not self.plan.get("redraw"):
             return True
         held = incursion(blue, red, self.country, self.home)
-        guard = self.plan["guard"]
-        if (held >= guard) if not self.defending else (held < guard / 2):
-            self.redraw_at = time.monotonic()
+        if self.defending:
+            self.pocket.append(held)
+            still = self.pocket[-STILL_LOOKS:]
+            if held < self.guard_share():
+                self.left_behind = 0.0  # Cleared: back to the push.
+            elif len(still) == STILL_LOOKS and max(still) - min(still) <= STILL_BAND:
+                self.left_behind, self.defending = max(still), False
+                self.order("pocket", held=round(held, 3))
+            else:
+                return True  # Go on clearing it.
+        else:
+            if self.left_behind:
+                self.left_behind = min(self.left_behind, held)
+            if held < self.guard_share():
+                return True  # Push on.
+        self.redraw_at = time.monotonic()
         return True
+
+    def guard_share(self):
+        """The enemy's share of the home land at which a redraw goes round its incursion:
+        the plan's `guard`; while clearing one, half that; above a pocket left behind
+        (guard_attack), POCKET_GROWTH more than it, if that is more."""
+        guard = self.plan.get("guard")
+        if not guard:
+            return None
+        if self.defending:
+            return guard / 2
+        return max(guard, self.left_behind + POCKET_GROWTH) if self.left_behind else guard
 
     def setup(self, desk):
         """While paused: the army, its general, its front, its offensive; then run."""
@@ -877,12 +916,11 @@ class Planner:
             # 20-24 s from clearing the orders to executing the new plan, about 55 game days
             # at speed 5 in which the army has no plan, a third of an attack's time.
             paused = bool(self.plan.get("pause_redraw")) and self.pause(desk, True)
-            guard = self.plan.get("guard")
-            if guard and self.defending:
-                guard /= 2  # Round the incursion until it is cleared (guard_attack).
             try:
                 self.clear_orders(desk)
-                rear = self.draw_front(desk, guard=guard)
+                rear = self.draw_front(desk, guard=self.guard_share())
+                if rear and not self.defending:
+                    self.pocket = []  # A new incursion to clear.
                 self.defending = bool(rear)
                 if self.plan["attack"] in OFFENSIVES and not rear:
                     self.draw_offensive(desk)
