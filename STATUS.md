@@ -456,6 +456,54 @@ it had been installed by hand on this PC only, and elsewhere the head silently r
 eagerly. The newest Triton, 3.8, was no faster and not bit-exact with the eager head, so
 3.6 stays until PyTorch moves.
 
+**`train-memory`, 2026-09-24.** One seed of the memory study's six arms (seed 1, 8
+epochs each, cache on the NVMe) took 64.1 min before and 21.2 min after. Every run was
+identical to the bit: each update's loss, the report and every tensor of the saved head.
+Measured on this PC's GPU with nothing else running on it, but with the CPU 55–100% busy
+from other work. The study's own seeds took 56–120 min each as that load changed.
+
+| Arm | Training before | Training after | Whole run before | Whole run after |
+|---|---|---|---|---|
+| GRU, 16, from empty | 132.1 s | 133.8 s | 4.4 min | 2.8 min |
+| GRU, 16, carried | 302.5 s | 152.0 s | 7.1 min | 3.0 min |
+| GRU, 256, carried | 360.0 s | 121.2 s | 7.9 min | 2.5 min |
+| Gated DeltaNet-2, 256 | 826.3 s | 170.2 s | 18.2 min | 3.9 min |
+| Mamba-3, 256 | 869.8 s | 293.0 s | 18.3 min | 5.9 min |
+| No memory, 256 | 364.8 s | 143.0 s | 7.9 min | 3.1 min |
+
+What was slow, and what changed:
+- **Copies.** Each update's 0.55 GB of cells was copied three times on one thread from a
+  memory map (0.6–0.9 GB/s) and sent from pageable memory, while the GPU waited. Now
+  eight threads read the file straight into pinned memory (about 9 GB/s from the page
+  cache, 5 GB/s from the NVMe), and the copy to the GPU runs while the batch before trains.
+- **A wait at every decision.** `fuse` made a tensor from a Python list at each step, and
+  that copy waits for the GPU. It is now made once.
+- **Launches.** An update over 256 decisions launches about 20,000 small kernels for the
+  GRU and 80,000 for Gated DeltaNet-2 or Mamba-3, forward and backward. They now replay
+  from CUDA graphs, one per batch shape; only the action head after them stays eager.
+- **Evaluation** stepped one decision at a time and copied every result to the host as
+  it went. Everything in a run but training took 109–265 s before and 27–64 s after.
+- The GRU from empty windows gains only in evaluation: its training reads 64 random cuts
+  an update, and is bound by the disk when the page cache is short of memory.
+
+Things to know:
+- On this driver a CUDA graph costs 10–18 KB of host memory per kernel, so the 80,000
+  kernels of 256 Gated DeltaNet-2 steps take about 1 GB. Windows also counts a process's
+  GPU memory in its private bytes.
+- Graphs that may replay at the same time must be captured on streams of their own. A
+  captured matrix product keeps its stream's cuBLAS workspace, and runs sharing one gave
+  different results in 4 of 24 tries (none of 36 once each had its own).
+- Tried and dropped: evaluating four games side by side (slower, since each needs its
+  own graphs), checking each loss one update late (no gain), and 12 or 16 reading
+  threads instead of 8 (no faster).
+- Not yet checked on real data: `train_memories`, which trains the four 256-decision
+  cells of a seed on one read of each batch. On synthetic caches it matches separate runs
+  to the bit; the full 30-run comparison with the study waits for a free GPU.
+- Behaviour cloning has a floor this work cannot move. The part of the model that trains
+  (the tower's last two blocks, the cell and fovea readers) costs 45–53 ms a frame
+  forward and backward, so an epoch of the 44 games takes at least 20 min however fast
+  the frozen blocks and the data become.
+
 Earlier, all on an RTX 4060 Ti with the game at 3840×2160 and the LeVJEPA encoder:
 
 | | Result |

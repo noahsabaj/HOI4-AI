@@ -1,11 +1,28 @@
 import json
+import random
 
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import default_collate
 
+from hoi4_arena import features
 from hoi4_arena.actions import GRID, SLOTS
-from hoi4_arena.features import CachedGame, MemoryHead, camera_targets, train_memory
+from hoi4_arena.features import (
+    CachedGame,
+    MemoryHead,
+    _carried_batches,
+    _GraphedUnroll,
+    _Loader,
+    _nll,
+    _reset_batches,
+    _to,
+    camera_targets,
+    evaluate,
+    load_cache,
+    train_memories,
+    train_memory,
+)
 from hoi4_arena.memory import (
     KINDS,
     GatedDeltaNet2Memory,
@@ -163,3 +180,220 @@ def test_train_memory_runs_end_to_end_on_a_small_cache(tmp_path, carry):
         head.load_state_dict(saved)
     with pytest.raises(FileExistsError):
         train_memory(tmp_path / "cache", tmp_path / "out", device="cpu")
+
+
+def _collated(rows, length, device):
+    """A batch the way train_memory made one before `_Loader`: pieces, collated, moved."""
+    pieces = [None if row is None else row[0].piece(row[1], length) for row in rows]
+    template = next(p for p in pieces if p is not None)
+    pieces = [p or {k: torch.zeros_like(v) for k, v in template.items()} for p in pieces]
+    return _to(default_collate(pieces), device)
+
+
+def _games(root, lengths, invalid=()):
+    for i, n in enumerate(lengths):
+        _cache(root, f"t{i}", "train", n, i)
+    games = load_cache(root, "train")
+    for game, step in invalid:
+        games[game].labels["valid"][step] = False
+    return games
+
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+def test_the_loader_reads_the_batches_collated_pieces_made(tmp_path, device):
+    games = _games(tmp_path, [19, 30, 11], invalid=[(1, 4), (1, 21)])
+    carried = list(_carried_batches(games, 8, 4, random.Random(0)))
+    reset = list(_reset_batches(games, 6, 2, 3, random.Random(1)))
+    assert any(row is None for rows, _, _ in carried for row in rows)
+    assert len(reset[-1][0]) < 3  # a short last batch, as in training
+    loader = _Loader(games, device, readers=3)
+    try:
+        for plans, first in ((carried, 0), (reset, 2)):
+            got = list(loader(iter(plans), first))
+            assert len(got) == len(plans)
+            for (rows, length, fresh), (batch, flags) in zip(plans, got, strict=True):
+                expected = _collated(rows, length, device)
+                for key, value in expected.items():
+                    assert batch[key].dtype == value.dtype, key
+                    assert torch.equal(batch[key], value), key
+                assert flags.tolist() == fresh
+                valid = expected["valid"][:, first:].flatten()
+                assert torch.equal(batch["scored"], valid.nonzero().squeeze(1))
+    finally:
+        loader.close()
+
+
+def test_the_loader_stops_cleanly_when_left_early(tmp_path):
+    games = _games(tmp_path, [40, 40])
+    loader = _Loader(games, "cpu", readers=2)
+    batches = loader(_carried_batches(games, 4, 2, random.Random(0)))
+    next(batches)
+    batches.close()
+    loader.close()
+
+
+@torch.no_grad()
+def _evaluate_before(head, games, device, clear_every=None):
+    """evaluate as it was before `_Loader`: batch by batch, one decision at a time when
+    clearing, every result copied to the host as it came."""
+    head.eval()
+    losses, active, outputs = [], [], []
+    autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
+    for game in games:
+        out, state = head.initial(1, device)
+        kept = []
+        for start in range(0, game.length, 128):
+            batch = _to(default_collate([game.piece(start, 128)]), device)
+            with torch.autocast(**autocast):
+                outs, out, state = _unroll_before(head, batch, out, state, start, clear_every)
+                nll, valid = _nll(head, outs, batch)
+            kept.append(outs[0, : min(128, game.length - start)].float().cpu())
+            losses.extend(nll.float().cpu().tolist())
+            acting = (batch["actions"][:, :, :, 0] != 0).any(-1)[valid]
+            active.extend(nll[acting].float().cpu().tolist())
+        outputs.append(torch.cat(kept).numpy())
+    head.train()
+    return float(np.mean(losses)), float(np.mean(active)) if active else None, outputs
+
+
+def _unroll_before(head, batch, out, state, start, clear_every):
+    """One piece of evaluate before `_Loader`: stepped one decision at a time when clearing."""
+    device = batch["summary"].device
+    if not clear_every:
+        outs, (out, state) = head.unroll(
+            batch, out, state, torch.tensor([start == 0], device=device)
+        )
+        return outs, out, state
+    parts = []
+    for t in range(128):
+        if (start + t) % clear_every == 0:
+            out, state = head.initial(1, device)
+        piece = {k: v[:, t : t + 1] for k, v in batch.items()}
+        o, (out, state) = head.unroll(
+            piece, out, state, torch.zeros(1, dtype=torch.bool, device=device)
+        )
+        parts.append(o)
+    return torch.cat(parts, 1), out, state
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+@pytest.mark.parametrize("kind", ["gru", "gdn2"])
+@pytest.mark.parametrize("clear_every", [None, 18])
+def test_evaluate_computes_what_it_did_before_the_loader(
+    tmp_path, monkeypatch, device, kind, clear_every
+):
+    # Games of uneven lengths, and graphs captured at a shape's second coming, so these few
+    # pieces replay them.
+    lengths = [150, 70, 300, 40, 130, 270, 90]
+    games = _games(tmp_path, lengths, invalid=[(0, 3), (1, 69), (4, 128)])
+    monkeypatch.setattr(features._Unrolls, "CAPTURE_AT", 2)
+    torch.manual_seed(0)
+    head = MemoryHead(8, kind).to(device)
+    before = _evaluate_before(head, games, device, clear_every)
+    after = evaluate(head, games, device, clear_every)
+    assert after[:2] == before[:2]
+    for a, b in zip(after[2], before[2], strict=True):
+        assert np.array_equal(a, b)
+
+
+@CUDA
+@pytest.mark.parametrize("kind", ["gru", "gdn2", "mamba3", "none"])
+@pytest.mark.parametrize("grad_from", [0, 2])
+def test_a_graphed_unroll_is_the_eager_one_to_the_bit(tmp_path, kind, grad_from):
+    games = _games(tmp_path, [40, 40, 40])
+    loader = _Loader(games, "cuda", readers=2)
+    rows = [(games[0], 3), (games[1], 0), (games[2], 20)]
+    batch, fresh = next(loader(iter([(rows, 10, [False, True, False])]), grad_from))
+    loader.close()
+    torch.manual_seed(0)
+    head = MemoryHead(8, kind).cuda()
+    autocast = {"device_type": "cuda", "dtype": torch.bfloat16}
+
+    def step(unroll):
+        outs, carried = unroll()
+        with torch.autocast(**autocast):
+            loss = _nll(head, outs, batch, grad_from)[0].mean()
+        loss.backward()
+        grads = [None if p.grad is None else p.grad.clone() for p in head.parameters()]
+        head.zero_grad(set_to_none=True)
+        return [outs.detach().clone(), carried[0].clone(), *(s.clone() for s in carried[1])], grads
+
+    def eager():
+        with torch.autocast(**autocast):
+            return head.unroll(batch, out, state, fresh, grad_from)
+
+    for start in ("empty", "carried"):
+        out, state = head.initial(3, "cuda")
+        if start == "carried":  # a bfloat16 memory, as after an update
+            with torch.no_grad(), torch.autocast(**autocast):
+                _, (out, state) = head.unroll(batch, out, state, fresh)
+        graph = _GraphedUnroll(head, batch, out, state, fresh, grad_from, autocast)
+        want = step(eager)
+        for _ in range(2):  # a replay leaves nothing behind for the next
+            got = step(lambda: graph(batch, out, state, fresh))
+            assert all(torch.equal(a, b) for a, b in zip(got[0], want[0], strict=True))
+            for a, b in zip(got[1], want[1], strict=True):
+                assert (a is None) == (b is None)
+                assert a is None or torch.equal(a, b)
+
+
+def _run(tmp_path, name, **settings):
+    out = tmp_path / name
+    report = settings.pop("train")(tmp_path / "cache", out, **settings)
+    head = torch.load(out / "head.pt", weights_only=True)["head"]
+    return report, (out / "metrics.jsonl").read_text(), head
+
+
+def _same(a, b):
+    ra, rb = dict(a[0]), dict(b[0])
+    ra.pop("train_seconds"), rb.pop("train_seconds")
+    assert ra == rb and a[1] == b[1]
+    assert a[2].keys() == b[2].keys() and all(torch.equal(a[2][k], b[2][k]) for k in a[2])
+
+
+def _small_cache(tmp_path):
+    for i in range(3):
+        _cache(tmp_path / "cache", f"t{i}", "train", 30 + 9 * i, i)
+    _cache(tmp_path / "cache", "v", "validation", 21, 7)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+@pytest.mark.parametrize("carry", [True, False])
+def test_cells_trained_together_learn_what_each_learns_alone(tmp_path, device, carry):
+    _small_cache(tmp_path)
+    settings = {"window": 8, "carry": carry, "burn_in": 0 if carry else 2, "decisions": 16}
+    settings.update(epochs=3, seed=3, device=device)
+    kinds = ["gru", "gdn2", "none"]
+    together = train_memories(
+        tmp_path / "cache", [tmp_path / f"all-{k}" for k in kinds], kinds, **settings
+    )
+    for kind, report in zip(kinds, together, strict=True):
+        out = tmp_path / f"all-{kind}"
+        joint = (report, (out / "metrics.jsonl").read_text(), torch.load(out / "head.pt")["head"])
+        alone = _run(tmp_path, f"one-{kind}", train=train_memory, memory=kind, **settings)
+        _same(joint, alone)
+
+
+@CUDA
+@pytest.mark.parametrize("kind", ["gru", "mamba3"])
+@pytest.mark.parametrize("carry", [True, False])
+def test_training_from_cuda_graphs_changes_no_bit(tmp_path, monkeypatch, kind, carry):
+    _small_cache(tmp_path)
+    settings = {"window": 8, "carry": carry, "burn_in": 0 if carry else 2, "decisions": 16}
+    settings.update(epochs=4, seed=1, device="cuda", memory=kind, train=train_memory)
+    captured = []
+    capture = features._GraphedUnroll.__init__
+
+    def counted(self, *args, **kwargs):
+        captured.append(torch.is_grad_enabled())
+        capture(self, *args, **kwargs)
+
+    monkeypatch.setattr(features._GraphedUnroll, "__init__", counted)
+    graphs = _run(tmp_path, "graphs", graphs=True, **settings)
+    assert True in captured and False in captured  # training and evaluation both replayed
+    captured.clear()
+    _same(graphs, _run(tmp_path, "eager", graphs=False, **settings))
+    assert not captured
