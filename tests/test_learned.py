@@ -806,3 +806,60 @@ def test_a_live_game_starts_only_with_commit_room_on_the_second_pc(monkeypatch):
     assert play.room_for_a_game(Station(), tries=2), "room once the lender's game has closed"
     readings = iter([{"commit_mb": 36000, "commit_limit_mb": 38000}] * 2)
     assert not play.room_for_a_game(Station(), tries=2)
+
+
+def test_the_pointer_s_parking_moves_are_found_and_its_clicks_kept():
+    """The scripted player parks the pointer to read the screen; only those moves go."""
+    from hoi4_arena.dataset import parking_moves
+
+    def event(t, **fields):
+        return {"t_ns": t, "event": fields}
+
+    events = [
+        event(1, kind="move", x=0.5, y=0.5),  # Parked: the next move comes first.
+        event(2, kind="move", x=0.2, y=0.3),
+        event(3, kind="move", x=0.5, y=0.5),  # Kept: something at the centre is clicked.
+        event(4, kind="button", button=0, down=True),
+        event(5, kind="button", button=0, down=False),
+        event(6, kind="move", x=0.5, y=0.5),  # Parked: a full zoom out ignores the pointer.
+        event(7, kind="wheel", delta=-120),
+        event(8, kind="move", x=0.5, y=0.5),  # Kept: a zoom in closes in on the pointer.
+        event(9, kind="wheel", delta=120),
+        event(10, kind="button", button=1, down=True),
+        event(11, kind="move", x=0.5, y=0.5),  # Kept: a drag, with a button held.
+        event(12, kind="button", button=1, down=False),
+        event(13, kind="move", x=0.65, y=0.012),  # Parked: the top bar's blank middle.
+    ]
+    assert parking_moves(events) == [0, 5, 12]
+
+
+def test_the_setup_ends_at_the_run_order_and_can_weigh_more(tmp_path):
+    from hoi4_arena.dataset import setup_end
+
+    times = np.arange(10) * 200_000_000
+    orders = [{"order": "army", "frame": 1}, {"order": "run", "frame": 4}]
+    assert setup_end({"orders": orders}, times) == times[4]
+    assert setup_end({}, times, seconds=1.0) == times[0] + 1_000_000_000
+    _scripted(tmp_path / "game", orders=[{"order": "run", "frame": 20}])
+    labels = session_labels(tmp_path / "game", sources=("scripted",), lead_in=0, setup_weight=3.0)
+    early = labels["decisions"] < labels["times"][20]
+    assert early.any() and (~early).any()
+    assert labels["weight"][early] == pytest.approx(np.full(early.sum(), 3.0))
+    assert labels["weight"][~early] == pytest.approx(np.full((~early).sum(), 1.0))
+
+
+def test_the_setup_s_targets_are_the_moves_before_its_first_clicks():
+    from hoi4_arena.heatmap import setup_targets
+
+    def onto(x, y):
+        return _token(1, round(x / 1919 * (GRID - 1)), round(y / 1079 * (GRID - 1)))
+
+    actions = np.zeros((12, SLOTS, 3), np.int64)
+    actions[1, 0], actions[1, 1] = onto(825, 57), _token(VOCAB.index(CLICK))  # The alert.
+    actions[3, 0], actions[3, 1] = onto(988, 1013), _token(VOCAB.index(CLICK))  # The +.
+    actions[5, 0] = _token(VOCAB.index({"kind": "key", "vk": 0x5A, "down": True}))  # Z.
+    actions[6, 0], actions[6, 1] = onto(700, 500), _token(VOCAB.index(CLICK))  # The front.
+    found = setup_targets(actions, 1920, 1080)
+    assert set(found) == {"alert", "plus", "front"}, "the portrait was never clicked"
+    assert found["alert"][:2] == (1, 0) and found["front"][:2] == (6, 0)
+    assert abs(found["plus"][2][0] - 988) < 2 and abs(found["plus"][2][1] - 1013) < 2

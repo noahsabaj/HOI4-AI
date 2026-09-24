@@ -189,6 +189,62 @@ def batch_to_device(batch, device, clips=True):
 
 PRESS_KINDS = [i for i, e in enumerate(VOCAB) if e and e["kind"] == "button" and e["down"]]
 
+# Where the scripted player puts the pointer only so that it can read the screen
+# (scripted.py, ai_games.py): the centre, before each search for a button (forming the
+# army, selecting it, clearing its orders, executing, checking the arrow, reinforcing,
+# pausing) and before each full zoom out (recentre); the top bar's blank middle, while it
+# reads the map (overview); below the middle, before the space bar that starts the game
+# (run_at). A lit alert or a tooltip under the pointer would spoil the search.
+PARKING = ((0.5, 0.5), (0.65, 0.012), (0.5, 0.75))
+
+
+def parking_moves(events):
+    """Indices of the moves in `events` (in time order) that only park the pointer.
+
+    A move onto a PARKING point, with no button held, where nothing uses the position
+    before the next move: no button press or release, and no wheel but a zoom out, which
+    ends fully out wherever the pointer is. In the scripted games 10.7% of all moves went
+    to the centre's one point, 1 in 18 of them while the army was formed, so the pointer
+    learned to put about 60% of its mass there, and the setup's buttons were missed by 500
+    to 1000 px (2026-09-24). A click on something at the centre keeps its move, and so
+    does a zoom in, which closes in on what the pointer is on.
+    """
+    found, held = [], set()
+    for i, item in enumerate(events):
+        event = item["event"]
+        if event["kind"] == "button":
+            (held.add if event["down"] else held.discard)(event["button"])
+            continue
+        if event["kind"] != "move" or held:
+            continue
+        x, y = event["x"], event["y"]
+        if not any(abs(x - px) < 1e-6 and abs(y - py) < 1e-6 for px, py in PARKING):
+            continue
+        used = False
+        for later in events[i + 1 :]:
+            kind = later["event"]["kind"]
+            if kind == "move":
+                break
+            if kind == "button" or (kind == "wheel" and later["event"].get("delta", 0) > 0):
+                used = True
+                break
+        if not used:
+            found.append(i)
+    return found
+
+
+def setup_end(manifest, times, seconds=30.0):
+    """When a game's setup ends, on the recording's clock (ns).
+
+    The scripted player sets up while the game is paused (the army, its general, the front
+    and the offensive) and then starts it; its `run` order is stamped with the frames
+    recorded by then. A recording without one (a policy's) takes the first `seconds`.
+    """
+    for order in manifest.get("orders") or []:
+        if order.get("order") == "run":
+            return int(times[min(max(int(order["frame"]), 0), len(times) - 1)])
+    return int(times[0] + seconds * 1e9)
+
 
 def presses_after_move(actions):
     """Per decision, whether a button is pressed in a slot after a move."""
@@ -230,6 +286,9 @@ def session_labels(
     state=False,
     orders=False,
     press_weight=1.0,
+    drop_parking=False,
+    setup_weight=1.0,
+    setup_seconds=30.0,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -263,6 +322,12 @@ def session_labels(
     (privileged.decision_states), and `orders` the scripted player's next order and the
     time until it (privileged.decision_orders), which the agent never sees: targets for
     training only.
+
+    `drop_parking` leaves out the moves that only park the pointer so the scripted player
+    can read the screen (parking_moves); the events around them keep their times, and
+    the count is returned as `parking`. `setup_weight` scales every decision of the setup
+    (setup_end: before the run order, else the first `setup_seconds`), the clicks that
+    form the army and give it its general, front and offensive.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -298,6 +363,10 @@ def session_labels(
             if not (e["event"].get("kind") == "key" and e["event"].get("vk") in dropped)
         ]
     events.sort(key=lambda e: e["t_ns"])
+    parked = parking_moves(events) if drop_parking else []
+    if parked:
+        skip = set(parked)
+        events = [e for i, e in enumerate(events) if i not in skip]
     # The first decision needs a whole clip of recorded video behind it, plus one
     # interval of margin. The lead-in is derived from the clip rather than written down:
     # a hardcoded 2.1 s was correct only while a clip spanned 2.0 s.
@@ -351,6 +420,9 @@ def session_labels(
         weight = weight * np.float32(loser_weight)
     if press_weight != 1.0:
         weight = weight * np.where(acting(actions), np.float32(press_weight), np.float32(1))
+    if setup_weight != 1.0:
+        setup = decisions < setup_end(manifest, times, setup_seconds)
+        weight = weight * np.where(setup, np.float32(setup_weight), np.float32(1))
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the
@@ -397,6 +469,7 @@ def session_labels(
         "weight": weight,
         "excluded": excluded,
         "label_source": label_source,
+        "parking": len(parked),
     }
 
 
@@ -599,9 +672,10 @@ class VideoSessions(IterableDataset):
 
     A `splits.json` in `root`, {recording folder name: split}, overrides the split each
     recording's manifest drew, so a study can choose its held-out games without touching
-    the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state` and `orders` pass to
-    session_labels; a lead-in shorter than a clip needs `clips` off. `tower`, a tower
-    cache (tower_cache.py), adds each decision's frozen-tower reading to its window.
+    the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state`, `orders`,
+    `press_weight`, `drop_parking` and `setup_weight` pass to session_labels; a lead-in
+    shorter than a clip needs `clips` off. `tower`, a tower cache (tower_cache.py), adds
+    each decision's frozen-tower reading to its window.
     """
 
     def __init__(
@@ -630,6 +704,8 @@ class VideoSessions(IterableDataset):
         orders=False,
         tower=None,
         press_weight=1.0,
+        drop_parking=False,
+        setup_weight=1.0,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -665,6 +741,8 @@ class VideoSessions(IterableDataset):
                     state=state,
                     orders=orders,
                     press_weight=press_weight,
+                    drop_parking=drop_parking,
+                    setup_weight=setup_weight,
                 )
             )
         self.tower_stamp = None
