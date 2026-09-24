@@ -101,7 +101,8 @@ def summary(reply: dict) -> str:
     if commit_near_limit(memory):
         lines.append(
             "WARNING: memory committed is near its limit; past it, allocations fail and the "
-            "game or the recording can crash, however much RAM is free"
+            "game or the recording can crash, however much RAM is free, unless Windows can "
+            "grow the pagefile"
         )
     for gpu in reply.get("gpu") or []:
         lines.append(
