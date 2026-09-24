@@ -482,6 +482,11 @@ def main():
     generation.add_argument("output")
     generation.add_argument("--game", required=True)
     generation.add_argument(
+        "--preset",
+        help="A named arena design (arenas.PRESETS: plains, river, passes, marsh, bay): "
+        "terrain, rivers, lakes and cities on the 12x8 grid. Without one, the plain arena.",
+    )
+    generation.add_argument(
         "--undefended",
         choices=["BLU", "RED"],
         help="Field no divisions for this country. A diagnostic, not a playable arena: "
@@ -510,6 +515,11 @@ def main():
         "audit-map", help="Check a generated arena for references the engine cannot resolve"
     )
     inspection.add_argument("mod")
+    picture = sub.add_parser(
+        "preview-map", help="Draw a generated arena: terrain, relief, rivers, states, cities"
+    )
+    picture.add_argument("mod")
+    picture.add_argument("output")
     collect = sub.add_parser("collect-pair")
     collect.add_argument("config")
     collect.add_argument("output")
@@ -813,6 +823,7 @@ def _dispatch(command, args):
         result = generate(
             args["game"],
             args["output"],
+            preset=args["preset"],
             undefended=args["undefended"],
             victory_points_on_border=args["victory_points_on_border"],
             **{key: value for key, value in grid.items() if value is not None},
@@ -826,6 +837,10 @@ def _dispatch(command, args):
 
         result = audit(args["mod"])
         _report(result["problems"])
+    elif command == "preview-map":
+        from .mapgen import preview
+
+        result = preview(args["mod"], args["output"])
     elif command == "collect-pair":
         from .runner import collect_pair
 

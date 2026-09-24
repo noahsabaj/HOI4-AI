@@ -170,6 +170,70 @@ every rule below came from a crash dump or the stock files.
 - Diagnostics: `--undefended BLU|RED` gives one side no army. `--victory-points-on-border`
   puts all victory points on one border province; it showed that victory points alone do
   not cause a surrender.
+- **Victory-point names go in `localisation/english/replace`.** The stock file names
+  thousands of provinces as `VICTORY_POINTS_<id>`, and its names won: Blue's capital
+  (province 564) showed as "Kassel".
+- **Railways must cross the border.** A supply hub works only while a railway joins it
+  to its holder's capital, and nobody in the arena can build one. With no line across
+  the border, a captured hub never supplied its captor: on the first terrain arena Blue
+  took three states, then stood for four years five provinces from Red's capital,
+  against a single Red division. The plain arena still has no crossing lines.
+- **Rivers run along province borders.** Only a river on a border is crossed (86% of
+  stock river pixels are on one). A river starts at a green source pixel at its free
+  end, is one pixel wide and edge-connected, and a tributary ends on a red join pixel.
+  Small rivers (indices 3–6) cost 30% of an attack to cross, large ones (7–11) 60%.
+- **Lakes are their own class**, as in the stock file: type `lake`, terrain `lakes`,
+  never coastal, no unit anchors, and in a land strategic region.
+- **Blue's capital must stand mid-country.** The country picker opens centred on it, and
+  the recorder picks Red by clicking Red's land there. With the capital near the west
+  coast, Red was off the screen and the pick failed.
+- **A mirror copied from one half needs symmetric noise.** Copying the western half's
+  half turn onto the east is exact, but left a 42-byte cliff down the middle of the
+  first mountain arena until the noise itself was symmetric. The map's wrap seam
+  (x = 0 meets x = 5631) keeps the plain lattice, because the fix for four-way corners
+  never looks there.
+
+## Arena maps (2026-09-24)
+
+`generate-map --preset <name>` writes one of six named arenas (`arenas.PRESETS`), and
+`preview-map` draws one from its files. Every one keeps the playable grid (12×8
+provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
+victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
+checks that, province by province and pixel by pixel.
+
+| Preset | What changes the fight |
+|---|---|
+| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front |
+| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across |
+| `passes` | Mountains two provinces deep on each side of the whole border (-50% attack), crossed by two one-province valleys |
+| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings |
+| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus |
+| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south |
+
+What a preset paints, all with stock assets:
+
+- **Terrain in regions:** the stock palette indices each type mostly uses (plains are
+  grass with farmland patches, forest dark and light, hills rolling and ridged,
+  mountains green slopes and bare rock above byte 150, marsh, urban). Each province's
+  painted majority matches its `definition.csv` terrain.
+- **Relief:** heights by type, near the stock medians: plains 102, hills 113-116 and
+  mountains 164 (90th percentile 190), against the stock's 102, 115 and 129 (172).
+  Coasts are ramped over 12 px and rivers lie in shallow valleys. `world_normal.bmp` is
+  computed from the heights, so the relief is lit.
+- **Cities:** each victory point is an urban province, 60% of it painted as city (stock
+  city models and night lights). Forests have stock European trees (85% cover).
+- **Borders that wander:** province seeds stray up to 22% of a province, and the Voronoi
+  is taken through a displacement that turns with the map, so coasts, state borders and
+  the front are no longer ruled lines.
+
+A preset takes 13–17 s to generate. `generation.json` records the preset, its terrain
+counts, and a state layout over the land box, from which `scripted.state_at` names the
+state under a point on any arena, bulges included.
+
+Live test, `arena-plains-v1` (2026-09-24, second PC, scripted Blue against the AI):
+loaded and ran 15 minutes with no errors, and the scripted player found its fronts on
+the new ground. It ended as a draw, in the supply stall above; v3 adds the lines across
+the border.
 
 ## The model and its data (2026-09-23)
 
