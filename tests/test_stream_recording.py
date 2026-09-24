@@ -52,6 +52,9 @@ class _Stream:
         for offset in range(0, len(stream), 1000):
             self.messages.put({"data": offset, "payload": stream[offset : offset + 1000]})
 
+    def frame_views(self, message):
+        return None
+
     def stop(self, timeout=90):
         end = {
             "reason": "stopped", "frames": self.frames, "encoded_frames": self.encoded, "exit": 0,
@@ -70,7 +73,7 @@ class _Desk:
     def protocol(self):
         return self.version
 
-    def start_stream(self, hz, profile, quality=None):
+    def start_stream(self, hz, profile, quality=None, views=None, **sizes):
         if isinstance(self.made, Exception):
             raise self.made
         return self.made
@@ -229,3 +232,29 @@ def test_the_observer_role_rides_on_the_token_line(tmp_path):
             desk = remote.RemoteDesktop(peer, attach=False, observer=observer)
             desk._shutdown()
         assert written[0] == line
+
+
+def test_a_stream_frame_brings_the_policy_views():
+    import lz4.block
+
+    from hoi4_arena.desktop import WorkerStream, view_options
+
+    stream = WorkerStream.__new__(WorkerStream)
+    stream.views = view_options((2, 4), detail=(2, 2), fovea=2)
+    sizes = [2 * 4 * 3, 4 * 2 * 2 * 3, 2 * 2 * 3]
+    raw = bytes(range(sum(sizes)))
+    meta = {
+        "views_bytes": len(raw), "view_size": [4, 2], "detail_size": [2, 2], "fovea_size": 2,
+        "encoding": "lz4",
+    }  # fmt: skip
+    # The worker sends a bare lz4 block, with no size before it.
+    payload = lz4.block.compress(raw, store_size=False)
+    views = stream.frame_views({"frame": meta, "payload": payload})
+    assert views.global_view.shape == (2, 4, 3) and views.quadrants.shape == (4, 2, 2, 3)
+    assert views.fovea.shape == (2, 2, 3) and views.fovea.reshape(-1)[-1] == sum(sizes) - 1
+    # A frame without views, or a stream that asked for none, brings none.
+    assert stream.frame_views({"frame": {}, "payload": b""}) is None
+    with pytest.raises(DesktopError, match="other than requested"):
+        stream.frame_views({"frame": {**meta, "fovea_size": 3}, "payload": payload})
+    with pytest.raises(DesktopError, match="corrupt"):
+        stream.frame_views({"frame": meta, "payload": b"junk"})

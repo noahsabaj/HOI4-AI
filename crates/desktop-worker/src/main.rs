@@ -440,6 +440,89 @@ pub fn next_tick(
     (next, skipped)
 }
 
+/// The status files of the other workers in `dir` (see platform::publish_status): each
+/// one's last report, if it is fresh (written in the last 5 s) and not this worker's own.
+pub fn worker_statuses(dir: &Path, own: u32, now: f64) -> Vec<serde_json::Value> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<serde_json::Value> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|v| v["pid"].as_u64() != Some(own as u64))
+        .filter(|v| v["t"].as_f64().is_some_and(|t| now - t < 5.0))
+        .collect();
+    out.sort_by_key(|v| v["pid"].as_u64());
+    out
+}
+
+/// Whether rectangle `inner` lies wholly within `outer`, as (left, top, right, bottom).
+#[cfg(windows)]
+pub fn rect_inside(
+    inner: windows_sys::Win32::Foundation::RECT,
+    outer: windows_sys::Win32::Foundation::RECT,
+) -> bool {
+    inner.left >= outer.left
+        && inner.top >= outer.top
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
+/// The policy's views of one BGRA frame: the global view, the four quadrants and the
+/// fovea on the pointer, RGB, in that order (`hoi4_arena.dataset.views`).
+pub fn views_payload(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    cursor: (i32, i32),
+    global: [usize; 2],
+    detail: [usize; 2],
+    fovea: usize,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for (i, b) in view_boxes(width, height).into_iter().enumerate() {
+        let size = if i == 0 { global } else { detail };
+        payload.extend_from_slice(&downscale_bgra(raw, width, b, size));
+    }
+    // Cropped from the same frame as the other views, on either backend. Training crops
+    // the recorded full frame, so a separate, later blit would disagree exactly at the
+    // pointer.
+    payload.extend_from_slice(&cursor_crop_bgra(
+        raw, width, height, cursor.0, cursor.1, fovea,
+    ));
+    payload
+}
+
+/// The views a request asks for: the global view's and the quadrants' [width, height], and
+/// the fovea's side.
+pub type ViewSizes = ([usize; 2], [usize; 2], usize);
+
+/// A request's view sizes, checked: the global view and the quadrants as [width,
+/// height] (a number is a square; the quadrants default to the global view's size) and
+/// the fovea's side (default the global view's width). None when no views are asked for.
+pub fn requested_views(cmd: &serde_json::Value) -> Result<Option<ViewSizes>, String> {
+    let view_size = view_dims(&cmd["views"])?;
+    let detail_size = view_dims(&cmd["detail"])?.or(view_size);
+    let fovea_size = cmd["fovea"]
+        .as_u64()
+        .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
+    let dims = [view_size, detail_size].into_iter().flatten();
+    if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
+        return Err("view_size_too_large".into());
+    }
+    let Some(global) = view_size else {
+        return Ok(None);
+    };
+    match detail_size {
+        Some(detail) if fovea_size > 0 && dims.clone().all(|[w, h]| w > 0 && h > 0) => {
+            Ok(Some((global, detail, fovea_size)))
+        }
+        _ => Err("view_size_zero".into()),
+    }
+}
+
 /// The script a control operation runs: compute jobs have their own.
 fn control_script(op: &str) -> &'static str {
     if op == "job" {
@@ -1120,6 +1203,25 @@ mod platform {
         if ClientToScreen(hwnd, &mut origin) == 0 {
             return Err("client_to_screen_failed".into());
         }
+        // A monitor switched off disconnects on DisplayPort: Windows shrinks the desktop to
+        // 1024x768 and the game's window hangs off it. Either backend would then return a
+        // frame of what is not there, so there is no frame: a stream records a gap, and
+        // goes on when the screen is back.
+        let desktop = RECT {
+            left: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            top: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            right: GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            bottom: GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        };
+        let client = RECT {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + w,
+            bottom: origin.y + h,
+        };
+        if !crate::rect_inside(client, desktop) {
+            return Err("game_window_off_screen".into());
+        }
         if matches!(screen, Screen::Untried) {
             *screen = match crate::duplication::Duplicator::new((origin.x, origin.y)) {
                 Ok(duplicator) => Screen::Active(Box::new(duplicator)),
@@ -1554,6 +1656,50 @@ mod platform {
         Ok((serde_json::json!({"output": text, "exit": exit}), vec![]))
     }
 
+    /// Bring the attached game window to the front, for setup only. A windowed game
+    /// started by a background process does not take focus, and nobody may be at the
+    /// second PC to click it. Windows only lets a process that has just sent input change
+    /// the foreground window, so this taps Alt first; the tap goes to whatever window had
+    /// focus, before the game has it.
+    ///
+    /// It waits 150 ms for the switch, on its own thread and without the input lock:
+    /// holding the lock through the wait held up a stream's ticks, which read the window
+    /// under it, by up to 150 ms each time a script focused the game (11% of the ticks of
+    /// the first scripted game recorded as a stream).
+    fn focus_window(shared: &Arc<Mutex<InputState>>, cmd: serde_json::Value) {
+        let armed = shared.lock().map(|state| state.armed).unwrap_or(true);
+        if armed {
+            respond(&cmd, Err("focus_refused_while_armed".into()));
+            return;
+        }
+        let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
+        if hwnd.is_null() {
+            respond(&cmd, Err("focus_before_attach".into()));
+            return;
+        }
+        thread::spawn(move || {
+            let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                let mut alt: [INPUT; 2] = zeroed();
+                for (i, up) in [false, true].into_iter().enumerate() {
+                    alt[i].r#type = INPUT_KEYBOARD;
+                    alt[i].Anonymous.ki.wVk = VK_MENU;
+                    alt[i].Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
+                }
+                SendInput(2, alt.as_ptr(), size_of::<INPUT>() as i32);
+                SetForegroundWindow(hwnd);
+            }
+            thread::sleep(Duration::from_millis(150));
+            respond(
+                &cmd,
+                Ok((serde_json::json!({"foreground": foreground()}), vec![])),
+            );
+        });
+    }
+
     fn fast_op(
         shared: &Arc<Mutex<InputState>>,
         cmd: &serde_json::Value,
@@ -1590,30 +1736,6 @@ mod platform {
             // at the second PC to click it. Windows only lets a process that has just sent
             // input change the foreground window, so this taps Alt first; the tap goes to
             // whatever window had focus, before the game has it.
-            "focus" => {
-                if *armed {
-                    return Err("focus_refused_while_armed".into());
-                }
-                let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
-                if hwnd.is_null() {
-                    return Err("focus_before_attach".into());
-                }
-                unsafe {
-                    if IsIconic(hwnd) != 0 {
-                        ShowWindow(hwnd, SW_RESTORE);
-                    }
-                    let mut alt: [INPUT; 2] = zeroed();
-                    for (i, up) in [false, true].into_iter().enumerate() {
-                        alt[i].r#type = INPUT_KEYBOARD;
-                        alt[i].Anonymous.ki.wVk = VK_MENU;
-                        alt[i].Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
-                    }
-                    SendInput(2, alt.as_ptr(), size_of::<INPUT>() as i32);
-                    SetForegroundWindow(hwnd);
-                }
-                thread::sleep(Duration::from_millis(150));
-                Ok((serde_json::json!({"foreground": foreground()}), vec![]))
-            }
             "events" => {
                 // While a stream records, the player's inputs go with its frames, and its
                 // end hands over the rest; taking them here would leave holes in its rows.
@@ -1854,22 +1976,10 @@ mod platform {
         // The global view, the quadrants and the fovea each have their own size
         // (`hoi4_arena.dataset.views`): [width, height] for the first two, or a number for
         // a square, and a square fovea.
-        let view_size = view_dims(&cmd["views"])?;
-        let detail_size = view_dims(&cmd["detail"])?.or(view_size);
-        let fovea_size = cmd["fovea"]
-            .as_u64()
-            .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
-        let dims = [view_size, detail_size].into_iter().flatten();
-        if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
-            return Err("view_size_too_large".into());
-        }
-        if view_size.is_some()
-            && (detail_size.is_none()
-                || fovea_size == 0
-                || dims.clone().any(|[w, h]| w == 0 || h == 0))
-        {
-            return Err("view_size_zero".into());
-        }
+        let wanted = crate::requested_views(cmd)?;
+        let view_size = wanted.map(|v| v.0);
+        let detail_size = wanted.map(|v| v.1);
+        let fovea_size = wanted.map_or(0, |v| v.2);
         let mut regions: Vec<[usize; 4]> = Vec::new();
         if let Some(list) = cmd["regions"].as_array() {
             if list.len() > 64 {
@@ -1899,18 +2009,9 @@ mod platform {
             payload.extend_from_slice(raw);
         }
         let mut views_bytes = 0usize;
-        if let (Some(global), Some(detail)) = (view_size, detail_size) {
-            for (i, b) in view_boxes(uw, uh).into_iter().enumerate() {
-                let size = if i == 0 { global } else { detail };
-                let v = downscale_bgra(raw, uw, b, size);
-                views_bytes += v.len();
-                payload.extend_from_slice(&v);
-            }
-            // Cropped from the same frame as the other views, on either backend. Training
-            // crops the recorded full frame, so a separate, later blit would disagree
-            // exactly at the pointer.
-            let v = cursor_crop_bgra(raw, uw, uh, cx, cy, fovea_size);
-            views_bytes += v.len();
+        if let Some((global, detail, fovea)) = wanted {
+            let v = crate::views_payload(raw, uw, uh, (cx, cy), global, detail, fovea);
+            views_bytes = v.len();
             payload.extend_from_slice(&v);
         }
         let mut region_bytes: Vec<usize> = Vec::new();
@@ -1996,6 +2097,10 @@ mod platform {
         next: Instant,
         last_t_ns: Option<u64>,
         encoder: crate::encoder::Encoder,
+        /// The policy's views to send with every frame, and lz4 or not: a live policy acts
+        /// on exactly the frames the recording holds, without a capture request a tick.
+        views: Option<crate::ViewSizes>,
+        lz4: bool,
     }
 
     fn start_stream(
@@ -2023,6 +2128,7 @@ mod platform {
             ),
         };
         let (args, quality) = crate::encoder::arguments(name, quality, hz)?;
+        let views = crate::requested_views(cmd)?;
         let profile = crate::encoder::profile(name).ok_or("unknown_encoder_profile")?;
         if hwnd.is_null() {
             return Err("stream_before_attach".into());
@@ -2080,6 +2186,8 @@ mod platform {
                 next: Instant::now(),
                 last_t_ns: None,
                 encoder,
+                views,
+                lz4: cmd["encoding"] == "lz4",
             },
             reply,
         ))
@@ -2108,7 +2216,7 @@ mod platform {
         let scheduled = s.next;
         let (next, skipped) = crate::next_tick(scheduled, s.period, Instant::now());
         s.next = next;
-        let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+        let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
         let grabbed = capturer.grab(hwnd, true);
         let scheduled_ns = scheduled
             .checked_duration_since(*ORIGIN.get_or_init(Instant::now))
@@ -2160,9 +2268,25 @@ mod platform {
             .unwrap_or(0);
         s.last_t_ns = Some(grabbed.end_ns);
         let (cx, cy) = grabbed.cursor;
+        let mut frame = serde_json::json!({"index": index, "seq": moment.seq, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "scheduled_ns": scheduled_ns, "cursor": [cx, cy], "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn, "width": grabbed.width, "height": grabbed.height});
+        let mut payload = Vec::new();
+        if let Some((global, detail, fovea)) = s.views {
+            let (uw, uh) = (grabbed.width as usize, grabbed.height as usize);
+            let views = crate::views_payload(&grabbed.raw, uw, uh, (cx, cy), global, detail, fovea);
+            frame["views_bytes"] = serde_json::json!(views.len());
+            frame["view_size"] = serde_json::json!(global);
+            frame["detail_size"] = serde_json::json!(detail);
+            frame["fovea_size"] = serde_json::json!(fovea);
+            frame["encoding"] = serde_json::json!(if s.lz4 { "lz4" } else { "raw" });
+            payload = if s.lz4 {
+                lz4_flex::block::compress(&views)
+            } else {
+                views
+            };
+        }
         post(
-            serde_json::json!({"stream": s.key, "frame": {"index": index, "seq": moment.seq, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "scheduled_ns": scheduled_ns, "cursor": [cx, cy], "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn, "width": grabbed.width, "height": grabbed.height}}),
-            Vec::new(),
+            serde_json::json!({"stream": s.key, "frame": frame}),
+            payload,
         );
         (Ok(grabbed), None)
     }
@@ -2179,7 +2303,7 @@ mod platform {
         let grabbed = match frame {
             Ok(g) => Ok(Arc::clone(g)),
             Err(_) => {
-                let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+                let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
                 capturer.grab(hwnd, true).map(Arc::new)
             }
         };
@@ -2295,7 +2419,62 @@ mod platform {
         });
         value["game"] = game_status();
         value["capture"] = STATS.lock().map(|s| s.report()).unwrap_or_default();
+        // The other workers on this PC: an observer's own capture says little, the one
+        // that holds the game (a recording's stream, say) is what the caller wants.
+        value["workers"] = serde_json::json!(crate::worker_statuses(
+            &status_dir(),
+            std::process::id(),
+            unix_seconds()
+        ));
         Ok((value, vec![]))
+    }
+
+    /// Where each worker on this PC leaves its capture and stream timing, once a second,
+    /// for the others' telemetry: one small file per worker, named by its process id.
+    fn status_dir() -> PathBuf {
+        std::env::temp_dir().join("hoi4-worker-status")
+    }
+
+    fn unix_seconds() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    }
+
+    /// Keep this worker's status file current while it captures, and remove it when the
+    /// worker ends. A worker that never captures writes nothing.
+    fn publish_status() {
+        let dir = status_dir();
+        let path = dir.join(format!("{}.json", std::process::id()));
+        let temp = dir.join(format!("{}.tmp", std::process::id()));
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            let Ok(stats) = STATS.lock() else {
+                continue;
+            };
+            if stats.captures == 0 && stats.failures == 0 {
+                continue;
+            }
+            let body = serde_json::json!({
+                "pid": std::process::id(),
+                "t": unix_seconds(),
+                "observer": OBSERVER.load(Ordering::Relaxed),
+                "streaming": STREAMING.load(Ordering::SeqCst),
+                "capture": stats.report(),
+            });
+            drop(stats);
+            let _ = std::fs::create_dir_all(&dir);
+            if std::fs::write(&temp, body.to_string()).is_ok() {
+                let _ = std::fs::rename(&temp, &path);
+            }
+        });
+    }
+
+    struct RemoveStatus;
+    impl Drop for RemoveStatus {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(status_dir().join(format!("{}.json", std::process::id())));
+        }
     }
 
     pub fn run(options: Options) -> Result<(), String> {
@@ -2317,6 +2496,8 @@ mod platform {
         }
         ORIGIN.get_or_init(Instant::now);
         OBSERVER.store(options.observer, Ordering::Relaxed);
+        publish_status();
+        let _remove_status = RemoveStatus;
         // An observer gives no input and records no player, so it hooks nothing: the
         // connection that holds the game keeps the only hooks, and F12 stays theirs.
         if !options.observer {
@@ -2445,6 +2626,10 @@ mod platform {
                     }
                     continue;
                 }
+                if op == "focus" {
+                    focus_window(&reader_state, cmd);
+                    continue;
+                }
                 // Telemetry waits about a second for its first window of measurements;
                 // on its own thread that holds up nothing else.
                 if op == "telemetry" {
@@ -2545,7 +2730,7 @@ mod platform {
                 }
                 continue;
             };
-            let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+            let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
             match cmd["op"].as_str().unwrap_or("") {
                 "attach" => {
                     let result = if stream.is_some() {
@@ -3230,6 +3415,71 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+    #[test]
+    fn workers_see_each_others_fresh_status_and_not_their_own() {
+        let dir = std::env::temp_dir().join(format!("worker-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 1000.0;
+        for (pid, t) in [(1u32, 999.0), (2, 990.0), (3, 999.5)] {
+            let body = serde_json::json!({"pid": pid, "t": t, "capture": {"captures": pid}});
+            std::fs::write(dir.join(format!("{pid}.json")), body.to_string()).unwrap();
+        }
+        std::fs::write(dir.join("4.tmp"), "{").unwrap();
+        let seen = worker_statuses(&dir, 3, now);
+        // 2 is stale, 3 is the asking worker itself, and a half-written file is skipped.
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["pid"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(worker_statuses(&dir, 0, now).is_empty());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_window_hanging_off_the_desktop_is_not_captured() {
+        use windows_sys::Win32::Foundation::RECT;
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let desktop = rect(0, 0, 3840, 2160);
+        assert!(rect_inside(rect(100, 50, 2020, 1130), desktop));
+        // The same window on the 1024x768 desktop left by a monitor switched off.
+        assert!(!rect_inside(
+            rect(100, 50, 2020, 1130),
+            rect(0, 0, 1024, 768)
+        ));
+        // Two monitors side by side, the left one at negative x.
+        assert!(rect_inside(
+            rect(-1900, 0, -100, 1000),
+            rect(-1920, 0, 3840, 2160)
+        ));
+    }
+    #[test]
+    fn views_are_checked_once_for_captures_and_streams() {
+        let asked = serde_json::json!({"views": [448, 256], "detail": [576, 320], "fovea": 224});
+        assert_eq!(
+            requested_views(&asked),
+            Ok(Some(([448, 256], [576, 320], 224)))
+        );
+        assert_eq!(requested_views(&serde_json::json!({})), Ok(None));
+        assert_eq!(
+            requested_views(&serde_json::json!({"views": 64})),
+            Ok(Some(([64, 64], [64, 64], 64)))
+        );
+        for bad in [
+            serde_json::json!({"views": [2000, 256]}),
+            serde_json::json!({"views": [448, 256], "fovea": 0}),
+            serde_json::json!({"views": [448, 0]}),
+        ] {
+            assert!(requested_views(&bad).is_err(), "{bad}");
+        }
+        // Global view, four quadrants and the fovea, RGB, in that order.
+        let (w, h) = (16usize, 8usize);
+        let raw = vec![7u8; w * h * 4];
+        let v = views_payload(&raw, w, h, (8, 4), [4, 2], [2, 2], 2);
+        assert_eq!(v.len(), 4 * 2 * 3 + 4 * (2 * 2 * 3) + 2 * 2 * 3);
     }
     #[test]
     fn stream_keys_are_short_and_plain() {
