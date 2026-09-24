@@ -655,7 +655,9 @@ def record(
                         ended = "F12"
                         break
                     except DesktopError as error:
-                        if "not_foreground" not in str(error):
+                        # A screen switched off leaves the window off the desktop: wait for
+                        # it as for a game out of focus.
+                        if "not_foreground" not in str(error) and "off_screen" not in str(error):
                             raise
                         frame = None
                 usable = (

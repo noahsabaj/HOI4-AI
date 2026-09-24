@@ -458,6 +458,18 @@ pub fn worker_statuses(dir: &Path, own: u32, now: f64) -> Vec<serde_json::Value>
     out
 }
 
+/// Whether rectangle `inner` lies wholly within `outer`, as (left, top, right, bottom).
+#[cfg(windows)]
+pub fn rect_inside(
+    inner: windows_sys::Win32::Foundation::RECT,
+    outer: windows_sys::Win32::Foundation::RECT,
+) -> bool {
+    inner.left >= outer.left
+        && inner.top >= outer.top
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
 /// The script a control operation runs: compute jobs have their own.
 fn control_script(op: &str) -> &'static str {
     if op == "job" {
@@ -1137,6 +1149,25 @@ mod platform {
         let mut origin = POINT { x: 0, y: 0 };
         if ClientToScreen(hwnd, &mut origin) == 0 {
             return Err("client_to_screen_failed".into());
+        }
+        // A monitor switched off disconnects on DisplayPort: Windows shrinks the desktop to
+        // 1024x768 and the game's window hangs off it. Either backend would then return a
+        // frame of what is not there, so there is no frame: a stream records a gap, and
+        // goes on when the screen is back.
+        let desktop = RECT {
+            left: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            top: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            right: GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            bottom: GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        };
+        let client = RECT {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + w,
+            bottom: origin.y + h,
+        };
+        if !crate::rect_inside(client, desktop) {
+            return Err("game_window_off_screen".into());
         }
         if matches!(screen, Screen::Untried) {
             *screen = match crate::duplication::Duplicator::new((origin.x, origin.y)) {
@@ -3322,6 +3353,29 @@ mod tests {
         assert_eq!(seen[0]["pid"], 1);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(worker_statuses(&dir, 0, now).is_empty());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_window_hanging_off_the_desktop_is_not_captured() {
+        use windows_sys::Win32::Foundation::RECT;
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let desktop = rect(0, 0, 3840, 2160);
+        assert!(rect_inside(rect(100, 50, 2020, 1130), desktop));
+        // The same window on the 1024x768 desktop left by a monitor switched off.
+        assert!(!rect_inside(
+            rect(100, 50, 2020, 1130),
+            rect(0, 0, 1024, 768)
+        ));
+        // Two monitors side by side, the left one at negative x.
+        assert!(rect_inside(
+            rect(-1900, 0, -100, 1000),
+            rect(-1920, 0, 3840, 2160)
+        ));
     }
     #[test]
     fn stream_keys_are_short_and_plain() {
