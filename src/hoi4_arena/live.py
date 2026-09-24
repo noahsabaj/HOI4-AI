@@ -1,16 +1,21 @@
-"""Watching the games live from a phone: the recording being written, followed and
-re-encoded for the web.
+"""Watching the games live from a phone.
 
-The second PC streams every game here, where record-ai writes it to screen.mkv as it
-comes, and ffmpeg can read that file while it grows (-follow). So the live view changes
-nothing in either PC's recording: `hoi4-arena live` finds the game being recorded,
-re-encodes it as HLS (H.264, which Safari on an iPhone or iPad plays natively) beside a
-snapshot of the screen each second (latest.jpg), and serves both on 127.0.0.1 with a page
-that shows the game and its run's record. `tailscale serve --bg --https=8443
-http://127.0.0.1:8765` publishes the page to the tailnet alone. It plays at the
-recording's 5 frames a second, a few seconds behind the game. The page is also an app:
-added to an iPhone's or iPad's home screen (Share, Add to Home Screen) it opens full
-screen with its own icon (install_app).
+`hoi4-arena live --peer PAIRING` asks the second PC's worker for a view of its game
+window (the worker's `view`): captured at 30 frames a second on that PC's GPU, apart
+from the recording, and sent as H.264 over a read-only connection. Here it is cut into
+HLS without encoding it again (Safari on an iPhone or iPad plays HLS natively), with a
+snapshot of the screen each second (latest.jpg), and served on 127.0.0.1 with a page
+that shows the game and its run's record. It shows the menus and loading between games
+too. `tailscale serve --bg --https=8443 http://127.0.0.1:8765` publishes the page to the
+tailnet alone.
+
+Without the pairing, or from a worker too old for views, it follows the recording being
+written instead: record-ai writes each game's screen.mkv as it comes, and ffmpeg reads
+the file while it grows (-follow), at the recording's 5 frames a second. Neither way
+changes a recording.
+
+The page is also an app: added to an iPhone's or iPad's home screen (Share, Add to Home
+Screen) it opens full screen with its own icon (install_app).
 """
 
 from __future__ import annotations
@@ -254,10 +259,145 @@ def serve(out, port=PORT):
     return server
 
 
-def watch(runs=("artifacts/*",), out=None, port=PORT, poll=2.0, ffmpeg=None, rounds=None):
-    """Follow each game as it is recorded, until stopped (or for `rounds` polls): the
-    page, the playlist and latest.jpg in `out` (by default the system's temp folder's
-    hoi4-live), and the status, served on `port`. Returns the last status.
+class Follower:
+    """The recording being written, followed at its 5 frames a second (hls_command): one
+    ffmpeg per game, from near the live edge, restarted 10 s after a failure."""
+
+    def __init__(self, ffmpeg, out):
+        self.ffmpeg, self.out = ffmpeg, Path(out)
+        self.proc, self.current, self.retry_at = None, None, 0.0
+
+    def step(self, found):
+        game = found[0] if found else None
+        proc = self.proc
+        if proc is not None and (proc.poll() is not None or game != self.current):
+            if proc.poll() is None:
+                proc.terminate()  # A new game began while the last one's file lay still.
+                proc.wait(timeout=10)
+            elif game == self.current:
+                self.retry_at = time.monotonic() + 10  # It failed mid-game: not at once.
+                log.warning("ffmpeg stopped (exit %s); again in 10 s", proc.returncode)
+            self.proc = None
+        if game is not None and self.proc is None and time.monotonic() >= self.retry_at:
+            started = (found[1].get("recorder") or {}).get("started_unix") or time.time()
+            start = max(0.0, time.time() - started - LEAD)
+            command = hls_command(
+                self.ffmpeg, game / "screen.mkv", self.out, start, next_segment(self.out)
+            )
+            self.proc = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+            self.current = game
+            log.info("following %s from %.0f s", game, start)
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+        self.proc = None
+
+
+def view_command(ffmpeg, out, number=0):
+    """ffmpeg cutting the second PC's live view (MPEG-TS on its stdin, keyframes every
+    2 s) into the playlist as it comes, without encoding it again, after a discontinuity,
+    with latest.jpg once a second."""
+    out = Path(out)
+    flags = "append_list+delete_segments+discont_start+omit_endlist+independent_segments"
+    return [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "mpegts", "-i", "pipe:0",
+        "-map", "0:v", "-c:v", "copy",
+        "-f", "hls", "-hls_time", str(SEGMENT), "-hls_list_size", str(SEGMENTS),
+        "-hls_delete_threshold", "5", "-hls_flags", flags, "-start_number", str(number),
+        "-hls_segment_filename", str(out / "seg%06d.ts"), str(out / "live.m3u8"),
+        "-map", "0:v", "-vf", "fps=1", "-q:v", "4", "-update", "1", str(out / "latest.jpg"),
+    ]  # fmt: skip
+
+
+def update_pending(peer, share=None):
+    """Whether a new worker waits on the second PC's share (Deploy-Peer stages it as
+    .new beside the running one). Its bridge swaps it in only while no connection is
+    open there, so a view that never closed would keep every update out."""
+    try:
+        share = share or f"//{json.loads(Path(peer).read_text())['host']}/HOI4Worker"
+        return (Path(share) / "hoi4-desktop-worker.exe.new").exists()
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+class PeerView:
+    """The second PC's own live view (its worker's `view`): the game window captured at
+    `hz` frames a second on that PC's GPU, sent as MPEG-TS over a read-only connection,
+    and cut into the playlist here without encoding it again (view_command). It shows
+    the menus and the loading between games too, where following the recording is 5
+    frames a second and stops. `refused` once a worker without views says no."""
+
+    def __init__(self, peer, ffmpeg, out, hz=30):
+        self.peer, self.ffmpeg, self.out, self.hz = peer, ffmpeg, Path(out), hz
+        self.desk = self.proc = None
+        self.ended = threading.Event()
+        self.refused = False
+
+    def start(self):
+        from .remote import RemoteDesktop
+
+        self.stop()
+        self.ended.clear()
+        command = view_command(self.ffmpeg, self.out, next_segment(self.out))
+        self.proc = subprocess.Popen(command, stdin=subprocess.PIPE)
+        try:
+            self.desk = RemoteDesktop(self.peer, attach=True, observer=True)
+            self.desk.streams["view"] = self.deliver
+            self.desk.request("view", action="start", key="view", hz=self.hz)
+        except Exception as error:
+            self.refused = "refused_for_observer" in str(error) or "unknown" in str(error)
+            self.stop()
+            raise
+
+    def deliver(self, message):
+        """A message of the view's stream, on the connection's reader thread."""
+        if "end" in message:
+            self.ended.set()
+            return
+        payload, proc = message.get("payload"), self.proc
+        if payload and proc is not None and proc.stdin is not None:
+            try:
+                proc.stdin.write(payload)
+            except (OSError, ValueError):
+                self.ended.set()
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None and not self.ended.is_set()
+
+    def stop(self):
+        desk, proc = self.desk, self.proc
+        self.desk = self.proc = None
+        if desk is not None:
+            try:
+                desk.request("view", action="stop", timeout=5)
+            except Exception:  # noqa: BLE001 - closing the connection stops it anyway.
+                pass
+            try:
+                desk.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if proc is not None:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - it is going anyway.
+                proc.kill()
+
+
+def watch(
+    runs=("artifacts/*",), out=None, port=PORT, poll=2.0, ffmpeg=None, rounds=None,
+    peer=None, hz=30,
+):  # fmt: skip
+    """Show each game live, until stopped (or for `rounds` polls): the page, the playlist
+    and latest.jpg in `out` (by default the system's temp folder's hoi4-live), and the
+    status, served on `port`. Returns the last status.
+
+    With `peer` (the second PC's pairing file) the video is that PC's own view of its
+    game window at `hz` frames a second (PeerView), which steps aside while a new worker
+    waits there; without, or from a worker too old for views, the recording being
+    written, at 5 frames a second (Follower).
 
     Nothing that goes wrong in a round stops it: on 2026-09-24 a status file that Windows
     held for a moment ended the whole view, and the page went blank. The status is kept
@@ -272,36 +412,40 @@ def watch(runs=("artifacts/*",), out=None, port=PORT, poll=2.0, ffmpeg=None, rou
         raise RuntimeError("the live view needs ffmpeg")
     server = serve(out, port)
     log.info("live view on http://127.0.0.1:%d/ from %s", server.server_port, out)
-    proc, current, retry_at = None, None, 0.0
+    follower = Follower(ffmpeg, out)
+    view = PeerView(peer, ffmpeg, out, hz) if peer else None
+    retry_at = 0.0
     try:
         while rounds is None or rounds > 0:
             rounds = None if rounds is None else rounds - 1
             try:
                 found = live_game(runs)
-                game = found[0] if found else None
-                if proc is not None and (proc.poll() is not None or game != current):
-                    if proc.poll() is None:
-                        proc.terminate()  # A new game began while the last one's lay still.
-                        proc.wait(timeout=10)
-                    elif game == current:
-                        retry_at = time.monotonic() + 10  # It failed mid-game: not at once.
-                        log.warning("ffmpeg stopped (exit %s); again in 10 s", proc.returncode)
-                    proc = None
-                if game is not None and proc is None and time.monotonic() >= retry_at:
-                    started = (found[1].get("recorder") or {}).get("started_unix") or time.time()
-                    start = max(0.0, time.time() - started - LEAD)
-                    video = game / "screen.mkv"
-                    command = hls_command(ffmpeg, video, out, start, next_segment(out))
-                    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL)
-                    current = game
-                    log.info("following %s from %.0f s", game, start)
-                server.status = status(found, runs)
+                fps = FPS
+                if view is not None and not view.refused:
+                    if view.running() and update_pending(peer):
+                        view.stop()
+                        log.info("a new worker waits on the second PC: the view steps aside")
+                    elif not view.running() and time.monotonic() >= retry_at:
+                        if update_pending(peer):
+                            retry_at = time.monotonic() + 5
+                        else:
+                            try:
+                                view.start()
+                                log.info("viewing the second PC at %d frames a second", hz)
+                            except Exception as error:  # noqa: BLE001 - tried again.
+                                retry_at = time.monotonic() + 5
+                                log.info("no view yet: %s", error)
+                    fps = hz if view.running() else 0
+                else:
+                    follower.step(found)
+                server.status = {**status(found, runs), "fps": fps}
             except Exception:  # noqa: BLE001 - the view goes on; the next round tries again.
                 log.exception("live view round failed")
             time.sleep(poll)
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        follower.stop()
+        if view is not None:
+            view.stop()
         server.shutdown()
     return server.status
 
@@ -404,7 +548,7 @@ footer { padding: 8px 16px 16px; font-size: 12px; }
 <div id="now">Waiting for a game&hellip;</div>
 <div id="record"></div>
 </main>
-<footer class="muted">5 frames a second, a few seconds behind the game.</footer>
+<footer class="muted">A few seconds behind the game.</footer>
 <script>
 const video = document.getElementById("video");
 const badge = document.getElementById("badge");
@@ -452,6 +596,9 @@ async function tick() {
   } else {
     now.innerHTML = 'Between games <span class="muted">' + (s.run || "") + "</span>";
   }
+  document.querySelector("footer").textContent = s.fps ?
+    s.fps + " frames a second, a few seconds behind the game." :
+    "The second PC's game window is closed: back when it opens.";
   document.getElementById("record").innerHTML = (s.record || []).map(g =>
     '<span class="' + g.result + '">' + arena(g.arena) + " " + (side[g.side] || "") + " " +
     (g.result === "win" ? "won" : g.result === "loss" ? "lost" : "timed out") + " " + clock(g.seconds) + "</span>"

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -163,3 +164,92 @@ def test_following_a_recording_makes_a_playlist_and_a_snapshot(tmp_path):
     assert (out / "seg000007.ts").stat().st_size > 0
     assert (out / "latest.jpg").read_bytes()[:2] == b"\xff\xd8"
     assert live.read_shared(out / "latest.jpg")[:2] == b"\xff\xd8"
+
+
+def test_the_second_pc_s_view_is_cut_into_the_playlist_without_encoding_again(tmp_path):
+    command = live.view_command("ffmpeg", tmp_path, number=12)
+    joined = " ".join(command)
+    assert "-f mpegts -i pipe:0" in joined and "-c:v copy" in joined
+    assert command[command.index("-start_number") + 1] == "12"
+    assert command[-1].endswith("latest.jpg")
+
+
+def test_the_view_steps_aside_while_a_new_worker_waits(tmp_path):
+    peer = tmp_path / "peer.json"
+    peer.write_text(json.dumps({"host": "second-pc"}))
+    share = tmp_path / "share"
+    share.mkdir()
+    assert not live.update_pending(peer, share)
+    (share / "hoi4-desktop-worker.exe.new").write_bytes(b"MZ")
+    assert live.update_pending(peer, share)
+    assert not live.update_pending(tmp_path / "missing.json")
+
+
+class FakeProcess:
+    def __init__(self):
+        self.stdin, self.returncode = io.BytesIO(), None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+    def kill(self):
+        self.returncode = -9
+
+
+def fake_worker(monkeypatch, requests, refuse=False):
+    from hoi4_arena import remote
+    from hoi4_arena.desktop import DesktopError
+
+    class Desk:
+        def __init__(self, peer, attach=True, observer=False):
+            assert attach and observer  # Read-only, beside the recording's connection.
+            self.streams = {}
+
+        def request(self, op, timeout=10, **fields):
+            requests.append((op, fields.get("action")))
+            if refuse and fields.get("action") == "start":
+                raise DesktopError("view_refused_for_observer")
+            return {"view": fields.get("key"), "hz": fields.get("hz")}
+
+        def close(self):
+            requests.append(("close", None))
+
+    monkeypatch.setattr(remote, "RemoteDesktop", Desk)
+    processes = []
+
+    def popen(command, **options):
+        processes.append(FakeProcess())
+        return processes[-1]
+
+    monkeypatch.setattr(live.subprocess, "Popen", popen)
+    return processes
+
+
+def test_a_view_passes_the_worker_s_video_on_and_ends_with_it(tmp_path, monkeypatch):
+    requests = []
+    processes = fake_worker(monkeypatch, requests)
+    view = live.PeerView("peer.json", "ffmpeg", tmp_path)
+    view.start()
+    assert requests == [("view", "start")] and view.running()
+    view.deliver({"stream": "view", "data": 0, "payload": b"\x47video"})
+    assert processes[0].stdin.getvalue() == b"\x47video"
+    # The window closed (a relaunch): the view ends, and is started again later.
+    view.deliver({"stream": "view", "end": {"reason": "window closed"}})
+    assert not view.running() and not view.refused
+    view.stop()
+    assert requests[-2:] == [("view", "stop"), ("close", None)]
+
+
+def test_a_worker_without_views_is_asked_no_more(tmp_path, monkeypatch):
+    from hoi4_arena.desktop import DesktopError
+
+    requests = []
+    fake_worker(monkeypatch, requests, refuse=True)
+    view = live.PeerView("peer.json", "ffmpeg", tmp_path)
+    with pytest.raises(DesktopError):
+        view.start()
+    assert view.refused and not view.running()

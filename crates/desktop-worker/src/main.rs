@@ -373,11 +373,12 @@ fn control_action(op: &str) -> Option<&'static str> {
 }
 
 /// What an observer connection may ask for: to look and to measure, never to give input,
-/// start or stop anything, or record. `report`, `saves` and a job's `status` only read.
+/// start or stop anything, or record. `report`, `saves` and a job's `status` only read;
+/// a `view` only watches, on a capture of its own (start_view).
 fn observer_allows(op: &str, cmd: &serde_json::Value) -> bool {
     match op {
         "attach" | "capture" | "status" | "telemetry" | "game_log" | "pointer" | "release" => true,
-        "report" | "saves" => true,
+        "report" | "saves" | "view" => true,
         "job" => cmd["action"] == "status",
         _ => false,
     }
@@ -2227,6 +2228,53 @@ mod platform {
         ))
     }
 
+    /// A live view of the attached game, for someone watching from a phone: ffmpeg
+    /// captures the window by itself on the GPU (encoder::view_arguments), apart from any
+    /// recording's clock and capture, at `hz` frames a second (30 by default). Its video
+    /// comes as the stream `key`'s data, then `end` with why.
+    fn start_view(
+        cmd: &serde_json::Value,
+        hwnd: HWND,
+        exe_dir: &Path,
+    ) -> Result<(crate::encoder::View, serde_json::Value), String> {
+        let key = cmd["key"]
+            .as_str()
+            .filter(|k| crate::valid_stream_key(k))
+            .ok_or("invalid_stream_key")?
+            .to_string();
+        let hz = match &cmd["hz"] {
+            serde_json::Value::Null => 30,
+            value => value
+                .as_u64()
+                .filter(|h| (1..=60).contains(h))
+                .ok_or("invalid_view_hz")? as u32,
+        };
+        if hwnd.is_null() {
+            return Err("view_before_attach".into());
+        }
+        let ffmpeg = crate::encoder::find_ffmpeg(exe_dir, std::env::var_os("PATH").as_deref())
+            .ok_or("ffmpeg_not_found")?;
+        let args = crate::encoder::view_arguments(hwnd as usize, hz);
+        let offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (tag, ended) = (key.clone(), key.clone());
+        let view = crate::encoder::View::start(
+            &ffmpeg,
+            &args,
+            move |chunk| {
+                let at = offset.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                push(serde_json::json!({"stream": tag, "data": at}), chunk);
+            },
+            move |why| {
+                push(
+                    serde_json::json!({"stream": ended, "end": {"reason": why}}),
+                    &[],
+                )
+            },
+        )?;
+        let reply = serde_json::json!({"view": key, "hz": hz, "encoder_pid": view.pid});
+        Ok((view, reply))
+    }
+
     /// A tick that recorded nothing, and why: the game not in front, a resized window, an
     /// encoder behind. No frame and no row, so the video and its rows stay in step.
     fn gap(stream: &Stream, reason: &str) {
@@ -2632,7 +2680,7 @@ mod platform {
                     respond(&cmd, Err(format!("{op}_refused_for_observer")));
                     continue;
                 }
-                if op == "capture" || op == "attach" || op == "stream" {
+                if matches!(op, "capture" | "attach" | "stream" | "view") {
                     if tx.send(cmd).is_err() {
                         break;
                     }
@@ -2723,6 +2771,8 @@ mod platform {
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
             .unwrap_or_default();
         let mut stream: Option<Stream> = None;
+        // A live view for someone watching (start_view), stopped with the connection.
+        let mut view: Option<crate::encoder::View> = None;
         // Captures asked for just before a stream's tick, served with that tick's frame.
         let mut waiting: Vec<serde_json::Value> = Vec::new();
         loop {
@@ -2830,6 +2880,21 @@ mod platform {
                     }
                     _ => reply(&cmd, Err("invalid_stream_action".into())),
                 },
+                "view" => match cmd["action"].as_str().unwrap_or("") {
+                    "start" if view.is_some() => reply(&cmd, Err("view_active".into())),
+                    "start" => match start_view(&cmd, hwnd, &exe_dir) {
+                        Ok((started, started_reply)) => {
+                            view = Some(started);
+                            reply(&cmd, Ok((started_reply, vec![])));
+                        }
+                        Err(error) => reply(&cmd, Err(error)),
+                    },
+                    "stop" => {
+                        let stopped = view.take().is_some();
+                        reply(&cmd, Ok((serde_json::json!({"stopped": stopped}), vec![])));
+                    }
+                    _ => reply(&cmd, Err("invalid_view_action".into())),
+                },
                 _ => {
                     let result = fast_op(&shared, &cmd);
                     if result.is_err() {
@@ -2839,7 +2904,9 @@ mod platform {
                 }
             }
         }
-        // The connection is gone. A stream's encoder dies with this process (its job).
+        // The connection is gone. A stream's encoder and a view die with this process
+        // (their jobs).
+        drop(view);
         drop(stream);
         shared
             .lock()
@@ -3423,6 +3490,7 @@ mod tests {
             "release",
             "report",
             "saves",
+            "view",
         ] {
             assert!(observer_allows(op, &status), "{op} should be allowed");
         }
