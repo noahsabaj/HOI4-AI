@@ -39,7 +39,9 @@ def split_for_session(session_id: str):
 
 # Encoder arguments by name. ffv1 is lossless. x264 at CRF 18 in full-resolution colour
 # (4:4:4, so thin coloured text keeps its edges) measured about 48 dB PSNR against ffv1
-# on a 1080p arena clip, and about a hundredth of the size.
+# on a 1080p arena clip, and about a hundredth of the size. Four threads encode 1080p at
+# about 24 fps, several times the 5 a recording needs; x264's own default on this 28-thread
+# CPU took 79 threads and 2 GB of memory per recording (2026-09-24).
 CODECS = {
     "ffv1": [
         "-c:v", "ffv1", "-level", "3",
@@ -48,7 +50,10 @@ CODECS = {
         # running game; sixteen slices measured about 70 fps.
         "-slices", "16", "-threads", str(min(16, os.cpu_count() or 4)),
     ],
-    "x264": ["-c:v", "libx264", "-preset", "faster", "-crf", "18", "-pix_fmt", "yuv444p"],
+    "x264": [
+        "-c:v", "libx264", "-preset", "faster", "-crf", "18", "-pix_fmt", "yuv444p",
+        "-threads", "4",
+    ],
 }  # fmt: skip
 
 
