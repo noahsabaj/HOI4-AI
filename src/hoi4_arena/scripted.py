@@ -141,9 +141,11 @@ def choose_plan(rng):
         # How far up the conscription laws to go as political power allows.
         "conscription": rng.choices(list(CONSCRIPTION), weights=list(CONSCRIPTION.values()))[0],
         "attack": attack,
-        # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5; some games
-        # hold for up to a game year and a half first.
-        "wait": round(rng.uniform(6, 60) if rng.random() < 0.6 else rng.uniform(60, 240)),
+        # Planning reaches its full 30% bonus in 15 days, about 6 s at speed 5. Most games
+        # hold far longer: the first win held 142 s while the AI lost 29k men against the
+        # line to its 10k and the script's divisions filled up, and the next broad game,
+        # which held 54 s, lost.
+        "wait": round(rng.uniform(6, 60) if rng.random() < 0.2 else rng.uniform(90, 240)),
         # An offensive stops at its line, so it is always drawn again, further on: a single
         # push took one state and then stood for four years (2026-09-23).
         "redraw": round(rng.uniform(30, 90)),
