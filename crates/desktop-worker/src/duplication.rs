@@ -11,8 +11,8 @@
 //!
 //! - `AcquireNextFrame` reports a timeout when nothing on screen has changed. That is not
 //!   a failure and must not stall the tick: the previous desktop image is still what is
-//!   on the screen, so it is kept and returned. HOI4 at speed does change every frame,
-//!   but a paused game or a menu genuinely does not.
+//!   on the screen, so it is kept (on the GPU) and read again. HOI4 at speed does change
+//!   every frame, but a paused game or a menu genuinely does not.
 //! - The duplication is lost on a resolution change, a full-screen transition, a driver
 //!   reset or a session switch, reported as `DXGI_ERROR_ACCESS_LOST`. Recovery is to
 //!   rebuild the whole chain, and the caller is expected to fall back to GDI if that
@@ -37,9 +37,9 @@ use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
@@ -101,14 +101,16 @@ pub struct Duplicator {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
-    staging: ID3D11Texture2D,
+    /// The last desktop image, kept on the GPU because a timeout means "unchanged", not
+    /// "no data". Only the game's rectangle of it is ever read back.
+    desktop: ID3D11Texture2D,
+    /// A CPU-readable texture the size of the game's client rectangle, and that size.
+    staging: Option<(ID3D11Texture2D, usize, usize)>,
     /// The duplicated output's position on the virtual desktop, which client coordinates
     /// from `ClientToScreen` are relative to and this buffer is not.
     origin: (i32, i32),
     width: usize,
     height: usize,
-    /// The last desktop image, kept because a timeout means "unchanged", not "no data".
-    frame: Vec<u8>,
     holding: bool,
     ready: bool,
 }
@@ -169,34 +171,17 @@ impl Duplicator {
                 (rect.right - rect.left) as usize,
                 (rect.bottom - rect.top) as usize,
             );
-            let descriptor = D3D11_TEXTURE2D_DESC {
-                Width: width as u32,
-                Height: height as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-            let mut staging = None;
-            device
-                .CreateTexture2D(&descriptor, None, Some(&mut staging))
-                .map_err(|e| format!("staging_texture_failed_{:x}", e.code().0))?;
+            let desktop = texture(&device, width, height, false)
+                .map_err(|e| format!("desktop_texture_failed_{e}"))?;
             Ok(Self {
                 device,
                 context,
                 duplication,
-                staging: staging.ok_or("staging_texture_missing")?,
+                desktop,
+                staging: None,
                 origin: (rect.left, rect.top),
                 width,
                 height,
-                frame: vec![0u8; width * height * 4],
                 holding: false,
                 ready: false,
             })
@@ -254,22 +239,9 @@ impl Duplicator {
             let texture: ID3D11Texture2D = resource
                 .cast()
                 .map_err(|_| Unavailable::Lost("frame_is_not_a_texture".into()))?;
-            self.context.CopyResource(&self.staging, &texture);
-
-            let mut mapped = Default::default();
-            self.context
-                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| Unavailable::Lost(format!("map_staging_failed_{:x}", e.code().0)))?;
-            // The staging row pitch is the driver's, not width * 4, so the rows are
-            // copied one at a time into a packed buffer the rest of the worker can index.
-            let pitch = mapped.RowPitch as usize;
-            let row = self.width * 4;
-            for y in 0..self.height {
-                let source = (mapped.pData as *const u8).add(y * pitch);
-                let target = self.frame.as_mut_ptr().add(y * row);
-                std::ptr::copy_nonoverlapping(source, target, row);
-            }
-            self.context.Unmap(&self.staging, 0);
+            // A copy on the GPU: the frame goes back to the compositor at once, and the
+            // image stays for the ticks where nothing new is presented.
+            self.context.CopyResource(&self.desktop, &texture);
             self.release();
             self.ready = true;
             Ok(())
@@ -297,7 +269,6 @@ impl Duplicator {
         w: usize,
         h: usize,
     ) -> Result<Vec<u8>, Unavailable> {
-        self.refresh()?;
         let x = screen.0 - self.origin.0;
         let y = screen.1 - self.origin.1;
         if x < 0 || y < 0 || x as usize + w > self.width || y as usize + h > self.height {
@@ -305,15 +276,98 @@ impl Duplicator {
                 "client_rect_outside_duplicated_output".into(),
             ));
         }
+        self.refresh()?;
+        if w == 0 || h == 0 {
+            return Ok(Vec::new());
+        }
         let (x, y) = (x as usize, y as usize);
+        // Only the game's rectangle crosses to the CPU: at 1920x1080 on a 3840x2160
+        // desktop, a quarter of what copying the whole output read back.
+        let staging = match &self.staging {
+            Some((staging, sw, sh)) if (*sw, *sh) == (w, h) => staging.clone(),
+            _ => {
+                let staging = texture(&self.device, w, h, true)
+                    .map_err(|e| Unavailable::Lost(format!("staging_texture_failed_{e}")))?;
+                self.staging = Some((staging.clone(), w, h));
+                staging
+            }
+        };
+        let region = D3D11_BOX {
+            left: x as u32,
+            top: y as u32,
+            front: 0,
+            right: (x + w) as u32,
+            bottom: (y + h) as u32,
+            back: 1,
+        };
         let mut out = vec![0u8; w * h * 4];
-        for row in 0..h {
-            let source = ((y + row) * self.width + x) * 4;
-            out[row * w * 4..(row + 1) * w * 4]
-                .copy_from_slice(&self.frame[source..source + w * 4]);
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                &self.desktop,
+                0,
+                Some(&region),
+            );
+            let mut mapped = Default::default();
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| Unavailable::Lost(format!("map_staging_failed_{:x}", e.code().0)))?;
+            // The staging row pitch is the driver's, not w * 4, so the rows are copied one
+            // at a time into a packed buffer the rest of the worker can index.
+            let pitch = mapped.RowPitch as usize;
+            let row = w * 4;
+            for line in 0..h {
+                let source = (mapped.pData as *const u8).add(line * pitch);
+                std::ptr::copy_nonoverlapping(source, out.as_mut_ptr().add(line * row), row);
+            }
+            self.context.Unmap(&staging, 0);
         }
         Ok(out)
     }
+}
+
+/// A BGRA texture of `width` x `height`: CPU-readable staging when `readable`, else a
+/// GPU-only copy target.
+fn texture(
+    device: &ID3D11Device,
+    width: usize,
+    height: usize,
+    readable: bool,
+) -> Result<ID3D11Texture2D, String> {
+    let descriptor = D3D11_TEXTURE2D_DESC {
+        Width: width as u32,
+        Height: height as u32,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: if readable {
+            D3D11_USAGE_STAGING
+        } else {
+            D3D11_USAGE_DEFAULT
+        },
+        BindFlags: 0,
+        CPUAccessFlags: if readable {
+            D3D11_CPU_ACCESS_READ.0 as u32
+        } else {
+            0
+        },
+        MiscFlags: 0,
+    };
+    let mut created = None;
+    unsafe {
+        device
+            .CreateTexture2D(&descriptor, None, Some(&mut created))
+            .map_err(|e| format!("{:x}", e.code().0))?;
+    }
+    created.ok_or_else(|| "missing".to_string())
 }
 
 impl Drop for Duplicator {

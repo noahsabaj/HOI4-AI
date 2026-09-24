@@ -86,6 +86,8 @@ class Desktop:
         self.pending = {}
         self.next_id = 1
         self.reader_error = None
+        # Recording streams by key: where each stream's messages go (WorkerStream).
+        self.streams = {}
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._drain, daemon=True).start()
         self.attached = None
@@ -107,8 +109,14 @@ class Desktop:
         req_id = reply.get("id")
         with self.pending_lock:
             box = self.pending.get(req_id)
+            # A recording stream's messages carry its key instead of a request's id.
+            sink = (
+                None if box is not None else getattr(self, "streams", {}).get(reply.get("stream"))
+            )
         if box is not None:
             box.put(reply)
+        elif sink is not None and req_id is None:
+            sink(reply)
         elif "error" in reply:
             # An error the worker could not tie to a request, such as a line it could not
             # parse. Keep it as evidence rather than dropping it silently.
@@ -330,6 +338,24 @@ class Desktop:
         """
         return bool(self.request("focus")["foreground"])
 
+    def protocol(self) -> int:
+        """What the worker speaks: 1, or 2 with telemetry, observers and streams."""
+        return int(self.request("status").get("protocol", 1))
+
+    def telemetry(self, timeout: float = 15) -> dict:
+        """What the worker's PC is doing: CPU, memory, GPU, disks, network, per process,
+        and the game's window and capture timing (protocol 2).
+
+        The first request starts the worker's sampler and waits about a second for it.
+        """
+        reply = self.request("telemetry", timeout=timeout)
+        reply.pop("payload", None)
+        return reply
+
+    def stream(self, hz=5, profile="h264_nvenc", quality=None):
+        """Start a recording stream the worker clocks and encodes (protocol 2)."""
+        return WorkerStream(self, hz=hz, profile=profile, quality=quality)
+
     def game_log(self, offset=0):
         """The arena mod's new game.log lines after `offset`, and the offset to pass next.
 
@@ -432,6 +458,49 @@ class Desktop:
 
     def __exit__(self, *_):
         self.close()
+
+
+class WorkerStream:
+    """A recording the worker clocks and encodes (protocol 2).
+
+    The worker captures the game `hz` times a second on its own timer, draws the pointer,
+    and encodes the frames with ffmpeg on its own PC (`profile` and `quality`, from its
+    fixed list). What arrives here, in order, on `messages`:
+    `{"frame": {...}}` for each frame the video holds (its times, pointer and inputs, as a
+    capture reply has them), `{"data": offset, "payload": bytes}` for the encoded video (NUT),
+    `{"gap": {"reason"}}` for a tick that recorded nothing (the game not in front, say), and
+    `{"end": {...}}` once. A frame's pixels never cross the network.
+    """
+
+    def __init__(self, desk, *, hz, profile, quality=None):
+        import uuid
+
+        self.desk = desk
+        self.key = uuid.uuid4().hex[:16]
+        self.messages = queue.Queue()
+        self.ended = None
+        with desk.pending_lock:
+            desk.streams[self.key] = self.messages.put
+        try:
+            self.info = desk.request(
+                "stream", timeout=20, action="start", key=self.key, hz=int(hz), profile=profile,
+                quality=quality,
+            )  # fmt: skip
+        except Exception:
+            with desk.pending_lock:
+                desk.streams.pop(self.key, None)
+            raise
+        self.info.pop("payload", None)
+
+    def stop(self, timeout=90):
+        """End the stream. By the time this returns every message is on `messages`."""
+        try:
+            reply = self.desk.request("stream", timeout=timeout, action="stop")
+            reply.pop("payload", None)
+            return reply
+        finally:
+            with self.desk.pending_lock:
+                self.desk.streams.pop(self.key, None)
 
 
 def read_reply(stream):

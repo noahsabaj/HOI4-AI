@@ -29,7 +29,7 @@ $jobs = Join-Path $PSScriptRoot 'jobs'
 $python = Join-Path $compute '.venv\Scripts\python.exe'
 New-Item -ItemType Directory -Force -Path $jobs | Out-Null
 $Commands = @('train-memory', 'train-bc', 'train-idm', 'train-critic', 'cache-features', 'label', 'check-session')
-$Scripts = @('memory_study.py', 'benchmark_policy.py', 'time_policy.py')
+$Scripts = @('memory_study.py', 'benchmark_policy.py', 'time_policy.py', 'codec_fidelity.py')
 
 function Read-Job([string]$JobId) {
     $file = Join-Path $jobs "$JobId.json"
