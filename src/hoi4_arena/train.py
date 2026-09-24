@@ -195,6 +195,24 @@ def state_loss(head, memory, target):
     return (error * known).sum() / known.sum()
 
 
+def wait_while_paused(output, poll=5.0, sleep=None):
+    """Hold training while a file named `pause` is in its output folder.
+
+    A live game on the same card needs its decisions within 200 ms, and a training step
+    beside it makes them late. The run keeps its memory and its place, and goes on when
+    the file is removed. Returns whether it waited.
+    """
+    import time
+
+    sleep = sleep or time.sleep
+    flag = Path(output) / "pause"
+    if not flag.exists():
+        return False
+    while flag.exists():
+        sleep(poll)
+    return True
+
+
 def train_bc(
     data,
     model_path,
@@ -374,6 +392,7 @@ def train_bc(
             for step, batch in enumerate(loader):
                 if epoch == first_epoch and step < skip:
                     continue  # Trained before the run was interrupted.
+                wait_while_paused(output)
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):

@@ -445,3 +445,19 @@ def test_greedy_pointing_takes_the_likeliest_place_and_still_samples_the_kind():
         head.kinds.bias[0] = 0.5
     kinds = {int(head(memory, cells, point=True)[0][0, 0, 0]) for _ in range(40)}
     assert len(kinds) > 1, "what to do is still sampled"
+
+
+def test_training_holds_while_its_pause_file_is_there(tmp_path):
+    from hoi4_arena.train import wait_while_paused
+
+    assert not wait_while_paused(tmp_path)
+    flag = tmp_path / "pause"
+    flag.write_text("")
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        if len(polls) == 3:
+            flag.unlink()
+
+    assert wait_while_paused(tmp_path, poll=2.0, sleep=sleep) and polls == [2.0] * 3
