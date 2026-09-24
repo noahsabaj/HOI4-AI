@@ -11,8 +11,9 @@ def test_plans_cover_every_attack_and_never_redraw_without_one():
     plans = [choose_plan(rng) for _ in range(400)]
     assert {p["attack"] for p in plans} == set(ATTACKS)
     assert all(p["redraw"] is None for p in plans if p["attack"] == "none")
-    assert all(p["wait"] == 0 or 5 <= p["wait"] <= 60 for p in plans)
-    assert any(p["wait"] == 0 for p in plans) and any(p["redraw"] for p in plans)
+    assert all(6 <= p["wait"] <= 60 for p in plans)
+    assert all(p["redraw"] for p in plans if p["attack"] == "broad")
+    assert any(p["redraw"] is None for p in plans if p["attack"] in ("near", "deep"))
 
 
 def test_points_map_to_the_states_mapgen_numbers():
@@ -40,10 +41,38 @@ def test_the_front_is_where_the_two_countries_touch():
     assert planner.box_point((0, 0, 10, 20), 10, 5) == [0.5, 0.5]
 
 
+def test_thin_lines_the_map_draws_are_not_land():
+    from hoi4_arena.scripted import clean
+
+    blue = np.zeros((100, 200), bool)
+    red = np.zeros((100, 200), bool)
+    blue[:, :100], red[:, 100:190] = True, True
+    # The blue glow along Red's outer coast, and an offensive's red arrow inside Blue.
+    blue[:, 190:192] = True
+    red[50:52, 20:90] = True
+    planner = Planner("BLU", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    assert max(x for x, _ in planner.front(blue, red)) > 180  # Taken for the front.
+    blue, red = clean(blue), clean(red)
+    assert {x for x, _ in planner.front(blue, red)} <= {100, 101, 102}
+    red_side = Planner("RED", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    assert {x for x, _ in red_side.front(blue, red)} <= {97, 98, 99}
+
+
+def test_a_broad_offensive_runs_the_front_s_length_a_third_of_the_way_in():
+    front = [(100, y) for y in range(5, 96)]
+    box = (0, 0, 100, 190)
+    blue = Planner("BLU", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    line = blue.broad_line(front, box)
+    assert len(line) == 9 and line[0][1] < 10 and line[-1][1] > 90
+    assert all(x == pytest.approx(130) for x, _ in line)
+    red = Planner("RED", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    assert all(x == pytest.approx(100 - 100 / 3) for x, _ in red.broad_line(front, box))
+
+
 def test_the_win_rate_counts_decided_games_by_side_and_attack():
     games = [
         {"started_as": "BLU", "winner": "BLU", "plan": {"attack": "deep"}},
-        {"started_as": "BLU", "winner": "RED", "plan": {"attack": "near"}},
+        {"started_as": "BLU", "winner": "RED", "seconds": 150, "plan": {"attack": "near"}},
         {"started_as": "RED", "winner": "RED", "plan": {"attack": "near"}},
         {"started_as": "RED", "winner": "timeout", "plan": {"attack": "none"}},
         {"started_as": "BLU", "error": "RuntimeError: no army"},
@@ -52,7 +81,7 @@ def test_the_win_rate_counts_decided_games_by_side_and_attack():
     assert report["errors"] == 1
     assert report["all"] == {
         "games": 4, "decided": 3, "wins": 2, "rate": 0.667,
-        "interval95": [round(x, 3) for x in wilson(2, 3)],
+        "interval95": [round(x, 3) for x in wilson(2, 3)], "lost_after_s": 150,
     }  # fmt: skip
     assert report["BLU"]["wins"] == 1 and report["RED"]["decided"] == 1
     assert report["near"]["decided"] == 2 and report["none"]["decided"] == 0
@@ -110,3 +139,33 @@ def test_the_conscription_law_is_read_from_its_slot_alone():
     assert planner.law(screen) == "limited"
     plans = [choose_plan(random.Random(i)) for i in range(300)]
     assert {p["conscription"] for p in plans} == set(CONSCRIPTION)
+
+
+def test_the_political_screen_is_opened_and_closed_by_looking(monkeypatch):
+    from hoi4_arena import scripted
+
+    noise = np.random.default_rng(0)
+    title = noise.integers(0, 255, (20, 60, 3), dtype=np.uint8)
+    background = noise.integers(0, 255, (1080, 1920, 3), dtype=np.uint8)
+    state = {"open": False, "presses": 0}
+
+    def fake_screen(desk):
+        rgb = background.copy()
+        if state["open"]:
+            rgb[94:114, 40:100] = title
+        return rgb
+
+    def fake_act(desk, events, pause=0.0):
+        # Q toggles the screen, as in the game.
+        if any(e.get("vk") == scripted.POLITICS and e.get("down") for e in events):
+            state["open"] = not state["open"]
+            state["presses"] += 1
+
+    monkeypatch.setattr(scripted, "screen", fake_screen)
+    monkeypatch.setattr(scripted, "act", fake_act)
+    monkeypatch.setattr(scripted.time, "sleep", lambda seconds: None)
+    templates = {"political_title": title}
+    planner = Planner("BLU", choose_plan(random.Random(1)), templates, None, 5, frame=lambda: 0)
+    assert planner.politics(None, True) and state == {"open": True, "presses": 1}
+    assert planner.politics(None, True) and state["presses"] == 1  # Open already: no press.
+    assert planner.politics(None, False) and state == {"open": False, "presses": 2}

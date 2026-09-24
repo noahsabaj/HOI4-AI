@@ -193,6 +193,13 @@ The policy was rebuilt so it can read the screen and point at what it sees:
   around each demonstrated point rather than the point, and `--look-before-click`
   presses only where the pointer already was, after the fovea has seen it (GUI-Actor,
   arXiv 2506.03143, points the same way, with an attention map over the screen).
+  The first heat maps (the policy after one epoch on 34 speed-5 AI games, 10 decisions
+  of a held-out game) are a near-even wash over the whole screen: a move scored about 2%
+  and no cell above 0.5%; the demonstrated point was a median 374 px away and never
+  among the hottest 1% of cells. That is right for those games: the scripted camera
+  picks where it pans and zooms at random, so nothing on screen says where it will
+  point. AI games cannot teach pointing; games whose clicks follow the screen, the
+  scripted player's (buttons found by template, fronts drawn on the border), can.
 - **Speed** is an input, so recordings at different speeds train together.
 - **Data** is read straight from the recordings' video; nothing is prepared, which at 448
   px would have been about 43 GB per hour. AI games now keep the scripted camera's
