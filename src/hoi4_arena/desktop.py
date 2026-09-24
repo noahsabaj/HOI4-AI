@@ -238,9 +238,7 @@ class Desktop:
         """
         options = {}
         if views:
-            options["views"] = list(hw(views))[::-1]
-            options["detail"] = list(hw(detail))[::-1]
-            options["fovea"] = int(fovea)
+            options.update(view_options(views, detail, fovea))
         if regions:
             options["regions"] = [[int(v) for v in r] for r in regions]
         if full is not None:
@@ -281,43 +279,8 @@ class Desktop:
             offset = full_bytes
         seen = None
         if meta.get("views_bytes"):
-            sizes = [meta.get(k) for k in ("view_size", "detail_size", "fovea_size")]
-
-            def pair(v):
-                ok = isinstance(v, list) and len(v) == 2
-                return ok and all(
-                    isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in v
-                )
-
-            f = sizes[2]
-            if not (
-                pair(sizes[0])
-                and pair(sizes[1])
-                and isinstance(f, int)
-                and not isinstance(f, bool)
-                and f > 0
-            ):
-                raise DesktopError(
-                    "Worker view payload has no [width, height] view and detail sizes. "
-                    "Rebuild and redeploy hoi4-desktop-worker."
-                )
-            (sw, sh), (dw, dh) = sizes[0], sizes[1]
-            if ([sw, sh], [dw, dh], f) != (options["views"], options["detail"], options["fovea"]):
-                raise DesktopError("Worker returned views at sizes other than requested")
-            parts = [sh * sw * 3, QUADRANTS * dh * dw * 3, f * f * 3]
-            if meta["views_bytes"] != sum(parts):
-                raise DesktopError(
-                    "Worker view payload is not the global frame, four quadrants, and "
-                    "fovea. Rebuild and redeploy hoi4-desktop-worker."
-                )
-            # The worker already emits RGB at policy resolution; no swizzle needed.
-            block = buffer[offset : offset + meta["views_bytes"]]
-            ends = np.cumsum(parts)
-            seen = Views(
-                block[: ends[0]].reshape(sh, sw, 3).copy(),
-                block[ends[0] : ends[1]].reshape(QUADRANTS, dh, dw, 3).copy(),
-                block[ends[1] :].reshape(f, f, 3).copy(),
-            )
+            wanted = (options["views"], options["detail"], options["fovea"])
+            seen = parse_views(meta, buffer[offset : offset + meta["views_bytes"]], wanted)
             offset += meta["views_bytes"]
         crops = None
         if region_bytes:
@@ -382,12 +345,18 @@ class Desktop:
         reply.pop("payload", None)
         return reply
 
-    def start_stream(self, hz=5, profile="h264_nvenc", quality=None):
+    def start_stream(self, hz=5, profile="h264_nvenc", quality=None, views=None, **sizes):
         """Start a recording stream the worker clocks and encodes (protocol 2).
 
-        Not `stream`: RemoteDesktop's socket file is its `stream`.
+        With `views` (and optionally `detail` and `fovea`, as for capture), every frame also
+        brings the policy's views of itself: a live policy acts on exactly the frames the
+        recording holds, without asking for a capture each tick. Not `stream`:
+        RemoteDesktop's socket file is its `stream`.
         """
-        return WorkerStream(self, hz=hz, profile=profile, quality=quality)
+        return WorkerStream(
+            self, hz=hz, profile=profile, quality=quality,
+            views=view_options(views, **sizes) if views else None,
+        )  # fmt: skip
 
     def game_log(self, offset=0):
         """The arena mod's new game.log lines after `offset`, and the offset to pass next.
@@ -505,25 +474,42 @@ class WorkerStream:
     `{"end": {...}}` once. A frame's pixels never cross the network.
     """
 
-    def __init__(self, desk, *, hz, profile, quality=None):
+    def __init__(self, desk, *, hz, profile, quality=None, views=None):
         import uuid
 
         self.desk = desk
         self.key = uuid.uuid4().hex[:16]
         self.messages = queue.Queue()
         self.ended = None
+        self.views = views
         with desk.pending_lock:
             desk.streams[self.key] = self.messages.put
         try:
             self.info = desk.request(
                 "stream", timeout=20, action="start", key=self.key, hz=int(hz), profile=profile,
-                quality=quality,
+                quality=quality, encoding=desk.encoding, **(views or {}),
             )  # fmt: skip
         except Exception:
             with desk.pending_lock:
                 desk.streams.pop(self.key, None)
             raise
         self.info.pop("payload", None)
+
+    def frame_views(self, message):
+        """The Views a frame message brings, or None."""
+        meta = message["frame"]
+        if not self.views or not meta.get("views_bytes"):
+            return None
+        block = bytes(message.get("payload") or b"")
+        if meta.get("encoding") == "lz4":
+            import lz4.block
+
+            try:
+                block = lz4.block.decompress(block, uncompressed_size=meta["views_bytes"])
+            except Exception as error:  # noqa: BLE001 - reported as the worker's fault.
+                raise DesktopError(f"a stream frame's views are corrupt: {error}") from error
+        wanted = (self.views["views"], self.views["detail"], self.views["fovea"])
+        return parse_views(meta, block, wanted)
 
     def stop(self, timeout=90):
         """End the stream. By the time this returns every message is on `messages`."""
@@ -534,6 +520,50 @@ class WorkerStream:
         finally:
             with self.desk.pending_lock:
                 self.desk.streams.pop(self.key, None)
+
+
+def view_options(views, detail=DETAIL_SIZE, fovea=FOVEA_SIZE):
+    """A request's view sizes as the worker takes them: [width, height] lists, and the
+    fovea's side. Sizes here are (height, width), or an int for a square."""
+    return {
+        "views": list(hw(views))[::-1],
+        "detail": list(hw(detail))[::-1],
+        "fovea": int(fovea),
+    }
+
+
+def parse_views(meta, block, wanted):
+    """The Views in a reply's view bytes (a capture's, or a stream frame's), checked
+    against the sizes asked for (`wanted`: [w, h], [w, h], fovea)."""
+    sizes = [meta.get(k) for k in ("view_size", "detail_size", "fovea_size")]
+
+    def pair(v):
+        ok = isinstance(v, list) and len(v) == 2
+        return ok and all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in v)
+
+    f = sizes[2]
+    if not (pair(sizes[0]) and pair(sizes[1]) and isinstance(f, int) and not isinstance(f, bool)):
+        raise DesktopError(
+            "Worker view payload has no [width, height] view and detail sizes. "
+            "Rebuild and redeploy hoi4-desktop-worker."
+        )
+    (sw, sh), (dw, dh) = sizes[0], sizes[1]
+    if ([sw, sh], [dw, dh], f) != tuple(wanted) or f <= 0:
+        raise DesktopError("Worker returned views at sizes other than requested")
+    parts = [sh * sw * 3, QUADRANTS * dh * dw * 3, f * f * 3]
+    if meta["views_bytes"] != sum(parts) or len(block) != sum(parts):
+        raise DesktopError(
+            "Worker view payload is not the global frame, four quadrants, and "
+            "fovea. Rebuild and redeploy hoi4-desktop-worker."
+        )
+    # The worker already emits RGB at policy resolution; no swizzle needed.
+    block = np.frombuffer(block, np.uint8)
+    ends = np.cumsum(parts)
+    return Views(
+        block[: ends[0]].reshape(sh, sw, 3).copy(),
+        block[ends[0] : ends[1]].reshape(QUADRANTS, dh, dw, 3).copy(),
+        block[ends[1] :].reshape(f, f, 3).copy(),
+    )
 
 
 def read_reply(stream):

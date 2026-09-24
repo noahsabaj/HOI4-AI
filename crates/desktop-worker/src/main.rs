@@ -470,6 +470,59 @@ pub fn rect_inside(
         && inner.bottom <= outer.bottom
 }
 
+/// The policy's views of one BGRA frame: the global view, the four quadrants and the
+/// fovea on the pointer, RGB, in that order (`hoi4_arena.dataset.views`).
+pub fn views_payload(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    cursor: (i32, i32),
+    global: [usize; 2],
+    detail: [usize; 2],
+    fovea: usize,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for (i, b) in view_boxes(width, height).into_iter().enumerate() {
+        let size = if i == 0 { global } else { detail };
+        payload.extend_from_slice(&downscale_bgra(raw, width, b, size));
+    }
+    // Cropped from the same frame as the other views, on either backend. Training crops
+    // the recorded full frame, so a separate, later blit would disagree exactly at the
+    // pointer.
+    payload.extend_from_slice(&cursor_crop_bgra(
+        raw, width, height, cursor.0, cursor.1, fovea,
+    ));
+    payload
+}
+
+/// The views a request asks for: the global view's and the quadrants' [width, height], and
+/// the fovea's side.
+pub type ViewSizes = ([usize; 2], [usize; 2], usize);
+
+/// A request's view sizes, checked: the global view and the quadrants as [width,
+/// height] (a number is a square; the quadrants default to the global view's size) and
+/// the fovea's side (default the global view's width). None when no views are asked for.
+pub fn requested_views(cmd: &serde_json::Value) -> Result<Option<ViewSizes>, String> {
+    let view_size = view_dims(&cmd["views"])?;
+    let detail_size = view_dims(&cmd["detail"])?.or(view_size);
+    let fovea_size = cmd["fovea"]
+        .as_u64()
+        .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
+    let dims = [view_size, detail_size].into_iter().flatten();
+    if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
+        return Err("view_size_too_large".into());
+    }
+    let Some(global) = view_size else {
+        return Ok(None);
+    };
+    match detail_size {
+        Some(detail) if fovea_size > 0 && dims.clone().all(|[w, h]| w > 0 && h > 0) => {
+            Ok(Some((global, detail, fovea_size)))
+        }
+        _ => Err("view_size_zero".into()),
+    }
+}
+
 /// The script a control operation runs: compute jobs have their own.
 fn control_script(op: &str) -> &'static str {
     if op == "job" {
@@ -1903,22 +1956,10 @@ mod platform {
         // The global view, the quadrants and the fovea each have their own size
         // (`hoi4_arena.dataset.views`): [width, height] for the first two, or a number for
         // a square, and a square fovea.
-        let view_size = view_dims(&cmd["views"])?;
-        let detail_size = view_dims(&cmd["detail"])?.or(view_size);
-        let fovea_size = cmd["fovea"]
-            .as_u64()
-            .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
-        let dims = [view_size, detail_size].into_iter().flatten();
-        if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
-            return Err("view_size_too_large".into());
-        }
-        if view_size.is_some()
-            && (detail_size.is_none()
-                || fovea_size == 0
-                || dims.clone().any(|[w, h]| w == 0 || h == 0))
-        {
-            return Err("view_size_zero".into());
-        }
+        let wanted = crate::requested_views(cmd)?;
+        let view_size = wanted.map(|v| v.0);
+        let detail_size = wanted.map(|v| v.1);
+        let fovea_size = wanted.map_or(0, |v| v.2);
         let mut regions: Vec<[usize; 4]> = Vec::new();
         if let Some(list) = cmd["regions"].as_array() {
             if list.len() > 64 {
@@ -1948,18 +1989,9 @@ mod platform {
             payload.extend_from_slice(raw);
         }
         let mut views_bytes = 0usize;
-        if let (Some(global), Some(detail)) = (view_size, detail_size) {
-            for (i, b) in view_boxes(uw, uh).into_iter().enumerate() {
-                let size = if i == 0 { global } else { detail };
-                let v = downscale_bgra(raw, uw, b, size);
-                views_bytes += v.len();
-                payload.extend_from_slice(&v);
-            }
-            // Cropped from the same frame as the other views, on either backend. Training
-            // crops the recorded full frame, so a separate, later blit would disagree
-            // exactly at the pointer.
-            let v = cursor_crop_bgra(raw, uw, uh, cx, cy, fovea_size);
-            views_bytes += v.len();
+        if let Some((global, detail, fovea)) = wanted {
+            let v = crate::views_payload(raw, uw, uh, (cx, cy), global, detail, fovea);
+            views_bytes = v.len();
             payload.extend_from_slice(&v);
         }
         let mut region_bytes: Vec<usize> = Vec::new();
@@ -2045,6 +2077,10 @@ mod platform {
         next: Instant,
         last_t_ns: Option<u64>,
         encoder: crate::encoder::Encoder,
+        /// The policy's views to send with every frame, and lz4 or not: a live policy acts
+        /// on exactly the frames the recording holds, without a capture request a tick.
+        views: Option<crate::ViewSizes>,
+        lz4: bool,
     }
 
     fn start_stream(
@@ -2072,6 +2108,7 @@ mod platform {
             ),
         };
         let (args, quality) = crate::encoder::arguments(name, quality, hz)?;
+        let views = crate::requested_views(cmd)?;
         let profile = crate::encoder::profile(name).ok_or("unknown_encoder_profile")?;
         if hwnd.is_null() {
             return Err("stream_before_attach".into());
@@ -2129,6 +2166,8 @@ mod platform {
                 next: Instant::now(),
                 last_t_ns: None,
                 encoder,
+                views,
+                lz4: cmd["encoding"] == "lz4",
             },
             reply,
         ))
@@ -2209,9 +2248,25 @@ mod platform {
             .unwrap_or(0);
         s.last_t_ns = Some(grabbed.end_ns);
         let (cx, cy) = grabbed.cursor;
+        let mut frame = serde_json::json!({"index": index, "seq": moment.seq, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "scheduled_ns": scheduled_ns, "cursor": [cx, cy], "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn, "width": grabbed.width, "height": grabbed.height});
+        let mut payload = Vec::new();
+        if let Some((global, detail, fovea)) = s.views {
+            let (uw, uh) = (grabbed.width as usize, grabbed.height as usize);
+            let views = crate::views_payload(&grabbed.raw, uw, uh, (cx, cy), global, detail, fovea);
+            frame["views_bytes"] = serde_json::json!(views.len());
+            frame["view_size"] = serde_json::json!(global);
+            frame["detail_size"] = serde_json::json!(detail);
+            frame["fovea_size"] = serde_json::json!(fovea);
+            frame["encoding"] = serde_json::json!(if s.lz4 { "lz4" } else { "raw" });
+            payload = if s.lz4 {
+                lz4_flex::block::compress(&views)
+            } else {
+                views
+            };
+        }
         post(
-            serde_json::json!({"stream": s.key, "frame": {"index": index, "seq": moment.seq, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "scheduled_ns": scheduled_ns, "cursor": [cx, cy], "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn, "width": grabbed.width, "height": grabbed.height}}),
-            Vec::new(),
+            serde_json::json!({"stream": s.key, "frame": frame}),
+            payload,
         );
         (Ok(grabbed), None)
     }
@@ -3376,6 +3431,31 @@ mod tests {
             rect(-1900, 0, -100, 1000),
             rect(-1920, 0, 3840, 2160)
         ));
+    }
+    #[test]
+    fn views_are_checked_once_for_captures_and_streams() {
+        let asked = serde_json::json!({"views": [448, 256], "detail": [576, 320], "fovea": 224});
+        assert_eq!(
+            requested_views(&asked),
+            Ok(Some(([448, 256], [576, 320], 224)))
+        );
+        assert_eq!(requested_views(&serde_json::json!({})), Ok(None));
+        assert_eq!(
+            requested_views(&serde_json::json!({"views": 64})),
+            Ok(Some(([64, 64], [64, 64], 64)))
+        );
+        for bad in [
+            serde_json::json!({"views": [2000, 256]}),
+            serde_json::json!({"views": [448, 256], "fovea": 0}),
+            serde_json::json!({"views": [448, 0]}),
+        ] {
+            assert!(requested_views(&bad).is_err(), "{bad}");
+        }
+        // Global view, four quadrants and the fovea, RGB, in that order.
+        let (w, h) = (16usize, 8usize);
+        let raw = vec![7u8; w * h * 4];
+        let v = views_payload(&raw, w, h, (8, 4), [4, 2], [2, 2], 2);
+        assert_eq!(v.len(), 4 * 2 * 3 + 4 * (2 * 2 * 3) + 2 * 2 * 3);
     }
     #[test]
     fn stream_keys_are_short_and_plain() {

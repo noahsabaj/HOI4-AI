@@ -224,6 +224,8 @@ class StreamRecorder:
         split=None,
         codec="nvenc",
         first_data_timeout=15.0,
+        views=None,
+        **sizes,
     ):
         import threading
 
@@ -237,7 +239,9 @@ class StreamRecorder:
         self.desk = desk
         self.root.mkdir(parents=True, exist_ok=False)
         try:
-            self.stream = desk.start_stream(hz=hz, profile=profile, quality=quality)
+            self.stream = desk.start_stream(
+                hz=hz, profile=profile, quality=quality, views=views, **sizes
+            )
         except DesktopError as error:
             shutil.rmtree(self.root, ignore_errors=True)
             raise StreamUnavailable(str(error)) from error
@@ -278,6 +282,7 @@ class StreamRecorder:
             stderr=self.log,
         )  # fmt: skip
         self.changed = threading.Condition()
+        self.views = None  # The newest frame's views, when the stream brings them.
         self.extras = {}
         self.held = None  # The newest row: written when the next one arrives, or at close.
         self.seen = 0  # Rows next_frame has handed out.
@@ -343,7 +348,16 @@ class StreamRecorder:
             message = self.stream.messages.get()
             if "frame" in message:
                 row = {**message["frame"], "received_ns": time.monotonic_ns()}
+                try:
+                    seen = self.stream.frame_views(message)
+                except DesktopError as error:
+                    self.write_error = self.write_error or f"views: {error}"
+                    seen = None
+                # The views travel with the frame to next_frame(), not into the rows.
+                for key in ("views_bytes", "view_size", "detail_size", "fovea_size", "encoding"):
+                    row.pop(key, None)
                 with self.changed:
+                    self.views = seen
                     if self.held is not None:
                         self._write(self.held)
                     for key, value in self.extras.items():
@@ -417,7 +431,7 @@ class StreamRecorder:
             if self.seen < self.manifest["frames"]:
                 self.seen = self.manifest["frames"]
                 self.gaps_seen = self.gap_count
-                return Frame(None, dict(self.held), self.held["received_ns"])
+                return Frame(None, dict(self.held), self.held["received_ns"], views=self.views)
             if self.gaps_seen < self.gap_count:
                 self.gaps_seen = self.gap_count
                 gap = self.last_gap or {}
