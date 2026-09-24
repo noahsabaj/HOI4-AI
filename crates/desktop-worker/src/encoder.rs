@@ -8,9 +8,11 @@
 //! its stdout, which the worker forwards. Only the video crosses the network.
 //!
 //! What ffmpeg may be asked to do is fixed here: a few named encoder profiles, each with one
-//! quality number, reading a pipe and writing a pipe. Nothing from a request reaches its
-//! command line except that name and number, both checked, so the worker still exposes no
-//! command and writes no file.
+//! quality number, reading a pipe and writing a pipe, and a live view (view_arguments)
+//! capturing the attached window by its handle and writing a pipe. Nothing from a request
+//! reaches its command line except that name and number and a view's rate, all checked
+//! (the window handle is the worker's own), so the worker still exposes no command and
+//! writes no file.
 
 #![cfg(windows)]
 
