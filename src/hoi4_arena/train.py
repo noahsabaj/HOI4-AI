@@ -41,6 +41,7 @@ def unroll(policy, batch, burn_in=2, training=True, checkpoint=False, chunk=CHUN
     clips = batch.get("clips")
     steps = batch["quadrants"].shape[1]
     dtype = batch["quadrants"].dtype
+    cached = "tower_grid" in batch
     seen = []
     for part, grad in ((slice(0, burn_in), False), (slice(burn_in, steps), training)):
         if part.start >= part.stop:
@@ -53,6 +54,11 @@ def unroll(policy, batch, burn_in=2, training=True, checkpoint=False, chunk=CHUN
                     batch["fovea"][:, part],
                     checkpoint=checkpoint,
                     chunk=chunk,
+                    tower=(
+                        (batch["tower_summary"][:, part], batch["tower_grid"][:, part])
+                        if cached
+                        else None
+                    ),
                 )
             )
     summary, cells, centre = (torch.cat(x, 1) for x in zip(*seen))
@@ -270,6 +276,7 @@ def train_bc(
     lr=1e-4,
     init=None,
     train_last=None,
+    tower_cache=None,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -300,7 +307,9 @@ def train_bc(
     order and the time until it (privileged.decision_orders). `init` starts the policy
     from a checkpoint's weights (fine-tuning), `lr` sets the learning rate. `train_last`
     sets how many of the vision tower's last blocks train (the encoder's default, 2, when
-    None); 0 freezes the tower, which then runs once without a graph.
+    None); 0 freezes the tower, which then runs once without a graph. With the tower
+    frozen, `tower_cache` (cache-tower) reads what it saw from disk instead of running it:
+    the cache must have been made from this very tower.
     """
     if not 0 < idm_weight <= 1:
         raise ValueError("idm_weight must be in (0, 1]")
@@ -328,7 +337,10 @@ def train_bc(
         "loser_weight": loser_weight,
         "state": state_weight > 0,
         "orders": order_weight > 0,
+        "tower": tower_cache,
     }
+    if tower_cache is not None and train_last != 0:
+        raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
     # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
@@ -348,6 +360,11 @@ def train_bc(
         saved = torch.load(init, map_location="cpu", weights_only=True)
         policy.load_state_dict(saved["policy"])
     policy = policy.to(device)
+    if tower_cache is not None:
+        from .tower_cache import fingerprint
+
+        if fingerprint(policy.encoder) != dataset.tower_stamp:
+            raise ValueError("the tower cache was made from another tower than this policy's")
     xm = {"candidates": xm_candidates, "form": xm_form}
     aux = PredictiveAuxiliary(
         feature_dim=encoder.dim,
@@ -360,7 +377,7 @@ def train_bc(
 
     state_head = torch.nn.Linear(policy.memory_dim, STATE_DIM)
     order_head = OrderHead(policy.memory_dim)
-    if init is not None:
+    if init is not None and Path(init).name.startswith("epoch-"):
         # The read-outs saved beside the checkpoint start where they left off too.
         for head, prefix in ((state_head, "state-head-"), (order_head, "order-head-")):
             saved_head = Path(init).with_name(Path(init).name.replace("epoch-", prefix))
@@ -403,6 +420,7 @@ def train_bc(
         "lr": lr,
         "init": str(Path(init).resolve()) if init else None,
         "train_last": train_last,
+        "tower_cache": str(Path(tower_cache).resolve()) if tower_cache else None,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

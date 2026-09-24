@@ -99,6 +99,16 @@ def main():
         "fights the recorder's country through the interface, with a random strategy each "
         "game, against the AI (needs an arena v3 or later for its daily state reports).",
     )
+    tower = sub.add_parser(
+        "cache-tower",
+        help="Run a checkpoint's frozen vision tower once over every frame of the "
+        "recordings and keep what it read, for train-bc --tower-cache.",
+    )
+    tower.add_argument("data")
+    tower.add_argument("checkpoint")
+    tower.add_argument("output")
+    tower.add_argument("--model", dest="model_path")
+    tower.add_argument("--sources", nargs="+")
     live = sub.add_parser(
         "play-policy",
         help="A trained policy plays arena games against the game's AI on the second PC, "
@@ -332,6 +342,11 @@ def main():
         type=int,
         help="How many of the vision tower's last blocks train (default 2); 0 freezes it, "
         "which makes a step about a third cheaper.",
+    )
+    train.add_argument(
+        "--tower-cache",
+        help="Read the frozen tower's output from this cache (cache-tower) instead of "
+        "running it; needs --train-last 0.",
     )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
@@ -737,6 +752,16 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
+    elif command == "cache-tower":
+        from .tower_cache import cache_tower
+
+        result = cache_tower(
+            args["data"],
+            args["checkpoint"],
+            args["output"],
+            model_path=args["model_path"],
+            sources=args["sources"],
+        )
     elif command == "play-policy":
         from .play import evaluate_policy
 

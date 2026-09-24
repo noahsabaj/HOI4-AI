@@ -495,3 +495,65 @@ def test_a_frozen_tower_trains_nothing_of_the_encoder():
     trainable = [n for n, p in encoder.named_parameters() if p.requires_grad]
     last = len(encoder.model.blocks) - 1
     assert trainable and all(n.startswith(f"model.blocks.{last}.") for n in trainable)
+
+
+@needs_ffmpeg
+def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch):
+    """Cached and run, the tower gives the policy the same summary and cells, and a run
+    trained from the cache refuses one made from another tower."""
+    import hoi4_arena.models as models
+    import hoi4_arena.train as train
+    from hoi4_arena.dataset import batch_to_device
+    from hoi4_arena.models import ScreenEncoder
+    from hoi4_arena.tower_cache import cache_tower
+
+    def small(path=None, variant="screen", **_):
+        return ScreenEncoder(pretrained=False, size=(32, 64))
+
+    monkeypatch.setattr(models, "build_encoder", small)
+    monkeypatch.setattr(train, "build_encoder", small)
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("game", "held-out"):
+        _scripted(data / name, players=["BLU"], winner="BLU")
+    (data / "splits.json").write_text(json.dumps({"game": "train", "held-out": "validation"}))
+    torch.manual_seed(0)
+    policy = Policy(small(), memory_dim=512)
+    checkpoint = tmp_path / "start.pt"
+    torch.save(
+        {"policy": policy.state_dict(), "config": {"model_path": "x", "variant": "screen"}},
+        checkpoint,
+    )
+    report = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
+    assert report["recordings"] == 2 and report["frames"] == 80
+    again = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
+    assert again["skipped"] == 2 and again["recordings"] == 0, "a finished recording stays"
+
+    common = {"sources": ("scripted",), "length": 3, "burn_in": 1, "device": "cpu",
+              "clips": False, "lead_in": 0, "shuffle": 0}  # fmt: skip
+    plain = next(iter(VideoSessions(data, **common)))
+    cached = next(iter(VideoSessions(data, tower=tmp_path / "cache", **common)))
+    assert cached["tower_grid"].shape == (4, 768, 32, 32)
+    policy.eval().requires_grad_(False)
+    batch = batch_to_device(torch.utils.data.default_collate([plain]), "cpu")
+    stored = batch_to_device(torch.utils.data.default_collate([cached]), "cpu")
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        run = policy.perceive_window(None, batch["quadrants"], batch["fovea"])
+        read = policy.perceive_window(
+            None, stored["quadrants"], stored["fovea"],
+            tower=(stored["tower_summary"], stored["tower_grid"]),
+        )  # fmt: skip
+    for a, b in zip(run, read, strict=True):
+        assert torch.allclose(a.float(), b.float(), atol=0.1, rtol=0.05)
+
+    common = {"sources": ("scripted",), "sequence": 2, "burn_in": 1, "workers": 0, "lead_in": 0}
+    train.train_bc(data, "model", tmp_path / "out", train_last=0, init=checkpoint,
+                   tower_cache=tmp_path / "cache", **common)  # fmt: skip
+    rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
+    assert rows[-1]["validation_nll"] > 0
+    with pytest.raises(ValueError, match="another tower"):
+        train.train_bc(data, "model", tmp_path / "other", train_last=0,
+                       tower_cache=tmp_path / "cache", **common)  # fmt: skip
+    with pytest.raises(ValueError, match="frozen tower"):
+        train.train_bc(data, "model", tmp_path / "unfrozen", init=checkpoint,
+                       tower_cache=tmp_path / "cache", **common)  # fmt: skip

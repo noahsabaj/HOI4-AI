@@ -506,6 +506,13 @@ class _Stream:
         self.globals = {}
         self.details = {}
         self.index = 0
+        # The tower cache's arrays (tower_cache.py), opened here, in the process that
+        # reads them: a memory map does not travel to a DataLoader worker.
+        self.tower = None
+        if labels.get("tower"):
+            self.tower = tuple(
+                np.load(labels["tower"][key], mmap_mode="r") for key in ("summary", "grid")
+            )
 
     def close(self):
         if self.decoder.poll() is None:
@@ -537,6 +544,12 @@ class _Stream:
         for key in ("state", "order_kind", "order_eta"):
             if key in labels:
                 window[key] = torch.from_numpy(labels[key][start : start + n].copy())
+        if self.tower is not None:
+            from .tower_cache import from_bits
+
+            frames = labels["frame_ids"][start : start + n]
+            window["tower_summary"] = from_bits(self.tower[0][frames])
+            window["tower_grid"] = from_bits(self.tower[1][frames])
         if self.clips:
             window["clips"] = torch.stack(
                 [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]
@@ -611,7 +624,8 @@ class VideoSessions(IterableDataset):
     A `splits.json` in `root`, {recording folder name: split}, overrides the split each
     recording's manifest drew, so a study can choose its held-out games without touching
     the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state` and `orders` pass to
-    session_labels; a lead-in shorter than a clip needs `clips` off.
+    session_labels; a lead-in shorter than a clip needs `clips` off. `tower`, a tower
+    cache (tower_cache.py), adds each decision's frozen-tower reading to its window.
     """
 
     def __init__(
@@ -638,6 +652,7 @@ class VideoSessions(IterableDataset):
         loser_weight=1.0,
         state=False,
         orders=False,
+        tower=None,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -674,6 +689,23 @@ class VideoSessions(IterableDataset):
                     orders=orders,
                 )
             )
+        self.tower_stamp = None
+        if tower is not None:
+            from .tower_cache import tower_paths
+
+            stamps = set()
+            for labels in self.sessions:
+                paths = tower_paths(tower, labels["root"])
+                if paths is None:
+                    raise ValueError(
+                        f"{labels['root'].name} is not in the tower cache {tower}; "
+                        "run cache-tower on this data first"
+                    )
+                labels["tower"] = paths
+                stamps.add(paths["tower"])
+            if len(stamps) > 1:
+                raise ValueError("the tower cache mixes the readings of different towers")
+            self.tower_stamp = stamps.pop() if stamps else None
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)
         if not self.windows:
             raise ValueError(f"No complete valid {split} sequences; record human sessions first")
@@ -734,4 +766,12 @@ def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=Fal
         drop_last=drop_last,
         num_workers=workers,
         pin_memory=bool(workers) and torch.device(device).type == "cuda",
+        worker_init_fn=_worker_threads if workers else None,
+        persistent_workers=bool(workers),
     )
+
+
+def _worker_threads(_worker_id, threads=2):
+    """More than the one thread a DataLoader worker is given: with one, the views of a
+    frame took 46 ms (2026-09-24)."""
+    torch.set_num_threads(threads)

@@ -636,7 +636,9 @@ class Policy(nn.Module):
         summary, grid = self.encoder(clip, quadrants)
         return summary, self.cells(grid, quadrants), self.foveal(fovea).mean((-2, -1))
 
-    def perceive_window(self, clips, quadrants, fovea, *, checkpoint=False, chunk=CHUNK):
+    def perceive_window(
+        self, clips, quadrants, fovea, *, checkpoint=False, chunk=CHUNK, tower=None
+    ):
         """`perceive` over a window of decisions: (B, T, ...) views in, (B, T, ...) out.
 
         Perception does not depend on the memory, so a window's frames need not wait for
@@ -648,6 +650,11 @@ class Policy(nn.Module):
         fit 8 GB. The frozen blocks are never recomputed. A chunk never spans two windows,
         so it is a view of the batch, not a copy the recomputation would have to keep.
         `clips` may be None for an encoder that does not read them.
+
+        `tower`, (summary, grid) per decision from a tower cache (tower_cache.py), stands
+        in for a wholly frozen encoder: its summary as it is, its grid already resized to
+        the cells' CELLS x CELLS (the 1x1 convolution and the bilinear resize commute), so
+        no frame goes through the tower at all.
         """
         split = getattr(self.encoder, "frozen", None)
         windows = []
@@ -657,7 +664,10 @@ class Policy(nn.Module):
                 span = slice(start, start + chunk)
                 clip = None if clips is None else clips[i, span]
                 quads, centre = quadrants[i, span], fovea[i, span]
-                state = split(clip, quads) if split else (clip, quads)
+                if tower is not None:
+                    state = ("cached", tower[0][i, span], tower[1][i, span])
+                else:
+                    state = split(clip, quads) if split else (clip, quads)
                 if checkpoint and torch.is_grad_enabled():
                     parts.append(
                         torch.utils.checkpoint.checkpoint(
@@ -670,8 +680,13 @@ class Policy(nn.Module):
         return tuple(torch.stack(x) for x in zip(*windows))
 
     def _perceive_tail(self, state, quadrants, fovea):
-        tail = getattr(self.encoder, "tail", None)
-        summary, grid = tail(state) if tail else self.encoder(*state)
+        if isinstance(state[0], str):  # ("cached", summary, grid)
+            # Stored in bfloat16; taken in the views' dtype, as the tower's own output is
+            # joined with them (under autocast the convolutions read bfloat16 either way).
+            summary, grid = state[1].to(quadrants.dtype), state[2].to(quadrants.dtype)
+        else:
+            tail = getattr(self.encoder, "tail", None)
+            summary, grid = tail(state) if tail else self.encoder(*state)
         return summary, self.cells(grid, quadrants), self.foveal(fovea).mean((-2, -1))
 
 
