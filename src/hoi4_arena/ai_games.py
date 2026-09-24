@@ -36,7 +36,7 @@ from PIL import Image
 
 from .arena_log import ArenaLog
 from .desktop import Desktop, DesktopError, local_control_args
-from .recording import Recorder
+from .recording import open_recorder, pixels
 from .remote import RemoteDesktop
 from .vision import ScreenRules, country_pixels, find_template
 
@@ -633,7 +633,9 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4, player=N
     first = desk.capture()
     hz = settings["hz"]
     source = "scripted" if player else "ai"
-    rec = Recorder(root, first, game_speed=speed, source=source, hz=hz, codec=settings["codec"])
+    rec = open_recorder(
+        desk, root, first, game_speed=speed, source=source, hz=hz, codec=settings["codec"]
+    )
     planner = None
     if player:
         planner = Planner(
@@ -657,9 +659,15 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4, player=N
         rec.append(first)
         mover.start()
         while time.monotonic() - start < settings["cap_minutes"] * 60:
-            deadline += 1 / hz
-            time.sleep(max(0, deadline - time.monotonic()))
-            frame = on_screen(desk.capture())
+            if rec.streamed:
+                # The worker keeps the clock and records every frame itself (--codec
+                # nvenc); this loop follows its frames and looks at the screen when it must.
+                frame = on_screen(rec.next_frame())
+                deadline = time.monotonic()
+            else:
+                deadline += 1 / hz
+                time.sleep(max(0, deadline - time.monotonic()))
+                frame = on_screen(desk.capture())
             if not frame.meta.get("foreground"):
                 focus(desk, tries=1)
                 continue
@@ -674,7 +682,7 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4, player=N
                 late += 1
                 deadline = now
             if rec.manifest["frames"] % int(hz) == 0:
-                popups.look(frame.rgb)  # About once a second; a search costs ~70 ms.
+                popups.look(pixels(desk, frame))  # About once a second; a search costs ~70 ms.
             if now >= next_poll:
                 next_poll = now + 1
                 seen = len(arena.lines)
@@ -684,7 +692,7 @@ def play(desk, root, popups, settings, station, country="BLU", speed=4, player=N
                 if arena.winner and ending is None:
                     # Keep a few seconds of the surrender on screen, then stop.
                     ending = now + 5
-                    Image.fromarray(frame.rgb).save(Path(root) / "capitulation.png")
+                    Image.fromarray(pixels(desk, frame)).save(Path(root) / "capitulation.png")
             if ending is not None and now >= ending:
                 outcome = arena.winner
                 break

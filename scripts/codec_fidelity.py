@@ -261,7 +261,7 @@ def main(argv=None):
     ap.add_argument("--build-truth", nargs="+", metavar="SOURCE")
     ap.add_argument("--templates", default="artifacts/screens-1080p")
     ap.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
-    ap.add_argument("--only", default="", help="Comma-separated candidate names")
+    ap.add_argument("--only", nargs="+", default=[], help="Candidate names (default: all)")
     ap.add_argument("--threads", type=int, default=4, help="Encoder and OpenCV threads")
     a = ap.parse_args(argv)
     cv2.setNumThreads(a.threads)
@@ -277,7 +277,7 @@ def main(argv=None):
     found = sightings(truth, names, temps, out / "sightings.json")
     kinds = sorted({s[0] for v in found.values() for s in v})
     print(f"{sum(map(len, found.values()))} template sightings: {kinds}", file=sys.stderr)
-    wanted = [n for n in a.only.split(",") if n] or list(CANDIDATES)
+    wanted = a.only or list(CANDIDATES)
     results_path = out / "results.json"
     results = json.loads(results_path.read_text()) if results_path.exists() else {}
     for name in wanted:

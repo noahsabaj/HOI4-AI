@@ -49,11 +49,13 @@ use windows::Win32::Graphics::Dxgi::{
 
 /// How long to wait for a new desktop frame before deciding the screen did not change.
 ///
-/// Zero would be wrong in the other direction: the compositor can be mid-present when the
-/// tick asks, and returning a stale frame every time would lose real motion. A few
-/// milliseconds is far below the 200 ms interval and well above a present interval at any
-/// refresh rate this runs at.
-const FRAME_TIMEOUT_MS: u32 = 8;
+/// None. The duplication hands over the newest complete desktop image presented since the
+/// last acquire, so a capture every 200 ms (a game draws dozens of frames in between) always
+/// gets the latest one at once, and a timeout means nothing was presented: the image kept
+/// from before is still the screen. Waiting 8 ms here, as before, waited for the next present
+/// on most calls and made a 1920x1080 capture take 14.9 ms p50 instead of 4.9 (this PC,
+/// 2026-09-24).
+const FRAME_TIMEOUT_MS: u32 = 0;
 
 /// How long to keep asking before the very first frame, which has nothing cached behind
 /// it. A freshly created duplication has no desktop image until something is presented,
@@ -239,10 +241,11 @@ impl Duplicator {
             let texture: ID3D11Texture2D = resource
                 .cast()
                 .map_err(|_| Unavailable::Lost("frame_is_not_a_texture".into()))?;
-            // A copy on the GPU: the frame goes back to the compositor at once, and the
-            // image stays for the ticks where nothing new is presented.
+            // A copy on the GPU, kept for the ticks where nothing new is presented. The
+            // frame is held until `client` has read its rectangle back: released any
+            // sooner, the compositor may draw the next frame into it before the queued
+            // copies run.
             self.context.CopyResource(&self.desktop, &texture);
-            self.release();
             self.ready = true;
             Ok(())
         }
@@ -313,9 +316,17 @@ impl Duplicator {
                 Some(&region),
             );
             let mut mapped = Default::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| Unavailable::Lost(format!("map_staging_failed_{:x}", e.code().0)))?;
+            // Map waits for the queued copies; only then is the frame given back.
+            let map = self
+                .context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped));
+            if let Err(e) = map {
+                self.release();
+                return Err(Unavailable::Lost(format!(
+                    "map_staging_failed_{:x}",
+                    e.code().0
+                )));
+            }
             // The staging row pitch is the driver's, not w * 4, so the rows are copied one
             // at a time into a packed buffer the rest of the worker can index.
             let pitch = mapped.RowPitch as usize;
@@ -326,6 +337,7 @@ impl Duplicator {
             }
             self.context.Unmap(&staging, 0);
         }
+        self.release();
         Ok(out)
     }
 }
@@ -541,6 +553,15 @@ mod tests {
             "{w}x{h}: duplication {fast:.1} ms p50, gdi blit {slow:.1} ms p50, {:.1}x",
             slow / fast
         );
+        // What a recording reads: a 1920x1080 game window, only its rectangle read back.
+        let (cw, ch) = (1920.min(w as usize), 1080.min(h as usize));
+        let mut window = Vec::new();
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            duplicator.client((0, 0), cw, ch).unwrap();
+            window.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        eprintln!("{cw}x{ch} window: duplication {:.1} ms p50", median(window));
         assert!(
             fast < slow,
             "duplication ({fast:.1} ms) is not faster than the blit ({slow:.1} ms)"
