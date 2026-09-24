@@ -248,7 +248,8 @@ def preset_arenas(tmp_path_factory):
     built = {}
     # marsh: lakes and a large river; salient: a bent border; bay: sea cut into the land.
     for name in ("marsh", "salient", "bay"):
-        report = generate(game, base / name, preset=name)
+        # The salient is drawn from another seed: the same design, another map.
+        report = generate(game, base / name, preset=name, seed=11 if name == "salient" else None)
         built[name] = (base / name, report, audit(base / name))
     return built
 
@@ -458,3 +459,80 @@ def test_the_layout_names_a_bulge_for_the_scripted_player(preset_arenas):
     assert 9 <= state_at(0.465, 0.75, layout) <= 16
     # Every state of both sides shows somewhere in the layout.
     assert set(range(1, 17)) <= set(np.unique(layout))
+
+
+def _rail_links(root):
+    links = set()
+    for line in (root / "map/railways.txt").read_text().splitlines():
+        cells = [int(c) for c in line.split()][2:]
+        links |= {tuple(sorted(pair)) for pair in zip(cells, cells[1:])}
+    return links
+
+
+def test_a_preset_railway_is_a_mirrored_trunk_that_reaches_every_hub(preset_arenas):
+    """A trunk network, not a line on every adjacency: taking a junction cuts off the
+    hubs beyond it. Every hub still reaches its capital, two lines cross the border,
+    and Red's network is Blue's turned round."""
+    for name, (root, report, checked) in preset_arenas.items():
+        assert checked["problems"] == [], name
+        links = _rail_links(root)
+        rows = _definitions(root)
+        land = {i for i, r in rows.items() if r[4] == "land"}
+        half = report["provinces"] // 2
+
+        def twin(province):
+            return (province + half - 1) % (2 * half) + 1
+
+        assert {tuple(sorted((twin(a), twin(b)))) for a, b in links} == links, name
+        assert all(a in land and b in land for a, b in links), name
+        blue = set().union(*(_state_provinces(root, s) for s in range(1, 9)))
+        across = [(a, b) for a, b in links if (a in blue) != (b in blue)]
+        assert len(across) >= 2, name
+        # Far fewer than the plain arena's line on every adjacency (513 on these maps).
+        assert len(links) < 150, (name, len(links))
+
+
+def test_the_audit_catches_a_hub_cut_off_from_its_capital(preset_arenas):
+    from hoi4_arena.mapgen import audit
+
+    root, _, _ = preset_arenas["bay"]
+    path = root / "map/railways.txt"
+    original = path.read_text()
+    hubs = [int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]]
+    # Lift every line into one hub: it is still a hub, but nothing joins it any more.
+    lonely = hubs[0]
+    kept = [line for line in original.splitlines() if str(lonely) not in line.split()[2:]]
+    path.write_text("\n".join(kept) + "\n")
+    try:
+        problems = audit(root)["problems"]
+    finally:
+        path.write_text(original)
+    assert any("no railway joins" in p for p in problems), problems
+
+
+def test_ground_colours_stay_bright_and_neutral_enough_to_read_as_land():
+    """The scripted player tells land by tint at full zoom-out, and only above a
+    brightness sum of 250 on screen. Forest and marsh at a colour-map sum near 180 drew
+    at about 220 and read as holes; the screen sum came out at about 1.8 times the colour
+    map's minus 84. A red cast would also blunt Blue's tint (blue minus red above 10)."""
+    from hoi4_arena.arenas import GROUND
+
+    for index, (r, g, b) in GROUND.items():
+        assert 1.8 * (r + g + b) - 84 >= 300, index
+        # No warmer than the plain arena's grass (red minus blue 16), which it was
+        # calibrated on.
+        assert r - b <= 18, index
+
+
+def test_a_seed_redraws_a_preset_and_the_report_measures_its_front(preset_arenas):
+    """The report says what attacking across each arena's border costs: the bay leaves
+    a narrow isthmus, the marsh puts much of its front at -40% or worse, and the bent
+    border of the salient is longer than a straight one."""
+    from hoi4_arena.arenas import PRESETS
+
+    fronts = {name: report["design"]["front"] for name, (_, report, _) in preset_arenas.items()}
+    assert preset_arenas["salient"][1]["design"]["seed"] == 11 != PRESETS["salient"].seed
+    assert preset_arenas["marsh"][1]["design"]["seed"] == PRESETS["marsh"].seed
+    assert fronts["bay"]["pairs"] < fronts["marsh"]["pairs"] < fronts["salient"]["pairs"]
+    assert fronts["marsh"]["share_at_40_or_worse"] >= 0.25
+    assert fronts["bay"]["mean_attack"] > fronts["marsh"]["mean_attack"]

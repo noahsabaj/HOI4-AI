@@ -6,6 +6,15 @@ use std::{
 
 #[cfg(windows)]
 mod duplication;
+#[cfg(windows)]
+mod encoder;
+#[cfg(windows)]
+mod telemetry;
+
+/// What this worker speaks beyond the first protocol: 2 adds `telemetry`, observer
+/// connections and worker-clocked recording streams (`stream`). A client learns it from
+/// `status` or `attach`; a worker without the field speaks 1.
+pub const PROTOCOL: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -311,12 +320,17 @@ fn valid_event(e: &Event, setup: bool) -> bool {
 pub struct Options {
     pub scripts: PathBuf,
     pub mods: PathBuf,
+    /// A read-only worker for a second connection (`--observer`): it installs no input
+    /// hooks and refuses everything that gives input or changes what runs, so it can watch
+    /// and measure while another connection holds the game.
+    pub observer: bool,
 }
 
 /// `--scripts <dir>` and `--mods <dir>`, defaulting to the worker's own folder and `mods`
 /// in it. That is the second PC's layout, where Deploy-Peer puts everything in one shared
 /// folder; a local caller passes the repo's `scripts` and `artifacts/mods`. Relative paths
-/// are made absolute now, against the directory the worker was started in.
+/// are made absolute now, against the directory the worker was started in. `--observer`
+/// makes the worker read-only (Options::observer).
 pub fn parse_options(
     args: impl IntoIterator<Item = OsString>,
     exe_dir: &Path,
@@ -324,12 +338,17 @@ pub fn parse_options(
     let mut options = Options {
         scripts: exe_dir.to_path_buf(),
         mods: exe_dir.join("mods"),
+        observer: false,
     };
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let slot = match flag.to_str() {
             Some("--scripts") => &mut options.scripts,
             Some("--mods") => &mut options.mods,
+            Some("--observer") => {
+                options.observer = true;
+                continue;
+            }
             _ => return Err(format!("unknown argument {}", flag.to_string_lossy())),
         };
         let value = args
@@ -351,6 +370,74 @@ fn control_action(op: &str) -> Option<&'static str> {
         "job" => Some("job"),
         _ => None,
     }
+}
+
+/// What an observer connection may ask for: to look and to measure, never to give input,
+/// start or stop anything, or record. `report`, `saves` and a job's `status` only read.
+fn observer_allows(op: &str, cmd: &serde_json::Value) -> bool {
+    match op {
+        "attach" | "capture" | "status" | "telemetry" | "game_log" | "pointer" | "release" => true,
+        "report" | "saves" => true,
+        "job" => cmd["action"] == "status",
+        _ => false,
+    }
+}
+
+/// When each event of a timed `apply` is due, in microseconds from the batch's start: one
+/// offset per event, in milliseconds on the wire, none past a second and none going back.
+/// None for an ordinary apply, whose events go at once.
+fn batch_offsets(value: &serde_json::Value, events: usize) -> Result<Option<Vec<u64>>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let list: Vec<f64> = serde_json::from_value(value.clone()).map_err(|_| "invalid_offsets")?;
+    let bad = list.len() != events
+        || list
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.0 || *v > 1000.0)
+        || list.windows(2).any(|w| w[1] < w[0]);
+    if bad {
+        return Err("invalid_offsets".into());
+    }
+    Ok(Some(
+        list.iter().map(|v| (v * 1000.0).round() as u64).collect(),
+    ))
+}
+
+/// A recording stream's key, which tags every message of that stream: short, and plain.
+fn valid_stream_key(key: &str) -> bool {
+    (1..=32).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// The value at quantile `q` of `values`, or None when there are none.
+fn quantile(values: impl IntoIterator<Item = f32>, q: f64) -> Option<f32> {
+    let mut sorted: Vec<f32> = values.into_iter().collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f32::total_cmp);
+    let at = ((sorted.len() - 1) as f64 * q).round() as usize;
+    Some(sorted[at])
+}
+
+/// The tick after the one due at `scheduled`: a period on, or, if the clock is already
+/// past that (a stalled machine), the first one still ahead, with how many were skipped.
+/// The clock keeps its phase, so frames stay a whole number of periods apart.
+pub fn next_tick(
+    scheduled: std::time::Instant,
+    period: std::time::Duration,
+    now: std::time::Instant,
+) -> (std::time::Instant, u64) {
+    let mut next = scheduled + period;
+    let mut skipped = 0;
+    while next <= now {
+        next += period;
+        skipped += 1;
+    }
+    (next, skipped)
 }
 
 /// The script a control operation runs: compute jobs have their own.
@@ -556,6 +643,99 @@ mod platform {
     /// A control operation is running. Set and checked under the input-state lock, so
     /// `arm` and a control operation can never both succeed.
     static CONTROL: AtomicBool = AtomicBool::new(false);
+    /// This worker serves an observer connection (Options::observer).
+    static OBSERVER: AtomicBool = AtomicBool::new(false);
+    /// A recording stream is running: the player's inputs go with its frames.
+    static STREAMING: AtomicBool = AtomicBool::new(false);
+    /// Capture timing, for telemetry.
+    static STATS: Mutex<Stats> = Mutex::new(Stats::new());
+
+    /// The last few hundred captures' timing, and the stream's, as telemetry reports them.
+    struct Stats {
+        captures: u64,
+        failures: u64,
+        /// Milliseconds each capture took, the newest last.
+        capture_ms: VecDeque<f32>,
+        backend: &'static str,
+        last_error: Option<String>,
+        stream: Option<StreamStats>,
+    }
+
+    struct StreamStats {
+        key: String,
+        profile: &'static str,
+        quality: u32,
+        hz: u32,
+        encoder_pid: u32,
+        started_ns: u64,
+        frames: u64,
+        ticks: u64,
+        skipped: u64,
+        gaps: std::collections::BTreeMap<String, u64>,
+        /// How late each tick's capture began after its scheduled time, in ms.
+        late_ms: VecDeque<f32>,
+        /// Time between consecutive recorded frames, in ms.
+        interval_ms: VecDeque<f32>,
+        queued: usize,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    const KEPT: usize = 300;
+
+    fn keep(values: &mut VecDeque<f32>, value: f32) {
+        if values.len() >= KEPT {
+            values.pop_front();
+        }
+        values.push_back(value);
+    }
+
+    impl Stats {
+        const fn new() -> Self {
+            Self {
+                captures: 0,
+                failures: 0,
+                capture_ms: VecDeque::new(),
+                backend: "none",
+                last_error: None,
+                stream: None,
+            }
+        }
+
+        fn report(&self) -> serde_json::Value {
+            let ms = |v: &VecDeque<f32>, q| crate::quantile(v.iter().copied(), q);
+            let stream = self.stream.as_ref().map(|s| {
+                serde_json::json!({
+                    "key": s.key,
+                    "profile": s.profile,
+                    "quality": s.quality,
+                    "hz": s.hz,
+                    "encoder_pid": s.encoder_pid,
+                    "seconds": (ns().saturating_sub(s.started_ns)) as f64 / 1e9,
+                    "frames": s.frames,
+                    "ticks": s.ticks,
+                    "skipped_ticks": s.skipped,
+                    "gaps": s.gaps,
+                    "late_ms_p50": ms(&s.late_ms, 0.5),
+                    "late_ms_p95": ms(&s.late_ms, 0.95),
+                    "late_ms_max": s.late_ms.iter().copied().fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v)))),
+                    "interval_ms_p50": ms(&s.interval_ms, 0.5),
+                    "interval_ms_p95": ms(&s.interval_ms, 0.95),
+                    "interval_ms_max": s.interval_ms.iter().copied().fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v)))),
+                    "encoder_queue": s.queued,
+                    "bytes_out": s.bytes.load(Ordering::Relaxed),
+                })
+            });
+            serde_json::json!({
+                "captures": self.captures,
+                "failures": self.failures,
+                "backend": self.backend,
+                "capture_ms_p50": ms(&self.capture_ms, 0.5),
+                "capture_ms_p95": ms(&self.capture_ms, 0.95),
+                "last_error": self.last_error,
+                "stream": stream,
+            })
+        }
+    }
     fn note(message: &str) {
         eprintln!("{message}");
         if let Ok(mut log) = LOG.lock() {
@@ -1435,6 +1615,11 @@ mod platform {
                 Ok((serde_json::json!({"foreground": foreground()}), vec![]))
             }
             "events" => {
+                // While a stream records, the player's inputs go with its frames, and its
+                // end hands over the rest; taking them here would leave holes in its rows.
+                if STREAMING.load(Ordering::SeqCst) {
+                    return Err("events_belong_to_the_stream".into());
+                }
                 let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
                 Ok((
                     serde_json::json!({"events": events, "t_ns": ns(), "overflow": OVERFLOW.swap(false, Ordering::Relaxed)}),
@@ -1498,12 +1683,619 @@ mod platform {
                         "held_buttons": held.buttons,
                         "t_ns": ns(),
                         "log": log_lines,
+                        "protocol": crate::PROTOCOL,
+                        "observer": OBSERVER.load(Ordering::Relaxed),
+                        "streaming": STREAMING.load(Ordering::SeqCst),
                     }),
                     vec![],
                 ))
             }
             _ => Err("unknown_operation".into()),
         }
+    }
+
+    /// How long before a stream's tick the capture thread stops waiting for requests and
+    /// sleeps on a precise timer instead: more than the system timer's 15.6 ms.
+    const WAKE_EARLY: Duration = Duration::from_millis(20);
+    /// A capture asked for this close to a tick waits for the tick's frame.
+    const DEFER: Duration = Duration::from_millis(40);
+
+    /// One frame as captured, the pointer drawn in: what a reply or the encoder takes its
+    /// pixels from.
+    struct Grabbed {
+        raw: Arc<Vec<u8>>,
+        width: i32,
+        height: i32,
+        start_ns: u64,
+        end_ns: u64,
+        backend: &'static str,
+        cursor: (i32, i32),
+        pointer_drawn: bool,
+    }
+
+    /// What a capture reply reports about the moment of its capture, read on the capture
+    /// thread in capture order.
+    struct Moment {
+        seq: u64,
+        events: Vec<serde_json::Value>,
+        overflow: bool,
+        stopped: bool,
+        foreground: bool,
+    }
+
+    /// What the capture thread keeps from one capture to the next.
+    struct Capturer {
+        screen: Screen,
+        rebuilds: u32,
+        pointer_cache: Option<(usize, Pointer)>,
+        seq: u64,
+    }
+
+    impl Capturer {
+        /// The attached game's client rectangle, with the pointer drawn where a player
+        /// sees it (unless `pointer` is false), before anything is cut from the frame, so
+        /// every view and the video show it.
+        fn grab(&mut self, hwnd: HWND, pointer: bool) -> Result<Grabbed, String> {
+            let result = unsafe { capture(&mut self.screen, &mut self.rebuilds, hwnd) };
+            {
+                let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+                match &result {
+                    Ok(frame) => {
+                        stats.captures += 1;
+                        stats.backend = frame.backend;
+                        let ms = (frame.end_ns - frame.start_ns) as f32 / 1e6;
+                        keep(&mut stats.capture_ms, ms);
+                    }
+                    Err(error) => {
+                        stats.failures += 1;
+                        stats.last_error = Some(error.clone());
+                    }
+                }
+            }
+            let Capture {
+                bytes: mut raw,
+                width,
+                height,
+                start_ns,
+                end_ns,
+                backend,
+            } = result?;
+            let (cx, cy) = unsafe { client_cursor(hwnd)? };
+            let pointer_drawn = pointer
+                && match unsafe { current_pointer(&mut self.pointer_cache) } {
+                    Some(image) => {
+                        draw_pointer(&mut raw, width as usize, height as usize, &image, cx, cy);
+                        true
+                    }
+                    None => false,
+                };
+            Ok(Grabbed {
+                raw: Arc::new(raw),
+                width,
+                height,
+                start_ns,
+                end_ns,
+                backend,
+                cursor: (cx, cy),
+                pointer_drawn,
+            })
+        }
+
+        /// The next reply's sequence number and flags. `drain` hands it the player's
+        /// inputs since the last one; while a stream records, those go with its frames.
+        fn moment(&mut self, drain: bool) -> Moment {
+            self.seq += 1;
+            let events = if drain {
+                std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                Vec::new()
+            };
+            Moment {
+                seq: self.seq,
+                events,
+                overflow: if drain {
+                    OVERFLOW.swap(false, Ordering::Relaxed)
+                } else {
+                    OVERFLOW.load(Ordering::Relaxed)
+                },
+                stopped: STOP.load(Ordering::SeqCst),
+                foreground: foreground(),
+            }
+        }
+    }
+
+    /// Attach to the one HOI4 window, and probe a capture of it.
+    fn attach(
+        shared: &Arc<Mutex<InputState>>,
+        capturer: &mut Capturer,
+    ) -> Result<(serde_json::Value, Vec<u8>), String> {
+        let hwnd = {
+            let mut state = shared.lock().map_err(|_| "input_lock")?;
+            state.held.release();
+            state.armed = false;
+            let hwnd = unsafe { select()? };
+            state.held.hwnd = hwnd as usize;
+            TARGET.store(hwnd as usize, Ordering::Relaxed);
+            hwnd
+        };
+        // The probe capture is the slow part. Apply can proceed while it runs. A failed
+        // probe is not a GDI frame; saying so hid a game that was not in front. A freshly
+        // launched game is not in front until someone focuses it, which is routine and
+        // filled the second PC's log, so only other failures are noted.
+        capturer.screen = Screen::Untried;
+        capturer.rebuilds = 0;
+        let probe = unsafe { capture(&mut capturer.screen, &mut capturer.rebuilds, hwnd) };
+        let attached_backend = match probe {
+            Ok(frame) => frame.backend.to_string(),
+            Err(reason) => {
+                if reason != "game_not_foreground" {
+                    note(&format!("attach probe failed: {reason}"));
+                }
+                "unavailable".to_string()
+            }
+        };
+        Ok((
+            serde_json::json!({"hwnd": hwnd as usize, "foreground": foreground(), "clock_ns": ns(), "backend": attached_backend, "computer": std::env::var("COMPUTERNAME").unwrap_or_default(), "protocol": crate::PROTOCOL, "observer": OBSERVER.load(Ordering::Relaxed)}),
+            vec![],
+        ))
+    }
+
+    /// A capture's reply from one grabbed frame: the full frame, the policy's views and
+    /// the requested regions, as asked, lz4-compressed if asked.
+    fn capture_reply(
+        cmd: &serde_json::Value,
+        grabbed: &Grabbed,
+        moment: Moment,
+    ) -> Result<(serde_json::Value, Vec<u8>), String> {
+        let (w, h) = (grabbed.width, grabbed.height);
+        let (uw, uh) = (w as usize, h as usize);
+        let raw = &grabbed.raw[..];
+        let (cx, cy) = grabbed.cursor;
+        // The global view, the quadrants and the fovea each have their own size
+        // (`hoi4_arena.dataset.views`): [width, height] for the first two, or a number for
+        // a square, and a square fovea.
+        let view_size = view_dims(&cmd["views"])?;
+        let detail_size = view_dims(&cmd["detail"])?.or(view_size);
+        let fovea_size = cmd["fovea"]
+            .as_u64()
+            .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
+        let dims = [view_size, detail_size].into_iter().flatten();
+        if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
+            return Err("view_size_too_large".into());
+        }
+        if view_size.is_some()
+            && (detail_size.is_none()
+                || fovea_size == 0
+                || dims.clone().any(|[w, h]| w == 0 || h == 0))
+        {
+            return Err("view_size_zero".into());
+        }
+        let mut regions: Vec<[usize; 4]> = Vec::new();
+        if let Some(list) = cmd["regions"].as_array() {
+            if list.len() > 64 {
+                return Err("too_many_regions".into());
+            }
+            for item in list {
+                let v: Vec<i64> =
+                    serde_json::from_value(item.clone()).map_err(|e| e.to_string())?;
+                if v.len() != 4 || v.iter().any(|&n| n < 0) {
+                    return Err("invalid_region".into());
+                }
+                let (x, y, rw, rh) = (v[0] as usize, v[1] as usize, v[2] as usize, v[3] as usize);
+                if rw == 0 || rh == 0 || x + rw > uw || y + rh > uh {
+                    return Err("region_outside_frame".into());
+                }
+                regions.push([y, x, rh, rw]);
+            }
+        }
+        let want_full = if view_size.is_none() && regions.is_empty() {
+            true
+        } else {
+            cmd["full"].as_bool().unwrap_or(false)
+        };
+        let mut payload = Vec::new();
+        let full_bytes = if want_full { raw.len() } else { 0 };
+        if want_full {
+            payload.extend_from_slice(raw);
+        }
+        let mut views_bytes = 0usize;
+        if let (Some(global), Some(detail)) = (view_size, detail_size) {
+            for (i, b) in view_boxes(uw, uh).into_iter().enumerate() {
+                let size = if i == 0 { global } else { detail };
+                let v = downscale_bgra(raw, uw, b, size);
+                views_bytes += v.len();
+                payload.extend_from_slice(&v);
+            }
+            // Cropped from the same frame as the other views, on either backend. Training
+            // crops the recorded full frame, so a separate, later blit would disagree
+            // exactly at the pointer.
+            let v = cursor_crop_bgra(raw, uw, uh, cx, cy, fovea_size);
+            views_bytes += v.len();
+            payload.extend_from_slice(&v);
+        }
+        let mut region_bytes: Vec<usize> = Vec::new();
+        for r in &regions {
+            let [top, left, rh, rw] = *r;
+            let mut crop = Vec::with_capacity(rw * rh * 4);
+            for y in 0..rh {
+                let i = ((top + y) * uw + left) * 4;
+                crop.extend_from_slice(&raw[i..i + rw * 4]);
+            }
+            region_bytes.push(crop.len());
+            payload.extend_from_slice(&crop);
+        }
+        let encoding = if cmd["encoding"] == "lz4" {
+            "lz4"
+        } else {
+            "raw"
+        };
+        let bytes = if encoding == "lz4" {
+            lz4_flex::block::compress(&payload)
+        } else {
+            payload
+        };
+        Ok((
+            serde_json::json!({"seq": moment.seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "detail_size": detail_size, "fovea_size": fovea_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn}),
+            bytes,
+        ))
+    }
+
+    /// A message of a stream: a JSON line and its payload, like a reply, tagged with the
+    /// stream's key where a reply has its request's id.
+    fn push(mut message: serde_json::Value, bytes: &[u8]) {
+        message["bytes"] = serde_json::json!(bytes.len());
+        let mut out = io::stdout().lock();
+        if writeln!(out, "{message}").is_ok() {
+            let _ = out.write_all(bytes);
+            let _ = out.flush();
+        }
+    }
+
+    /// The capture thread's output, written by a thread of its own, in order.
+    ///
+    /// Output is one pipe, and a reply carrying a full frame holds it until the frame has
+    /// crossed to the other PC. A tick that wrote its frame's row itself waited behind that:
+    /// once for 618 ms in the first streamed game, costing three frames. Posting never
+    /// waits, so the clock does not either.
+    static OUTBOX: OnceLock<mpsc::Sender<(serde_json::Value, Vec<u8>)>> = OnceLock::new();
+
+    fn post(message: serde_json::Value, bytes: Vec<u8>) {
+        let outbox = OUTBOX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<(serde_json::Value, Vec<u8>)>();
+            thread::spawn(move || {
+                for (message, bytes) in rx {
+                    push(message, &bytes);
+                }
+            });
+            tx
+        });
+        let _ = outbox.send((message, bytes));
+    }
+
+    /// `respond`, through the outbox: for the capture thread.
+    fn reply(cmd: &serde_json::Value, result: Result<(serde_json::Value, Vec<u8>), String>) {
+        let (mut response, bytes) = match result {
+            Ok(value) => value,
+            Err(error) => (serde_json::json!({"error": error}), Vec::new()),
+        };
+        if let Some(id) = cmd.get("id").filter(|id| !id.is_null()) {
+            response["id"] = id.clone();
+        }
+        post(response, bytes);
+    }
+
+    /// A recording stream: the worker captures the attached game on its own clock and
+    /// encodes it here, and the caller receives the video and each frame's times, pointer
+    /// and inputs as they come.
+    struct Stream {
+        key: String,
+        width: i32,
+        height: i32,
+        period: Duration,
+        /// When the next tick is due.
+        next: Instant,
+        last_t_ns: Option<u64>,
+        encoder: crate::encoder::Encoder,
+    }
+
+    fn start_stream(
+        cmd: &serde_json::Value,
+        hwnd: HWND,
+        exe_dir: &Path,
+    ) -> Result<(Stream, serde_json::Value), String> {
+        let key = cmd["key"]
+            .as_str()
+            .filter(|k| crate::valid_stream_key(k))
+            .ok_or("invalid_stream_key")?
+            .to_string();
+        let hz = cmd["hz"]
+            .as_u64()
+            .filter(|h| (1..=30).contains(h))
+            .ok_or("invalid_stream_hz")? as u32;
+        let name = cmd["profile"].as_str().unwrap_or("");
+        let quality = match &cmd["quality"] {
+            serde_json::Value::Null => None,
+            value => Some(
+                value
+                    .as_u64()
+                    .filter(|&q| q <= 51)
+                    .ok_or("encoder_quality_out_of_range")? as u32,
+            ),
+        };
+        let (args, quality) = crate::encoder::arguments(name, quality, hz)?;
+        let profile = crate::encoder::profile(name).ok_or("unknown_encoder_profile")?;
+        if hwnd.is_null() {
+            return Err("stream_before_attach".into());
+        }
+        let (w, h) = unsafe {
+            let mut r: RECT = zeroed();
+            GetClientRect(hwnd, &mut r);
+            (r.right, r.bottom)
+        };
+        if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+            return Err("invalid_client_geometry".into());
+        }
+        let ffmpeg = crate::encoder::find_ffmpeg(exe_dir, std::env::var_os("PATH").as_deref())
+            .ok_or("ffmpeg_not_found")?;
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (tag, counter) = (key.clone(), Arc::clone(&bytes));
+        let encoder = crate::encoder::Encoder::start(
+            &ffmpeg,
+            w as usize,
+            h as usize,
+            hz,
+            &args,
+            move |chunk| {
+                let offset = counter.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                push(serde_json::json!({"stream": tag, "data": offset}), chunk);
+            },
+        )?;
+        let started_ns = ns();
+        if let Ok(mut stats) = STATS.lock() {
+            stats.stream = Some(StreamStats {
+                key: key.clone(),
+                profile: profile.name,
+                quality,
+                hz,
+                encoder_pid: encoder.pid,
+                started_ns,
+                frames: 0,
+                ticks: 0,
+                skipped: 0,
+                gaps: Default::default(),
+                late_ms: VecDeque::new(),
+                interval_ms: VecDeque::new(),
+                queued: 0,
+                bytes,
+            });
+        }
+        STREAMING.store(true, Ordering::SeqCst);
+        let reply = serde_json::json!({"stream": key, "width": w, "height": h, "hz": hz, "profile": profile.name, "quality": quality, "hardware": profile.hardware, "encoder_pid": encoder.pid, "t_ns": started_ns});
+        Ok((
+            Stream {
+                key,
+                width: w,
+                height: h,
+                period: Duration::from_nanos(1_000_000_000 / hz as u64),
+                next: Instant::now(),
+                last_t_ns: None,
+                encoder,
+            },
+            reply,
+        ))
+    }
+
+    /// A tick that recorded nothing, and why: the game not in front, a resized window, an
+    /// encoder behind. No frame and no row, so the video and its rows stay in step.
+    fn gap(stream: &Stream, reason: &str) {
+        if let Ok(mut stats) = STATS.lock() {
+            if let Some(s) = stats.stream.as_mut() {
+                *s.gaps.entry(reason.to_string()).or_default() += 1;
+            }
+        }
+        post(
+            serde_json::json!({"stream": stream.key, "gap": {"reason": reason, "t_ns": ns()}}),
+            Vec::new(),
+        );
+    }
+
+    /// What one tick of a stream produced: its frame, for captures that waited for it,
+    /// and why the stream cannot go on, if it cannot.
+    type Ticked = (Result<Arc<Grabbed>, String>, Option<&'static str>);
+
+    /// One tick of a stream: capture, hand the frame to the encoder, and tell the caller.
+    fn tick(s: &mut Stream, capturer: &mut Capturer, shared: &Arc<Mutex<InputState>>) -> Ticked {
+        let scheduled = s.next;
+        let (next, skipped) = crate::next_tick(scheduled, s.period, Instant::now());
+        s.next = next;
+        let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+        let grabbed = capturer.grab(hwnd, true);
+        let scheduled_ns = scheduled
+            .checked_duration_since(*ORIGIN.get_or_init(Instant::now))
+            .map_or(0, |d| d.as_nanos() as u64);
+        if let Ok(mut stats) = STATS.lock() {
+            if let Some(stream_stats) = stats.stream.as_mut() {
+                stream_stats.ticks += 1;
+                stream_stats.skipped += skipped;
+                stream_stats.queued = s.encoder.queued();
+                if let Ok(g) = &grabbed {
+                    let late = g.start_ns.saturating_sub(scheduled_ns) as f32 / 1e6;
+                    keep(&mut stream_stats.late_ms, late);
+                }
+            }
+        }
+        let grabbed = match grabbed {
+            Ok(g) => Arc::new(g),
+            Err(reason) => {
+                disarm(shared);
+                gap(s, &reason);
+                return (Err(reason), None);
+            }
+        };
+        if (grabbed.width, grabbed.height) != (s.width, s.height) {
+            gap(s, "window_size_changed");
+            return (Ok(grabbed), None);
+        }
+        match s.encoder.push(Arc::clone(&grabbed.raw)) {
+            Ok(()) => {}
+            Err(crate::encoder::Push::Full) => {
+                gap(s, "encoder_behind");
+                return (Ok(grabbed), None);
+            }
+            Err(crate::encoder::Push::Closed) => return (Ok(grabbed), Some("encoder_exited")),
+        }
+        let moment = capturer.moment(true);
+        let index = STATS
+            .lock()
+            .ok()
+            .and_then(|mut stats| {
+                let stream_stats = stats.stream.as_mut()?;
+                if let Some(last) = s.last_t_ns {
+                    let interval = grabbed.end_ns.saturating_sub(last) as f32 / 1e6;
+                    keep(&mut stream_stats.interval_ms, interval);
+                }
+                stream_stats.frames += 1;
+                Some(stream_stats.frames - 1)
+            })
+            .unwrap_or(0);
+        s.last_t_ns = Some(grabbed.end_ns);
+        let (cx, cy) = grabbed.cursor;
+        post(
+            serde_json::json!({"stream": s.key, "frame": {"index": index, "seq": moment.seq, "capture_start_ns": grabbed.start_ns, "t_ns": grabbed.end_ns, "scheduled_ns": scheduled_ns, "cursor": [cx, cy], "events": moment.events, "overflow": moment.overflow, "stopped": moment.stopped, "foreground": moment.foreground, "backend": grabbed.backend, "pointer_drawn": grabbed.pointer_drawn, "width": grabbed.width, "height": grabbed.height}}),
+            Vec::new(),
+        );
+        (Ok(grabbed), None)
+    }
+
+    /// Answer a capture that waited for a tick: with the tick's frame, or a fresh one if
+    /// the tick has none.
+    fn serve(
+        cmd: &serde_json::Value,
+        frame: &Result<Arc<Grabbed>, String>,
+        capturer: &mut Capturer,
+        replies: &mpsc::Sender<(serde_json::Value, Arc<Grabbed>, Moment)>,
+        shared: &Arc<Mutex<InputState>>,
+    ) {
+        let grabbed = match frame {
+            Ok(g) => Ok(Arc::clone(g)),
+            Err(_) => {
+                let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+                capturer.grab(hwnd, true).map(Arc::new)
+            }
+        };
+        match grabbed {
+            Ok(g) => {
+                let moment = capturer.moment(!STREAMING.load(Ordering::SeqCst));
+                let _ = replies.send((cmd.clone(), g, moment));
+            }
+            Err(error) => {
+                disarm(shared);
+                reply(cmd, Err(error));
+            }
+        }
+    }
+
+    /// End a stream: ffmpeg writes out what it holds, every byte of it reaches the caller,
+    /// then the stream's end, then (for a stop) the stop's reply. The player's inputs since
+    /// the last frame go with the end.
+    fn finish_stream(s: Stream, reason: &'static str, reply_to: Option<serde_json::Value>) {
+        let trailing = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()));
+        let overflow = OVERFLOW.swap(false, Ordering::Relaxed);
+        STREAMING.store(false, Ordering::SeqCst);
+        let Stream { key, encoder, .. } = s;
+        thread::spawn(move || {
+            let finish = encoder.finish(Duration::from_secs(30));
+            let stats = STATS
+                .lock()
+                .map(|mut stats| {
+                    let report = stats.report()["stream"].clone();
+                    stats.stream = None;
+                    report
+                })
+                .unwrap_or_default();
+            let end = serde_json::json!({
+                "reason": reason,
+                "frames": stats["frames"],
+                "encoded_frames": finish.frames,
+                "bytes": finish.bytes,
+                "exit": finish.exit,
+                "errors": finish.errors,
+                "trailing_events": trailing,
+                "overflow": overflow,
+                "stats": stats,
+                "t_ns": ns(),
+            });
+            push(serde_json::json!({"stream": key, "end": end}), &[]);
+            if let Some(cmd) = reply_to {
+                respond(&cmd, Ok((end, vec![])));
+            }
+        });
+    }
+
+    /// The game's window as Windows sees it: there, responding, in front, on which screen.
+    fn game_status() -> serde_json::Value {
+        unsafe {
+            let mut windows: Vec<(usize, String)> = Vec::new();
+            EnumWindows(Some(enumerate), &mut windows as *mut _ as LPARAM);
+            let attached = TARGET.load(Ordering::Relaxed) as HWND;
+            let hwnd = if !attached.is_null() && IsWindow(attached) != 0 {
+                attached
+            } else if windows.len() == 1 {
+                windows[0].0 as HWND
+            } else {
+                null_mut()
+            };
+            let desktop = [
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            ];
+            if hwnd.is_null() {
+                return serde_json::json!({"windows": windows.len(), "desktop": desktop});
+            }
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            let mut r: RECT = zeroed();
+            GetClientRect(hwnd, &mut r);
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+            let mut info: MONITORINFO = zeroed();
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            let screen =
+                (!monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0).then(|| {
+                    let m = info.rcMonitor;
+                    [m.right - m.left, m.bottom - m.top]
+                });
+            serde_json::json!({
+                "windows": windows.len(),
+                "attached": hwnd == attached,
+                "pid": pid,
+                // Windows calls a window hung after 5 s without handling its messages.
+                "responding": IsHungAppWindow(hwnd) == 0,
+                "minimized": IsIconic(hwnd) != 0,
+                "foreground": GetForegroundWindow() == hwnd,
+                "client": [r.right, r.bottom],
+                // The screen the window is on; a monitor switched off shrinks the desktop
+                // to 1024x768 and leaves the game on no screen.
+                "monitor": screen,
+                "desktop": desktop,
+            })
+        }
+    }
+
+    /// Everything telemetry reports, plus this worker's own view: the game's window and
+    /// capture timing.
+    fn telemetry_reply() -> Result<(serde_json::Value, Vec<u8>), String> {
+        let mut value = crate::telemetry::snapshot(Duration::from_secs(3))?;
+        value["t_ns"] = serde_json::json!(ns());
+        value["worker"] = serde_json::json!({
+            "pid": std::process::id(),
+            "observer": OBSERVER.load(Ordering::Relaxed),
+            "protocol": crate::PROTOCOL,
+            "streaming": STREAMING.load(Ordering::SeqCst),
+            "control_running": CONTROL.load(Ordering::SeqCst),
+        });
+        value["game"] = game_status();
+        value["capture"] = STATS.lock().map(|s| s.report()).unwrap_or_default();
+        Ok((value, vec![]))
     }
 
     pub fn run(options: Options) -> Result<(), String> {
@@ -1524,7 +2316,12 @@ mod platform {
             }
         }
         ORIGIN.get_or_init(Instant::now);
-        hooks()?;
+        OBSERVER.store(options.observer, Ordering::Relaxed);
+        // An observer gives no input and records no player, so it hooks nothing: the
+        // connection that holds the game keeps the only hooks, and F12 stays theirs.
+        if !options.observer {
+            hooks()?;
+        }
         let shared = Arc::new(Mutex::new(InputState {
             held: Held {
                 keys: BTreeSet::new(),
@@ -1549,6 +2346,50 @@ mod platform {
                 state.armed = false;
             }
         });
+        // Timed applies: a decision's events, each at its own offset, applied on this PC's
+        // clock. A policy on the other PC sends one request a tick instead of one per
+        // 25 ms slot, and no slot waits for the network or for a capture's reply to finish.
+        // Every event gets the same checks as an ordinary apply, when it is applied.
+        let (timed_tx, timed_rx) = mpsc::channel::<(serde_json::Value, Vec<Event>, Vec<u64>)>();
+        let timed_state = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("timed-apply".into())
+            .spawn(move || {
+                for (cmd, events, offsets) in timed_rx {
+                    let start = Instant::now();
+                    let mut times = Vec::with_capacity(events.len());
+                    let result = (|| -> Result<(serde_json::Value, Vec<u8>), String> {
+                        for (event, micros) in events.iter().zip(&offsets) {
+                            let due = start + Duration::from_micros(*micros);
+                            let now = Instant::now();
+                            if due > now {
+                                thread::sleep(due - now);
+                            }
+                            let mut state = timed_state.lock().map_err(|_| "input_lock")?;
+                            if !state.armed || STOP.load(Ordering::SeqCst) || !foreground() {
+                                state.held.release();
+                                state.armed = false;
+                                return Err("focus_lost_during_batch".into());
+                            }
+                            if !valid_event(event, state.setup) {
+                                return Err("invalid_event_batch".into());
+                            }
+                            state.held.apply(event)?;
+                            state.last = Instant::now();
+                            times.push(ns());
+                        }
+                        Ok((
+                            serde_json::json!({"applied": events.len(), "t_ns": ns(), "times_ns": times}),
+                            vec![],
+                        ))
+                    })();
+                    if result.is_err() {
+                        disarm(&timed_state);
+                    }
+                    respond(&cmd, result);
+                }
+            })
+            .map_err(|e| format!("timed_thread_failed: {e}"))?;
         // Unbounded: a capture in progress must not stop the reader from pulling the
         // next apply off stdin. A bounded send here would freeze the slots behind the blit.
         let (tx, rx) = mpsc::channel();
@@ -1567,10 +2408,47 @@ mod platform {
                     }
                 };
                 let op = cmd["op"].as_str().unwrap_or("");
-                if op == "capture" || op == "attach" {
+                if options.observer && !observer_allows(op, &cmd) {
+                    respond(&cmd, Err(format!("{op}_refused_for_observer")));
+                    continue;
+                }
+                if op == "capture" || op == "attach" || op == "stream" {
                     if tx.send(cmd).is_err() {
                         break;
                     }
+                    continue;
+                }
+                if op == "apply" && !cmd["at_ms"].is_null() {
+                    let checked = (|| -> Result<(Vec<Event>, Vec<u64>), String> {
+                        let state = reader_state.lock().map_err(|_| "input_lock")?;
+                        if !state.armed || STOP.load(Ordering::SeqCst) || !foreground() {
+                            return Err("input_not_armed_or_focus_lost".into());
+                        }
+                        let events: Vec<Event> = serde_json::from_value(cmd["events"].clone())
+                            .map_err(|e| e.to_string())?;
+                        if events.len() > 64 || !events.iter().all(|e| valid_event(e, state.setup))
+                        {
+                            return Err("invalid_event_batch".into());
+                        }
+                        let offsets =
+                            batch_offsets(&cmd["at_ms"], events.len())?.ok_or("invalid_offsets")?;
+                        Ok((events, offsets))
+                    })();
+                    match checked {
+                        Ok((events, offsets)) => {
+                            let _ = timed_tx.send((cmd, events, offsets));
+                        }
+                        Err(error) => {
+                            disarm(&reader_state);
+                            respond(&cmd, Err(error));
+                        }
+                    }
+                    continue;
+                }
+                // Telemetry waits about a second for its first window of measurements;
+                // on its own thread that holds up nothing else.
+                if op == "telemetry" {
+                    thread::spawn(move || respond(&cmd, telemetry_reply()));
                     continue;
                 }
                 // Launch, quit, report and restart_discord reply from their own thread.
@@ -1590,169 +2468,155 @@ mod platform {
                 respond(&cmd, result);
             }
         });
-        let mut seq = 0u64;
         // One duplication per process, held across ticks: the device, the output
         // enumeration and the staging texture all cost far more to create than the
         // capture they serve. It stays on this thread. Apply runs on the reader.
-        let mut screen = Screen::Untried;
-        let mut pointer_cache: Option<(usize, Pointer)> = None;
-        let mut rebuilds = 0u32;
-        while let Ok(cmd) = rx.recv() {
-            let result = (|| -> Result<(serde_json::Value, Vec<u8>), String> {
-                match cmd["op"].as_str().unwrap_or("") {
-                    "attach" => {
-                        let hwnd = {
-                            let mut state = shared.lock().map_err(|_| "input_lock")?;
-                            state.held.release();
-                            state.armed = false;
-                            let hwnd = unsafe { select()? };
-                            state.held.hwnd = hwnd as usize;
-                            TARGET.store(hwnd as usize, Ordering::Relaxed);
-                            hwnd
-                        };
-                        // The probe capture is the slow part. Apply can proceed while it runs.
-                        // A failed probe is not a GDI frame; saying so hid a game that was
-                        // not in front.
-                        screen = Screen::Untried;
-                        rebuilds = 0;
-                        let attached_backend =
-                            match unsafe { capture(&mut screen, &mut rebuilds, hwnd) } {
-                                Ok(frame) => frame.backend.to_string(),
-                                Err(reason) => {
-                                    note(&format!("attach probe failed: {reason}"));
-                                    "unavailable".to_string()
-                                }
-                            };
-                        Ok((
-                            serde_json::json!({"hwnd": hwnd as usize, "foreground": foreground(), "clock_ns": ns(), "backend": attached_backend, "computer": std::env::var("COMPUTERNAME").unwrap_or_default()}),
-                            vec![],
-                        ))
+        let mut capturer = Capturer {
+            screen: Screen::Untried,
+            rebuilds: 0,
+            pointer_cache: None,
+            seq: 0,
+        };
+        // A capture's reply is pure work on pixels (views, crops, lz4), done off this
+        // thread so the next capture, or a stream's next tick, need not wait for it.
+        let (replies, pending_replies) =
+            mpsc::channel::<(serde_json::Value, Arc<Grabbed>, Moment)>();
+        let builder_state = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("replies".into())
+            .spawn(move || {
+                for (cmd, grabbed, moment) in pending_replies {
+                    let result = capture_reply(&cmd, &grabbed, moment);
+                    if result.is_err() {
+                        disarm(&builder_state);
                     }
-                    "capture" => {
-                        let hwnd = {
-                            let state = shared.lock().map_err(|_| "input_lock")?;
-                            state.held.hwnd as HWND
-                        };
-                        let Capture {
-                            bytes: mut raw,
-                            width: w,
-                            height: h,
-                            start_ns: start,
-                            end_ns: end,
-                            backend,
-                        } = unsafe { capture(&mut screen, &mut rebuilds, hwnd)? };
-                        let (uw, uh) = (w as usize, h as usize);
-                        let (cx, cy) = unsafe { client_cursor(hwnd)? };
-                        // Draw the pointer before anything is cut from the frame, so every
-                        // view and the recorded video show it where a player saw it.
-                        // `"pointer": false` leaves the frame as captured.
-                        let pointer_drawn = cmd["pointer"].as_bool().unwrap_or(true)
-                            && match unsafe { current_pointer(&mut pointer_cache) } {
-                                Some(pointer) => {
-                                    draw_pointer(&mut raw, uw, uh, &pointer, cx, cy);
-                                    true
-                                }
-                                None => false,
-                            };
-                        // The global view, the quadrants and the fovea each have their own
-                        // size (`hoi4_arena.dataset.views`): [width, height] for the first
-                        // two, or a number for a square, and a square fovea.
-                        let view_size = view_dims(&cmd["views"])?;
-                        let detail_size = view_dims(&cmd["detail"])?.or(view_size);
-                        let fovea_size = cmd["fovea"]
-                            .as_u64()
-                            .map_or(view_size.map_or(0, |[w, _]| w), |v| v as usize);
-                        let dims = [view_size, detail_size].into_iter().flatten();
-                        if fovea_size > 1024 || dims.clone().any(|[w, h]| w > 1024 || h > 1024) {
-                            return Err("view_size_too_large".into());
-                        }
-                        if view_size.is_some()
-                            && (detail_size.is_none()
-                                || fovea_size == 0
-                                || dims.clone().any(|[w, h]| w == 0 || h == 0))
-                        {
-                            return Err("view_size_zero".into());
-                        }
-                        let mut regions: Vec<[usize; 4]> = Vec::new();
-                        if let Some(list) = cmd["regions"].as_array() {
-                            if list.len() > 64 {
-                                return Err("too_many_regions".into());
-                            }
-                            for item in list {
-                                let v: Vec<i64> = serde_json::from_value(item.clone())
-                                    .map_err(|e| e.to_string())?;
-                                if v.len() != 4 || v.iter().any(|&n| n < 0) {
-                                    return Err("invalid_region".into());
-                                }
-                                let (x, y, rw, rh) =
-                                    (v[0] as usize, v[1] as usize, v[2] as usize, v[3] as usize);
-                                if rw == 0 || rh == 0 || x + rw > uw || y + rh > uh {
-                                    return Err("region_outside_frame".into());
-                                }
-                                regions.push([y, x, rh, rw]);
-                            }
-                        }
-                        let want_full = if view_size.is_none() && regions.is_empty() {
-                            true
-                        } else {
-                            cmd["full"].as_bool().unwrap_or(false)
-                        };
-                        let mut payload = Vec::new();
-                        let full_bytes = if want_full { raw.len() } else { 0 };
-                        if want_full {
-                            payload.extend_from_slice(&raw);
-                        }
-                        let mut views_bytes = 0usize;
-                        if let (Some(global), Some(detail)) = (view_size, detail_size) {
-                            for (i, b) in view_boxes(uw, uh).into_iter().enumerate() {
-                                let size = if i == 0 { global } else { detail };
-                                let v = downscale_bgra(&raw, uw, b, size);
-                                views_bytes += v.len();
-                                payload.extend_from_slice(&v);
-                            }
-                            // Cropped from the same frame as the other views, on either
-                            // backend. Training crops the recorded full frame, so a
-                            // separate, later blit would disagree exactly at the pointer.
-                            let v = cursor_crop_bgra(&raw, uw, uh, cx, cy, fovea_size);
-                            views_bytes += v.len();
-                            payload.extend_from_slice(&v);
-                        }
-                        let mut region_bytes: Vec<usize> = Vec::new();
-                        for r in &regions {
-                            let [top, left, rh, rw] = *r;
-                            let mut crop = Vec::with_capacity(rw * rh * 4);
-                            for y in 0..rh {
-                                let i = ((top + y) * uw + left) * 4;
-                                crop.extend_from_slice(&raw[i..i + rw * 4]);
-                            }
-                            region_bytes.push(crop.len());
-                            payload.extend_from_slice(&crop);
-                        }
-                        let encoding = if cmd["encoding"] == "lz4" {
-                            "lz4"
-                        } else {
-                            "raw"
-                        };
-                        let bytes = if encoding == "lz4" {
-                            lz4_flex::block::compress(&payload)
-                        } else {
-                            payload
-                        };
-                        seq += 1;
-                        let events = std::mem::take(&mut *EVENTS.lock().map_err(|_| "event_lock")?);
-                        Ok((
-                            serde_json::json!({"seq": seq, "width": w, "height": h, "encoding": encoding, "capture_start_ns": start, "t_ns": end, "events": events, "overflow": OVERFLOW.swap(false, Ordering::Relaxed), "stopped": STOP.load(Ordering::SeqCst), "foreground": foreground(), "cursor": [cx, cy], "full_bytes": full_bytes, "view_size": view_size, "detail_size": detail_size, "fovea_size": fovea_size, "views_bytes": views_bytes, "region_bytes": region_bytes, "backend": backend, "pointer_drawn": pointer_drawn}),
-                            bytes,
-                        ))
-                    }
-                    _ => fast_op(&shared, &cmd),
+                    respond(&cmd, result);
                 }
-            })();
-            if result.is_err() {
-                disarm(&shared);
+            })
+            .map_err(|e| format!("reply_thread_failed: {e}"))?;
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let mut stream: Option<Stream> = None;
+        // Captures asked for just before a stream's tick, served with that tick's frame.
+        let mut waiting: Vec<serde_json::Value> = Vec::new();
+        loop {
+            // Without a stream this waits for requests; with one, for requests until the
+            // next tick is due. The wait wakes early (a blocking wait is only as precise as
+            // the system timer, 15.6 ms by default) and sleeps the rest on a
+            // high-resolution timer.
+            let cmd = match stream.as_ref().map(|s| s.next) {
+                None => match rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                },
+                Some(next) => {
+                    let now = Instant::now();
+                    if next <= now {
+                        None
+                    } else {
+                        match rx.recv_timeout((next - now).saturating_sub(WAKE_EARLY)) {
+                            Ok(cmd) => Some(cmd),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                let now = Instant::now();
+                                if next > now {
+                                    thread::sleep(next - now);
+                                }
+                                None
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                }
+            };
+            let Some(cmd) = cmd else {
+                let Some(s) = stream.as_mut() else {
+                    continue;
+                };
+                let (frame, fatal) = tick(s, &mut capturer, &shared);
+                for cmd in waiting.drain(..) {
+                    serve(&cmd, &frame, &mut capturer, &replies, &shared);
+                }
+                if let Some(reason) = fatal {
+                    if let Some(s) = stream.take() {
+                        finish_stream(s, reason, None);
+                    }
+                }
+                continue;
+            };
+            let hwnd = shared.lock().map(|state| state.held.hwnd).unwrap_or(0) as HWND;
+            match cmd["op"].as_str().unwrap_or("") {
+                "attach" => {
+                    let result = if stream.is_some() {
+                        // Attaching resets the capture the stream is using.
+                        Err("attach_refused_while_streaming".to_string())
+                    } else {
+                        attach(&shared, &mut capturer)
+                    };
+                    if result.is_err() {
+                        disarm(&shared);
+                    }
+                    reply(&cmd, result);
+                }
+                "capture" => {
+                    let pointer = cmd["pointer"].as_bool().unwrap_or(true);
+                    let soon = stream
+                        .as_ref()
+                        .is_some_and(|s| s.next.saturating_duration_since(Instant::now()) < DEFER);
+                    if soon && pointer {
+                        // The tick is about to capture anyway, and a capture now would
+                        // make it late.
+                        waiting.push(cmd);
+                        continue;
+                    }
+                    match capturer.grab(hwnd, pointer) {
+                        Ok(grabbed) => {
+                            let moment = capturer.moment(stream.is_none());
+                            let _ = replies.send((cmd, Arc::new(grabbed), moment));
+                        }
+                        Err(error) => {
+                            disarm(&shared);
+                            reply(&cmd, Err(error));
+                        }
+                    }
+                }
+                "stream" => match cmd["action"].as_str().unwrap_or("") {
+                    "start" if stream.is_some() => reply(&cmd, Err("stream_active".into())),
+                    "start" => match start_stream(&cmd, hwnd, &exe_dir) {
+                        Ok((started, started_reply)) => {
+                            stream = Some(started);
+                            reply(&cmd, Ok((started_reply, vec![])));
+                        }
+                        Err(error) => reply(&cmd, Err(error)),
+                    },
+                    "stop" => match stream.take() {
+                        Some(s) => {
+                            finish_stream(s, "stopped", Some(cmd));
+                            // Captures that waited for a tick that will not come.
+                            for cmd in waiting.drain(..) {
+                                serve(&cmd, &Err(String::new()), &mut capturer, &replies, &shared);
+                            }
+                        }
+                        None => reply(&cmd, Err("no_stream".into())),
+                    },
+                    "status" => {
+                        let report = STATS.lock().map(|s| s.report()).unwrap_or_default();
+                        reply(&cmd, Ok((report, vec![])));
+                    }
+                    _ => reply(&cmd, Err("invalid_stream_action".into())),
+                },
+                _ => {
+                    let result = fast_op(&shared, &cmd);
+                    if result.is_err() {
+                        disarm(&shared);
+                    }
+                    reply(&cmd, result);
+                }
             }
-            respond(&cmd, result);
         }
+        // The connection is gone. A stream's encoder dies with this process (its job).
+        drop(stream);
         shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2291,6 +3155,92 @@ mod tests {
         assert_eq!(control_script("launch"), "Game-Control.ps1");
     }
     #[test]
+    fn a_stalled_tick_skips_ahead_and_keeps_the_phase() {
+        let start = std::time::Instant::now();
+        let period = std::time::Duration::from_millis(200);
+        // On time: the next tick is one period on.
+        assert_eq!(next_tick(start, period, start), (start + period, 0));
+        // 650 ms late: the ticks at 200, 400 and 600 ms are gone; the next is at 800.
+        let late = start + std::time::Duration::from_millis(650);
+        assert_eq!(next_tick(start, period, late), (start + period * 4, 3));
+        // Exactly on a later tick counts that one as missed too: it is due now, not ahead.
+        assert_eq!(
+            next_tick(start, period, start + period),
+            (start + period * 2, 1)
+        );
+    }
+    #[test]
+    fn observers_only_look() {
+        let status = serde_json::json!({});
+        for op in [
+            "attach",
+            "capture",
+            "status",
+            "telemetry",
+            "game_log",
+            "pointer",
+            "release",
+            "report",
+            "saves",
+        ] {
+            assert!(observer_allows(op, &status), "{op} should be allowed");
+        }
+        for op in [
+            "arm",
+            "apply",
+            "focus",
+            "events",
+            "launch",
+            "quit",
+            "restart_discord",
+            "stream",
+        ] {
+            assert!(!observer_allows(op, &status), "{op} should be refused");
+        }
+        assert!(observer_allows(
+            "job",
+            &serde_json::json!({"action": "status"})
+        ));
+        for action in ["start", "stop"] {
+            assert!(!observer_allows(
+                "job",
+                &serde_json::json!({"action": action})
+            ));
+        }
+    }
+    #[test]
+    fn timed_batches_take_one_offset_per_event_within_a_second() {
+        let offsets = |v: serde_json::Value, n| batch_offsets(&v, n);
+        assert_eq!(offsets(serde_json::Value::Null, 3), Ok(None));
+        assert_eq!(
+            offsets(serde_json::json!([0, 25, 50.5]), 3),
+            Ok(Some(vec![0, 25_000, 50_500]))
+        );
+        for bad in [
+            serde_json::json!([0, 25]),
+            serde_json::json!([0, 25, 1001]),
+            serde_json::json!([0, -1, 5]),
+            serde_json::json!([50, 25, 75]),
+            serde_json::json!(["0", 1, 2]),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                offsets(bad.clone(), 3),
+                Err("invalid_offsets".into()),
+                "{bad}"
+            );
+        }
+    }
+    #[test]
+    fn stream_keys_are_short_and_plain() {
+        assert!(valid_stream_key("a1b2c3d4e5f60718") && valid_stream_key("rec_1-x"));
+        for key in ["", "a b", "../x", "a;b", &"k".repeat(33)] {
+            assert!(!valid_stream_key(key), "{key:?}");
+        }
+        assert_eq!(quantile([3.0, 1.0, 2.0], 0.5), Some(2.0));
+        assert_eq!(quantile(Vec::<f32>::new(), 0.5), None);
+    }
+    #[test]
     fn options_default_to_the_workers_own_folder() {
         let exe = Path::new("D:\\worker");
         let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
@@ -2298,9 +3248,11 @@ mod tests {
             parse_options(args(&[]), exe).unwrap(),
             Options {
                 scripts: exe.to_path_buf(),
-                mods: exe.join("mods")
+                mods: exe.join("mods"),
+                observer: false,
             }
         );
+        assert!(parse_options(args(&["--observer"]), exe).unwrap().observer);
         let given = parse_options(
             args(&[
                 "--mods",

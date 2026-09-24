@@ -17,9 +17,16 @@ log = logging.getLogger(__name__)
 
 
 class RemoteDesktop(Desktop):
-    def __init__(self, config, *, attach: bool = True):
+    encoding = "lz4"
+
+    def __init__(self, config, *, attach: bool = True, observer: bool = False):
         """Connect to the second PC's worker. `attach=False` as for Desktop: the control
-        operations need no game running there."""
+        operations need no game running there.
+
+        `observer=True` asks for a read-only connection beside the one that holds the game:
+        telemetry, `report`, captures, the game log, and no input, launches or recording.
+        A bridge from before observers refuses it by closing the connection.
+        """
         from collections import deque
 
         # The peer worker's stderr stays on the peer's console; keep the attribute so
@@ -50,7 +57,11 @@ class RemoteDesktop(Desktop):
         self.pending = {}
         self.next_id = 1
         self.reader_error = None
-        self.stream.write(spec["token"].encode("ascii") + b"\n")
+        self.streams = {}
+        # An observer is read-only: it can watch and measure while another connection
+        # holds the game, and the bridge starts its worker with --observer.
+        role = b" observer" if observer else b""
+        self.stream.write(spec["token"].encode("ascii") + role + b"\n")
         self.stream.flush()
         threading.Thread(target=self._read_remote, daemon=True).start()
         self.attached = None

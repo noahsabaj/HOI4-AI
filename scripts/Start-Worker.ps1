@@ -92,6 +92,21 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 public static class Hoi4Bridge {
+    // One connection holds the game: it may give input, launch, record. Beside it, a few
+    // observers may watch and measure (telemetry, report, captures), each with a worker
+    // started with --observer, which hooks nothing and refuses anything else. Before,
+    // the bridge took one connection at a time, so nothing could reach this PC while a
+    // recording ran, not even a report.
+    private const int MaxObservers = 4;
+    // How long a second connection that wants the game waits for the first to finish
+    // (a recorder closing one connection and opening the next), before it is told why not.
+    private const int PrimaryWaitMs = 8000;
+    private static readonly SemaphoreSlim primary = new SemaphoreSlim(1, 1);
+    private static readonly object gate = new object();
+    private static int connections = 0;
+    private static int observers = 0;
+    private static int workers = 0;
+
     private static async Task Pump(Stream source, Stream destination) {
         var buffer = new byte[65536];
         int count;
@@ -109,80 +124,130 @@ public static class Hoi4Bridge {
         }
         return stamp.ToString();
     }
+    // The first line after the handshake: the token, then " observer" for a read-only
+    // connection. At most 128 bytes.
+    private static string ReadLine(Stream stream) {
+        var line = new StringBuilder();
+        for (int i = 0; i < 128; i++) {
+            int b = stream.ReadByte();
+            if (b == 10) return line.ToString();
+            if (b < 0) throw new IOException("closed before the token");
+            line.Append((char)b);
+        }
+        return null;
+    }
+    // A reply the client can read as an error: the worker protocol's JSON line, no payload.
+    private static void Refuse(Stream stream, string why) {
+        var line = Encoding.UTF8.GetBytes("{\"error\":\"" + why + "\",\"bytes\":0}\n");
+        try { stream.Write(line, 0, line.Length); stream.Flush(); } catch (Exception) {}
+        Console.WriteLine("Refused a connection: " + why);
+    }
+    private static void Serve(TcpClient client, X509Certificate2 cert, string peer, string token, string exe) {
+        using (client)
+        using (var tls = new SslStream(client.GetStream(), false)) {
+            if (!((IPEndPoint)client.Client.RemoteEndPoint).Address.Equals(IPAddress.Parse(peer))) return;
+            Process worker = null;
+            StreamWriter errorLog = null;
+            Task errors = null;
+            bool holding = false, watching = false, started = false;
+            try {
+                tls.ReadTimeout = 10000; tls.WriteTimeout = 10000;
+                tls.AuthenticateAsServer(cert, false, SslProtocols.Tls12, false);
+                var line = ReadLine(tls);
+                bool observer;
+                if (line == token) observer = false;
+                else if (line == token + " observer") observer = true;
+                else return;
+                if (observer) {
+                    watching = true;
+                    if (Interlocked.Increment(ref observers) > MaxObservers) {
+                        Refuse(tls, "too_many_observers");
+                        return;
+                    }
+                } else {
+                    if (!primary.Wait(PrimaryWaitMs)) {
+                        Refuse(tls, "worker_busy: another connection holds the game here (a recording or a match); an observer connection can still watch and measure");
+                        return;
+                    }
+                    holding = true;
+                }
+                lock (gate) {
+                    // Deploy-Peer stages a new worker beside the running one. It is swapped
+                    // in only while no worker runs, never under a connection.
+                    if (workers == 0 && File.Exists(exe + ".new")) {
+                        try { File.Move(exe + ".new", exe, true); Console.WriteLine("Updated worker."); }
+                        catch (Exception error) { Console.WriteLine("Worker update deferred: " + error.Message); }
+                    }
+                    worker = new Process();
+                    worker.StartInfo = new ProcessStartInfo(exe) {
+                        UseShellExecute=false, CreateNoWindow=true,
+                        RedirectStandardInput=true, RedirectStandardOutput=true,
+                        RedirectStandardError=true
+                    };
+                    if (observer) worker.StartInfo.ArgumentList.Add("--observer");
+                    worker.Start();
+                    workers++;
+                    started = true;
+                }
+                errorLog = new StreamWriter(Path.Combine(Path.GetDirectoryName(exe), observer ? "observer-stderr.log" : "worker-stderr.log"), true);
+                var log = errorLog;
+                var process = worker;
+                errors = Task.Run(() => {
+                    string text;
+                    while ((text = process.StandardError.ReadLine()) != null) {
+                        Console.Error.WriteLine(text);
+                        lock (log) { log.WriteLine(text); log.Flush(); }
+                    }
+                });
+                var input = Pump(tls, worker.StandardInput.BaseStream);
+                var output = Pump(worker.StandardOutput.BaseStream, tls);
+                Task.WaitAny(input, output);
+            } catch (Exception error) { Console.WriteLine(error.GetType().Name + ": " + error.Message); }
+            finally {
+                if (worker != null) {
+                    try { worker.StandardInput.Close(); } catch (Exception) {}
+                    try { if (!worker.WaitForExit(2000)) worker.Kill(); } catch (Exception) {}
+                }
+                // The worker has exited, so stderr reaches EOF. Let the reader write a
+                // crash's last lines before the log closes under it.
+                if (errors != null) {
+                    try { errors.Wait(2000); } catch (Exception) {}
+                }
+                if (errorLog != null) {
+                    try { lock (errorLog) { errorLog.Dispose(); } } catch (Exception) {}
+                }
+                if (worker != null) worker.Dispose();
+                if (started) lock (gate) { workers--; }
+                if (holding) primary.Release();
+                if (watching) Interlocked.Decrement(ref observers);
+            }
+        }
+    }
     // True when the watched files changed and the caller should restart from them.
     public static bool Run(string bind, int port, string peer, string pfx, string password, string token, string exe, string[] watch) {
         var stamp = Stamp(watch);
         var cert = X509CertificateLoader.LoadPkcs12FromFile(pfx, password, X509KeyStorageFlags.UserKeySet);
         var listener = new TcpListener(IPAddress.Parse(bind), port);
-        listener.Start(1);
-        Console.WriteLine("HOI4 worker ready at " + bind + ":" + port + ". F12 stops game input.");
+        listener.Start(16);
+        Console.WriteLine("HOI4 worker ready at " + bind + ":" + port + ". F12 stops game input. Observers welcome.");
         try {
-            while (true) {
-                // Updates are picked up only between connections, never during a match.
-                for (int tick = 0; !listener.Pending(); tick++) {
-                    if (tick % 2 == 1) {
-                        string now;
-                        try { now = Stamp(watch); } catch (IOException) { now = stamp; }
-                        if (now != stamp) return true;
-                    }
-                    Thread.Sleep(500);
+            for (int tick = 0; ; tick++) {
+                if (listener.Pending()) {
+                    var client = listener.AcceptTcpClient();
+                    Interlocked.Increment(ref connections);
+                    Task.Run(() => {
+                        try { Serve(client, cert, peer, token, exe); }
+                        finally { Interlocked.Decrement(ref connections); }
+                    });
+                    continue;
                 }
-                using (var client = listener.AcceptTcpClient()) {
-                    if (!((IPEndPoint)client.Client.RemoteEndPoint).Address.Equals(IPAddress.Parse(peer))) continue;
-                    using (var tls = new SslStream(client.GetStream(), false)) {
-                        Process worker = null;
-                        StreamWriter errorLog = null;
-                        Task errors = null;
-                        try {
-                            tls.ReadTimeout = 10000; tls.WriteTimeout = 10000;
-                            tls.AuthenticateAsServer(cert, false, SslProtocols.Tls12, false);
-                            var incoming = new StringBuilder();
-                            for (int i=0; i<65; i++) { int b=tls.ReadByte(); if(b==10) break; if(b<0) throw new IOException(); incoming.Append((char)b); }
-                            if (incoming.ToString() != token) continue;
-                            // Deploy-Peer stages a new worker beside the running one. No
-                            // worker is running between connections, so swap it in here.
-                            if (File.Exists(exe + ".new")) {
-                                try { File.Move(exe + ".new", exe, true); Console.WriteLine("Updated worker."); }
-                                catch (Exception error) { Console.WriteLine("Worker update deferred: " + error.Message); }
-                            }
-                            worker = new Process();
-                            worker.StartInfo = new ProcessStartInfo(exe) {
-                                UseShellExecute=false, CreateNoWindow=true,
-                                RedirectStandardInput=true, RedirectStandardOutput=true,
-                                RedirectStandardError=true
-                            };
-                            worker.Start();
-                            errorLog = new StreamWriter(Path.Combine(Path.GetDirectoryName(exe), "worker-stderr.log"), true);
-                            var log = errorLog;
-                            errors = Task.Run(() => {
-                                string line;
-                                while ((line = worker.StandardError.ReadLine()) != null) {
-                                    Console.Error.WriteLine(line);
-                                    log.WriteLine(line);
-                                    log.Flush();
-                                }
-                            });
-                            var input = Pump(tls, worker.StandardInput.BaseStream);
-                            var output = Pump(worker.StandardOutput.BaseStream, tls);
-                            Task.WaitAny(input, output);
-                        } catch (Exception error) { Console.WriteLine(error.GetType().Name + ": " + error.Message); }
-                        finally {
-                            if (worker != null) {
-                                worker.StandardInput.Close();
-                                if (!worker.WaitForExit(2000)) worker.Kill();
-                            }
-                            // The worker has exited, so stderr reaches EOF. Let the reader
-                            // write a crash's last lines before the log closes under it.
-                            if (errors != null) {
-                                try { errors.Wait(2000); } catch (Exception) {}
-                            }
-                            if (errorLog != null) {
-                                try { errorLog.Dispose(); } catch (Exception) {}
-                            }
-                            if (worker != null) worker.Dispose();
-                        }
-                    }
+                // Updates are picked up only with no connection open, never during a match.
+                if (tick % 8 == 7 && Volatile.Read(ref connections) == 0) {
+                    string now;
+                    try { now = Stamp(watch); } catch (IOException) { now = stamp; }
+                    if (now != stamp) return true;
                 }
+                Thread.Sleep(125);
             }
         } finally { listener.Stop(); cert.Dispose(); }
     }

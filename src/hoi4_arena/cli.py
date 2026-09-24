@@ -48,10 +48,12 @@ def main():
     record.add_argument("--split", choices=["train", "validation", "test"])
     record.add_argument(
         "--codec",
-        choices=["ffv1", "x264"],
+        choices=["ffv1", "x264", "nvenc", "nvenc-hevc", "x264-source", "ffv1-source"],
         default="ffv1",
         help="ffv1 is lossless. x264 is visually lossless (CRF 18, 4:4:4) at about a "
-        "hundredth of the size.",
+        "hundredth of the size. nvenc (H.264 4:4:4 at least as faithful as x264 CRF 18) and "
+        "the -source codecs are encoded by the worker on the PC that captures, on its own "
+        "clock; only the video crosses the network (falls back to x264 here if it cannot).",
     )
     record.add_argument(
         "--game-speed",
@@ -83,7 +85,13 @@ def main():
         help="1920x1080 crops of popup Ok buttons, clicked wherever they appear.",
     )
     ai.add_argument("--hz", type=float, default=5)
-    ai.add_argument("--codec", choices=["ffv1", "x264"], default="x264")
+    ai.add_argument(
+        "--codec",
+        choices=["ffv1", "x264", "nvenc", "nvenc-hevc", "x264-source", "ffv1-source"],
+        default="nvenc",
+        help="As for record. nvenc (the default) is recorded on the worker's clock and "
+        "encoded where the game runs; x264 is the old way, a request per frame, encoded here.",
+    )
     ai.add_argument("--cap-minutes", type=float, default=45)
     ai.add_argument(
         "--speeds",
@@ -582,6 +590,16 @@ def main():
         help="Load this save game at launch, skipping the main menu: its name in the save "
         "games folder, without .hoi4 (letters, digits and _). `control saves` lists them.",
     )
+    tele = sub.add_parser(
+        "telemetry",
+        help="What a PC is doing: CPU, RAM, GPU (busy, video encoder, VRAM), disks, network, "
+        "per process (the game, the worker, the encoder), the game's window and capture "
+        "timing. With --peer it uses a read-only connection, so it works during a recording.",
+    )
+    tele.add_argument("--peer", help="The second PC's peer.json; this PC if omitted")
+    tele.add_argument("--watch", type=float, help="Repeat every this many seconds")
+    tele.add_argument("--count", type=int, help="With --watch, stop after this many")
+    tele.add_argument("--json", dest="as_json", action="store_true", help="Print the raw reply")
     job = sub.add_parser(
         "job",
         help="Run compute on the second PC's GPU: set up its Python environment, run a "
@@ -636,6 +654,12 @@ def main():
         "--preset",
         help="A named arena design (arenas.PRESETS: plains, river, passes, marsh, bay): "
         "terrain, rivers, lakes and cities on the 12x8 grid. Without one, the plain arena.",
+    )
+    generation.add_argument(
+        "--seed",
+        type=int,
+        help="Redraw a preset's noise, province shapes and river courses: the same design, "
+        "another map. Recorded in generation.json.",
     )
     generation.add_argument(
         "--undefended",
@@ -787,6 +811,13 @@ def control(action, peer=None, mod=None, window="1920x1080", save=None):
 
     if action == "launch" and not mod:
         raise ValueError("launch needs --mod, the arena's folder name")
+    if peer and action in ("report", "saves"):
+        # Read-only: through an observer connection, so it works while a recording holds
+        # the game there.
+        from .telemetry import open_observer
+
+        with open_observer(peer) as desktop:
+            return getattr(desktop, action)()
     with (
         RemoteDesktop(peer, attach=False)
         if peer
@@ -941,6 +972,10 @@ def _dispatch(command, args):
                 result = {k: v for k, v in desktop.attached.items() if k != "payload"}
     elif command == "control":
         print(control(**args))
+    elif command == "telemetry":
+        from .telemetry import watch
+
+        watch(args["peer"], args["watch"], args["as_json"], args["count"])
     elif command == "job":
         from .remote import RemoteDesktop
 
@@ -993,6 +1028,7 @@ def _dispatch(command, args):
             args["game"],
             args["output"],
             preset=args["preset"],
+            seed=args["seed"],
             undefended=args["undefended"],
             victory_points_on_border=args["victory_points_on_border"],
             **{key: value for key, value in grid.items() if value is not None},

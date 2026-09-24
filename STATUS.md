@@ -177,7 +177,13 @@ every rule below came from a crash dump or the stock files.
   to its holder's capital, and nobody in the arena can build one. With no line across
   the border, a captured hub never supplied its captor: on the first terrain arena Blue
   took three states, then stood for four years five provinces from Red's capital,
-  against a single Red division. The plain arena still has no crossing lines.
+  against a single Red division. The plain arena still has no crossing lines. The audit
+  checks that every hub is joined by rail to its country's others and, on a preset, that
+  at least two lines cross the border.
+- **Dark ground must still read as land.** The scripted player counts a pixel as land
+  only above a brightness sum of 250 at full zoom-out. Forest and marsh filling the
+  middle of the marsh arena's front drew at about 220 (plains about 330), and its
+  front-line click fell in the hole, on the lake. They are drawn lighter now.
 - **Rivers run along province borders.** Only a river on a border is crossed (86% of
   stock river pixels are on one). A river starts at a green source pixel at its free
   end, is one pixel wide and edge-connected, and a tributary ends on a red join pixel.
@@ -201,14 +207,21 @@ provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n")
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
 checks that, province by province and pixel by pixel.
 
-| Preset | What changes the fight |
-|---|---|
-| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front |
-| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across |
-| `passes` | Mountains two provinces deep on each side of the whole border (-50% attack), crossed by two one-province valleys |
-| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings |
-| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus |
-| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south |
+| Preset | What changes the fight | Front | Attack across it |
+|---|---|---|---|
+| none | The plain arena, for comparison | 15 | -3% |
+| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front | 15 | -8% |
+| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across | 15 | -2% |
+| `passes` | Mountains two provinces deep on each side of the whole border, crossed by two one-province valleys | 15 | -37% |
+| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
+| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
+| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+
+"Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
+mean penalty for attacking into the defender's province there: the stock terrain
+penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
+-60% where a river runs along that border. On `passes` 73% of the front costs 40% or
+more. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 
@@ -222,18 +235,35 @@ What a preset paints, all with stock assets:
   computed from the heights, so the relief is lit.
 - **Cities:** each victory point is an urban province, 60% of it painted as city (stock
   city models and night lights). Forests have stock European trees (85% cover).
+- **A trunk railway:** per side, the cheapest tree joining the capital, cities and
+  hubs, routed round mountains and marsh, plus two loops, and two lines across the
+  border; 58-70 links in all, against 513 for a line on every adjacency. Each state's
+  hub stands on its city or on the easiest ground near its middle, so taking a junction
+  cuts off the hubs beyond it. On the passes arena the lines cross in the two valleys.
 - **Borders that wander:** province seeds stray up to 22% of a province, and the Voronoi
   is taken through a displacement that turns with the map, so coasts, state borders and
   the front are no longer ruled lines.
 
-A preset takes 13–17 s to generate. `generation.json` records the preset, its terrain
-counts, and a state layout over the land box, from which `scripted.state_at` names the
-state under a point on any arena, bulges included.
+A preset takes 13–17 s to generate. `--seed` redraws its noise, province shapes and
+river courses: the same design, another map, so an agent need not learn one map by
+heart. `generation.json` records the preset and seed, its terrain counts, its front
+(the numbers in the table above), and a state layout over the land box, from which
+`scripted.state_at` names the state under a point on any arena, bulges included.
 
-Live test, `arena-plains-v1` (2026-09-24, second PC, scripted Blue against the AI):
-loaded and ran 15 minutes with no errors, and the scripted player found its fronts on
-the new ground. It ended as a draw, in the supply stall above; v3 adds the lines across
-the border.
+Live tests on the second PC (2026-09-24), the scripted player against the game's AI.
+On the plain arena, 23 such games ended by game day 290-820.
+
+- `plains-v1`, as Blue: loaded with no errors, and the scripted player found its fronts
+  on the new ground. A draw after 15 minutes: the supply stall above.
+- `passes-v3`, as Red: Red won in 541 s. Blue surrendered on day 1236, after a seesaw
+  at the valleys: 22 changes of control, with West 6 taken four times and East 7 three.
+- `marsh-v3` and `v4`: loaded, lakes included, but first Red could not be picked (the
+  capital fix) and then the front line would not draw on dark ground (the colour fix).
+- `marsh-v6`, as Red: loaded with no map errors in the game's log. The AI won in 79 s:
+  the lake splits the front, Red's army held only the southern stretch (89% of its
+  division-days in one state), and Blue walked round the north without a casualty.
+- Close-ups show stock textures, relief lit by the normal map, dense forests, city
+  models among farmland, rivers and railways.
 
 ## The model and its data (2026-09-23)
 
@@ -463,6 +493,83 @@ files there, skipping unchanged files. `hoi4-arena control` launches, closes and
 inspects HOI4 there through the worker. On the second PC, `Start-Worker.ps1
 -Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
 updates by itself, but only between connections, never mid-match. See the README.
+
+Since 2026-09-24 the bridge there takes one connection that holds the game (a recording,
+a match, a launch) and up to four read-only observers beside it. An observer's worker
+hooks no input and refuses input, launches, jobs and recording, so `hoi4-arena telemetry
+--peer ...` and `control report --peer ...` work while a game is recorded. Before, the
+bridge took one connection at a time, and a report during a game timed out on the TLS
+handshake. A second full connection now waits 8 s for the first to finish, then is told
+`worker_busy`.
+
+`telemetry` reads, once a second: CPU and memory of the PC and of the processes that
+matter (the game, the workers, ffmpeg, the bridge, compute jobs, the busiest others), GPU
+use per process (Windows' GPU Engine counters) and for the card (NVML: busy, video
+encoder, memory, temperature, power), disks, the network, the game window (responding,
+in front, on which screen) and the capture's timing.
+
+## Recording where the game runs (2026-09-24)
+
+Frames used to be pulled one request at a time: every 200 ms the recorder asked the
+worker for a full 1080p frame, the frame crossed the network as lz4 (1.2-3.2x on game
+frames), and this PC encoded it with x264. Anything else on the connection (the camera's
+own screenshots) or on this PC (a busy CPU) made frames late. Over 41 games on the second
+PC, recordings reached 3.8-5.0 fps with up to 36 late ticks a game, and even the 5.0 fps
+games bunched their frames (10-20% of intervals over 300 ms).
+
+Now the worker keeps the clock. With `--codec nvenc` (`record-ai`'s default, and a
+choice for `record`) the worker captures the game 5 times a second on its own timer,
+draws the pointer, and hands the frames to ffmpeg on the same PC, which encodes them on
+that PC's NVIDIA encoder. Only the video and each frame's row (times, pointer, inputs)
+cross the network, and this PC writes them as they come. An older worker, or a PC without
+NVENC, falls back to x264 here, and the manifest says which ran.
+
+One AI game each on the second PC, same camera and worker, 2026-09-24:
+
+| | x264 here, one request a frame | NVENC stream |
+|---|---|---|
+| Frames per second (nominal 5) | 3.34 | 4.99 |
+| Late ticks | 59 | 0 |
+| Frame interval p50 / p95 / p99 | 199 / 859 / 1039 ms | 200.0 / 200.5 / 205.7 ms |
+| Intervals over 300 ms | 25.5% | 0.28% (one stall, since fixed) |
+| Out of the second PC | 148 Mbit/s | 56 Mbit/s: 3.4 video, the rest the camera's screenshots |
+| Encoder on this PC | 0.49 cores, 554 MB | 0.002 cores, 23 MB (a remux) |
+| Recorder process on this PC | 0.68 cores | 0.49 cores, mostly camera and popup image work |
+| Worker, encoder, bridge on the second PC | 0.17, none, 0.04 cores (at 3.3 fps) | 0.14, 0.09, 0.03 cores; 3% of the video encoder |
+
+The game itself took 3.4-3.5 cores, 3.2 GB and 30% of the GPU either way. x264 is now
+capped at 4 threads: its default here took 80 threads and 2 GB for the same 5 fps.
+
+**Is the video as good?** Against 452 lossless 1080p frames (a clip, and screenshots of
+menus, maps and scripted games, each held three frames), each candidate encoded and then
+decoded with the training reader's own command (`scripts/codec_fidelity.py`, run as a
+compute job on the second PC's GPU):
+
+| | KB/frame | PSNR whole / top bar | Worst pixel, 99.9% | Template scores moved | Decode fps |
+|---|---|---|---|---|---|
+| x264 CRF 18, 4:4:4 (before) | 86.9 | 44.83 / 43.47 dB | 80, 9 | 0.0115 | 245 |
+| **NVENC H.264 4:4:4, p7, QP 14** | 88.7 | **45.47 / 43.97 dB** | **50, 7** | **0.0029** | **260** |
+| NVENC QP 16 | 72.1 | 44.21 / 42.59 dB | 64, 9 | 0.0035 | 259 |
+| NVENC HEVC 4:4:4, QP 14 | 82.0 | 45.16 / 43.59 dB | 72, 7 | 0.0042 | 239 |
+| NVENC lossless | 333.3 | 52.63 / 53.28 dB | 2, 2 | 0.0014 | 224 |
+
+That is 151 sightings of 11 templates from `artifacts/screens-1080p`; none moved in any
+candidate, and the screen rules' error changed by 1.80 at most at QP 14 against 3.07 for
+x264. So the stream keeps full-resolution colour and keeps what the policy reads better
+than x264 did. On real games its files are larger (3.4 against 2.2 Mbit/s) and still
+decode faster: 122 against 110 fps through the reader, alternated on this PC.
+
+**Capture is faster.** The worker keeps the desktop image on the GPU, reads back only the
+game's window, and no longer waits up to 8 ms for the next present: a 1920x1080 capture
+went from 14.9 to 4.9 ms p50 on this PC (16 to 4.8 ms on the second PC), still
+pixel-identical to the GDI blit.
+
+Also: the capture thread's own output goes through a queue, so a tick never waits for a
+large reply to cross the network (one did, for 618 ms). `apply` can take a decision's
+events with their offsets (`at_ms`) and apply them on the worker's clock, one request
+instead of eight; offsets of 50 ms came out 50.2 and 50.3 ms apart on the second PC.
+Captures travel raw over the local pipe (lz4 cost 16-21 ms a frame). BGRA to RGB takes
+2.2 ms instead of 18.4.
 
 ## Recording AI games
 
@@ -821,8 +928,8 @@ hand-recorded play.
    the policy that way on the scripted games, and repeat the GRU against Mamba-3 there.
 4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
    with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
-   closed through its worker (`launch`, `quit`) and its frames recorded here: a full
-   1080p frame takes about 86 ms over the network, so 5 Hz fits. Both monitors must stay
+   closed through its worker (`launch`, `quit`) and encoded there on its own clock
+   (`--codec nvenc`, "Recording where the game runs"). Both monitors must stay
    switched on (brightness can be zero): a monitor switched off disconnects on
    DisplayPort, Windows shrinks the desktop to 1024x768, and the capture breaks, which
    the recorder reports. On the second PC the Discord overlay is off: after a
@@ -832,7 +939,8 @@ hand-recorded play.
    camera's inputs as labels, so they teach camera control and popup clearing, and
    serve the encoder, predicting who wins, and a first opponent. On the 12x8 arena the
    first two games took 24.8 and 31.5 minutes, so a match limit of 1800 s is too short
-   there; the recorder's cap is 45 minutes. Recordings are 1080p x264 (CRF 18, 4:4:4).
+   there; the recorder's cap is 45 minutes. Recordings are 1080p H.264 4:4:4: NVENC
+   at QP 14 since 2026-09-24, x264 at CRF 18 before and as the fallback.
    `desync` gets calibrated whenever one happens.
 5. **Record 1–4 hours of human play** on the arena, with `--game-speed` set to the
    speed used. This is the only source of a player's inputs.
