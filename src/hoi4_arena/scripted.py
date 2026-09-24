@@ -161,18 +161,19 @@ ARMY_BAR_TOP = 0.88
 COLUMNS, ROWS, STATE_WIDTH, STATE_HEIGHT, STATE_ROWS = 24, 8, 3, 4, 2
 ENEMY = {"BLU": "RED", "RED": "BLU"}
 # Arrows toward one state lost the front's flanks or its rear in every game with them
-# (2026-09-23), so most games attack broad. A "front" attack draws no offensive line: the
-# front line itself is executed, and pushes along the whole border.
-ATTACKS = {"broad": 0.55, "front": 0.15, "near": 0.15, "deep": 0.15}
+# (2026-09-23), so most games attack broad. A "front" attack (the front line executed
+# alone, no offensive line) never advanced in its two games (a loss and a 10-minute
+# draw on 2026-09-24), so it is left out, though step() still knows it.
+ATTACKS = {"broad": 0.7, "near": 0.15, "deep": 0.15}
 # The attacks that draw an offensive line.
 OFFENSIVES = ("broad", "near", "deep")
 # The share of games for each kind of plan: the best found so far (best_plan), the best
 # with one change under test (CHALLENGER), and the rest with every choice drawn at random,
 # so the recordings still show varied plans, good and bad.
-SHARES = {"best": 0.55, "challenger": 0.15, "explore": 0.3}
-# The change under test, applied to the best plan: a shorter hold (120-160 s). The wins
-# that held 113-142 s ended in 208-344 s (mean 286), those that held 199-227 s in 337-371 s
-# (mean 354), all won; the conscription ladder is done by about 120 s.
+SHARES = {"best": 0.7, "challenger": 0.0, "explore": 0.3}
+# The change under test, applied to the best plan, when the challenger has a share: a
+# shorter hold (120-160 s; a win and a 10-minute draw on 2026-09-24). None has one while
+# the best plan's record is measured.
 CHALLENGER = {"variant": "brisk", "wait": (120, 160)}
 
 

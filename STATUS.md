@@ -997,6 +997,28 @@ beat (`win-rate`).
 - **Tests of new arenas draw their side at random** (all of the first eight had been
   Red), and `win-rate` counts each arena by side. The best plan so far on the v6 arenas:
   river, plains and passes won; marsh, bay and salient lost (before the guard).
+- **The record (2026-09-24, 06:30).** The best plan (broad offensives after a 120-240 s
+  hold, All Adults Serve, paused redraws, the guard) won 11 of 13 decided games since
+  03:00 (85%, 95% interval 58-96%): 8 of 8 as Blue, 3 of 5 as Red, 6 of 6 on the v4
+  arena. Both losses were as Red on arenas where HOI4 spreads the divisions badly (marsh
+  and salient). The random exploring plans won 1 of 7. Since the fixes of 2026-09-23 the
+  script has won 26 of 41 decided games in all.
+- **Loading inside the running game.** Every HOI4 launch on the second PC left about
+  100 MB of commit charge behind until a reboot (found by the worker's telemetry): with a
+  34.6 GB limit, a 27 GB baseline and 5.2 GB for a game, launches ran out after a night of
+  games. The next game on the same arena now loads its start save from inside the
+  running one: the winner's peace conference is left (Confirm and Exit, then OK),
+  popups are cleared, the menu at the top right opens Load Game, the save is found in
+  the list by its name (scrolling down to it) and loaded. It took 3.3 s to the paused
+  map, at speed 1 like a fresh start, and the arena log is then read from where it
+  stood before the war was declared. HOI4 is still launched afresh every 8 games, after
+  any failure, and for another arena; `--main-only` keeps a run on its given arenas, and
+  otherwise the main arena takes two pairs of games in every three, so that runs of four
+  games load in place.
+- **A memory guard.** Before a game the recorder reads the second PC's commit charge
+  from its telemetry: before loading in the running game, the charge as it is; before a
+  launch, after quitting, the charge plus the 5.3 GB a game takes. At 95% of the limit
+  it starts no game, writes MEMORY-STOP into the run's folder and stops.
 
 ## A learned player from the scripted games (2026-09-24)
 

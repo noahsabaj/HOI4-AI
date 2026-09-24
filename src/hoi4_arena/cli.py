@@ -153,6 +153,12 @@ def main():
         "games that start alike do not play alike.",
     )
     ai.add_argument(
+        "--main-only",
+        action="store_true",
+        help="Play only the given arenas; accepted test arenas do not join the turn (each "
+        "arena switch is a launch of HOI4).",
+    )
+    ai.add_argument(
         "--eval-dir",
         help="Lend the second PC between games to live evaluations that reserve it: "
         '<dir>/queue/<name>.json ({"minutes": N}) is answered by <dir>/granted/<name>.json '

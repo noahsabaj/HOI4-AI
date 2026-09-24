@@ -114,9 +114,9 @@ def test_each_arena_in_turn_is_played_as_both_countries():
     ]
     assert games[:4] == [("a", "BLU"), ("a", "RED"), ("b", "BLU"), ("b", "RED")]
     assert games[4:] == games[:4]
-    # Accepted arenas take turns in every other pair; the main arena keeps half.
+    # Accepted arenas take turns in every third pair; the main arena keeps two thirds.
     arenas = [ai_games.game_arena(["v4"], i, ["x", "y"]) for i in range(12)]
-    assert arenas == ["v4", "v4", "x", "x", "v4", "v4", "y", "y", "v4", "v4", "x", "x"]
+    assert arenas == ["v4"] * 4 + ["x"] * 2 + ["v4"] * 4 + ["y"] * 2
     latest = ai_games.latest_versions(["m/arena-plains-v1", "m/arena-bay-v2", "m/arena-plains-v2"])
     assert latest == ["m/arena-bay-v2", "m/arena-plains-v2"]
 
@@ -346,3 +346,41 @@ def test_the_map_errors_are_read_from_the_report():
     assert found["count"] == 3 and len(found["examples"]) == 2
     assert found["examples"][0].startswith("[02:00:01]")
     assert ai_games.parse_map_errors("report:\nnothing") is None
+
+
+def test_no_new_game_past_the_memory_limit(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    reading = {"memory": {"commit_mb": 33000, "commit_limit_mb": 34568}}
+    observer = MagicMock()
+    observer.__enter__.return_value.telemetry.return_value = reading
+    import hoi4_arena.telemetry as telemetry
+
+    monkeypatch.setattr(telemetry, "open_observer", lambda peer: observer)
+    station = ai_games.Station("peer", "peer.json")
+    assert ai_games.memory_pressure(station) == pytest.approx(33000 / 34568)
+    assert ai_games.memory_pressure(station, 500) == pytest.approx(33500 / 34568)
+    assert ai_games.memory_pressure(ai_games.Station("here")) is None
+    with pytest.raises(ai_games.MemoryStop):
+        ai_games.check_memory(station, ai_games.GAME_MB)
+    reading["memory"]["commit_mb"] = 27000  # No game running: room for one.
+    ai_games.check_memory(station, ai_games.GAME_MB)
+
+
+def test_a_start_save_is_loaded_in_game_only_where_its_name_is_calibrated(tmp_path, monkeypatch):
+    monkeypatch.setattr(ai_games, "SCREENS", tmp_path)
+    from PIL import Image
+
+    rng = np.random.default_rng(4)
+    name = rng.integers(0, 255, (18, 80, 3), dtype=np.uint8)
+    Image.fromarray(name).save(tmp_path / "save-arenav4red.png")
+    assert ai_games.can_load("arenav4red") and not ai_games.can_load("arenamarshv6red")
+    assert not ai_games.can_load(None)
+    frame = rng.integers(0, 255, (1080, 1920, 3), dtype=np.uint8)
+    frame[613:631, 865:945] = name
+    x, y = ai_games.shown(frame, "save-arenav4red", 0.93)
+    assert abs(x * 1920 - 905) < 1 and abs(y * 1080 - 622) < 1
+    assert (
+        ai_games.shown(rng.integers(0, 255, (1080, 1920, 3), dtype=np.uint8), "save-arenav4red")
+        is None
+    )
