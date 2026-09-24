@@ -742,3 +742,24 @@ def test_decisions_that_act_weigh_more_than_waiting_and_the_camera():
     actions[4, 0] = _token(1, 9, 9)  # The camera looking about: no press follows.
     actions[5, 0] = _token(VOCAB.index({"kind": "wheel", "delta": 120}))
     assert acting(actions).tolist() == [True, False, True, False, False, False]
+
+
+def test_a_save_rides_out_a_moment_s_lock_on_its_file(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from hoi4_arena import learning
+
+    calls = []
+    real = Path.replace
+
+    def flaky(self, target):
+        calls.append(target)
+        if len(calls) < 3:
+            raise PermissionError(32, "in use")
+        return real(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky)
+    monkeypatch.setattr(learning.time, "sleep", lambda s: None)
+    (tmp_path / "a.tmp").write_text("new")
+    learning.replace_patiently(tmp_path / "a.tmp", tmp_path / "a.pt")
+    assert (tmp_path / "a.pt").read_text() == "new" and len(calls) == 3

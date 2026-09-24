@@ -190,6 +190,23 @@ def save_checkpoint(path, policy, config, *, auxiliary=None, optimizer=None, pro
     return digest
 
 
+def replace_patiently(source, target, tries=10, wait=1.0):
+    """Rename `source` over `target`, retrying while Windows reports the target in use.
+
+    A scanner opening the freshly written file (or another reader) makes the rename fail
+    with WinError 32 for a moment; on 2026-09-24 that ended a training run at a routine
+    save. A few retries a second apart ride it out; a lasting lock still raises.
+    """
+    for attempt in range(tries):
+        try:
+            Path(source).replace(target)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(wait)
+
+
 class Progress:
     """A training run's position and state, saved as it goes so an interruption costs minutes.
 
@@ -250,7 +267,7 @@ class Progress:
         # Written whole and renamed, so an interruption mid-write leaves the last one.
         temp = self.path.with_suffix(".tmp")
         torch.save(payload, temp)
-        temp.replace(self.path)
+        replace_patiently(temp, self.path)
         self.last = self.clock()
 
     def tick(self, epoch, step, modules, optimizer):
