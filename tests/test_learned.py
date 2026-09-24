@@ -763,3 +763,19 @@ def test_a_save_rides_out_a_moment_s_lock_on_its_file(tmp_path, monkeypatch):
     (tmp_path / "a.tmp").write_text("new")
     learning.replace_patiently(tmp_path / "a.tmp", tmp_path / "a.pt")
     assert (tmp_path / "a.pt").read_text() == "new" and len(calls) == 3
+
+
+def test_a_second_copy_of_a_run_refuses_its_folder_and_a_dead_owner_s_lock_is_taken(tmp_path):
+    import os
+
+    from hoi4_arena.learning import RunLock
+
+    with RunLock(tmp_path):
+        assert (tmp_path / "run.lock").read_text() == str(os.getpid())
+        with pytest.raises(RuntimeError, match="one run per folder"):
+            with RunLock(tmp_path):
+                pass
+    assert not (tmp_path / "run.lock").exists()
+    (tmp_path / "run.lock").write_text("999999")  # A run killed without cleaning up.
+    with RunLock(tmp_path):
+        assert (tmp_path / "run.lock").read_text() == str(os.getpid())

@@ -290,7 +290,15 @@ def wait_while_paused(output, poll=5.0, sleep=None):
     return True
 
 
-def train_bc(
+def train_bc(data, model_path, output, **options):
+    """Behaviour cloning (_train_bc), one run at a time per output folder (RunLock)."""
+    from .learning import RunLock
+
+    with RunLock(output):
+        return _train_bc(data, model_path, output, **options)
+
+
+def _train_bc(
     data,
     model_path,
     output,

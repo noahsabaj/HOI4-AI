@@ -141,7 +141,15 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
     return count
 
 
-def cache_tower(
+def cache_tower(data, checkpoint, output, **options):
+    """The tower cache (_cache_tower), one build at a time per cache folder (RunLock)."""
+    from .learning import RunLock
+
+    with RunLock(output):
+        return _cache_tower(data, checkpoint, output, **options)
+
+
+def _cache_tower(
     data,
     checkpoint,
     output,
