@@ -157,6 +157,21 @@ def main():
         '<dir>/queue/<name>.json ({"minutes": N}) is answered by <dir>/granted/<name>.json '
         "with HOI4 closed, and play resumes at <dir>/done/<name>.json or after N+15 minutes.",
     )
+    tower = sub.add_parser(
+        "cache-tower",
+        help="Run a checkpoint's frozen vision tower once over every frame of the "
+        "recordings and keep what it read, for train-bc --tower-cache.",
+    )
+    tower.add_argument("data")
+    tower.add_argument("checkpoint")
+    tower.add_argument("output")
+    tower.add_argument("--model", dest="model_path")
+    tower.add_argument("--sources", nargs="+")
+    tower.add_argument(
+        "--spill",
+        help="Where recordings go once the output's drive would keep less than --keep-free",
+    )
+    tower.add_argument("--keep-free", type=float, default=30.0, help="GB to leave free")
     live = sub.add_parser(
         "play-policy",
         help="A trained policy plays arena games against the game's AI on the second PC, "
@@ -191,6 +206,12 @@ def main():
         "--point",
         action="store_true",
         help="Place each move on its likeliest spot while still sampling what to do",
+    )
+    live.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Below 1 sharpens what the policy does each slot (its likeliest input gains)",
     )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
@@ -384,6 +405,23 @@ def main():
         default=0.0,
         help="Weight of the next-order loss: the memory predicts the scripted player's next "
         "order and the time until it, from the manifest's orders. Training only; 0 is off.",
+    )
+    train.add_argument(
+        "--train-last",
+        type=int,
+        help="How many of the vision tower's last blocks train (default 2); 0 freezes it, "
+        "which makes a step about a third cheaper.",
+    )
+    train.add_argument(
+        "--tower-cache",
+        help="Read the frozen tower's output from this cache (cache-tower) instead of "
+        "running it; needs --train-last 0.",
+    )
+    train.add_argument(
+        "--carry",
+        action="store_true",
+        help="Carry the memory through each game, window after window in order "
+        "(truncated backpropagation through time), instead of from empty per window.",
     )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
@@ -825,6 +863,18 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
+    elif command == "cache-tower":
+        from .tower_cache import cache_tower
+
+        result = cache_tower(
+            args["data"],
+            args["checkpoint"],
+            args["output"],
+            model_path=args["model_path"],
+            sources=args["sources"],
+            spill=args["spill"],
+            keep_free_gb=args["keep_free"],
+        )
     elif command == "play-policy":
         from .play import evaluate_policy
 

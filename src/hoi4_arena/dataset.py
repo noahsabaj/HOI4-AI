@@ -462,6 +462,13 @@ class _Stream:
         self.globals = {}
         self.details = {}
         self.index = 0
+        # The tower cache's arrays (tower_cache.py), opened here, in the process that
+        # reads them: a memory map does not travel to a DataLoader worker.
+        self.tower = None
+        if labels.get("tower"):
+            self.tower = tuple(
+                np.load(labels["tower"][key], mmap_mode="r") for key in ("summary", "grid")
+            )
 
     def close(self):
         if self.decoder.poll() is None:
@@ -493,6 +500,12 @@ class _Stream:
         for key in ("state", "order_kind", "order_eta"):
             if key in labels:
                 window[key] = torch.from_numpy(labels[key][start : start + n].copy())
+        if self.tower is not None:
+            from .tower_cache import from_bits
+
+            frames = labels["frame_ids"][start : start + n]
+            window["tower_summary"] = from_bits(self.tower[0][frames])
+            window["tower_grid"] = from_bits(self.tower[1][frames])
         if self.clips:
             window["clips"] = torch.stack(
                 [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]
@@ -567,7 +580,8 @@ class VideoSessions(IterableDataset):
     A `splits.json` in `root`, {recording folder name: split}, overrides the split each
     recording's manifest drew, so a study can choose its held-out games without touching
     the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state` and `orders` pass to
-    session_labels; a lead-in shorter than a clip needs `clips` off.
+    session_labels; a lead-in shorter than a clip needs `clips` off. `tower`, a tower
+    cache (tower_cache.py), adds each decision's frozen-tower reading to its window.
     """
 
     def __init__(
@@ -594,6 +608,7 @@ class VideoSessions(IterableDataset):
         loser_weight=1.0,
         state=False,
         orders=False,
+        tower=None,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -630,6 +645,23 @@ class VideoSessions(IterableDataset):
                     orders=orders,
                 )
             )
+        self.tower_stamp = None
+        if tower is not None:
+            from .tower_cache import tower_paths
+
+            stamps = set()
+            for labels in self.sessions:
+                paths = tower_paths(tower, labels["root"])
+                if paths is None:
+                    raise ValueError(
+                        f"{labels['root'].name} is not in the tower cache {tower}; "
+                        "run cache-tower on this data first"
+                    )
+                labels["tower"] = paths
+                stamps.add(paths["tower"])
+            if len(stamps) > 1:
+                raise ValueError("the tower cache mixes the readings of different towers")
+            self.tower_stamp = stamps.pop() if stamps else None
         self.windows = sum(len(sequence_starts(s["valid"], length, burn_in)) for s in self.sessions)
         if not self.windows:
             raise ValueError(f"No complete valid {split} sequences; record human sessions first")
@@ -676,6 +708,91 @@ class VideoSessions(IterableDataset):
                 stream.close()
 
 
+class GameSequences(IterableDataset):
+    """Each game's decisions in order, in windows of `length`, `slots` games side by side.
+
+    For a memory carried through whole games, trained by truncated backpropagation
+    through time: batch slot b plays one recording from its first decision on, window
+    after window; when the recording ends, the slot starts the next one and marks that
+    window `fresh`, so the trainer empties that slot's memory. The memory study
+    (2026-09-24, 44 AI games, 5 seeds) found carrying the memory between 16-decision
+    windows the largest effect it measured: held-out loss 3.109 against 3.169 for windows
+    started empty, which is how train-bc trained.
+
+    Every decision is in a window, valid or not: an invalid one is still seen by the
+    memory, and train_bc scores it with weight 0. A game's last partial window is left
+    out. Items are whole batches, with `slot` (unique across DataLoader workers) and
+    `fresh`; `sessions` is a VideoSessions, for its recordings and their labels.
+    """
+
+    def __init__(self, sessions, length=16, slots=2, *, seed=0, device="cpu", clips=True):
+        self.sessions = sessions.sessions
+        self.length, self.slots, self.seed = length, slots, seed
+        self.device, self.clips = device, clips
+        self.windows = sum(
+            max(0, int(labels["readable"].sum())) // length for labels in self.sessions
+        )
+        self.epoch = 0
+
+    def __len__(self):
+        """Batches in an epoch, about: windows over slots."""
+        return -(-self.windows // self.slots)
+
+    def _open(self, labels):
+        count = int(labels["readable"].sum())
+        starts = list(range(0, count - self.length + 1, self.length))
+        if not starts:
+            return None
+        return _Stream(labels, self.length, 0, self.device, starts=starts, clips=self.clips)
+
+    def __iter__(self):
+        rng = random.Random(f"{self.seed}:{self.epoch}")
+        self.epoch += 1
+        order = list(self.sessions)
+        rng.shuffle(order)
+        worker = get_worker_info()
+        base = 0
+        if worker is not None and worker.num_workers > 1:
+            order = order[worker.id :: worker.num_workers]
+            base = worker.id * self.slots
+        streams = [None] * self.slots
+        fresh = [True] * self.slots
+        # Windows a stream finished together (after a capture gap), in order.
+        pending = [[] for _ in range(self.slots)]
+        try:
+            while True:
+                windows, ids, starts = [], [], []
+                for b in range(self.slots):
+                    while not pending[b]:
+                        if streams[b] is None:
+                            if not order:
+                                break
+                            streams[b], fresh[b] = self._open(order.pop()), True
+                            continue
+                        done = streams[b].advance()
+                        if done is None:
+                            streams[b] = None
+                            continue
+                        pending[b].extend(done)
+                    if not pending[b]:
+                        continue
+                    window = pending[b].pop(0)
+                    windows.append(window)
+                    ids.append(base + b)
+                    starts.append(fresh[b])
+                    fresh[b] = False
+                if not windows:
+                    return
+                batch = torch.utils.data.default_collate(windows)
+                batch["slot"] = torch.tensor(ids)
+                batch["fresh"] = torch.tensor(starts)
+                yield batch
+        finally:
+            for stream in streams:
+                if stream is not None:
+                    stream.close()
+
+
 def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=False):
     """Batches of VideoSessions' windows, prepared by `workers` background processes.
 
@@ -690,4 +807,12 @@ def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=Fal
         drop_last=drop_last,
         num_workers=workers,
         pin_memory=bool(workers) and torch.device(device).type == "cuda",
+        worker_init_fn=_worker_threads if workers else None,
+        persistent_workers=bool(workers),
     )
+
+
+def _worker_threads(_worker_id, threads=2):
+    """More than the one thread a DataLoader worker is given: with one, the views of a
+    frame took 46 ms (2026-09-24)."""
+    torch.set_num_threads(threads)

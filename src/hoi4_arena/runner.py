@@ -18,7 +18,7 @@ from .dataset import CLIP_FRAMES, clip_frame_ids, normalize, recorded_speed, vie
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
 from .learning import approximate_kl, file_hash, value_estimate
-from .models import CELL_DIM, Policy, build_encoder, halve_frozen
+from .models import CELL_DIM, Policy, build_encoder, halve_frozen, reads_clip
 from .recording import Recorder
 from .remote import RemoteDesktop
 from .vision import ScreenRules
@@ -130,6 +130,7 @@ class Actor:
         game_speed,
         memory_window=None,
         point=False,
+        temperature=1.0,
     ):
         """`memory_window` N runs the memory afresh over the last N decisions' perception
         at every decision, from an empty state, instead of carrying it from the game's
@@ -140,6 +141,7 @@ class Actor:
         samples."""
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
         self.point = point
+        self.temperature = temperature
         self.memory_window = memory_window
         self.recent = deque(maxlen=memory_window) if memory_window else None
         # The policy is told the speed the match runs at: the same clip is a different
@@ -220,6 +222,7 @@ class Actor:
                         noise=torch.zeros(1, self.policy.actor.noise_dim, device=self.device),
                         deterministic=self.deterministic,
                         point=getattr(self, "point", False),
+                        temperature=getattr(self, "temperature", 1.0),
                     )
         torch.cuda.synchronize()
 
@@ -246,21 +249,28 @@ class Actor:
         # Same lookback Sessions uses. Integer nanoseconds: dividing t_ns by 1e9 and
         # stepping in float seconds would not land on the same frames.
         timestamp_ns = int(timestamp_ns)
-        self.history.append((timestamp_ns, global_view))
-        times = np.array([t for t, _ in self.history], dtype=np.int64)
-        ids = clip_frame_ids(times, timestamp_ns)
-        clip = torch.stack([self.history[max(0, int(i))][1] for i in ids])
-        before = (
-            np.zeros(self.policy.memory_dim, np.float32)
-            if self.hidden is None
-            else self.hidden[0].float().cpu().numpy()
-        )
+        # A lean actor (play-policy) keeps no training sample, and builds no clip for an
+        # encoder that reads none (models.reads_clip): only the action leaves the card.
+        lean = getattr(self, "lean", False)
+        clip = None
+        if not lean or reads_clip(self.policy.encoder):
+            self.history.append((timestamp_ns, global_view))
+            times = np.array([t for t, _ in self.history], dtype=np.int64)
+            ids = clip_frame_ids(times, timestamp_ns)
+            clip = torch.stack([self.history[max(0, int(i))][1] for i in ids])
+        before = None
+        if not lean:
+            before = (
+                np.zeros(self.policy.memory_dim, np.float32)
+                if self.hidden is None
+                else self.hidden[0].float().cpu().numpy()
+            )
         with (
             torch.inference_mode(),
             torch.autocast(torch.device(device).type, dtype=torch.bfloat16),
         ):
             inputs = (
-                normalize(clip).permute(3, 0, 1, 2)[None],
+                None if clip is None else normalize(clip).permute(3, 0, 1, 2)[None],
                 normalize(quads).permute(0, 3, 1, 2)[None],
                 normalize(fovea).permute(2, 0, 1)[None],
                 torch.from_numpy(self.previous)[None].to(device),
@@ -290,7 +300,11 @@ class Actor:
                 noise=noise,
                 deterministic=self.deterministic,
                 point=getattr(self, "point", False),
+                temperature=getattr(self, "temperature", 1.0),
             )
+        if lean:
+            self.previous = action[0].cpu().numpy()
+            return self.previous, None
         # One host transfer for the whole sample. Four separate .cpu()/.item() calls
         # each waited for the GPU, on the same thread that has to start the next capture.
         host = {
