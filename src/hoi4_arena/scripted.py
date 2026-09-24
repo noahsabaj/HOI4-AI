@@ -26,6 +26,13 @@ Calibrated live at 1920x1080 on 2026-09-23:
   offensive, which the game routes along its own path.
 - The green arrow above the army card activates the plan. Once active, it changes.
 - The Battle Plans bar shows while an army is selected.
+- Q opens the political screen. Its first law slot is conscription: a click lists the
+  laws, a click on one asks "Replace Idea?", and OK changes it for political power
+  (Limited Conscription 150, Extensive 300; a country starts with 2 and gains about 2 a
+  day). The AI changes it once it can afford to: in the first v4 games its manpower pool
+  began refilling in late May and its deployed manpower rose from 15k to 16-21k, while
+  the script's, which never changed the law, only fell. The law is read from the slot's
+  own icon, since the open list shows every law's icon.
 """
 
 from __future__ import annotations
@@ -43,13 +50,25 @@ from .vision import country_pixels
 # counts as found. Correlation shrugs off a button lit under the pointer, where squared
 # difference did not: on the calibration screens and the first live game each button
 # scored 1.00 where it was (0.92 lit, 0.88 hovered) and at most 0.55 anywhere else.
-FOUND = {"unassigned": 0.85, "activate": 0.8, "plans_bar": 0.8}
+FOUND = {
+    "unassigned": 0.85,
+    "activate": 0.8,
+    "plans_bar": 0.8,
+    "confirm_ok": 0.9,
+    "political_title": 0.8,
+}
 # The create-army + glows while divisions are selected, so no fixed picture of it holds:
 # the first live game's frames scored 0.17 against a template taken a minute earlier.
 # It is found by colour instead, the only green in the army bar before an army exists:
 # 201 to 336 pixels of it where it showed, none while it was grey.
 GREEN_PLUS = 60
-FRONT_LINE, OFFENSIVE_LINE, SHIFT = 0x5A, 0x58, 0x10
+FRONT_LINE, OFFENSIVE_LINE, SHIFT, POLITICS = 0x5A, 0x58, 0x10, 0x51
+# The political screen at 1080p: the conscription slot (its icon's box), each law's row
+# in the list it opens, the confirmation's OK and Cancel, and the list's close button.
+LAW_SLOT = (38, 571, 82, 615)
+LAW_ROWS = {"limited": (703, 322), "extensive": (703, 396)}
+CONFIRM, CANCEL, CLOSE_LIST = (1054, 677), (884, 677), (1005, 100)
+CONSCRIPTION = {"none": 0.2, "limited": 0.3, "extensive": 0.5}
 # The first army's card in the army bar at the bottom, 1080p fractions.
 ARMY_CARD = (947 / 1920, 1010 / 1080)
 # The army bar, where the create-army + shows: the bottom tenth of the screen.
@@ -72,6 +91,10 @@ def choose_plan(rng):
     """
     attack = rng.choices(list(ATTACKS), weights=list(ATTACKS.values()))[0]
     return {
+        # How far to raise conscription once political power allows: not at all, to
+        # Limited, or on to Extensive. Mostly raised, as the AI does; sometimes not, to
+        # measure what it is worth.
+        "conscription": rng.choices(list(CONSCRIPTION), weights=list(CONSCRIPTION.values()))[0],
         "attack": attack,
         "wait": 0 if rng.random() < 0.4 else round(rng.uniform(5, 60)),
         "redraw": None if attack == "none" or rng.random() < 0.5 else round(rng.uniform(40, 120)),
@@ -116,7 +139,7 @@ class Planner:
         self.frame = frame
         self.rng = rng or random.Random()
         self.orders = []
-        self.activate_at = self.redraw_at = math.inf
+        self.activate_at = self.redraw_at = self.law_at = math.inf
         self.active = self.running = False
         # A setup that failed, for play() to end the game with.
         self.error = None
@@ -312,10 +335,13 @@ class Planner:
             self.activate_at = now + self.plan["wait"]
         if self.plan["redraw"]:
             self.redraw_at = now + self.plan["redraw"]
+        if self.plan.get("conscription", "none") != "none":
+            # About 150 political power after half a minute at speed 5.
+            self.law_at = now + 30
 
     def due(self):
         now = time.monotonic()
-        return now >= self.activate_at or now >= self.redraw_at
+        return min(self.activate_at, self.redraw_at, self.law_at) <= now
 
     def step(self, desk):
         """The next due order, once the game runs. True if the camera was moved."""
@@ -329,7 +355,53 @@ class Planner:
                 self.activate(desk)
             self.redraw_at = now + self.plan["redraw"]
             return True
+        if now >= self.law_at:
+            done = self.raise_conscription(desk)
+            self.law_at = math.inf if done else now + 10
         return False
+
+    def law(self, rgb):
+        """The conscription law the political screen's slot shows, or None."""
+        import cv2
+
+        x0, y0, x1, y1 = LAW_SLOT
+        patch = rgb[y0:y1, x0:x1]
+        for name in ("limited", "volunteer"):
+            template = self.templates[f"law_{name}"]
+            if cv2.matchTemplate(patch, template, cv2.TM_CCOEFF_NORMED).max() > 0.9:
+                return name
+        return "other"
+
+    def raise_conscription(self, desk):
+        """One step of the conscription law toward the plan's. True once it is there."""
+        goal = self.plan["conscription"]
+        if self.find(screen(desk), "political_title") is None:
+            act(desk, tap(POLITICS))
+            time.sleep(0.8)
+        rgb = screen(desk)
+        now = self.law(rgb)
+        target = {"volunteer": "limited", "limited": "extensive"}.get(now)
+        if now == goal or now == "other" or target is None or (now, goal) == ("limited", "limited"):
+            act(desk, tap(POLITICS))
+            return True
+        self.click(desk, pixels(LAW_SLOT[0] + 22, LAW_SLOT[1] + 22))
+        time.sleep(0.8)
+        self.click(desk, pixels(*LAW_ROWS[target]))
+        time.sleep(0.8)
+        changed = False
+        if self.find(screen(desk), "confirm_ok") is not None:
+            self.click(desk, pixels(*CONFIRM))
+            time.sleep(0.8)
+            changed = self.law(screen(desk)) != now
+        if self.find(screen(desk), "confirm_ok") is not None:
+            self.click(desk, pixels(*CANCEL))  # Not enough political power yet.
+            time.sleep(0.5)
+        self.click(desk, pixels(*CLOSE_LIST))
+        time.sleep(0.5)
+        act(desk, tap(POLITICS))
+        if changed:
+            self.order("law", law=target)
+        return changed and target == goal
 
 
 def green_plus(rgb):
@@ -343,6 +415,11 @@ def green_plus(rgb):
     return float(np.median(xs)) / rgb.shape[1], (float(np.median(ys)) + top) / rgb.shape[0]
 
 
+def pixels(x, y):
+    """1080p pixels as screen fractions."""
+    return x / 1920, y / 1080
+
+
 def load_templates(paths):
     from PIL import Image
 
@@ -353,6 +430,10 @@ TEMPLATES = {
     "unassigned": "artifacts/screens-1080p/unassigned-divisions.png",
     "activate": "artifacts/screens-1080p/activate-plan.png",
     "plans_bar": "artifacts/screens-1080p/battle-plans-bar.png",
+    "law_volunteer": "artifacts/screens-1080p/law-volunteer.png",
+    "law_limited": "artifacts/screens-1080p/law-limited.png",
+    "confirm_ok": "artifacts/screens-1080p/confirm-ok.png",
+    "political_title": "artifacts/screens-1080p/political-title.png",
 }
 
 
@@ -391,4 +472,7 @@ def win_rate(results):
         report[side] = tally([g for g in played if g["started_as"] == side])
     for attack in ATTACKS:
         report[attack] = tally([g for g in played if (g.get("plan") or {}).get("attack") == attack])
+    for law in CONSCRIPTION:
+        chosen = [g for g in played if (g.get("plan") or {}).get("conscription") == law]
+        report[f"conscription_{law}"] = tally(chosen)
     return report

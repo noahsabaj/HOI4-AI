@@ -88,3 +88,25 @@ def test_the_console_types_an_event_id_with_its_period():
     ]
     # Grave, then e v e n t, space, a r e n a, period, 1, enter, grave.
     assert keys == [0xC0, *b"EVENT", 0x20, *b"ARENA", 0xBE, ord("1"), 0x0D, 0xC0]
+
+
+def test_the_conscription_law_is_read_from_its_slot_alone():
+    from hoi4_arena.scripted import CONSCRIPTION, LAW_SLOT
+
+    generator = np.random.default_rng(0)
+    limited = generator.integers(0, 255, (44, 44, 3), dtype=np.uint8)
+    volunteer = generator.integers(0, 255, (44, 44, 3), dtype=np.uint8)
+    planner = Planner(
+        "BLU", choose_plan(random.Random(1)), {"law_limited": limited, "law_volunteer": volunteer},
+        None, 5, frame=lambda: 0,
+    )  # fmt: skip
+    screen = np.zeros((1080, 1920, 3), np.uint8)
+    # The open list shows every law's icon; only the slot's own says which is in force.
+    screen[300:344, 600:644] = limited
+    x0, y0, x1, y1 = LAW_SLOT
+    screen[y0:y1, x0:x1] = volunteer
+    assert planner.law(screen) == "volunteer"
+    screen[y0:y1, x0:x1] = limited
+    assert planner.law(screen) == "limited"
+    plans = [choose_plan(random.Random(i)) for i in range(300)]
+    assert {p["conscription"] for p in plans} == set(CONSCRIPTION)
