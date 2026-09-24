@@ -112,6 +112,9 @@ pub fn arguments(name: &str, quality: Option<u32>, hz: u32) -> Result<(Vec<Strin
             &q_text,
             "-bf",
             "0",
+            // Out as soon as encoded, not after a queue of frames.
+            "-delay",
+            "0",
             "-g",
             &gop,
         ],
@@ -131,6 +134,8 @@ pub fn arguments(name: &str, quality: Option<u32>, hz: u32) -> Result<(Vec<Strin
             "-qp",
             &q_text,
             "-bf",
+            "0",
+            "-delay",
             "0",
             "-g",
             &gop,

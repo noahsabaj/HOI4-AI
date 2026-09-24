@@ -277,11 +277,20 @@ class StreamRecorder:
         # NUT from the worker, remuxed without decoding into the Matroska file training reads.
         self.muxer = subprocess.Popen(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "nut", "-i", "pipe:0",
-             "-c", "copy", "-f", "matroska", str(self.root / "screen.mkv")],
+             "-c", "copy", "-f", "matroska", "-cluster_time_limit", "1000",
+             str(self.root / "screen.mkv")],
             stdin=subprocess.PIPE,
             stderr=self.log,
         )  # fmt: skip
         self.changed = threading.Condition()
+        # How long each frame's row took from the worker's capture to this process: the
+        # worker's clock mapped onto this one through a few status round trips.
+        self.delivery_ms = []
+        try:
+            self.offset_ns, rtt = desk.clock_offset()
+            self.manifest["clock_rtt_ms"] = round(rtt / 1e6, 3)
+        except (DesktopError, AttributeError, TypeError, KeyError):
+            self.offset_ns = None
         self.views = None  # The newest frame's views, when the stream brings them.
         self.extras = {}
         self.held = None  # The newest row: written when the next one arrives, or at close.
@@ -347,7 +356,10 @@ class StreamRecorder:
         while True:
             message = self.stream.messages.get()
             if "frame" in message:
+                arrived = time.perf_counter_ns()
                 row = {**message["frame"], "received_ns": time.monotonic_ns()}
+                if self.offset_ns is not None and "t_ns" in row:
+                    self.delivery_ms.append((arrived - row["t_ns"] - self.offset_ns) / 1e6)
                 try:
                     seen = self.stream.frame_views(message)
                 except DesktopError as error:
@@ -507,6 +519,7 @@ class StreamRecorder:
             complete=complete and rc == 0 and problem is None,
             reason=reason or problem,
             rows_cut=cut,
+            delivery_ms=_spread(self.delivery_ms),
             encoder_exit=end.get("exit"),
             muxer_exit=rc,
             video_frames=video,
@@ -515,6 +528,18 @@ class StreamRecorder:
             stream=end.get("stats"),
         )
         self._manifest()
+
+
+def _spread(values):
+    """p50, p95 and the largest of `values`, rounded, or None when there are none."""
+    if not values:
+        return None
+    ordered = sorted(values)
+
+    def at(q):
+        return round(ordered[min(len(ordered) - 1, round(q * (len(ordered) - 1)))], 2)
+
+    return {"p50": at(0.5), "p95": at(0.95), "max": round(ordered[-1], 2), "n": len(ordered)}
 
 
 def count_frames(path):

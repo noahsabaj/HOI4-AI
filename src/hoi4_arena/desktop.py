@@ -331,6 +331,19 @@ class Desktop:
         """
         return bool(self.request("focus")["foreground"])
 
+    def clock_offset(self, tries=3):
+        """(offset, round trip) in ns: add the offset to a worker time (`t_ns`) to get
+        this process's time.perf_counter_ns() of the same moment, to within half the round
+        trip. The fastest of a few status requests is used."""
+        best = None
+        for _ in range(tries):
+            before = time.perf_counter_ns()
+            worker = int(self.request("status")["t_ns"])
+            after = time.perf_counter_ns()
+            if best is None or after - before < best[1]:
+                best = ((before + after) // 2 - worker, after - before)
+        return best
+
     def protocol(self) -> int:
         """What the worker speaks: 1, or 2 with telemetry, observers and streams."""
         return int(self.request("status").get("protocol", 1))
