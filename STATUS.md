@@ -170,6 +170,70 @@ every rule below came from a crash dump or the stock files.
 - Diagnostics: `--undefended BLU|RED` gives one side no army. `--victory-points-on-border`
   puts all victory points on one border province; it showed that victory points alone do
   not cause a surrender.
+- **Victory-point names go in `localisation/english/replace`.** The stock file names
+  thousands of provinces as `VICTORY_POINTS_<id>`, and its names won: Blue's capital
+  (province 564) showed as "Kassel".
+- **Railways must cross the border.** A supply hub works only while a railway joins it
+  to its holder's capital, and nobody in the arena can build one. With no line across
+  the border, a captured hub never supplied its captor: on the first terrain arena Blue
+  took three states, then stood for four years five provinces from Red's capital,
+  against a single Red division. The plain arena still has no crossing lines.
+- **Rivers run along province borders.** Only a river on a border is crossed (86% of
+  stock river pixels are on one). A river starts at a green source pixel at its free
+  end, is one pixel wide and edge-connected, and a tributary ends on a red join pixel.
+  Small rivers (indices 3–6) cost 30% of an attack to cross, large ones (7–11) 60%.
+- **Lakes are their own class**, as in the stock file: type `lake`, terrain `lakes`,
+  never coastal, no unit anchors, and in a land strategic region.
+- **Blue's capital must stand mid-country.** The country picker opens centred on it, and
+  the recorder picks Red by clicking Red's land there. With the capital near the west
+  coast, Red was off the screen and the pick failed.
+- **A mirror copied from one half needs symmetric noise.** Copying the western half's
+  half turn onto the east is exact, but left a 42-byte cliff down the middle of the
+  first mountain arena until the noise itself was symmetric. The map's wrap seam
+  (x = 0 meets x = 5631) keeps the plain lattice, because the fix for four-way corners
+  never looks there.
+
+## Arena maps (2026-09-24)
+
+`generate-map --preset <name>` writes one of six named arenas (`arenas.PRESETS`), and
+`preview-map` draws one from its files. Every one keeps the playable grid (12×8
+provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
+victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
+checks that, province by province and pixel by pixel.
+
+| Preset | What changes the fight |
+|---|---|
+| `plains` | Farmland, a few woods and low hills. Rivers run toward the enemy, not across the front |
+| `river` | A large river runs coast to coast four provinces behind each border: -60% to attack across |
+| `passes` | Mountains two provinces deep on each side of the whole border (-50% attack), crossed by two one-province valleys |
+| `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings |
+| `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus |
+| `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south |
+
+What a preset paints, all with stock assets:
+
+- **Terrain in regions:** the stock palette indices each type mostly uses (plains are
+  grass with farmland patches, forest dark and light, hills rolling and ridged,
+  mountains green slopes and bare rock above byte 150, marsh, urban). Each province's
+  painted majority matches its `definition.csv` terrain.
+- **Relief:** heights by type, near the stock medians: plains 102, hills 113-116 and
+  mountains 164 (90th percentile 190), against the stock's 102, 115 and 129 (172).
+  Coasts are ramped over 12 px and rivers lie in shallow valleys. `world_normal.bmp` is
+  computed from the heights, so the relief is lit.
+- **Cities:** each victory point is an urban province, 60% of it painted as city (stock
+  city models and night lights). Forests have stock European trees (85% cover).
+- **Borders that wander:** province seeds stray up to 22% of a province, and the Voronoi
+  is taken through a displacement that turns with the map, so coasts, state borders and
+  the front are no longer ruled lines.
+
+A preset takes 13–17 s to generate. `generation.json` records the preset, its terrain
+counts, and a state layout over the land box, from which `scripted.state_at` names the
+state under a point on any arena, bulges included.
+
+Live test, `arena-plains-v1` (2026-09-24, second PC, scripted Blue against the AI):
+loaded and ran 15 minutes with no errors, and the scripted player found its fronts on
+the new ground. It ended as a draw, in the supply stall above; v3 adds the lines across
+the border.
 
 ## The model and its data (2026-09-23)
 
@@ -576,6 +640,77 @@ beat (`win-rate`).
   winners' armies filled to 41-48k deployed manpower while the AI's stayed at 8-15k,
   and the AI lost 2 to 4 men for each of the script's. Most plans now hold 90-240 s
   before attacking, from the first win; too few games yet to say which part matters.
+- **Recruitment.** Winning games left manpower unused while the AI never had more
+  than 8 divisions, so plans now draw 0, 2 or 4 training slots. U opens Recruit &
+  Deploy; Train on the army's template adds a deployment line, its "No location set"
+  is answered on the map, where the player's own land shows green, and Add Unit adds
+  slots. New divisions deploy unassigned: a shift+click on the top bar's alert selects
+  them and a right-click on the army's card adds them (8/24 became 16/24 in the
+  calibration game), every 20 s. Slots opened at the start took the manpower the
+  divisions needed to fill up from 31%: in the first game with them the army's
+  deployed manpower fell from 14.7k to 5.5k and Blue surrendered in December 1936. So
+  recruiting starts 60 s after the conscription goal is reached. That is late: in the
+  games since, no new division deployed before the war ended, so its effect on the win
+  rate is not measured yet.
+- **The best plan, a challenger, and exploration (2026-09-24).** Every game since the
+  fixes that held 90 s or more before attacking had won (6 of 6), and three of four
+  that attacked within 60 s had lost. So 40% of games now play the best plan found so
+  far (broad offensives after a hold of 120-240 s, All Adults Serve, no recruiting),
+  30% play it with one change under test (now: the front line executed alone, no
+  offensive line), and 30% draw every choice at random, so the recordings stay
+  varied. `win-rate` reports each apart, and by arena.
+- **A quiet hold.** The first best-plan loss came before its attack: the plan was
+  redrawn every 33 s while the front held, each redraw took 15-30 s, and the
+  conscription steps, checked after the redraws, found few turns between them
+  (Limited at 67 s, Extensive at 146 s, against 41 and 65 s in the wins). Every redraw
+  also deleted the front line under the divisions. The AI broke in while the army was
+  still at 17k. Now nothing is redrawn until the attack, conscription comes first, and
+  the redraw period counts from the end of the last redraw. Since then the laws have
+  come at 38-46, 60-69, 79-94 and 99-117 s, as political power allows.
+- **A plan counts as executing only when its arrow is lit.** In the next game the
+  attack started 65 s late: selecting the army had left the pointer on its card, the
+  general's tooltip covered the execute arrow, neither the idle nor the ready look was
+  found, and that was taken for executing. The arrow's green averages 54-65 idle or
+  ready and 90-105 executing (the dots or the check before it come and go while it
+  executes), so the check now asks for a lit arrow, looked at with the pointer off the
+  bar.
+- **The attack can swing back.** In 2 of 11 long-hold games the attack let the AI
+  into the script's rear: its broad line pulled the army forward while the AI held
+  part of the script's border states, and the AI's last divisions walked into the
+  empty home half. One of them was lost that way (the AI took the victory points
+  first). In the wins the AI held 0-14% of the script's home half when the attack
+  began and none after the push; in that loss it grew to 10%, 17%, then 89%. An
+  optional guard (`guard` in a plan, off in every plan so far) executes the front line
+  alone at a redraw while the enemy holds at least that share.
+- **Games an hour (2026-09-24).** Filmed on the second PC, every menu answered within a
+  second of its click, while the recorder slept 25, 8, 40, 40 and 20 s through them; the
+  map came 3.5-4.5 s after Start. Those waits are now a few seconds. Better, a game can
+  launch straight into a start save (`--start-save ARENA:COUNTRY:SAVE`), made with the
+  console's `savegame <name>` while paused at the start of a new game: it reaches the
+  paused map 7 s after the launch returns, and recording starts 13-22 s after the
+  launch, against about 145 s before. A game on another arena that comes through the
+  menus saves its own start for the next one there. After a save loads, the arena logs
+  no `player` line (on_startup does not fire), so the manifest takes the save's country,
+  checked by the flag at the top left.
+- **Games that started alike played alike.** With the same side and the same declarer,
+  games' daily reports were identical to the hour until the script's first law change,
+  about 100 days in: the game's random draws repeat from the same start, so there were
+  only four openings. Each game now runs 0-14 s at speed 1 (about half a game hour a
+  second) before the war is declared (`--opening`), so its war starts at its own hour.
+- **Services beside the games.** `--arena-queue` plays each arena test request once,
+  between the station's own games, to the best plan, and answers it in `results/`:
+  whether it loaded and started, the outcome, planner errors, the map errors the game
+  logged (counted by the worker's report, and once a run on the main arena to compare),
+  and screenshots: the start, a full view mid-game, the end, and eight close-ups zoomed
+  into the terrain view over both countries. Arenas that pass join the rotation in every
+  other pair of games, newest versions only. `--eval-dir` lends the second PC between
+  games to a live evaluation that reserves it (queue, granted, done). A claim names its
+  process, and a recorder that starts offers the claims of dead ones again. A `DRAIN`
+  file in the output folder ends a run between games. Popups are searched on their own
+  thread at half size, confirmed at full size: two full-frame searches had taken about
+  350 ms on the capture thread and cost frames. Each run writes its own results file.
+- **The country picker** closes in on Blue's capital; on an arena with the capitals in
+  the rear no Red land showed. It is zoomed out until the country shows.
 
 ## A learned player from the scripted games (2026-09-24)
 
@@ -624,6 +759,49 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   backpropagation through time). In the memory study on the AI games this was the
   largest effect: held-out loss 3.109 against 3.169 with each window started empty.
 
+## The memory study (2026-09-24)
+
+Which memory should the policy have, and how should it be trained?
+`scripts/memory_study.py` trained six arms, five seeds each, with `train_memory` on one
+cache of frozen perception features (`artifacts/bc-v2s5` reading the 44 speed-5 AI
+games). Every arm got the same decisions per update and the same passes. Each was scored
+on held-out imitation loss with the memory carried from the start of each game, as the
+policy plays. The rule for switching was written into the script before any run.
+
+| Arm | Held-out loss | Loss, memory cleared every 18 decisions | Time since zoom-out, R² |
+|---|---|---|---|
+| GRU, 16-decision windows, memory carried | **3.109 ± 0.003** | 3.108 | 0.010 |
+| Mamba-3, 256, carried | 3.120 ± 0.009 | 3.257 | 0.151 |
+| GRU, 256, carried | 3.123 ± 0.006 | 3.123 | 0.019 |
+| No memory | 3.129 ± 0.004 | 3.129 | 0.032 |
+| Gated DeltaNet-2, 256, carried | 3.134 ± 0.016 | 3.134 | 0.051 |
+| GRU, 16, from empty (how `train-bc` trains) | 3.169 ± 0.008 | 3.169 | 0.005 |
+
+The verdict, by the rule:
+- **Train with the memory carried through whole games.** The 256-decision GRU beats the
+  old way, where each window starts from an empty memory, by far more than twice the
+  noise. The 16-decision GRU with its memory carried is better still.
+- **The GRU stays.** Neither Mamba-3 nor Gated DeltaNet-2 beats the 256-decision GRU by
+  twice the noise.
+
+What the numbers say besides:
+- **The new cells do hold more.** A linear read-out of Mamba-3's memory recovers how long
+  since the camera zoomed out (R² 0.15, against 0.01-0.02 for the GRUs). And clearing
+  its memory costs it 0.14, while it costs the GRU nothing. But on these games that
+  knowledge does not help predict the next input: the AI games' camera moves at random,
+  so there is little for a long memory to find.
+- **Carrying matters, though the GRU uses only a few seconds.** Clearing the carried
+  GRU's memory every 18 decisions (3.6 s) during evaluation changes nothing. Yet the GRU
+  trained from empty windows scores worse than no memory at all (3.169 against 3.129),
+  whether its memory is cleared or not. Why training from empty hurts this much is not
+  understood yet.
+- **Nobody predicts the winner.** Every arm's read-out matches the base rate (0.63).
+- **Timings are not comparable.** This PC was shared with other work, and seed 4 ran up
+  to 2x slower than seeds 1-3.
+
+Next: train the policy with its memory carried, and repeat the GRU against Mamba-3 on the
+scripted player's games, whose plans run for minutes, before closing the question.
+
 ## Open work
 
 In order. Since 2026-09-23 the scripted player comes first: it gives a win rate to beat
@@ -638,14 +816,9 @@ hand-recorded play.
    (`train-state-value`), weight the scripted games' decisions by advantage
    (`advantage --state-value`), and train the policy on them (`train-bc --advantage`).
    Judge it by win rate against the AI and against the scripted player, not by loss.
-3. **Train memory on long windows.** Freeze a behaviour-cloned policy's perception,
-   cache what it reads from every decision of the recordings, and train the memory,
-   the action head and the value on windows of 128–512 decisions instead of 16. Then
-   compare the cells on those cached features, same budget, five seeds: no memory, the
-   GRU at 16 and at 256 decisions, Gated DeltaNet-2 and Mamba-3 at 256. They are
-   scored on held-out imitation loss, on the win prediction, and on probes of what the
-   memory holds (where the pointer was, how long since the camera last zoomed out).
-   The rule for switching is written down before the runs.
+3. **Train the memory carried through whole games.** The study is done: carrying beats
+   starting each window empty, and the GRU stays (see "The memory study"). Next, train
+   the policy that way on the scripted games, and repeat the GRU against Mamba-3 there.
 4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
    with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
    closed through its worker (`launch`, `quit`) and its frames recorded here: a full

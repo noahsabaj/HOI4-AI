@@ -1475,10 +1475,13 @@ def test_audit_rejects_a_tag_with_no_country_leader(arena):
 
 
 def test_audit_rejects_a_victory_point_the_stock_game_would_name(arena):
-    """An unnamed victory point shows whatever the stock localisation calls that id."""
-    text = (arena / "localisation/english/arena_l_english.yml").read_text(encoding="utf-8-sig")
+    """An unnamed victory point shows whatever the stock localisation calls that id, and a
+    name loads after the stock one only from the replace folder (564 showed as Kassel)."""
+    from hoi4_arena.mapgen import VICTORY_POINT_NAMES
+
+    text = (arena / VICTORY_POINT_NAMES).read_text(encoding="utf-8-sig")
     stripped = chr(10).join(r for r in text.splitlines() if "VICTORY_POINTS_" not in r)
-    problems = _audit_with(arena, "localisation/english/arena_l_english.yml", stripped)
+    problems = _audit_with(arena, VICTORY_POINT_NAMES, stripped)
     assert any("has no name" in p for p in problems), problems
 
 

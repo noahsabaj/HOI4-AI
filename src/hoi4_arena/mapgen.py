@@ -5,6 +5,11 @@ documentation, and `audit` re-checks the written files against the same rules. T
 does not report bad map data: `CProvinceProvider::GetProvince` returns null below id 1 and
 the match-start callers dereference the result, so a wrong value ends the process with an
 access violation and no log line.
+
+A named preset (`arenas.PRESETS`, `generate-map --preset`) paints the arena as a real
+front: vanilla terrain in coherent regions, relief, rivers along province borders, lakes,
+cities with the victory points, and province borders that wander. Without one the
+generator writes the plain arena the diagnostics were measured on, unchanged.
 """
 
 from __future__ import annotations
@@ -16,8 +21,12 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
+
+from . import arenas
+from .arenas import PRESETS
 
 # Graphical terrain palette indices. These are the two the stock terrain.bmp actually
 # paints most land with: index 0 covers 9.8% of the stock map as terrain_0 (type plains)
@@ -181,20 +190,32 @@ def shore_heights(ground):
     return np.round(middle + half * ramp).astype(np.uint8)
 
 
+SEA, LAND, LAKE = 0, 1, 2
+DESCRIPTION = "Equal infantry armies. Multiple routes. Normal supply and fog of war."
+VICTORY_POINT_NAMES = "localisation/english/replace/arena_victory_points_l_english.yml"
+# Samples across and down the land's bounding box in generation.json's state layout: four
+# a province on the 12x8 arena.
+LAYOUT = (96, 32)
+
+
 def generate(
     game,
     output,
     *,
+    preset=None,
     undefended=None,
     victory_points_on_border=False,
     columns_per_half=COLUMNS_PER_HALF,
     rows=ROWS,
-    state_columns=STATE_COLUMNS,
-    state_rows=STATE_ROWS,
+    state_columns=None,
+    state_rows=None,
     land_columns=None,
     land_rows=None,
 ):
-    """Write an arena. The keyword arguments build diagnostics, not playable arenas.
+    """Write an arena. Apart from `preset`, the keyword arguments build diagnostics.
+
+    `preset` names a design in `arenas.PRESETS`, which also sets the grid (12 by 8
+    provinces a side in 8 states) unless the grid arguments override it.
 
     `undefended` fields no divisions for one side. `victory_points_on_border` moves every
     victory point onto the border column. That does not produce a surrender: capitulation
@@ -211,6 +232,17 @@ def generate(
     minimum, and a land block that does not divide into the state grid is rejected here
     rather than left for the engine.
     """
+    design = None
+    if preset is not None:
+        if preset not in PRESETS:
+            raise ValueError(f"unknown preset {preset!r}: choose from {', '.join(PRESETS)}")
+        design = PRESETS[preset]
+        land_columns = design.land_columns if land_columns is None else land_columns
+        land_rows = design.land_rows if land_rows is None else land_rows
+        state_columns = design.state_columns if state_columns is None else state_columns
+        state_rows = design.state_rows if state_rows is None else state_rows
+    state_columns = STATE_COLUMNS if state_columns is None else int(state_columns)
+    state_rows = STATE_ROWS if state_rows is None else int(state_rows)
     game, root = Path(game), Path(output).resolve()
     if not (game / "map/provinces.bmp").exists():
         raise ValueError("Point --game at the installed HOI4 directory")
@@ -261,16 +293,74 @@ def generate(
             for y in range(rows)
         ]
     )
+    rng = np.random.default_rng(design.seed) if design else None
+    # Design units: 24 by 8 across both countries' land, whatever the actual grid.
+    scale_x = arenas.DESIGN_COLUMNS / (2 * land_columns)
+    scale_y = arenas.DESIGN_ROWS / land_rows
+
+    def to_design(x, y):
+        return (x - column0 * step_x) / step_x * scale_x, (y - row0 * step_y) / step_y * scale_y
+
+    def to_pixel(x, y):
+        return column0 * step_x + x / scale_x * step_x, row0 * step_y + y / scale_y * step_y
+
+    if design:
+        # Seeds stray from the lattice, so provinces vary in size and shape as stock ones
+        # do. The right half is still the left turned round, seed for seed.
+        stray = rng.uniform(-design.jitter, design.jitter, left.shape) * [step_x, step_y]
+        # The two outermost columns stay on the lattice: they meet their own twins across
+        # the map's wrap seam, where no four-way corner is ever fixed.
+        stray[np.arange(half_count) // rows < 2] = 0
+        left = left + stray
     points = np.concatenate([left, [width - 1, height - 1] - left])
-    yy, xx = np.mgrid[:height, :width]
-    ids = cKDTree(points).query(np.stack([xx.ravel(), yy.ravel()], 1))[1].reshape(height, width) + 1
     # At least two rings of provinces on the outer edges are sea, so the land sits in open
     # water rather than running off the edge of the world. A smaller land block leaves
     # more of the grid as sea, at the same province size. The right half is the left half
     # rotated, so it shares the left half's land flags.
     column, row = np.divmod(np.arange(half_count), rows)
     half_land = (column >= column0) & (row >= row0) & (row < row0 + land_rows)
-    land = np.concatenate([half_land, half_land])
+    half_kind = np.where(half_land, LAND, SEA)
+    if design:
+        # A bay turns land cells to sea and a lake to lake, each with its half turn.
+        cells = np.flatnonzero(half_land)
+        placed = np.array([to_design(*left[i]) for i in cells])
+
+        def nearest(x, y):
+            if x >= arenas.DESIGN_COLUMNS / 2:
+                x, y = arenas.DESIGN_COLUMNS - x, arenas.DESIGN_ROWS - y
+            return int(cells[np.argmin(np.hypot(*(placed - [x, y]).T))])
+
+        for x, y in design.bays:
+            half_kind[nearest(x, y)] = SEA
+        for x, y in design.lakes:
+            half_kind[nearest(x, y)] = LAKE
+    kind = np.concatenate([half_kind, half_kind])
+    land = kind == LAND
+    # Who holds each land province: Blue the western half, Red the eastern, except where
+    # a design bends the border. A trade gives Blue the eastern cell nearest the point
+    # and Red that cell's twin, so each side still holds as many provinces as before.
+    BLUE, RED = 1, 2
+    owner = np.where(land, np.repeat([BLUE, RED], half_count), 0).astype(np.int8)
+    traded = []
+    if design:
+        for x, y in design.trades:
+            cell = nearest(x, y)
+            if half_kind[cell] != LAND or cell in traded:
+                raise ValueError(f"trade at ({x}, {y}) does not name a fresh land cell")
+            traded.append(cell)
+            owner[cell], owner[half_count + cell] = RED, BLUE
+    if design:
+        warp = arenas.warp_field(rng, (height, width), design.warp)
+        ids = arenas.voronoi(points, (height, width), warp, half_count)
+        del warp
+        arenas.merge_fragments(ids)
+        ids[:, width // 2 :] = arenas.mirror_ids(ids[:, : width // 2][::-1, ::-1], half_count)
+    else:
+        yy, xx = np.mgrid[:height, :width]
+        ids = (
+            cKDTree(points).query(np.stack([xx.ravel(), yy.ravel()], 1))[1].reshape(height, width)
+            + 1
+        )
     # Break pixel-only four-way contacts, preserving rotational symmetry. The map wraps
     # horizontally, so the seam between the last and first column is a contact too.
     for _ in range(3):
@@ -298,17 +388,55 @@ def generate(
     (root / "map").mkdir()
     Image.fromarray(colors[ids]).save(root / "map/provinces.bmp")
     ground = land[ids - 1]
-    # Forest on every sixth row, so the same one-in-six share of the map as the 8x12 grid
-    # painted, which is close to the share the stock terrain.bmp gives palette index 1.
-    terrain_types = ["forest" if i % rows % 6 == 3 else "plains" for i in range(half_count)] * 2
-    terrain_ids = np.array([TERRAIN_INDEX[t] for t in terrain_types], dtype=np.uint8)
+    city_cells = []
+    if design:
+        # The design's terrain for each western land cell, then the cities on the cells
+        # nearest where the design puts them. The eastern half is the same, turned.
+        painted = dict(
+            zip(
+                cells.tolist(),
+                arenas.design_terrain(design, [tuple(p) for p in placed], rng),
+            )
+        )
+        for x, y in design.cities:
+            if x >= arenas.DESIGN_COLUMNS / 2:
+                x, y = arenas.DESIGN_COLUMNS - x, arenas.DESIGN_ROWS - y
+            for k in np.argsort(np.hypot(*(placed - [x, y]).T)):
+                cell = int(cells[k])
+                if half_kind[cell] == LAND and cell not in city_cells + traded:
+                    city_cells.append(cell)
+                    break
+        half_types = [
+            "urban"
+            if i in city_cells
+            else {LAND: painted.get(i), SEA: "ocean", LAKE: "lakes"}[half_kind[i]]
+            for i in range(half_count)
+        ]
+        terrain_types = half_types * 2
+        # Counters, buildings and weather stand on each province's inmost point, since a
+        # warped province need not contain its own seed.
+        anchor = arenas.anchors(ids, total_provinces, half_count)
+    else:
+        # Forest on every sixth row, so the same one-in-six share of the map as the 8x12
+        # grid painted, close to the share the stock terrain.bmp gives palette index 1.
+        terrain_types = ["forest" if i % rows % 6 == 3 else "plains" for i in range(half_count)] * 2
+        terrain_ids = np.array([TERRAIN_INDEX[t] for t in terrain_types], dtype=np.uint8)
+        anchor = points
     neighbours = adjacency(ids, len(points))
-    # A coast is a shared edge between the two classes, so it belongs to both provinces.
-    # Since 1.11 the bitmap decides and definition.csv only has to agree with it, but a
-    # disagreement is one MAP_ERROR per province in an already long startup log.
-    coastal = {i: any(land[i - 1] != land[j - 1] for j in sides) for i, sides in neighbours.items()}
+    # A coast is a shared edge between land and sea, so it belongs to both provinces. A
+    # lake makes no coast: stock land that touches only a lake is never coastal. Since 1.11
+    # the bitmap decides and definition.csv only has to agree with it, but a disagreement
+    # is one MAP_ERROR per province in an already long startup log.
+    sea = kind == SEA
+    coastal = {
+        i: bool(
+            (land[i - 1] and any(sea[j - 1] for j in sides))
+            or (sea[i - 1] and any(land[j - 1] for j in sides))
+        )
+        for i, sides in neighbours.items()
+    }
     ports = {
-        i: min((j for j in neighbours[i] if not land[j - 1]), default=0)
+        i: min((j for j in neighbours[i] if sea[j - 1]), default=0)
         for i in neighbours
         if land[i - 1] and coastal[i]
     }
@@ -321,28 +449,67 @@ def generate(
             image.putpalette(palette)
         image.save(root / "map" / name)
 
-    graphical = np.where(ground, terrain_ids[ids - 1], OCEAN_INDEX)
-    indexed("terrain.bmp", graphical)
-    indexed("rivers.bmp", np.where(ground, 255, 254))
-    Image.fromarray(shore_heights(ground)).save(root / "map/heightmap.bmp")
-    Image.new("RGB", (width // 2, height // 2), (128, 128, 255)).save(root / "map/world_normal.bmp")
     trees = (
         width * TREES_NUMERATOR // TREES_DENOMINATOR,
         height * TREES_NUMERATOR // TREES_DENOMINATOR,
     )
-    indexed("trees.bmp", np.zeros((trees[1], trees[0]), dtype=np.uint8))
-    indexed("cities.bmp", np.full((height, width), CITY_INDEX, dtype=np.uint8))
+    half = (slice(None, None, 2), slice(None, None, 2))
+    heights = None
+    river_paths = []
+    if design:
+        lookup = np.zeros(total_provinces + 1, np.int8)
+        lookup[1:] = kind
+        kind_px = lookup[ids]
+        lookup = np.full(total_provinces + 1, -1, np.int8)
+        for i, name in enumerate(terrain_types, 1):
+            if kind[i - 1] == LAND:
+                lookup[i] = arenas.LAND_TYPES.index(name)
+        types_px = lookup[ids]
+        lookup = np.zeros(total_provinces + 1, np.int8)
+        lookup[1:] = owner
+        river_paths, joined = arenas.draw_rivers(design.rivers, ids, kind_px, lookup[ids], to_pixel)
+        river_px = arenas.river_pixels(river_paths, joined, ids.shape)
+        heights = arenas.relief(rng, types_px, kind_px, river_px)
+        cities_both = [c + 1 for c in city_cells] + [c + 1 + half_count for c in city_cells]
+        urban_px, style_px, lights_px = arenas.city_layers(rng, ids, cities_both, anchor)
+        graphical = arenas.terrain_pixels(rng, types_px, heights, urban_px)
+        ground = kind_px == LAND
+        indexed("terrain.bmp", graphical)
+        indexed(
+            "rivers.bmp",
+            np.where(
+                river_px >= 0,
+                river_px,
+                np.where(ground, arenas.RIVER_LAND, arenas.RIVER_WATER),
+            ),
+        )
+        Image.fromarray(heights).save(root / "map/heightmap.bmp")
+        Image.fromarray(arenas.normals(heights)).save(root / "map/world_normal.bmp")
+        indexed("trees.bmp", arenas.tree_pixels(rng, types_px, trees))
+        indexed("cities.bmp", np.where(style_px >= 0, style_px, CITY_INDEX))
+        colour = arenas.colour_map(rng, graphical, lights_px, np.array(OCEAN_COLOUR))
+        land_half = ground[half]
+        del kind_px, types_px, river_px, urban_px, style_px, lights_px
+    else:
+        graphical = np.where(ground, terrain_ids[ids - 1], OCEAN_INDEX)
+        indexed("terrain.bmp", graphical)
+        indexed("rivers.bmp", np.where(ground, 255, 254))
+        Image.fromarray(shore_heights(ground)).save(root / "map/heightmap.bmp")
+        Image.new("RGB", (width // 2, height // 2), (128, 128, 255)).save(
+            root / "map/world_normal.bmp"
+        )
+        indexed("trees.bmp", np.zeros((trees[1], trees[0]), dtype=np.uint8))
+        indexed("cities.bmp", np.full((height, width), CITY_INDEX, dtype=np.uint8))
+        land_half, terrain_half = ground[half], graphical[half]
+        colour = np.zeros((*land_half.shape, 4), dtype=np.uint8)
+        colour[...] = OCEAN_COLOUR
+        for index, value in GROUND_COLOUR.items():
+            colour[land_half & (terrain_half == index)] = value
 
     # The map-shaped textures. Every one of these is a painting of the stock Earth at the
     # stock map's aspect, so leaving them out leaves the Earth's coastline drawn over the
     # arena's ocean, its biome colours over the arena's land and its cities glowing at
     # night. They are half the province bitmap's resolution, uncompressed, without mips.
-    half = (slice(None, None, 2), slice(None, None, 2))
-    land_half, terrain_half = ground[half], graphical[half]
-    colour = np.zeros((*land_half.shape, 4), dtype=np.uint8)
-    colour[...] = OCEAN_COLOUR
-    for index, value in GROUND_COLOUR.items():
-        colour[land_half & (terrain_half == index)] = value
     write_dds(root / "map/terrain/colormap_rgb_cityemissivemask_a.dds", colour)
     fog = np.where(land_half[..., None], np.array(FOG_LAND), np.array(FOG_SEA)).astype(np.uint8)
     write_dds(root / "map/terrain/fow_rgb_waterspec_a.dds", fog)
@@ -364,11 +531,27 @@ def generate(
     for i in range(1, len(points) + 1):
         is_land = bool(land[i - 1])
         r, g, b = colors[i]
+        # A lake is its own class, as in the stock file: type lake, terrain lakes,
+        # continent 0, never coastal.
+        category, terrain = {
+            LAND: ("land", terrain_types[i - 1]),
+            SEA: ("sea", "ocean"),
+            LAKE: ("lake", "lakes"),
+        }[kind[i - 1]]
         definitions.append(
-            f"{i};{r};{g};{b};{'land' if is_land else 'sea'};{str(coastal[i]).lower()};"
-            f"{terrain_types[i - 1] if is_land else 'ocean'};{1 if is_land else 0}"
+            f"{i};{r};{g};{b};{category};{str(coastal[i]).lower()};{terrain};{1 if is_land else 0}"
         )
     write("map/definition.csv", "\n".join(definitions) + "\n")
+
+    def ground_y(province, x, y):
+        """The height a model in `province` stands at, in world units: the ground on land,
+        sea level on water, as in the stock placement files. The plain arena is flat."""
+        if heights is None:
+            return "10.00"
+        if kind[province - 1] != LAND:
+            return "9.50"
+        return f"{heights[int(y), int(x)] / 10:.2f}"
+
     write(
         "map/default.map",
         "\n".join(
@@ -419,19 +602,24 @@ def generate(
         "-1;-1;;-1;-1;-1;-1;-1;-1\n",
     )
     stacks = []
-    for i, (x, y) in enumerate(points, 1):
+    for i, (x, y) in enumerate(anchor, 1):
+        if kind[i - 1] == LAKE:
+            continue  # Stock lakes carry no counter anchors: nothing can stand on one.
         slots = LAND_STACKS if land[i - 1] else SEA_STACKS
         if land[i - 1] and coastal[i]:
             slots += PORT_STACKS
         for slot in slots:
-            stacks.append(f"{i};{slot};{x}.00;10.00;{height - y}.00;0.00;0.30")
+            stacks.append(f"{i};{slot};{x}.00;{ground_y(i, x, y)};{height - y}.00;0.00;0.30")
     write("map/unitstacks.txt", "\n".join(stacks) + "\n")
     weather = " ".join(
         f"period = {{ between = {{ 0.{month} {last}.{month} }} "
         f"temperature = {{ 15.0 20.0 }} no_phenomenon = 1.0 }}"
         for month, last in enumerate(MONTH_LAST_DAY)
     )
-    for region, mask in [(1, land), (2, ~land)]:
+    # Lakes belong to the land region, as every stock lake does (56 land regions hold
+    # them, no naval one).
+    regions = [(1, kind != SEA), (2, kind == SEA)]
+    for region, mask in regions:
         listed = (np.flatnonzero(mask) + 1).tolist()
         # A sea region takes its provincial terrain from the region, not definition.csv.
         naval = "" if region == 1 else "naval_terrain = water_shallow_sea "
@@ -444,17 +632,19 @@ def generate(
     # Weather objects belong over their own region, so each one is anchored on provinces
     # that region actually contains.
     positions = []
-    for region, mask in [(1, land), (2, ~land)]:
+    for region, mask in regions:
         listed = (np.flatnonzero(mask) + 1).tolist()
         chosen = [listed[len(listed) // 4], listed[3 * len(listed) // 4]]
-        for kind in ["small", "big"]:
+        for size in ["small", "big"]:
             for province in chosen:
-                x, y = points[province - 1]
-                positions.append(f"{region};{x}.00;10.00;{height - y}.00;{kind}")
+                x, y = anchor[province - 1]
+                positions.append(
+                    f"{region};{x}.00;{ground_y(province, x, y)};{height - y}.00;{size}"
+                )
     write("map/weatherpositions.txt", "\n".join(positions) + "\n")
 
-    left_land = (np.flatnonzero(land[:half_count]) + 1).tolist()
-    right_land = [i + half_count for i in left_land]
+    left_land = (np.flatnonzero(owner == BLUE) + 1).tolist()
+    right_land = [(i + half_count - 1) % total_provinces + 1 for i in left_land]
     state_width, state_height = land_columns // state_columns, land_rows // state_rows
     states_per_country = state_columns * state_rows
     # One division per row of the border column, so a side actually holds its own front
@@ -473,6 +663,21 @@ def generate(
         row = index % rows - row0
         return (column // state_width) * state_rows + row // state_height
 
+    # A traded province joins the state of its new owner's nearest own province, and its
+    # twin the twin of that state.
+    joined_state = {}
+    for cell in traded:
+        gained = half_count + cell + 1
+        home = min(
+            (i for i in left_land if i <= half_count),
+            key=lambda i: np.linalg.norm(anchor[i - 1] - anchor[gained - 1]),
+        )
+        joined_state[gained] = state_cell(home)
+        joined_state[cell + 1] = state_cell(home)
+
+    def state_of(province, half):
+        return half * states_per_country + joined_state.get(province, state_cell(province)) + 1
+
     states, state_owner, capitals, capital_states, victory_points = {}, {}, [], [], {}
     for half, (tag, province_list) in enumerate([("BLU", left_land), ("RED", right_land)]):
         if (land_columns, land_rows) != (full_columns, full_rows):
@@ -485,20 +690,31 @@ def generate(
         # The border column: one province per land row, nearest the vertical seam. The
         # starting divisions stand here, and the harness puts every victory point here
         # too, so it is computed once and shared.
-        border = sorted(province_list, key=lambda i: abs(points[i - 1, 0] - width / 2))[
-            :divisions_per_country
-        ]
-        capital = (
-            min(border, key=lambda i: abs(points[i - 1, 1] - height / 2))
-            if victory_points_on_border
-            else min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - centre))
-        )
+        by_seam = sorted(province_list, key=lambda i: abs(anchor[i - 1, 0] - width / 2))
+        if design:
+            # The provinces that touch the enemy, nearest the seam first, so a bent
+            # border is held along its bends.
+            mine = set(province_list)
+            touching = [
+                i for i in by_seam if any(land[j - 1] and j not in mine for j in neighbours[i])
+            ]
+            by_seam = touching + [i for i in by_seam if i not in touching]
+        border = by_seam[:divisions_per_country]
+        # A design's cities are its own, capital first; the plain arena's capital is the
+        # province nearest the middle of the country.
+        towns = [c + 1 + half * half_count for c in city_cells]
+        if victory_points_on_border:
+            capital = min(border, key=lambda i: abs(anchor[i - 1, 1] - height / 2))
+        elif towns:
+            capital = towns[0]
+        else:
+            capital = min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - centre))
         capitals.append(capital)
         for province in province_list:
-            state = half * states_per_country + state_cell(province) + 1
+            state = state_of(province, half)
             states.setdefault(state, []).append(province)
             state_owner[state] = tag
-        capital_states.append(half * states_per_country + state_cell(capital) + 1)
+        capital_states.append(state_of(capital, half))
         # Victory points are not the surrender threshold. A measured match gave Red a
         # single border province carrying all 35 of them; Blue took it on 13 January
         # and Red had not capitulated by May 1940. Surrender is occupation.
@@ -508,6 +724,8 @@ def generate(
         # measurement that separated the two.
         if victory_points_on_border:
             outposts = []
+        elif towns:
+            outposts = towns[1:]
         else:
             spread = sorted(
                 province_list,
@@ -665,19 +883,27 @@ def generate(
             for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
         ),
     )
-    # Ordinary supply hubs and rail lines following actual bitmap adjacency.
+    # Ordinary supply hubs and rail lines following actual bitmap adjacency. On a preset
+    # the lines also cross the border, as they do on the stock map. A hub supplies only
+    # while a railway joins it to its holder's capital, and nobody in the arena can build
+    # one, so without them a captured hub never served its captor: on the first terrain
+    # arena Blue took three states and then stood for four years, five provinces short
+    # of Red's capital, against a single Red division.
     rails = [
         f"1 2 {a} {b}"
         for a, sides in sorted(neighbours.items())
         for b in sorted(sides)
-        if a < b and land[a - 1] and land[b - 1] and (a <= half_count) == (b <= half_count)
+        if a < b
+        and land[a - 1]
+        and land[b - 1]
+        and (design is not None or owner[a - 1] == owner[b - 1])
     ]
     write("map/railways.txt", "\n".join(rails) + "\n")
 
     def state_centre(province_list):
         """The province nearest the middle of a state, used to anchor its hub and slots."""
-        middle = points[np.array(province_list) - 1].mean(axis=0)
-        return min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - middle))
+        middle = anchor[np.array(province_list) - 1].mean(axis=0)
+        return min(province_list, key=lambda i: np.linalg.norm(anchor[i - 1] - middle))
 
     centres = {state: state_centre(listed) for state, listed in states.items()}
     # A hub in every state rather than one per country. Supply flow falls off per province
@@ -691,21 +917,23 @@ def generate(
     # position for leaves it holding province 0, which is the null province.
     buildings = []
     for state, province_list in sorted(states.items()):
-        cx, cy = points[centres[state] - 1]
-        for kind, slots in STATE_BUILDINGS.items():
+        cx, cy = anchor[centres[state] - 1]
+        cz = ground_y(centres[state], cx, cy)
+        for building, slots in STATE_BUILDINGS.items():
             for slot in range(slots):
                 buildings.append(
-                    f"{state};{kind};{cx + slot * 2}.00;10.00;{height - cy + slot * 2}.00;0.00;0"
+                    f"{state};{building};{cx + slot * 2}.00;{cz};{height - cy + slot * 2}.00;0.00;0"
                 )
         if any(coastal[i] for i in province_list):
-            buildings.append(f"{state};dockyard;{cx}.00;10.00;{height - cy}.00;0.00;0")
+            buildings.append(f"{state};dockyard;{cx}.00;{cz};{height - cy}.00;0.00;0")
         for i in province_list:
-            x, y = points[i - 1]
-            for kind in PROVINCE_BUILDINGS:
-                buildings.append(f"{state};{kind};{x}.00;10.00;{height - y}.00;0.00;0")
-            for kind in COASTAL_BUILDINGS if coastal[i] else ():
-                port = ports[i] if kind in PORT_BUILDINGS else 0
-                buildings.append(f"{state};{kind};{x}.00;10.00;{height - y}.00;0.00;{port}")
+            x, y = anchor[i - 1]
+            z = ground_y(i, x, y)
+            for building in PROVINCE_BUILDINGS:
+                buildings.append(f"{state};{building};{x}.00;{z};{height - y}.00;0.00;0")
+            for building in COASTAL_BUILDINGS if coastal[i] else ():
+                port = ports[i] if building in PORT_BUILDINGS else 0
+                buildings.append(f"{state};{building};{x}.00;{z};{height - y}.00;0.00;{port}")
     write("map/buildings.txt", "\n".join(buildings) + "\n")
     write(
         "common/national_focus/arena.txt",
@@ -782,16 +1010,18 @@ def generate(
     # what they need. Training may read it (a win predictor that sees the true state,
     # perception checked against what is really on the map); the agent never does, and a
     # vanilla lobby has no mod. At speed 5 a day passes in about 0.4 s.
-    ids = sorted(states)
+    state_ids = sorted(states)
     daily = (
-        "".join(f" set_temp_variable = {{ arena_d{s} = num_armies_in_state@{s} }}" for s in ids)
+        "".join(
+            f" set_temp_variable = {{ arena_d{s} = num_armies_in_state@{s} }}" for s in state_ids
+        )
         + " set_temp_variable = { arena_rifles = num_equipment_in_armies_k@infantry_equipment }"
         " set_temp_variable = { arena_needed = num_target_equipment_in_armies_k@infantry_equipment }"
         ' log = "ARENA day [GetDateText] [ROOT.GetTag] states [?num_controlled_states] owned'
         " [?num_owned_controlled_states] divisions [?num_divisions] surrender"
         " [?surrender_progress] strength [?enemies_strength_ratio] casualties [?casualties_k]"
         " manpower [?manpower_k] deployed [?deployed_army_manpower_k] rifles [?arena_rifles]"
-        " needed [?arena_needed] at" + "".join(f" {s}=[?arena_d{s}]" for s in ids) + '"'
+        " needed [?arena_needed] at" + "".join(f" {s}=[?arena_d{s}]" for s in state_ids) + '"'
     )
     write(
         "common/on_actions/arena.txt",
@@ -816,8 +1046,8 @@ def generate(
     # from the tag renders a raw key, starting with the name of the war.
     localisation = [
         "l_english:",
-        ' ARENA_BOOKMARK:0 "Infantry Arena"',
-        ' ARENA_DESC:0 "Equal infantry armies. Multiple routes. Normal supply and fog of war."',
+        f' ARENA_BOOKMARK:0 "{f"Arena: {design.title}" if design else "Infantry Arena"}"',
+        f' ARENA_DESC:0 "{design.summary if design else DESCRIPTION}"',
         ' ARENA_BLU_HISTORY:0 "Blue holds the western half of the arena."',
         ' ARENA_RED_HISTORY:0 "Red holds the eastern half of the arena."',
         ' ARENA_REGION_1:0 "Arena"',
@@ -851,12 +1081,18 @@ def generate(
                 for n in range(1, GENERALS_PER_COUNTRY + 1)
             ),
         ]
+    write("localisation/english/arena_l_english.yml", "\n".join(localisation) + "\n")
+    # A victory point is named by VICTORY_POINTS_<province>, and the stock file names
+    # thousands of stock provinces that way: on the first terrain arena Blue's capital,
+    # province 564, showed as Kassel. Keys in the replace folder load last and win.
+    labels = ["l_english:"]
     for tag, listed in victory_points.items():
         side = "West" if tag == "BLU" else "East"
         for order, province in enumerate(listed):
-            label = f"{side} Capital" if order == 0 else f"{side} Outpost {order}"
-            localisation.append(f' VICTORY_POINTS_{province}:0 "{label}"')
-    write("localisation/english/arena_l_english.yml", "\n".join(localisation) + "\n")
+            town = "City" if design else "Outpost"
+            label = f"{side} Capital" if order == 0 else f"{side} {town} {order}"
+            labels.append(f' VICTORY_POINTS_{province}:0 "{label}"')
+    write(VICTORY_POINT_NAMES, "\n".join(labels) + "\n")
     replacements = [
         # The stock tutorial hard-codes state 550 and provinces 5010, 5091 and 12766, and
         # the in-game hint loader resolves them at match start whether or not anyone asked
@@ -891,6 +1127,17 @@ def generate(
     (root.with_suffix(".mod")).write_text(
         descriptor + f'path = "{root.as_posix()}"\n', newline="\r\n"
     )
+    # Which state lies where, sampled on a grid over the land's bounding box: the
+    # scripted player reads the land box off the screen and names the state under a point
+    # by it (scripted.state_at), so a bent border names its bulges right.
+    lookup = np.zeros(total_provinces + 1, np.int16)
+    for state, listed in states.items():
+        lookup[listed] = state
+    ys, xs = np.nonzero(ground)
+    box = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+    across = (box[0] + (np.arange(LAYOUT[0]) + 0.5) * (box[2] - box[0]) / LAYOUT[0]).astype(int)
+    down = (box[1] + (np.arange(LAYOUT[1]) + 0.5) * (box[3] - box[1]) / LAYOUT[1]).astype(int)
+    grid = lookup[ids[down][:, across]]
     report = {
         "width": width,
         "height": height,
@@ -911,9 +1158,28 @@ def generate(
         "coastal_land_provinces": sum(1 for i in neighbours if land[i - 1] and coastal[i]),
         "victory_points_per_country": len(victory_points["BLU"]),
         "rotational_mirror": True,
+        "preset": preset,
+        "layout": {"box": box, "states": [" ".join(map(str, row)) for row in grid.tolist()]},
         "gameplay_verified": False,
         "engine_load_verified": False,
     }
+    if design:
+        # What the design came out as, measured on the written map, one side's worth.
+        blue = [i for i in range(1, half_count + 1) if land[i - 1]]
+        report["design"] = {
+            "title": design.title,
+            "seed": design.seed,
+            "terrain": {
+                name: sum(1 for i in blue if terrain_types[i - 1] == name)
+                for name in arenas.LAND_TYPES
+            },
+            "lakes": int((kind[:half_count] == LAKE).sum()),
+            "bays": len(design.bays),
+            "traded": len(traded),
+            "rivers": len(river_paths) // 2,
+            "river_pixels": sum(len(path) for path, _ in river_paths) // 2,
+            "cities": [c + 1 for c in city_cells],
+        }
     write("generation.json", json.dumps(report, indent=2))
     return report
 
@@ -927,6 +1193,132 @@ def _dds_size(path):
     header = path.open("rb").read(20)
     rows, columns = struct.unpack_from("<II", header, 12)
     return columns, rows
+
+
+def _audit_pixels(root, rows, graphical, heights):
+    """What the bitmaps say against definition.csv: one piece per province and no
+    four-way corners, terrain that agrees, dry land and wet water, rivers the engine can
+    trace and that are crossed, and, for a preset, an exact half-turn mirror."""
+    problems = []
+    ids, _ = _province_ids(root)
+    count = max(int(r[0]) for r in rows)
+    kinds = np.array(["land"] + [r[4] for r in rows[1:]])
+    terrains = np.array(["unknown"] + [r[6] for r in rows[1:]])
+    # A province in two pieces is two places with one name.
+    split = [
+        i
+        for i, box in enumerate(ndimage.find_objects(ids), 1)
+        if box is not None and ndimage.label(ids[box] == i)[1] > 1
+    ]
+    if split:
+        problems.append(f"{len(split)} provinces are in more than one piece, first {split[0]}")
+    wrapped = np.concatenate([ids, ids[:, :1]], axis=1)
+    a, b, c, d = wrapped[:-1, :-1], wrapped[:-1, 1:], wrapped[1:, :-1], wrapped[1:, 1:]
+    corners = int(((a != b) & (a != c) & (a != d) & (b != c) & (b != d) & (c != d)).sum())
+    if corners:
+        problems.append(f"{corners} pixel corners where four provinces meet")
+    # The terrain a province is painted with must be the terrain definition.csv gives it:
+    # the painted majority, as on the stock map, where 81% of a plains province is grass.
+    types = np.array([arenas.GRAPHICAL_TYPE.get(k, "unknown") for k in range(256)])
+    shown = types[graphical]
+    order = np.argsort(ids, axis=None)
+    bounds = np.searchsorted(ids.ravel()[order], np.arange(count + 2))
+    disagree = []
+    for i in range(1, count + 1):
+        if kinds[i] != "land":
+            continue
+        pixels = shown.ravel()[order[bounds[i] : bounds[i + 1]]]
+        names, votes = np.unique(pixels, return_counts=True)
+        if names[votes.argmax()] != terrains[i]:
+            disagree.append(i)
+    if disagree:
+        problems.append(
+            f"{len(disagree)} land provinces are painted another terrain than definition.csv "
+            f"gives them, first {disagree[0]}"
+        )
+    wet = kinds[ids] != "land"
+    if wet.any() and np.median(heights[wet]) >= arenas.SEA_LEVEL:
+        problems.append("water sits above sea level")
+    flooded = []
+    for i in range(1, count + 1):
+        if kinds[i] == "land":
+            if np.median(heights.ravel()[order[bounds[i] : bounds[i + 1]]]) <= arenas.SEA_LEVEL:
+                flooded.append(i)
+    if flooded:
+        problems.append(f"{len(flooded)} land provinces lie below sea level, first {flooded[0]}")
+    problems += _audit_rivers(np.array(Image.open(root / "map/rivers.bmp")), ids, wet)
+    report = root / "generation.json"
+    if report.exists() and json.loads(report.read_text()).get("preset"):
+        half = count // 2
+        mirrored = (ids[::-1, ::-1] + half - 1) % count + 1
+        if (mirrored != ids).any():
+            problems.append(f"{int((mirrored != ids).sum())} province pixels break the mirror")
+        for name in ("terrain.bmp", "rivers.bmp", "heightmap.bmp", "trees.bmp", "cities.bmp"):
+            pixels = np.array(Image.open(root / "map" / name))
+            if (pixels != pixels[::-1, ::-1]).any():
+                problems.append(f"{name} is not the same turned round")
+        twins = (np.arange(1, count + 1) + half - 1) % count + 1
+        if (terrains[1:] != terrains[twins]).any() or (kinds[1:] != kinds[twins]).any():
+            problems.append("definition.csv gives a province another terrain than its twin")
+        # A mirror made by copying one half's turn onto the other is exact but can leave
+        # a seam where the halves meet: a 42-byte cliff ran down the middle of the first
+        # mountain arena. The step across the middle must look like the steps beside it.
+        middle = heights.shape[1] // 2
+        across = np.abs(heights[:, middle] - heights[:, middle - 1]).mean()
+        beside = np.abs(np.diff(heights[:, middle - 4 : middle + 4], axis=1)).mean()
+        if across > 2 * beside + 0.5:
+            problems.append(f"the heightmap has a seam down the middle ({across:.1f} bytes)")
+    return problems
+
+
+def _audit_rivers(rivers, ids, wet):
+    """Rivers the engine can trace, and that are crossed where they run.
+
+    The engine follows a river from its source pixel (index 0) through edge-sharing
+    pixels, so each river needs a source at a free end, must not meet another except at
+    a join pixel (index 1), and must never touch one only at a corner. A river is only
+    crossed where it runs along a border, which is where 86% of stock river pixels are.
+    """
+    problems = []
+    allowed = set(range(12)) | {arenas.RIVER_WATER, arenas.RIVER_LAND}
+    stray = set(np.unique(rivers).tolist()) - allowed
+    if stray:
+        problems.append(f"rivers.bmp uses indices outside the stock palette: {sorted(stray)}")
+    river = rivers <= 11
+    if not river.any():
+        return problems
+    if (river & wet).any():
+        problems.append(f"{int((river & wet).sum())} river pixels lie on water")
+    edge = np.zeros_like(river)
+    edge[:-1] |= ids[:-1] != ids[1:]
+    edge[1:] |= ids[:-1] != ids[1:]
+    edge[:, :-1] |= ids[:, :-1] != ids[:, 1:]
+    edge[:, 1:] |= ids[:, :-1] != ids[:, 1:]
+    inland = int((river & ~edge).sum())
+    if inland:
+        problems.append(f"{inland} river pixels are inside a province, where none is crossed")
+    padded = np.pad(river, 1)
+    around = (
+        padded[:-2, 1:-1].astype(np.int8) + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:]
+    )
+    sources = rivers == arenas.RIVER_SOURCE
+    if (sources & (around != 1)).any():
+        problems.append("a river source is not at the free end of its river")
+    if ((rivers == arenas.RIVER_JOIN) & (around != 2)).any():
+        problems.append("a join pixel does not sit between its river and the one it joins")
+    if (river & (around > 3)).any():
+        problems.append("rivers cross or split where the engine cannot trace them")
+    # Two river pixels meeting only at a corner, with neither pixel between them a river.
+    down_right = river[:-1, :-1] & river[1:, 1:] & ~river[:-1, 1:] & ~river[1:, :-1]
+    down_left = river[:-1, 1:] & river[1:, :-1] & ~river[:-1, :-1] & ~river[1:, 1:]
+    corner = int(down_right.sum() + down_left.sum())
+    if corner:
+        problems.append(f"{corner} river pixels touch only at a corner")
+    labels, found = ndimage.label(river)
+    unsourced = found - len(set(np.unique(labels[sources]).tolist()) - {0})
+    if unsourced:
+        problems.append(f"{unsourced} rivers have no source pixel, so they are never drawn")
+    return problems
 
 
 def audit(root):
@@ -981,10 +1373,12 @@ def audit(root):
             cells = row.split(";")
             stacks.setdefault(int(cells[0]), set()).add(int(cells[1]))
     check("unitstacks.txt", stacks)
+    # Lakes carry no anchors, as in the stock file: nothing stands on one.
     bare = [
         p
         for p in sorted(valid)
-        if not set(LAND_STACKS if kind[p] == "land" else SEA_STACKS) <= stacks.get(p, set())
+        if kind[p] != "lake"
+        and not set(LAND_STACKS if kind[p] == "land" else SEA_STACKS) <= stacks.get(p, set())
     ]
     if bare:
         problems.append(f"{len(bare)} provinces lack counter anchors, first {bare[0]}")
@@ -1088,14 +1482,16 @@ def audit(root):
     wanted = tuple(side * TREES_NUMERATOR // TREES_DENOMINATOR for side in provinces)
     if trees != wanted:
         problems.append(f"trees.bmp is {trees}, but the engine fixes it at 75/256: {wanted}")
-    painted = set(np.unique(np.array(Image.open(root / "map/terrain.bmp"))).tolist())
-    stray = painted - set(TERRAIN_INDEX.values()) - {OCEAN_INDEX}
+    graphical = np.array(Image.open(root / "map/terrain.bmp"))
+    painted = set(np.unique(graphical).tolist())
+    stray = painted - set(arenas.GRAPHICAL_TYPE)
     if stray:
         problems.append(f"terrain.bmp paints unintended palette indices {sorted(stray)}")
     heights = np.array(Image.open(root / "map/heightmap.bmp")).astype(np.int16)
     step = max(np.abs(np.diff(heights, axis=0)).max(), np.abs(np.diff(heights, axis=1)).max())
     if step > 48:
         problems.append(f"heightmap has a {step}-byte neighbour step, steeper than any stock coast")
+    problems += _audit_pixels(root, rows, graphical, heights)
     for name, divisor in [
         ("map/terrain/colormap_rgb_cityemissivemask_a.dds", 2),
         ("map/terrain/fow_rgb_waterspec_a.dds", 2),
@@ -1137,6 +1533,8 @@ def audit(root):
     names = root / "common/names/01_arena_names.txt"
     characters = root / "common/characters/arena.txt"
     localised = (root / "localisation/english/arena_l_english.yml").read_text(encoding="utf-8-sig")
+    replaced = root / VICTORY_POINT_NAMES
+    replaced = replaced.read_text(encoding="utf-8-sig") if replaced.exists() else ""
     for index, tag in enumerate(tags):
         if not names.exists() or not re.search(rf"^{tag}\s*=\s*{{", names.read_text(), re.M):
             problems.append(
@@ -1166,6 +1564,158 @@ def audit(root):
     for state, listed in sorted(states.items()):
         text = (root / f"history/states/{state}-arena.txt").read_text()
         for province in re.findall(r"victory_points\s*=\s*\{\s*(\d+)", text):
-            if f" VICTORY_POINTS_{province}:" not in localised:
+            # Named in the replace folder, or the stock name of that province id wins.
+            if f" VICTORY_POINTS_{province}:" not in replaced:
                 problems.append(f"victory point {province} has no name, so a stock name shows")
     return {"provinces": count, "states": len(states), "problems": problems}
+
+
+# Preview colours for each province terrain type, lit by the heightmap.
+PREVIEW_COLOUR = {
+    "plains": (178, 196, 120),
+    "forest": (72, 122, 64),
+    "hills": (196, 178, 118),
+    "mountain": (150, 136, 120),
+    "marsh": (104, 150, 130),
+    "urban": (96, 92, 92),
+    "ocean": (58, 88, 138),
+    "lakes": (74, 116, 170),
+}
+
+
+def _province_ids(root):
+    """The province id of every pixel, read back through definition.csv's colours."""
+    rows = [r.split(";") for r in (root / "map/definition.csv").read_text().splitlines() if r]
+    lookup = {(int(r[1]) << 16) | (int(r[2]) << 8) | int(r[3]): int(r[0]) for r in rows}
+    pixels = np.asarray(Image.open(root / "map/provinces.bmp").convert("RGB")).astype(np.int64)
+    packed = (pixels[..., 0] << 16) | (pixels[..., 1] << 8) | pixels[..., 2]
+    keys = np.array(sorted(lookup))
+    values = np.array([lookup[k] for k in keys])
+    found = np.clip(np.searchsorted(keys, packed), 0, len(keys) - 1)
+    return np.where(keys[found] == packed, values[found], 0), rows
+
+
+def preview(root, output, width=1800):
+    """Draw an arena as the files describe it: terrain lit by the relief, rivers, lakes,
+    state and country borders, victory points and the starting divisions."""
+    from PIL import ImageDraw, ImageFont
+
+    root, output = Path(root), Path(output)
+    ids, rows = _province_ids(root)
+    count = max(int(r[0]) for r in rows)
+    terrain = ["ocean"] * (count + 1)
+    for r in rows[1:]:
+        terrain[int(r[0])] = r[6] if r[4] != "sea" else "ocean"
+    land = np.array([t not in ("ocean", "lakes") for t in terrain])
+    ys, xs = np.nonzero(land[ids])
+    margin = 70
+    y0, y1 = max(ys.min() - margin, 0), min(ys.max() + margin, ids.shape[0])
+    x0, x1 = max(xs.min() - margin, 0), min(xs.max() + margin, ids.shape[1])
+    crop = ids[y0:y1, x0:x1]
+    palette = np.array([PREVIEW_COLOUR.get(t, (255, 0, 255)) for t in terrain], np.float32)
+    image = palette[crop]
+    # Farmland reads lighter than grass, as it does in the game's own texture.
+    graphical = np.asarray(Image.open(root / "map/terrain.bmp"))[y0:y1, x0:x1]
+    image[graphical == arenas.FARMLAND] *= 1.08
+    heights = np.asarray(Image.open(root / "map/heightmap.bmp")).astype(np.float32)[y0:y1, x0:x1]
+    gy, gx = np.gradient(ndimage.gaussian_filter(heights, 1.5))
+    shade = np.clip(1 + 0.09 * (-gx - gy), 0.55, 1.35)
+    lift = np.clip((heights - 100) / 160, 0, 0.35)
+    image = image * shade[..., None] * (1 + lift[..., None])
+    # States and owners, from the history files.
+    owner_of, state_of = {}, {}
+    for path in sorted((root / "history/states").glob("*.txt")):
+        text = path.read_text()
+        state = int(re.search(r"id\s*=\s*(\d+)", text).group(1))
+        owner = re.search(r"owner\s*=\s*(\w+)", text).group(1)
+        for province in _block(text, "provinces"):
+            owner_of[province], state_of[province] = owner, state
+    owners = np.zeros(count + 1, np.int8)
+    states = np.zeros(count + 1, np.int32)
+    for province, tag in owner_of.items():
+        owners[province] = 1 if tag == "BLU" else 2
+        states[province] = state_of[province]
+    own = owners[crop]
+    tint = np.zeros_like(image)
+    tint[own == 1] = (40, 100, 220)
+    tint[own == 2] = (220, 60, 60)
+    image = np.where((own > 0)[..., None], 0.8 * image + 0.2 * tint, image)
+
+    def edges(labels):
+        found = np.zeros(labels.shape, bool)
+        found[:-1] |= labels[:-1] != labels[1:]
+        found[:, :-1] |= labels[:, :-1] != labels[:, 1:]
+        return found
+
+    image[edges(crop)] *= 0.82
+    state_edge = ndimage.binary_dilation(edges(states[crop]) & (states[crop] > 0))
+    image[state_edge] = image[state_edge] * 0.35
+    country = ndimage.binary_dilation(edges(own) & (own > 0), iterations=2)
+    image[country] = (20, 20, 20)
+    rivers = np.asarray(Image.open(root / "map/rivers.bmp"))[y0:y1, x0:x1]
+    river = rivers <= 11
+    # Large rivers (indices 7 to 11, -60% to attack across) drawn twice as wide.
+    wide = ndimage.binary_dilation(river & (rivers >= 7), iterations=2)
+    image[ndimage.binary_dilation(river) | wide] = (40, 90, 200)
+    image[ndimage.binary_dilation(rivers == arenas.RIVER_SOURCE, iterations=3)] = (40, 200, 60)
+    picture = Image.fromarray(np.clip(image, 0, 255).astype(np.uint8))
+    scale = width / picture.width
+    picture = picture.resize((width, round(picture.height * scale)), Image.LANCZOS)
+    draw = ImageDraw.Draw(picture)
+    try:
+        font = ImageFont.truetype("arial.ttf", 20)
+        title_font = ImageFont.truetype("arialbd.ttf", 30)
+    except OSError:
+        font = title_font = ImageFont.load_default()
+    anchors = {}
+    for line in (root / "map/unitstacks.txt").read_text().splitlines():
+        cells = line.split(";")
+        if len(cells) > 4 and cells[1] == "38":
+            anchors[int(cells[0])] = (float(cells[2]), ids.shape[0] - float(cells[4]))
+
+    def at(province):
+        x, y = anchors[province]
+        return (x - x0) * scale, (y - y0) * scale
+
+    for path in sorted((root / "history/units").glob("*.txt")):
+        for province in re.findall(r"location\s*=\s*(\d+)", path.read_text()):
+            x, y = at(int(province))
+            draw.rectangle((x - 9, y - 6, x + 9, y + 6), fill=(30, 30, 30), outline=(240, 240, 240))
+    for path in sorted((root / "history/states").glob("*.txt")):
+        for province, value in re.findall(
+            r"victory_points\s*=\s*\{\s*(\d+)\s+(\d+)", path.read_text()
+        ):
+            x, y = at(int(province))
+            radius = 13 if int(value) >= 20 else 9
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=(250, 220, 60),
+                outline=(20, 20, 20),
+                width=2,
+            )
+            draw.text(
+                (x + radius + 3, y - 11),
+                value,
+                fill=(255, 255, 255),
+                font=font,
+                stroke_width=2,
+                stroke_fill=(0, 0, 0),
+            )
+    report = root / "generation.json"
+    title = root.name
+    if report.exists():
+        found = json.loads(report.read_text())
+        design = found.get("design")
+        if design:
+            title = f"{root.name}: {design['title']}"
+    draw.text(
+        (16, 12),
+        title,
+        fill=(255, 255, 255),
+        font=title_font,
+        stroke_width=3,
+        stroke_fill=(0, 0, 0),
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    picture.save(output)
+    return {"preview": str(output), "size": picture.size}

@@ -1,4 +1,5 @@
 import random
+import sys
 
 import numpy as np
 import pytest
@@ -104,3 +105,244 @@ def test_each_speed_is_played_as_both_countries_and_the_pcs_are_out_of_step():
     peer = [ai_games.game_plan("peer", i, [4, 5]) for i in range(4)]
     assert here == [("BLU", 4), ("RED", 4), ("BLU", 5), ("RED", 5)]
     assert peer == [("RED", 4), ("BLU", 4), ("RED", 5), ("BLU", 5)]
+
+
+def test_each_arena_in_turn_is_played_as_both_countries():
+    mods = ["a", "b"]
+    games = [
+        (ai_games.game_arena(mods, i), ai_games.game_plan("here", i, [5])[0]) for i in range(8)
+    ]
+    assert games[:4] == [("a", "BLU"), ("a", "RED"), ("b", "BLU"), ("b", "RED")]
+    assert games[4:] == games[:4]
+    # Accepted arenas take turns in every other pair; the main arena keeps half.
+    arenas = [ai_games.game_arena(["v4"], i, ["x", "y"]) for i in range(12)]
+    assert arenas == ["v4", "v4", "x", "x", "v4", "v4", "y", "y", "v4", "v4", "x", "x"]
+    latest = ai_games.latest_versions(["m/arena-plains-v1", "m/arena-bay-v2", "m/arena-plains-v2"])
+    assert latest == ["m/arena-bay-v2", "m/arena-plains-v2"]
+
+
+def test_an_arena_request_is_claimed_once_answered_and_accepted_once(tmp_path):
+    import json
+    import os
+
+    queue = tmp_path / "arenas" / "queue"
+    queue.mkdir(parents=True)
+    (queue / "wide.json").write_text(json.dumps({"mod": "D:/mods/arena-wide"}))
+    (queue / "broken.json").write_text("{")
+    for path in queue.iterdir():
+        os.utime(path, (1, 1))  # Long since written.
+    request = ai_games.take_request(queue, "here")
+    assert request["name"] == "wide" and request["mod"] == "D:/mods/arena-wide"
+    assert request["claimed"].name == f"wide.here-{os.getpid()}.taken"
+    assert request["claimed"].exists()
+    # The other station finds nothing left, and a broken request is answered, not played.
+    assert ai_games.take_request(queue, "peer") is None
+    answered = json.loads((tmp_path / "arenas" / "results" / "broken.json").read_text())
+    assert answered["accepted"] is False and "bad request" in answered["error"]
+    assert not (queue / "broken.json").exists()
+    # A request still being written waits.
+    (queue / "fresh.json").write_text("{")
+    assert ai_games.take_request(queue, "here") is None and (queue / "fresh.json").exists()
+    for _ in range(2):
+        ai_games.accept_arena(queue, "D:/mods/arena-wide")
+    assert ai_games.accepted_arenas(queue) == ["D:/mods/arena-wide"]
+
+
+def test_an_arena_passes_only_if_it_loads_starts_and_is_played_out(tmp_path):
+    request = {"name": "wide", "mod": "D:/mods/arena-wide"}
+    entry = {"station": "here", "started_as": "RED", "winner": "BLU", "seconds": 300}
+    stages = {"loaded": True, "started": True, "shots": {"start": tmp_path / "start.png"}}
+    result = ai_games.test_result(request, entry, tmp_path, stages)
+    assert result["accepted"] and result["outcome"] == "BLU"
+    assert result["screenshots"] == {"start": str(tmp_path / "start.png")}
+    failed = {**entry, "winner": "timeout", "reason": "RuntimeError: the scripted player's setup"}
+    assert not ai_games.test_result(request, failed, tmp_path, stages)["accepted"]
+    unstarted = {"station": "here", "started_as": "RED", "error": "RuntimeError: no map"}
+    stages = {"loaded": True, "started": False, "shots": {}}
+    result = ai_games.test_result(request, unstarted, tmp_path, stages)
+    assert not result["accepted"] and result["error"] == "RuntimeError: no map"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows'")
+def test_an_arena_kept_elsewhere_is_linked_into_the_mods_folder(tmp_path):
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    source = tmp_path / "elsewhere" / "arena-wide"
+    source.mkdir(parents=True)
+    (source / "descriptor.mod").write_text('name = "wide"')
+    ai_games.local_mod(source, mods)
+    assert (mods / "arena-wide" / "descriptor.mod").read_text() == 'name = "wide"'
+    ai_games.local_mod(source, mods)  # Linked already: nothing to do.
+    other = tmp_path / "other" / "arena-wide"
+    other.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="already called arena-wide"):
+        ai_games.local_mod(other, mods)
+
+
+def test_the_second_pc_is_lent_out_until_the_evaluation_is_done(tmp_path):
+    import json
+    import os
+    from unittest.mock import Mock
+
+    root = tmp_path / "eval"
+    (root / "queue").mkdir(parents=True)
+    (root / "queue" / "bc-v3.json").write_text(json.dumps({"minutes": 20}))
+    os.utime(root / "queue" / "bc-v3.json", (1, 1))
+    reservation = ai_games.take_reservation(root)
+    assert reservation["name"] == "bc-v3" and reservation["minutes"] == 20
+    assert ai_games.take_reservation(root) is None
+    station = Mock()
+    station.name = "peer"
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] >= 600:  # The evaluation ends after ten minutes.
+            (root / "done").mkdir(exist_ok=True)
+            (root / "done" / "bc-v3.json").write_text("{}")
+
+    assert ai_games.lend(station, root, reservation, clock=lambda: clock[0], sleep=sleep)
+    station.quit.assert_called_once()
+    assert json.loads((root / "granted" / "bc-v3.json").read_text())["minutes"] == 20
+    assert 600 <= clock[0] < 620 and not reservation["claimed"].exists()
+    # One that never says it is done gets the PC for its minutes and 15 more.
+    (root / "queue" / "slow.json").write_text(json.dumps({"minutes": 5}))
+    os.utime(root / "queue" / "slow.json", (1, 1))
+    clock[0] = 0.0
+    slow = ai_games.take_reservation(root)
+    assert not ai_games.lend(
+        station,
+        root,
+        slow,
+        clock=lambda: clock[0],
+        sleep=lambda s: None or clock.__setitem__(0, clock[0] + s),
+    )
+    assert clock[0] >= 20 * 60
+
+
+def test_start_saves_are_named_per_arena_and_side():
+    saves = ai_games.parse_saves(["arena-12x8-v4:BLU:arenav4blu", "arena-12x8-v4:RED:arenav4red"])
+    assert saves == {("arena-12x8-v4", "BLU"): "arenav4blu", ("arena-12x8-v4", "RED"): "arenav4red"}
+    with pytest.raises(ValueError):
+        ai_games.parse_saves(["arena-12x8-v4:GRN:x"])
+
+
+def test_the_opening_hours_end_paused_even_if_the_mark_blinks(monkeypatch):
+    from unittest.mock import Mock
+
+    game = {"paused": True, "presses": 0, "looks": 0}
+
+    def fake_act(desk, events, pause=0.15):
+        if any(e.get("vk") == 0x20 and e.get("down") for e in events):
+            game["paused"] = not game["paused"]
+            game["presses"] += 1
+
+    def fake_screen(desk):
+        game["looks"] += 1
+        return game
+
+    rules = Mock()
+    # Paused, but the blinking mark shows only on every third look.
+    rules.matches.side_effect = lambda name, g: g["paused"] and g["looks"] % 3 == 0
+    monkeypatch.setattr(ai_games, "act", fake_act)
+    monkeypatch.setattr(ai_games, "screen", fake_screen)
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    ai_games.run_briefly(None, rules, 1.5)
+    assert game["paused"] and game["presses"] == 2
+
+
+def test_the_country_played_is_read_from_the_flag_at_the_top_left():
+    frame = np.full((1080, 1920, 3), 30, np.uint8)
+    assert ai_games.picked(frame, ai_games.TOP_FLAG) is None
+    x0, y0, x1, y1 = ai_games.TOP_FLAG
+    frame[y0:y1, x0:x1] = (28, 57, 114)  # Blue's flag, measured after loading its save.
+    assert ai_games.picked(frame, ai_games.TOP_FLAG) == "BLU"
+    frame[y0:y1, x0:x1] = (150, 40, 40)
+    assert ai_games.picked(frame, ai_games.TOP_FLAG) == "RED"
+
+
+def test_closeups_zoom_fully_in_over_each_country(monkeypatch, tmp_path):
+    frame = np.full((1080, 1920, 3), 40, np.uint8)
+    frame[300:700, 500:950] = BLUE_LAND
+    frame[300:700, 950:1400] = RED_LAND
+    moves, wheels = [], []
+
+    def fake_act(desk, events, pause=0.15):
+        for e in events:
+            if e["kind"] == "move":
+                moves.append((e["x"], e["y"]))
+            elif e["kind"] == "wheel":
+                wheels.append(e["delta"])
+
+    monkeypatch.setattr(ai_games, "act", fake_act)
+    monkeypatch.setattr(ai_games, "screen", lambda desk: frame)
+    monkeypatch.setattr(ai_games, "recentre", lambda desk: True)
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    shots = ai_games.closeups(None, tmp_path)
+    assert len(shots) == 8 and all(p.exists() for p in shots)
+    assert wheels.count(120) == 8 * ai_games.ZOOM_MAX
+    # Four points in each country's land, and the pointer off the map for each view.
+    points = [m for m in moves if m != (0.65, 0.012)]
+    assert sum(x < 950 / 1920 for x, _ in points) == 4 and len(points) == 8
+
+
+def test_a_claim_whose_recorder_died_is_offered_again(tmp_path):
+    import os
+
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    mine = queue / f"ours.peer-{os.getpid()}.taken"
+    mine.write_text("{}")
+    # A process id that is not running (ids are multiples of 4 on Windows; 3 never is).
+    (queue / "lost.peer-3.taken").write_text('{"minutes": 50}')
+    (queue / "old.taken").write_text("{}")  # Before claims named their process.
+    assert ai_games.reoffer(queue) == ["lost", "old"]
+    assert mine.exists() and (queue / "lost.json").read_text() == '{"minutes": 50}'
+    assert (queue / "old.json").exists()
+    assert ai_games.alive(os.getpid()) and not ai_games.alive(3)
+
+
+def test_a_popup_is_found_at_half_size_and_placed_at_full_size():
+    rng = np.random.default_rng(3)
+    frame = rng.integers(20, 60, (1080, 1920, 3), dtype=np.uint8)
+    # Buttons are drawn in flat blocks, not noise: blocks survive the halving.
+    button = np.kron(rng.integers(60, 255, (6, 24, 3)), np.ones((4, 4, 1))).astype(np.uint8)
+    button = button[:22, :95]
+    frame[611:633, 1301:1396] = button  # At an odd pixel, which halving blurs.
+    popups = Popups([button], rng=random.Random(1), clock=lambda: 10.0)
+    popups.look(frame)
+    (x, y), _ = popups.pending
+    assert abs(x * 1920 - (1301 + 47.5)) < 1 and abs(y * 1080 - (611 + 11)) < 1
+    empty = Popups([button], rng=random.Random(1), clock=lambda: 10.0)
+    empty.look(rng.integers(20, 60, (1080, 1920, 3), dtype=np.uint8))
+    assert empty.pending is None
+
+
+def test_a_start_through_the_menus_is_saved_for_the_next_games(tmp_path):
+    name = ai_games.save_name("D:/mods/arena-marsh-v4", "RED")
+    assert name == "arenamarshv4red"
+    registry = tmp_path / "saves-peer.json"
+    assert ai_games.known_saves(registry) == {}
+    ai_games.remember_save(registry, "arena-marsh-v4", "RED", name)
+    ai_games.remember_save(registry, "arena-marsh-v4", "BLU", "arenamarshv4blu")
+    assert ai_games.known_saves(registry) == {
+        ("arena-marsh-v4", "RED"): "arenamarshv4red",
+        ("arena-marsh-v4", "BLU"): "arenamarshv4blu",
+    }
+
+
+def test_the_map_errors_are_read_from_the_report():
+    report = "\n".join(
+        [
+            "== error.log (09/24/2026 02:00:00)",
+            "[02:00:01][map.cpp:10]: something",
+            "== map errors in error.log: 3",
+            "[02:00:01][map.cpp:10]: MAP_ERROR: province 12 has no terrain",
+            "  map/adjacencies.csv: line 4",
+            "== end of map errors",
+        ]
+    )
+    found = ai_games.parse_map_errors(report)
+    assert found["count"] == 3 and len(found["examples"]) == 2
+    assert found["examples"][0].startswith("[02:00:01]")
+    assert ai_games.parse_map_errors("report:\nnothing") is None
