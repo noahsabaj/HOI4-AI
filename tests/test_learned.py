@@ -528,6 +528,15 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
     assert report["recordings"] == 2 and report["frames"] == 80
     again = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
     assert again["skipped"] == 2 and again["recordings"] == 0, "a finished recording stays"
+    # A drive that would keep too little free sends the recordings to the spill folder.
+    from hoi4_arena.tower_cache import tower_paths
+
+    full = cache_tower(
+        data, checkpoint, tmp_path / "full", device="cpu", spill=tmp_path / "spill",
+        keep_free_gb=1e9,
+    )  # fmt: skip
+    assert full["spilled"] == 2
+    assert tower_paths(tmp_path / "full", "game")["grid"].parent.parent == tmp_path / "spill"
 
     common = {"sources": ("scripted",), "length": 3, "burn_in": 1, "device": "cpu",
               "clips": False, "lead_in": 0, "shuffle": 0}  # fmt: skip

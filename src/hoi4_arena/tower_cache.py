@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -31,6 +32,7 @@ from .dataset import normalize, parse_cursor, views
 from .models import CELLS
 
 GRID_FILE, SUMMARY_FILE, DONE = "tower-grid.npy", "tower-summary.npy", "done.json"
+log = logging.getLogger(__name__)
 
 
 def fingerprint(encoder):
@@ -118,11 +120,24 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
     return count
 
 
-def cache_tower(data, checkpoint, output, *, model_path=None, device=None, sources=None):
+def cache_tower(
+    data,
+    checkpoint,
+    output,
+    *,
+    model_path=None,
+    device=None,
+    sources=None,
+    spill=None,
+    keep_free_gb=30.0,
+):
     """The frozen tower's reading of every frame of every recording in `data`.
 
     The tower is `checkpoint`'s, in the weights training reads (float32, not halved).
-    Recordings already cached for this tower are skipped. Returns what was done.
+    Recordings already cached for this tower are skipped. With `spill`, a recording that
+    would leave less than `keep_free_gb` free on the output's drive goes there instead:
+    the fast drive takes what it can hold, and tower_paths finds the rest. Returns what
+    was done.
     """
     from .models import Policy, build_encoder
 
@@ -136,23 +151,36 @@ def cache_tower(data, checkpoint, output, *, model_path=None, device=None, sourc
     stamp = fingerprint(encoder)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    (output / "tower.json").write_text(json.dumps({"tower": stamp, "checkpoint": str(checkpoint)}))
-    done = skipped = frames = 0
+    note = {"tower": stamp, "checkpoint": str(checkpoint), "spill": str(spill) if spill else None}
+    (output / "tower.json").write_text(json.dumps(note))
+    done = skipped = frames = spilled = 0
     began = time.monotonic()
     for manifest_path in sorted(Path(data).glob("*/manifest.json")):
         manifest = json.loads(manifest_path.read_text())
         if not manifest.get("complete") or (sources and manifest.get("source") not in sources):
             continue
-        target = output / manifest_path.parent.name
-        marker = target / DONE
-        if marker.exists() and json.loads(marker.read_text()).get("tower") == stamp:
+        name = manifest_path.parent.name
+        found = tower_paths(output, name)
+        if found is not None and found.get("tower") == stamp:
             skipped += 1
             continue
+        size = manifest["frames"] * encoder.dim * (CELLS * CELLS + 1) * 2
+        target = output / name
+        if spill and shutil.disk_usage(output).free - size < keep_free_gb * 2**30:
+            target = Path(spill) / name
+            spilled += 1
+        started = time.monotonic()
         frames += cache_recording(encoder, manifest_path.parent, target, device, stamp=stamp)
+        seconds = max(time.monotonic() - started, 1e-6)
+        log.info(
+            "%s: %d frames in %.0f s, %.0f MB/s written to %s",
+            name, manifest["frames"], seconds, size / seconds / 2**20, target.parent,
+        )  # fmt: skip
         done += 1
     return {
         "tower": stamp,
         "recordings": done,
+        "spilled": spilled,
         "skipped": skipped,
         "frames": frames,
         "seconds": round(time.monotonic() - began),
@@ -160,13 +188,23 @@ def cache_tower(data, checkpoint, output, *, model_path=None, device=None, sourc
 
 
 def tower_paths(cache, root):
-    """The cached files of a recording, checked complete; None when it has none."""
-    target = Path(cache) / Path(root).name
-    marker = target / DONE
-    if not marker.exists():
-        return None
-    return {
-        "grid": target / GRID_FILE,
-        "summary": target / SUMMARY_FILE,
-        **json.loads(marker.read_text()),
-    }
+    """The cached files of a recording, checked complete; None when it has none.
+
+    Looked for in the cache, then in the drive it spilled onto (tower.json's `spill`).
+    """
+    cache, name = Path(cache), Path(root).name
+    places = [cache / name]
+    note = cache / "tower.json"
+    if note.exists():
+        spill = json.loads(note.read_text()).get("spill")
+        if spill:
+            places.append(Path(spill) / name)
+    for target in places:
+        marker = target / DONE
+        if marker.exists():
+            return {
+                "grid": target / GRID_FILE,
+                "summary": target / SUMMARY_FILE,
+                **json.loads(marker.read_text()),
+            }
+    return None

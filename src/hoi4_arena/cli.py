@@ -109,6 +109,11 @@ def main():
     tower.add_argument("output")
     tower.add_argument("--model", dest="model_path")
     tower.add_argument("--sources", nargs="+")
+    tower.add_argument(
+        "--spill",
+        help="Where recordings go once the output's drive would keep less than --keep-free",
+    )
+    tower.add_argument("--keep-free", type=float, default=30.0, help="GB to leave free")
     live = sub.add_parser(
         "play-policy",
         help="A trained policy plays arena games against the game's AI on the second PC, "
@@ -761,6 +766,8 @@ def _dispatch(command, args):
             args["output"],
             model_path=args["model_path"],
             sources=args["sources"],
+            spill=args["spill"],
+            keep_free_gb=args["keep_free"],
         )
     elif command == "play-policy":
         from .play import evaluate_policy
