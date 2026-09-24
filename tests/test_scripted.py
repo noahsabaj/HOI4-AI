@@ -21,12 +21,16 @@ def test_most_games_play_the_best_plan_and_the_rest_explore():
     plans = [choose_plan(random.Random(i)) for i in range(1000)]
     best = [p for p in plans if p["best"]]
     assert abs(len(best) / len(plans) - SHARES["best"]) < 0.05
-    assert all(p.keys() == best_plan(random.Random(0)).keys() for p in plans)
+    base_keys = best_plan(random.Random(0)).keys()
+    extra = {"guard", "pause_redraw"}
+    assert all(p.keys() - extra == base_keys - extra for p in plans)
     # The challenger is the best plan with one change.
     challengers = [p for p in plans if p["variant"] == CHALLENGER["variant"]]
     assert abs(len(challengers) / len(plans) - SHARES["challenger"]) < 0.05
-    changed = {k for p in challengers for k in p if p[k] != best_plan(random.Random(0))[k]}
-    assert changed - {"wait", "redraw", "best", "variant"} == set(CHALLENGER) - {"variant"}
+    base = best_plan(random.Random(0))
+    changed = {k for p in challengers for k in p if p[k] != base.get(k)}
+    assert changed - {"wait", "redraw", "best", "variant"} <= set(CHALLENGER) - {"variant"}
+    assert all(p.keys() == base.keys() for p in challengers)
     # The best plan holds at least two minutes, then attacks broad, at All Adults Serve.
     assert {(p["attack"], p["conscription"], p["recruit"]) for p in best} == {
         ("broad", "all_adults", 0)
@@ -44,6 +48,10 @@ def test_most_games_play_the_best_plan_and_the_rest_explore():
     assert (report["best"]["decided"], report["best"]["wins"]) == (2, 1)
     assert (report["explore"]["decided"], report["explore"]["wins"]) == (2, 2)
     assert report["best_BLU"]["wins"] == 1 and report["best_RED"]["wins"] == 0
+    games[0]["arena"] = games[1]["arena"] = "arena-bay-v6"
+    report = win_rate(games)
+    assert report["arena_arena-bay-v6_BLU"]["wins"] == 1
+    assert report["arena_arena-bay-v6_RED"]["decided"] == 1
 
 
 def test_the_hold_is_quiet_and_conscription_comes_before_redraws(monkeypatch):
@@ -52,19 +60,21 @@ def test_the_hold_is_quiet_and_conscription_comes_before_redraws(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(scripted.time, "monotonic", lambda: clock[0])
     plan = {**choose_plan(random.Random(0), shares={"best": 1}), "wait": 100, "redraw": 40}
+    plan["pause_redraw"] = plan["guard"] = None  # Each has its own test below.
     planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
     calls = []
 
     def takes(name, seconds, result=True):
-        def order(desk):
+        def order(desk, **options):
             calls.append((clock[0], name))
             clock[0] += seconds
             return result() if callable(result) else result
 
         return order
 
-    for name in ("clear_orders", "draw_front", "draw_offensive"):
+    for name in ("clear_orders", "draw_offensive"):
         setattr(planner, name, takes(name, 6))
+    planner.draw_front = takes("draw_front", 6, result=False)  # Not round an incursion.
     # Political power for a step every 25 s after the first 40.
     paid = {"steps": 0}
 
@@ -432,3 +442,99 @@ def test_an_incursion_is_the_enemy_s_share_of_the_home_half():
     assert planner.guarding() and planner.orders[-1]["order"] == "guard"
     planner.plan["guard"] = 0.3
     assert not planner.guarding()
+    # Against the land held at the start: a border that bends is not an incursion.
+    home = np.zeros_like(blue)
+    home[:, :100] = True  # Blue started with a smaller share than the half.
+    assert incursion(blue, red, "BLU", home) == pytest.approx((red & home).sum() / home.sum())
+
+
+def test_a_lake_on_the_border_is_never_clicked_and_splits_the_front():
+    from hoi4_arena.scripted import apart, ashore, land_box
+
+    blue = np.zeros((200, 300), bool)
+    red = np.zeros((200, 300), bool)
+    blue[20:180, 20:150], red[20:180, 150:280] = True, True
+    # A lake on the border, from row 80 to 120, neither country's land.
+    blue[80:120, 120:150], red[80:120, 150:180] = False, False
+    planner = Planner("RED", choose_plan(random.Random(1)), {}, None, 5, frame=lambda: 0)
+    front = planner.front(blue, red)
+    dry = ashore(front, blue, red, land_box(blue, red))
+    assert dry and all(not (69 <= y <= 130) for _, y in dry)
+    stretches = apart(dry)
+    assert len(stretches) == 2 and {min(y for _, y in s) < 80 for s in stretches} == {True, False}
+    # A plain border is one stretch.
+    blue[80:120, 120:150], red[80:120, 150:180] = True, True
+    assert len(apart(planner.front(blue, red))) == 1
+
+
+def test_a_paused_redraw_pauses_draws_resumes_and_lets_the_plan_build(monkeypatch):
+    from hoi4_arena import scripted
+
+    clock = [0.0]
+    monkeypatch.setattr(scripted.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(scripted.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "pause_redraw": True}
+    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
+    calls = []
+    planner.pause = lambda desk, paused: calls.append(("pause", paused)) or True
+    for name in ("clear_orders", "draw_front", "draw_offensive"):
+        setattr(planner, name, lambda desk, name=name, **options: calls.append((name,)))
+    planner.attacking, planner.redraw_at = True, 0.0
+    assert planner.step(None)
+    assert calls == [
+        ("pause", True), ("clear_orders",), ("draw_front",), ("draw_offensive",), ("pause", False)
+    ]  # fmt: skip
+    assert planner.activate_at == scripted.PLANNING
+
+
+def test_the_guard_draws_the_front_round_an_incursion_into_the_home_land():
+    blue = np.zeros((100, 200), bool)
+    red = np.zeros((100, 200), bool)
+    blue[10:90, 10:100], red[10:90, 100:190] = True, True
+    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "guard": 0.15}
+    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
+    planner.home = blue.copy()
+    crop = np.full((100, 200, 3), 150, np.uint8)
+    box = (10, 10, 90, 190)
+    # No incursion: the whole border, not the rear.
+    stretches, rear = planner.stretches(blue, red, box, crop, guard=0.15)
+    assert not rear and len(stretches) == 1 and min(x for x, _ in stretches[0]) >= 99
+    # Blue has pushed into Red while Red holds a quarter of Blue's own land in its rear.
+    blue[10:90, 100:140], red[10:90, 100:140] = True, False
+    red[10:50, 10:55], blue[10:50, 10:55] = True, False
+    stretches, rear = planner.stretches(blue, red, box, crop, guard=0.15)
+    assert rear and all(planner.home[y, x] for x, y in stretches[0])
+    assert max(x for x, _ in stretches[0]) < 60 and planner.orders[-1]["order"] == "guard"
+    # Below the guard's share the push goes on.
+    stretches, rear = planner.stretches(blue, red, box, crop, guard=0.5)
+    assert not rear
+
+
+def test_while_the_front_holds_the_guard_counter_attacks_an_incursion_and_stops(monkeypatch):
+    from hoi4_arena import scripted
+
+    plan = {**choose_plan(random.Random(0), shares={"best": 1}), "pause_redraw": False}
+    planner = Planner("BLU", plan, {}, None, 5, frame=lambda: 0)
+    planner.home = np.ones((4, 4), bool)
+    held = {"share": 0.0}
+    calls = []
+    monkeypatch.setattr(scripted, "incursion", lambda blue, red, country, home: held["share"])
+    planner.overview = lambda desk: (None, np.ones((4, 4), bool), np.zeros((4, 4), bool), (0,) * 4)
+    planner.clear_orders = lambda desk: calls.append("clear")
+    planner.draw_offensive = lambda desk: calls.append("offensive")
+    planner.activate = lambda desk: calls.append("activate") or True
+
+    def draw_front(desk, guard=None):
+        calls.append(("front", guard))
+        return bool(guard) and held["share"] >= guard
+
+    planner.draw_front = draw_front
+    for share, expected, defending in [
+        (0.05, [], False),  # A small incursion: hold.
+        (0.20, ["clear", ("front", 0.15), "activate"], True),  # Counter-attack round it.
+        (0.10, [], True),  # Still over half the guard's share: go on.
+        (0.02, ["clear", ("front", None), "offensive"], False),  # Clear: back to the hold.
+    ]:
+        held["share"], calls[:] = share, []
+        assert planner.guard_hold(None) and calls == expected
+        assert planner.defending is defending
