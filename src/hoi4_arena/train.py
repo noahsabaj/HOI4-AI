@@ -331,6 +331,7 @@ def train_bc(
     train_last=None,
     tower_cache=None,
     carry=False,
+    reinit=(),
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -435,6 +436,11 @@ def train_bc(
     if init is not None:
         saved = torch.load(init, map_location="cpu", weights_only=True)
         policy.load_state_dict(saved["policy"])
+        for name in reinit:
+            # Layers trained in another regime start afresh (their default initialization).
+            for layer in getattr(policy, name).modules():
+                if hasattr(layer, "reset_parameters"):
+                    layer.reset_parameters()
     policy = policy.to(device)
     if tower_cache is not None:
         from .tower_cache import fingerprint
@@ -498,6 +504,7 @@ def train_bc(
         "train_last": train_last,
         "tower_cache": str(Path(tower_cache).resolve()) if tower_cache else None,
         "carry": carry,
+        "reinit": list(reinit),
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

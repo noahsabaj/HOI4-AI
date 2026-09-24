@@ -430,6 +430,12 @@ def main():
         help="Carry the memory through each game, window after window in order "
         "(truncated backpropagation through time), instead of from empty per window.",
     )
+    train.add_argument(
+        "--reinit",
+        nargs="+",
+        default=[],
+        help="Policy layers to start afresh after --init, such as fusion memory",
+    )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
     weigh = sub.add_parser(
