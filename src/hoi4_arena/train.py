@@ -195,6 +195,20 @@ def state_loss(head, memory, target):
     return (error * known).sum() / known.sum()
 
 
+def train_blocks(encoder, count):
+    """Let only the vision tower's last `count` blocks train (the Qwen3.5 tower's
+    `model.blocks`, or LeVJEPA's `model.encoder.blocks` and its final norm)."""
+    model = encoder.model
+    blocks = model.blocks if hasattr(model, "blocks") else model.encoder.blocks
+    model.requires_grad_(False)
+    for block in list(blocks)[len(blocks) - count :] if count else []:
+        block.requires_grad_(True)
+    norm = getattr(getattr(model, "encoder", None), "norm", None)
+    if norm is not None and count:
+        norm.requires_grad_(True)
+    return encoder
+
+
 def wait_while_paused(output, poll=5.0, sleep=None):
     """Hold training while a file named `pause` is in its output folder.
 
@@ -255,6 +269,7 @@ def train_bc(
     order_weight=0.0,
     lr=1e-4,
     init=None,
+    train_last=None,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -283,7 +298,9 @@ def train_bc(
     arena log, weighted by it; the read-out is saved beside the policy and never used to
     act. `order_weight` > 0 likewise has the memory predict the scripted player's next
     order and the time until it (privileged.decision_orders). `init` starts the policy
-    from a checkpoint's weights (fine-tuning), `lr` sets the learning rate.
+    from a checkpoint's weights (fine-tuning), `lr` sets the learning rate. `train_last`
+    sets how many of the vision tower's last blocks train (the encoder's default, 2, when
+    None); 0 freezes the tower, which then runs once without a graph.
     """
     if not 0 < idm_weight <= 1:
         raise ValueError("idm_weight must be in (0, 1]")
@@ -293,6 +310,8 @@ def train_bc(
         raise FileExistsError("Checkpoints are immutable")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     encoder = build_encoder(model_path, variant)
+    if train_last is not None:
+        train_blocks(encoder, train_last)
     common = {
         "length": sequence,
         "burn_in": burn_in,
@@ -383,6 +402,7 @@ def train_bc(
         "order_weight": order_weight,
         "lr": lr,
         "init": str(Path(init).resolve()) if init else None,
+        "train_last": train_last,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

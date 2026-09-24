@@ -471,3 +471,17 @@ def test_training_holds_while_its_pause_file_is_there(tmp_path):
             flag.unlink()
 
     assert wait_while_paused(tmp_path, poll=2.0, sleep=sleep) and polls == [2.0] * 3
+
+
+def test_a_frozen_tower_trains_nothing_of_the_encoder():
+    from hoi4_arena.models import ScreenEncoder
+    from hoi4_arena.train import train_blocks
+
+    encoder = ScreenEncoder(pretrained=False)
+    assert any(p.requires_grad for p in encoder.parameters())
+    train_blocks(encoder, 0)
+    assert not any(p.requires_grad for p in encoder.parameters())
+    train_blocks(encoder, 1)
+    trainable = [n for n, p in encoder.named_parameters() if p.requires_grad]
+    last = len(encoder.model.blocks) - 1
+    assert trainable and all(n.startswith(f"model.blocks.{last}.") for n in trainable)

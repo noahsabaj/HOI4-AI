@@ -327,6 +327,12 @@ def main():
         help="Weight of the next-order loss: the memory predicts the scripted player's next "
         "order and the time until it, from the manifest's orders. Training only; 0 is off.",
     )
+    train.add_argument(
+        "--train-last",
+        type=int,
+        help="How many of the vision tower's last blocks train (default 2); 0 freezes it, "
+        "which makes a step about a third cheaper.",
+    )
     train.add_argument("--lr", type=float, default=1e-4)
     train.add_argument("--init", help="Start from this checkpoint's policy weights.")
     weigh = sub.add_parser(
