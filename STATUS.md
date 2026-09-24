@@ -571,6 +571,11 @@ beat (`win-rate`).
   AI's stayed near 14.5k, and the AI lost 29k men against the held line to Blue's
   10k. Then broad offensives, redrawn every 67 s, took Red's states one by one, and
   Red surrendered in January 1938, after 344 s.
+- **4 wins in the first 6 games since the fixes** (67%, 95% interval 30-90%): 2 of 2
+  as Blue, 2 of 4 as Red; 3 of 4 with broad offensives, 1 of 2 with a deep arrow. The
+  winners' armies filled to 41-48k deployed manpower while the AI's stayed at 8-15k,
+  and the AI lost 2 to 4 men for each of the script's. Most plans now hold 90-240 s
+  before attacking, from the first win; too few games yet to say which part matters.
 
 ## Open work
 
