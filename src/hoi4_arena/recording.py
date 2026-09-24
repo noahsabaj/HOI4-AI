@@ -32,6 +32,12 @@ def audit_pixels(frame):
     raise ValueError("Capture carries no pixels to record")
 
 
+def recorder_identity():
+    """The process making a recording, for its manifest: while it runs, salvage() leaves
+    the recording alone."""
+    return {"pid": os.getpid(), "started_unix": round(time.time(), 1)}
+
+
 def split_for_session(session_id: str):
     bucket = int(hashlib.sha256(session_id.encode()).hexdigest()[:8], 16) % 100
     return "train" if bucket < 80 else "validation" if bucket < 90 else "test"
@@ -101,6 +107,7 @@ class Recorder:
             "complete": False,
             "frames": 0,
             "privileged_state": False,
+            "recorder": recorder_identity(),
         }
         self.events = (self.root / "frames.jsonl").open("w", encoding="utf8")
         ffmpeg = shutil.which("ffmpeg")
@@ -271,6 +278,7 @@ class StreamRecorder:
             "complete": False,
             "frames": 0,
             "privileged_state": False,
+            "recorder": recorder_identity(),
         }
         self.events = (self.root / "frames.jsonl").open("w", encoding="utf8")
         self.log = (self.root / "ffmpeg.log").open("wb")
@@ -284,11 +292,16 @@ class StreamRecorder:
         )  # fmt: skip
         self.changed = threading.Condition()
         # How long each frame's row took from the worker's capture to this process: the
-        # worker's clock mapped onto this one through a few status round trips.
+        # worker's clock mapped onto this one through a few status round trips, measured
+        # again with each telemetry sample, since two PCs' clocks drift apart (by about
+        # 5 ppm here: 2 ms over a game).
         self.delivery_ms = []
+        self.clock = None  # (this PC's time, offset) of the first mapping, for the drift.
         try:
             self.offset_ns, rtt = desk.clock_offset()
             self.manifest["clock_rtt_ms"] = round(rtt / 1e6, 3)
+            self.manifest["clock_offset_ns"] = self.offset_ns
+            self.clock = (time.perf_counter_ns(), self.offset_ns)
         except (DesktopError, AttributeError, TypeError, KeyError):
             self.offset_ns = None
         self.views = None  # The newest frame's views, when the stream brings them.
@@ -345,6 +358,25 @@ class StreamRecorder:
                 }  # fmt: skip
                 out.write(json.dumps(row) + "\n")
                 out.flush()
+                self._resync()
+
+    def _resync(self):
+        """Map the worker's clock onto this one again. Only a quick round trip is trusted:
+        the mapping is good to half of it."""
+        if self.clock is None:
+            return
+        try:
+            offset, rtt = self.desk.clock_offset()
+        except Exception as error:  # noqa: BLE001 - the old mapping stays.
+            log.warning("clock: %s", error)
+            return
+        if rtt > 5_000_000:
+            return
+        self.offset_ns = offset
+        since, first = self.clock
+        elapsed = time.perf_counter_ns() - since
+        if elapsed > 0:
+            self.manifest["clock_drift_ppm"] = round((offset - first) / elapsed * 1e6, 2)
 
     def _manifest(self):
         temp = self.root / "manifest.tmp"
@@ -357,7 +389,7 @@ class StreamRecorder:
             message = self.stream.messages.get()
             if "frame" in message:
                 arrived = time.perf_counter_ns()
-                row = {**message["frame"], "received_ns": time.monotonic_ns()}
+                row = {**message["frame"], "received_ns": arrived}
                 if self.offset_ns is not None and "t_ns" in row:
                     self.delivery_ms.append((arrived - row["t_ns"] - self.offset_ns) / 1e6)
                 try:
@@ -448,7 +480,7 @@ class StreamRecorder:
                 self.gaps_seen = self.gap_count
                 gap = self.last_gap or {}
                 return Frame(
-                    None, {"foreground": False, "gap": gap.get("reason")}, time.monotonic_ns()
+                    None, {"foreground": False, "gap": gap.get("reason")}, time.perf_counter_ns()
                 )
             raise DesktopError(f"the worker's stream ended: {self.end}")
 
@@ -556,6 +588,207 @@ def count_frames(path):
         return int(out.stdout.strip())
     except ValueError:
         return None
+
+
+# What a salvage keeps as the recorder left it, so that `salvage --undo` can put it back.
+UNSALVAGED_MANIFEST, UNSALVAGED_ROWS = "manifest-unsalvaged.json", "frames-unsalvaged.jsonl"
+# A recording written to more recently than this may still have its recorder.
+SALVAGE_IDLE_S = 600
+
+
+def _recorder_alive(manifest):
+    """Whether the process that made this recording still runs, when its manifest names
+    it (recorder_identity); older recordings cannot say, and count as not."""
+    import psutil
+
+    recorder = manifest.get("recorder") or {}
+    pid, started = recorder.get("pid"), recorder.get("started_unix")
+    if not pid:
+        return False
+    try:
+        # A process created after the recording began reuses the number; it is not the
+        # recorder.
+        return started is None or psutil.Process(pid).create_time() <= started + 1
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True  # There, but not ours to look at: assume it is.
+
+
+def _held_open(path):
+    """Whether any other process has `path` open.
+
+    On Windows an exclusive open fails while another handle is open, such as a recorder's
+    on its rows or its encoder's on the video. Elsewhere this cannot tell, and the time
+    since the last write has to do.
+    """
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]  # fmt: skip
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_read, no_sharing, open_existing, sharing_violation = 0x80000000, 0, 3, 32
+    handle = kernel32.CreateFileW(str(path), generic_read, no_sharing, None, open_existing, 0, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        return ctypes.get_last_error() == sharing_violation
+    kernel32.CloseHandle(handle)
+    return False
+
+
+def whole_frames(path, hz):
+    """How many frames from the start of the video at `path` are all there, by their
+    timestamps, or None if it cannot be read.
+
+    An encoder killed mid-stream can leave its last frames out of order: x264's B-frames
+    are written after the frame they come before, so the video may end on a frame with
+    one missing ahead of it. Frame i of the video must be row i, so only the unbroken run
+    from the first frame counts. Nothing is decoded.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not Path(path).exists():
+        return None
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    ).stdout  # fmt: skip
+    times = []
+    for line in out.split():
+        try:
+            times.append(float(line.strip().strip(",")))
+        except ValueError:
+            continue
+    if not times:
+        return None
+    first = min(times)
+    present = {round((t - first) * hz) for t in times}
+    whole = 0
+    while whole in present:
+        whole += 1
+    return whole
+
+
+def salvage(root, *, dry_run=False, idle_s=SALVAGE_IDLE_S):
+    """Finish a recording whose recorder stopped without closing it (it was killed, say).
+
+    Training takes only complete recordings, and a recorder that never closed its
+    recording never said it was, though the video and the rows are good up to where it
+    stopped. Frame i of the video is row i, so the rows past the video's end go (frames
+    the encoder had not yet written, or wrote with one missing before them: whole_frames),
+    as close() drops them from a stream cut short, and so does a row torn by the kill and
+    anything after it. The manifest then says complete,
+    with `salvaged` saying what was done; what the recorder left is kept beside it
+    (UNSALVAGED_MANIFEST, UNSALVAGED_ROWS), and unsalvage() puts it back.
+
+    Never touches a recording something may still be writing: one written to in the last
+    `idle_s` seconds, whose recorder still runs, or whose files a process holds open. Nor
+    one its recorder closed as unusable (its player's setup failed, say), which is not
+    salvage's to overrule. Returns what was done, or why not.
+    """
+    root = Path(root)
+    result = {"root": str(root), "salvaged": False}
+    try:
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf8"))
+    except (OSError, ValueError) as error:
+        return {**result, "why": f"no readable manifest: {error}"}
+    result["source"] = manifest.get("source")
+    if manifest.get("complete"):
+        return {**result, "why": "salvaged before" if manifest.get("salvaged") else "complete"}
+    if "encoder_exit" in manifest or "muxer_exit" in manifest:
+        why = f"its recorder closed it as unusable: {manifest.get('reason')}"
+        return {**result, "why": why}
+    rows_path, video_path = root / "frames.jsonl", root / "screen.mkv"
+    if not rows_path.exists() or not video_path.exists():
+        return {**result, "why": "it has no rows or no video"}
+    idle = time.time() - max(p.stat().st_mtime for p in root.rglob("*") if p.is_file())
+    if idle < idle_s:
+        return {**result, "why": f"written {idle:.0f} s ago: its recorder may still run"}
+    if _recorder_alive(manifest):
+        return {**result, "why": f"its recorder, process {manifest['recorder']['pid']}, runs"}
+    held = [p.name for p in (rows_path, video_path) if _held_open(p)]
+    if held:
+        return {**result, "why": f"another process holds {' and '.join(held)} open"}
+    video = whole_frames(video_path, manifest.get("nominal_fps") or 5)
+    if not video:
+        return {**result, "why": "its video is unreadable or empty"}
+    lines = rows_path.read_text(encoding="utf8", errors="replace").splitlines()
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            break
+        if not isinstance(row, dict) or row.get("index") != len(rows) or "t_ns" not in row:
+            break
+        if rows and row["t_ns"] <= rows[-1]["t_ns"]:
+            break
+        rows.append(row)
+    kept = min(len(rows), video)
+    result.update(rows=len(lines), video_frames=video, kept=kept)
+    # A frame the encoder had but whose row was not yet written is fine at the very end;
+    # more than that and the rows and the video cannot be matched up.
+    if video > len(rows) + 2:
+        return {**result, "why": f"the video holds {video} frames but only {len(rows)} rows"}
+    if kept < MIN_FRAMES:
+        return {**result, "why": f"only {kept} whole frames, and training needs {MIN_FRAMES}"}
+    if dry_run:
+        return {**result, "why": "dry run"}
+    shutil.copyfile(root / "manifest.json", root / UNSALVAGED_MANIFEST)
+    if kept < len(lines):
+        rows_path.replace(root / UNSALVAGED_ROWS)
+        temp = root / "frames.tmp"
+        temp.write_text("".join(line + "\n" for line in lines[:kept]), encoding="utf8")
+        temp.replace(rows_path)
+    manifest.update(
+        complete=True,
+        frames=kept,
+        video_frames=video,
+        salvaged={
+            "at_unix": round(time.time(), 1),
+            "rows_dropped": len(lines) - kept,
+            "why": "the recorder stopped without closing the recording",
+        },
+    )
+    temp = root / "manifest.tmp"
+    temp.write_text(json.dumps(manifest, indent=2), encoding="utf8")
+    temp.replace(root / "manifest.json")
+    return {**result, "salvaged": True}
+
+
+def unsalvage(root):
+    """Put back what salvage() changed: the manifest and rows the recorder left."""
+    root = Path(root)
+    kept = root / UNSALVAGED_MANIFEST
+    if not kept.exists():
+        return {"root": str(root), "restored": False, "why": "not salvaged"}
+    if (root / UNSALVAGED_ROWS).exists():
+        (root / UNSALVAGED_ROWS).replace(root / "frames.jsonl")
+    kept.replace(root / "manifest.json")
+    return {"root": str(root), "restored": True}
+
+
+def recordings(paths):
+    """The recordings at or under each of `paths`: folders with a manifest and rows."""
+    found = []
+    for path in map(Path, paths):
+        if (path / "manifest.json").exists():
+            found.append(path)
+            continue
+        found.extend(
+            sorted(
+                m.parent
+                for m in path.rglob("manifest.json")
+                if (m.parent / "frames.jsonl").exists()
+            )
+        )
+    return found
 
 
 def open_recorder(desk, root, first, *, game_speed, source="human", hz=15, codec="x264", **kw):

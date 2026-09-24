@@ -201,7 +201,7 @@ every rule below came from a crash dump or the stock files.
 
 ## Arena maps (2026-09-24)
 
-`generate-map --preset <name>` writes one of six named arenas (`arenas.PRESETS`), and
+`generate-map --preset <name>` writes one of seven named arenas (`arenas.PRESETS`), and
 `preview-map` draws one from its files. Every one keeps the playable grid (12×8
 provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
@@ -216,12 +216,13 @@ checks that, province by province and pixel by pixel.
 | `marsh` | A marsh round a two-province lake fills the middle of the front; forests on both wings | 12 | -17% |
 | `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
 | `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
+| `ford` | A large river runs along the whole border, except at one ford in the middle | 15 | -56% |
 
 "Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
 mean penalty for attacking into the defender's province there: the stock terrain
 penalties (forest -15%, hills -25%, urban -30%, marsh -40%, mountains -50%) plus -30% or
 -60% where a river runs along that border. On `passes` 73% of the front costs 40% or
-more. Measured on the v6 files.
+more, on `ford` 93%. Measured on the v6 files.
 
 What a preset paints, all with stock assets:
 
@@ -250,20 +251,37 @@ heart. `generation.json` records the preset and seed, its terrain counts, its fr
 (the numbers in the table above), and a state layout over the land box, from which
 `scripted.state_at` names the state under a point on any arena, bulges included.
 
-Live tests on the second PC (2026-09-24), the scripted player against the game's AI.
-On the plain arena, 23 such games ended by game day 290-820.
+Live tests on the second PC (2026-09-24): the scripted player against the game's AI,
+one game an arena, so no arena can yet be said to favour either side. Every v6 arena
+loaded with no map errors in the game's log. "Captures" counts the states that changed
+hands before the surrender; most plain-arena games were a single sweep of 8.
 
-- `plains-v1`, as Blue: loaded with no errors, and the scripted player found its fronts
-  on the new ground. A draw after 15 minutes: the supply stall above.
-- `passes-v3`, as Red: Red won in 541 s. Blue surrendered on day 1236, after a seesaw
-  at the valleys: 22 changes of control, with West 6 taken four times and East 7 three.
-- `marsh-v3` and `v4`: loaded, lakes included, but first Red could not be picked (the
-  capital fix) and then the front line would not draw on dark ground (the colour fix).
-- `marsh-v6`, as Red: loaded with no map errors in the game's log. The AI won in 79 s:
-  the lake splits the front, Red's army held only the southern stretch (89% of its
-  division-days in one state), and Blue walked round the north without a casualty.
+| Arena | Scripted side | Winner | Surrender on day | Captures | Casualties, Blue / Red |
+|---|---|---|---|---|---|
+| plain, 23 games | both | scripted 10 of 21, 2 draws | 277–822 | mostly 8 | |
+| `plains` | Red | scripted | 772 | 8 | 61k / 10k |
+| `river` | Red | scripted | 751 | 8 | 71k / 12k |
+| `passes` | Blue | scripted | 726 | 8 | 8k / 77k |
+| `passes` (v3) | Red | scripted | 1236 | 22 | 104k / 13k |
+| `marsh` | Red | AI | 100 | 8 | 1k / 2k |
+| `bay` | Red | AI | 1026 | 20 | 111k / 15k |
+| `salient` | Red | AI | 259 | 8 | 9k / 7k |
+| `ford` | Blue | scripted | 803 | 8 | 8k / 86k |
+
+- `river`: Red took Blue's border states in May 1937 and the river states by June, then
+  stood seven months at the river before breaking through in January 1938.
+- `bay`: Red broke through the isthmus first and took six of Blue's eight states by
+  April 1938. Blue's counteroffensive retook them all, then took Red's homeland.
+- `marsh`: the lake splits the front. Red's army held only the southern stretch (89% of
+  its division-days in one state), and Blue walked round the north.
+- `salient`: Red's army sat in its own bulge (77% of its division-days) while Blue went
+  round it.
+- `plains`: v1 stood four years after three states, for want of railways across the
+  border; v6, with them, went on to a surrender.
 - Close-ups show stock textures, relief lit by the normal map, dense forests, city
-  models among farmland, rivers and railways.
+  models among farmland, rivers and single railway lines.
+- Also fixed on the way: `marsh-v3` could not pick Red (the capital was off the picker's
+  screen), and `marsh-v4` could not draw a front on dark ground.
 
 ## The model and its data (2026-09-23)
 
@@ -456,6 +474,54 @@ it had been installed by hand on this PC only, and elsewhere the head silently r
 eagerly. The newest Triton, 3.8, was no faster and not bit-exact with the eager head, so
 3.6 stays until PyTorch moves.
 
+**`train-memory`, 2026-09-24.** One seed of the memory study's six arms (seed 1, 8
+epochs each, cache on the NVMe) took 64.1 min before and 21.2 min after. Every run was
+identical to the bit: each update's loss, the report and every tensor of the saved head.
+Measured on this PC's GPU with nothing else running on it, but with the CPU 55–100% busy
+from other work. The study's own seeds took 56–120 min each as that load changed.
+
+| Arm | Training before | Training after | Whole run before | Whole run after |
+|---|---|---|---|---|
+| GRU, 16, from empty | 132.1 s | 133.8 s | 4.4 min | 2.8 min |
+| GRU, 16, carried | 302.5 s | 152.0 s | 7.1 min | 3.0 min |
+| GRU, 256, carried | 360.0 s | 121.2 s | 7.9 min | 2.5 min |
+| Gated DeltaNet-2, 256 | 826.3 s | 170.2 s | 18.2 min | 3.9 min |
+| Mamba-3, 256 | 869.8 s | 293.0 s | 18.3 min | 5.9 min |
+| No memory, 256 | 364.8 s | 143.0 s | 7.9 min | 3.1 min |
+
+What was slow, and what changed:
+- **Copies.** Each update's 0.55 GB of cells was copied three times on one thread from a
+  memory map (0.6–0.9 GB/s) and sent from pageable memory, while the GPU waited. Now
+  eight threads read the file straight into pinned memory (about 9 GB/s from the page
+  cache, 5 GB/s from the NVMe), and the copy to the GPU runs while the batch before trains.
+- **A wait at every decision.** `fuse` made a tensor from a Python list at each step, and
+  that copy waits for the GPU. It is now made once.
+- **Launches.** An update over 256 decisions launches about 20,000 small kernels for the
+  GRU and 80,000 for Gated DeltaNet-2 or Mamba-3, forward and backward. They now replay
+  from CUDA graphs, one per batch shape; only the action head after them stays eager.
+- **Evaluation** stepped one decision at a time and copied every result to the host as
+  it went. Everything in a run but training took 109–265 s before and 27–64 s after.
+- The GRU from empty windows gains only in evaluation: its training reads 64 random cuts
+  an update, and is bound by the disk when the page cache is short of memory.
+
+Things to know:
+- On this driver a CUDA graph costs 10–18 KB of host memory per kernel, so the 80,000
+  kernels of 256 Gated DeltaNet-2 steps take about 1 GB. Windows also counts a process's
+  GPU memory in its private bytes.
+- Graphs that may replay at the same time must be captured on streams of their own. A
+  captured matrix product keeps its stream's cuBLAS workspace, and runs sharing one gave
+  different results in 4 of 24 tries (none of 36 once each had its own).
+- Tried and dropped: evaluating four games side by side (slower, since each needs its
+  own graphs), checking each loss one update late (no gain), and 12 or 16 reading
+  threads instead of 8 (no faster).
+- Not yet checked on real data: `train_memories`, which trains the four 256-decision
+  cells of a seed on one read of each batch. On synthetic caches it matches separate runs
+  to the bit; the full 30-run comparison with the study waits for a free GPU.
+- Behaviour cloning has a floor this work cannot move. The part of the model that trains
+  (the tower's last two blocks, the cell and fovea readers) costs 45–53 ms a frame
+  forward and backward, so an epoch of the 44 games takes at least 20 min however fast
+  the frozen blocks and the data become.
+
 Earlier, all on an RTX 4060 Ti with the game at 3840×2160 and the LeVJEPA encoder:
 
 | | Result |
@@ -591,6 +657,49 @@ second PC with `focus` every third frame and a full capture every seventh: tick 
   this PC, with the worker's clock mapped through status round trips (1.6 ms): 51 ms p50
   and 71 ms p95 with views on, over the network. NVENC hands each frame over at once
   (`-delay 0`), and the video is written in clusters of at most a second.
+
+**Video on disk sooner.** On a live scripted game the video on disk trailed the rows by
+1.7 s p50 and 4.3 s p95 (5.2 s at worst). Before `-delay 0` and the 1 s clusters it trailed
+by 10.7 / 14.1 / 15.7 s. Without views, rows arrived within a millisecond of the capture
+at the median and 18 ms at p95.
+
+**Rows and replies leave at once.** The bridge and the client used to hold a small message
+until the last one sent was acknowledged (Nagle's algorithm). They now send it at once.
+Measured on the second PC during a 60 s stream, with a focus every third frame and a full
+capture every seventh:
+- rows arrived 0.8 ms p50 and 4.1 ms p95 after capture, against 2.4 and 35.6 ms before;
+- status round trips took 1.2 ms p50 and 16.3 ms p95, against 1.5 and 57.7 ms.
+
+Both ends also probe a quiet connection after 10 s. A peer that vanishes (its PC switched
+off) no longer holds the game there until the bridge restarts.
+
+**A game that exits or hangs during a stream.**
+- The stream's gaps now say `game_exited` or `game_not_responding` instead of looking like
+  focus loss. A hung game's frozen ghost is never recorded.
+- `focus` refuses with `game_window_gone` instead of pressing Alt at whatever is in front,
+  such as the crash reporter.
+- Input, capture and focus now also check that the window still belongs to the game's
+  process, because Windows can reuse a closed window's handle for another program.
+
+Checked by quitting the game during a stream: every gap said `game_exited`, focus
+refused, and the 28 frames before the quit made a complete recording.
+
+Rows' `received_ns` now uses the high-resolution clock. `time.monotonic` ticks in 15.6 ms
+steps on Windows before Python 3.13. Manifests give `clock_offset_ns`, and the clock
+mapping is renewed every 30 s, because the two PCs drift apart by 3-7 ppm.
+
+**Killed recordings can be salvaged.** A recorder killed before it closed its recording
+(a run stopped by hand, say) leaves it incomplete, and training skips every incomplete
+recording. On 2026-09-24, 13 such recordings in artifacts/ held 16,774 usable rows, 56
+minutes of play. `hoi4-arena salvage` finishes them. It keeps the frames the video holds
+whole, drops the rows past them, and marks the manifest complete, with `salvaged` saying
+so. A killed x264 can leave its last frames out of order, so only the unbroken run
+counts. What the recorder left is kept beside it, and `--undo` puts it back. It never
+touches a recording that may still be going: one written in the last 10 minutes, one
+whose recorder still runs (manifests now name it), or one whose files a process holds
+open. It also leaves alone one its recorder closed as unusable. Salvaged copies of a
+scripted game and an AI game loaded for training with as many decisions per frame as
+complete games.
 
 ## Recording AI games
 
@@ -839,6 +948,39 @@ beat (`win-rate`).
   350 ms on the capture thread and cost frames. Each run writes its own results file.
 - **The country picker** closes in on Blue's capital; on an arena with the capitals in
   the rear no Red land showed. It is zoomed out until the country shows.
+- **The arena's front is not always one straight line (2026-09-24).** On the new arenas
+  the best plan lost in ways the v4 arena never showed. HOI4 spreads a held front's
+  divisions along it by frontage and never shifts them: on the salient arena Red's stood
+  6 to 2 across its two border states all game, the AI massed on the thin side, walked
+  through Red's interior and took its victory points before the attack (137 s); on the
+  marsh arena a lake cuts the border, and the short stretch got 1 division of 8 (lost in
+  79 s). And the attack could pull the whole army far forward while a few of the AI's
+  divisions took the empty home half's victory points: on v4 (the share of the home land
+  the AI held grew 10%, 17%, then 89%) and on the bay arena, where one Blue division
+  walked through Red's homeland while Red's army stood deep in Blue's west.
+- **The guard.** The best plan now watches the land it held at the start. While the front
+  holds, it looks every 30 s; during the attack, at each redraw. When the AI holds 15%
+  or more of it, the front line is drawn round what the AI holds there and executed, so
+  the army turns back and clears it; under half that, the army returns to its front and
+  offensive. In the wins the AI never held more than 14% of the home land at a redraw.
+- **Redraws while paused.** A redraw during the attack (clear, front, offensive, execute)
+  left the army without an executing plan for 20-24 s, about 55 game days, and came
+  every 30-90 s: a third of the attack stood idle. The best plan now pauses the game for
+  the redraw, checked by the pause mark, and executes the new plan once its planning
+  bonus has built (6 s, 15 days). It has done so cleanly in every game since.
+- **Lakes and split borders.** On the marsh arena parts of the grey lake read as Blue
+  land, so every front-line click fell in the lake ("You cannot draw Front Line here"),
+  and a refused click leaves the tool on, so every second try pressed Z onto it and turned
+  it off. Now Blue's land must lean green over red (the lake does not), clicks keep clear
+  of water, the tool's "N divisions will be assigned" is looked for and switched off
+  after a refused click, and a border that water cuts in two at the start gets a front
+  line on each stretch. The divisions still split by frontage (above).
+- **Full views without a tooltip.** Recentring left the pointer mid-map, where a
+  province's tooltip covered part of the border in every planner view; it now waits on
+  the top bar. With it gone, the v4 border reads as one stretch.
+- **Tests of new arenas draw their side at random** (all of the first eight had been
+  Red), and `win-rate` counts each arena by side. The best plan so far on the v6 arenas:
+  river, plains and passes won; marsh, bay and salient lost (before the guard).
 
 ## A learned player from the scripted games (2026-09-24)
 

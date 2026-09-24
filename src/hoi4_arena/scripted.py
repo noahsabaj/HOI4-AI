@@ -94,13 +94,21 @@ FOUND = {
     # "No location set": 0.96-1.00 shown, 0.73 on every other screen.
     "recruit_title": 0.8,
     "no_location": 0.9,
+    # The Battle Plans bar's "N divisions will be assigned." while the front line tool is
+    # on: 1.00 on, at most 0.51 off (2026-09-24).
+    "front_tool": 0.8,
 }
 # The create-army + glows while divisions are selected, so no fixed picture of it holds:
 # the first live game's frames scored 0.17 against a template taken a minute earlier.
 # It is found by colour instead, the only green in the army bar before an army exists:
 # 201 to 336 pixels of it where it showed, none while it was grey.
 GREEN_PLUS = 60
-FRONT_LINE, OFFENSIVE_LINE, SHIFT, POLITICS = 0x5A, 0x58, 0x10, 0x51
+FRONT_LINE, OFFENSIVE_LINE, SHIFT, POLITICS, SPACE = 0x5A, 0x58, 0x10, 0x51, 0x20
+# Seconds a plan redrawn while paused is left planning before it executes: its bonus
+# grows 2% a day to 30%, 15 days, about 6 s at speed 5.
+PLANNING = 6
+# Seconds between the guard's looks at the home land while the front holds (guard_hold).
+HOLD_CHECK = 30
 # The political screen at 1080p: the conscription slot (its icon's box), each law's row
 # in the list it opens, the confirmation's OK and Cancel, and the list's close button.
 LAW_SLOT = (38, 571, 82, 615)
@@ -161,12 +169,11 @@ OFFENSIVES = ("broad", "near", "deep")
 # The share of games for each kind of plan: the best found so far (best_plan), the best
 # with one change under test (CHALLENGER), and the rest with every choice drawn at random,
 # so the recordings still show varied plans, good and bad.
-SHARES = {"best": 0.4, "challenger": 0.3, "explore": 0.3}
-# The change under test. Broad offensives pulled the middle of the front forward while
-# the AI kept pockets and a salient in the script's own land (2026-09-23), and one won
-# game swung back from the AI's 96% surrender to 24%: a front line executed alone pushes
-# along the whole border and follows it as it moves.
-CHALLENGER = {"variant": "front", "attack": "front"}
+SHARES = {"best": 0.55, "challenger": 0.15, "explore": 0.3}
+# The change under test, applied to the best plan: a shorter hold (120-160 s). The wins
+# that held 113-142 s ended in 208-344 s (mean 286), those that held 199-227 s in 337-371 s
+# (mean 354), all won; the conscription ladder is done by about 120 s.
+CHALLENGER = {"variant": "brisk", "wait": (120, 160)}
 
 
 def best_plan(rng):
@@ -177,6 +184,12 @@ def best_plan(rng):
     within 60 s lost. While the front holds, the AI loses 3 to 6 men for each of the
     script's attacking it, and the script's divisions fill up from the manpower that All
     Adults Serve brings, to about 48k against the AI's 14-18k.
+
+    The attack redraws its plan while the game is paused (a redraw had left the army
+    without an executing plan for 20-24 s, a third of the attack's time), and the guard
+    turns the army back to clear its home land when the AI holds 15% of it (three losses
+    of 2026-09-24 came from the army pushing on while a few of the AI's divisions took
+    the empty home half's victory points).
     """
     return {
         "best": True,
@@ -186,6 +199,8 @@ def best_plan(rng):
         "recruit": 0,
         "wait": round(rng.uniform(120, 240)),
         "redraw": round(rng.uniform(30, 90)),
+        "pause_redraw": True,
+        "guard": 0.15,
     }
 
 
@@ -205,7 +220,11 @@ def choose_plan(rng, shares=None):
     if kind == "best":
         return best_plan(rng)
     if kind == "challenger":
-        return {**best_plan(rng), "best": False, **CHALLENGER}
+        change = {
+            key: round(rng.uniform(*value)) if isinstance(value, tuple) else value
+            for key, value in CHALLENGER.items()
+        }
+        return {**best_plan(rng), "best": False, **change}
     attack = rng.choices(list(ATTACKS), weights=list(ATTACKS.values()))[0]
     return {
         "best": False,
@@ -301,8 +320,10 @@ class Planner:
         self.rng = rng or random.Random()
         self.orders = []
         self.activate_at = self.redraw_at = self.law_at = self.reinforce_at = math.inf
-        self.recruit_at = math.inf
+        self.recruit_at = self.check_at = math.inf
         self.recruit_tries = 0
+        # Whether the army is counter-attacking an incursion while the front holds.
+        self.defending = False
         # Whether the plan executes now (lit), the game runs, and the hold is over.
         self.active = self.running = self.attacking = False
         # Attempts at activating the current plan.
@@ -316,7 +337,11 @@ class Planner:
         # Where to keep each settled full view of the map, if anywhere (arena tests), and
         # the land masks of the last one.
         self.overview_dir = None
-        self.last_view = None
+        self.last_view = self.home = None
+        # Where to keep the planner's view when an order fails (keep), and how many kept.
+        self.debug_dir, self.kept = None, 0
+        # Whether water cut the border in two at the start (draw_front).
+        self.split_border = False
 
     def order(self, kind, **details):
         self.orders.append({"frame": self.frame(), "order": kind, **details})
@@ -368,6 +393,16 @@ class Planner:
     def selected(self, desk):
         return self.find(screen(desk), "plans_bar") is not None
 
+    def keep(self, rgb, why, most=3):
+        """The planner's own view when an order failed, kept in the game's folder (the
+        recording's frames did not show why one did on 2026-09-24)."""
+        if self.debug_dir is None or self.kept >= most or rgb is None:
+            return
+        from PIL import Image
+
+        self.kept += 1
+        Image.fromarray(rgb).save(Path(self.debug_dir) / f"planner-{why}-{self.frame():06d}.png")
+
     def select_army(self, desk):
         if not self.selected(desk):
             self.click(desk, ARMY_CARD)
@@ -386,6 +421,9 @@ class Planner:
         clicks landed off the border, the fourth on a state, which opened its panel.
         """
         recentre(desk)
+        # Off the map, onto the top bar's blank middle: recentring leaves the pointer in
+        # the middle of the map, where a province's tooltip covered part of the border.
+        act(desk, [{"kind": "move", "x": 0.65, "y": 0.012}])
         last = None
         for _ in range(tries):
             time.sleep(0.3)
@@ -394,6 +432,10 @@ class Planner:
             blue, red = country_pixels(rgb[top:bottom])
             if blue is None:
                 return rgb, None, None, None
+            # Blue's land leans green over red (g-r about 14-20); a grey lake, whose blue
+            # just passes country_pixels' test, does not (g-r about 0).
+            crop = rgb[top:bottom].astype(np.int16)
+            blue &= crop[..., 1] - crop[..., 0] > 5
             blue, red = clean(blue), clean(red)
             if not blue.any() or not red.any():
                 return rgb, None, None, None
@@ -407,6 +449,9 @@ class Planner:
             Image.fromarray(rgb).save(self.overview_dir / f"{self.frame():06d}.png")
         if blue is not None:
             self.last_view = (blue, red)
+            if self.home is None and not self.running:
+                # The land held at the start, before the war moves the border.
+                self.home = blue if self.country == "BLU" else red
         return rgb, blue, red, box
 
     def assign_general(self, desk, tries=3):
@@ -441,8 +486,10 @@ class Planner:
         self.order("clear")
         return True
 
-    def draw_front(self, desk, tries=4):
-        """A front line along the whole border, checked: the army card shows a plan.
+    def draw_front(self, desk, tries=4, guard=None):
+        """A front line along the whole border, checked: the army card shows a plan. With
+        `guard`, round the enemy's incursion instead, when there is one (stretches). True
+        if the front was drawn round an incursion.
 
         The front line tool takes a click on the enemy's side of the border, on one of
         the fronts it highlights ("You cannot draw Front Line here" anywhere else, deep in
@@ -453,22 +500,85 @@ class Planner:
         for attempt in range(tries):
             # A fresh look each time: the camera may have moved since the last.
             rgb, blue, red, box = self.overview(desk)
-            if box is None or not self.select_army(desk):
-                raise RuntimeError("no arena or army to draw a front line with")
+            if box is None:
+                self.keep(rgb, "no-arena")
+                raise RuntimeError("no arena on screen to draw a front line on")
+            if not self.select_army(desk):
+                self.keep(screen(desk), "no-army")
+                raise RuntimeError("the army would not be selected to draw a front line")
             front = self.front(blue, red)
             if not front:
                 raise RuntimeError("the two countries do not touch on screen")
+            # A click the tool refused leaves it on, and Z toggles it: off first. On the
+            # marsh arena every second try pressed Z onto a tool still on (2026-09-24).
+            if self.find(screen(desk), "front_tool", top=0.7) is not None:
+                act(desk, tap(FRONT_LINE))
+                time.sleep(0.4)
+            crop = rgb[MAP_TOP : rgb.shape[0] - MAP_BOTTOM]
+            stretches, rear = self.stretches(blue, red, box, crop, guard)
+            front = stretches[0]
             # The border's middle first: the tool follows the whole border from there.
             middle = sorted(front, key=lambda p: p[1])[len(front) // 2]
             x, y = middle if attempt == 0 else self.rng.choice(front)
             act(desk, tap(FRONT_LINE))
             self.click(desk, self.screen_point(rgb, x, y))
             time.sleep(0.8)
-            if plan_shown(screen(desk)):
-                self.order("front", at=self.box_point(box, x, y), tries=attempt + 1)
-                return
+            shot = screen(desk)
+            if plan_shown(shot):
+                where = {"rear": True} if rear else {}
+                self.order("front", at=self.box_point(box, x, y), tries=attempt + 1, **where)
+                for other in stretches[1:]:
+                    self.more_front(desk, rgb, box, other)
+                return rear
+            if self.find(shot, "front_tool", top=0.7) is not None:
+                act(desk, tap(FRONT_LINE))
+                time.sleep(0.4)
             self.select_army(desk)
         raise RuntimeError("no front line took: the army card never showed a plan")
+
+    def stretches(self, blue, red, box, crop, guard=None):
+        """Where the front line tool is clicked: stretches of front points (the middle of
+        the first is clicked, then one for each other), and whether they are the rear's.
+
+        Never on water: the tool refuses a lake on the border. A lake can also cut the
+        border in two, and the tool follows one stretch, so at the start each stretch
+        gets a front; later the war's pockets would split the army between them. With
+        `guard`, while the enemy holds at least that share of the land held at the start
+        (incursion), the front is drawn round what it holds there, and the army turns
+        back to clear it: in two lost games of 2026-09-24 the army pushed on while one or
+        a few of the AI's divisions walked through the empty home half and took its
+        victory points.
+        """
+        front = self.front(blue, red)
+        dry = ashore(front, blue, red, box, crop)
+        if guard and self.home is not None:
+            held = incursion(blue, red, self.country, self.home)
+            if held >= guard:
+                inside = [(x, y) for x, y in dry if self.home[y, x]]
+                if inside:
+                    self.order("guard", held=round(held, 3))
+                    return [inside], True
+        stretches = apart(dry)
+        if not self.running:
+            self.split_border = len(stretches) > 1
+        if not self.split_border:
+            stretches = [sum(stretches, [])]
+        return stretches, False
+
+    def more_front(self, desk, rgb, box, stretch):
+        """Another front line for the army, on a stretch of border the first did not
+        reach; the tool is left off."""
+        if self.find(screen(desk), "front_tool", top=0.7) is not None:
+            act(desk, tap(FRONT_LINE))
+            time.sleep(0.4)
+        x, y = sorted(stretch, key=lambda p: p[1])[len(stretch) // 2]
+        act(desk, tap(FRONT_LINE))
+        self.click(desk, self.screen_point(rgb, x, y))
+        time.sleep(0.8)
+        if self.find(screen(desk), "front_tool", top=0.7) is not None:
+            act(desk, tap(FRONT_LINE))
+            time.sleep(0.4)
+        self.order("front", at=self.box_point(box, x, y), stretch=True)
 
     def front(self, blue, red):
         """Crop pixels on the enemy's side of the border, as (x, y).
@@ -619,6 +729,64 @@ class Planner:
         self.active = plan_shown(rgb) and waiting is None and arrow_lit(rgb)
         return self.active
 
+    def guard_hold(self, desk):
+        """The guard while the front holds: when the AI holds the plan's `guard` share of
+        the land held at the start, the army counter-attacks round it (drawn while paused
+        if the plan pauses, and executed); once it holds under half that, the army goes
+        back to the front and the offensive drawn for the attack, and holds again.
+
+        The held front never shifts its divisions: HOI4 spreads them along it by frontage.
+        On the salient arena (2026-09-24) Red's stood 6 to 2 across its two border states
+        all game; the AI massed on the thin side in July 1936, walked through Red's
+        interior, and Red capitulated in September, before its attack. True: the camera
+        moved.
+        """
+        rgb, blue, red, box = self.overview(desk)
+        if blue is None or self.home is None:
+            return True
+        held = incursion(blue, red, self.country, self.home)
+        guard = self.plan["guard"]
+        if (held < guard) if not self.defending else (held >= guard / 2):
+            return True  # Nothing to change: hold, or go on counter-attacking.
+        paused = bool(self.plan.get("pause_redraw")) and self.pause(desk, True)
+        try:
+            self.clear_orders(desk)
+            if self.defending:
+                # The home land is clear again: back to the front, and the offensive
+                # drawn for the attack, waiting.
+                self.draw_front(desk)
+                if self.plan["attack"] in OFFENSIVES:
+                    self.draw_offensive(desk)
+                self.defending = False
+            else:
+                self.defending = self.draw_front(desk, guard=guard)
+                if not self.defending and self.plan["attack"] in OFFENSIVES:
+                    self.draw_offensive(desk)  # Gone by the fresh look: the plan as it was.
+        finally:
+            if paused:
+                self.pause(desk, False)
+        if self.defending:
+            self.activate(desk)
+        return True
+
+    def pause(self, desk, paused):
+        """Pause or unpause the running game with Space, checked by the blinking pause mark
+        (looked for over two seconds). True once it is as asked."""
+        for _ in range(3):
+            seen = False
+            for _ in range(8):
+                if self.rules.matches("paused", screen(desk)):
+                    seen = True
+                    break
+                time.sleep(0.25)
+            if seen == paused:
+                if paused:
+                    self.order("pause")
+                return True
+            act(desk, [{"kind": "move", "x": 0.5, "y": 0.5}, *tap(SPACE)])
+            time.sleep(0.5)
+        return False
+
     def guarding(self):
         """Whether the home half needs the army: with a plan's `guard`, a redraw during the
         attack executes the front line alone (it pushes along the whole border, the
@@ -627,7 +795,7 @@ class Planner:
         guard = self.plan.get("guard")
         if not guard or self.last_view is None:
             return False
-        held = incursion(*self.last_view, self.country)
+        held = incursion(*self.last_view, self.country, self.home)
         if held >= guard:
             self.order("guard", held=round(held, 3))
         return held >= guard
@@ -654,10 +822,15 @@ class Planner:
             self.law_at = now + 30
         if self.plan.get("recruit") and self.law_at == math.inf:
             self.recruit_at = now + RECRUIT_AFTER
+        if self.plan.get("guard"):
+            self.check_at = now + HOLD_CHECK
 
     def due(self):
         now = time.monotonic()
-        waits = (self.activate_at, self.redraw_at, self.law_at, self.recruit_at, self.reinforce_at)
+        waits = (
+            self.activate_at, self.redraw_at, self.law_at, self.recruit_at, self.reinforce_at,
+            self.check_at,
+        )  # fmt: skip
         return min(waits) <= now
 
     def step(self, desk):
@@ -688,16 +861,29 @@ class Planner:
             if done and self.plan.get("recruit"):
                 self.recruit_at = now + RECRUIT_AFTER
             return False
+        if now >= self.check_at:
+            # While the front holds; during the attack the redraws guard the home land.
+            self.check_at = math.inf if self.attacking else now + HOLD_CHECK
+            return False if self.attacking else self.guard_hold(desk)
         if now >= self.redraw_at:
             # Soon again, should the redraw fail part way.
             self.redraw_at = now + 5
-            self.clear_orders(desk)
-            self.draw_front(desk)
-            if self.plan["attack"] in OFFENSIVES and not self.guarding():
-                self.draw_offensive(desk)
+            # With `pause_redraw` the game waits while the plan is redrawn: a redraw takes
+            # 20-24 s from clearing the orders to executing the new plan, about 55 game days
+            # at speed 5 in which the army has no plan, a third of an attack's time.
+            paused = bool(self.plan.get("pause_redraw")) and self.pause(desk, True)
+            try:
+                self.clear_orders(desk)
+                rear = self.draw_front(desk, guard=self.plan.get("guard"))
+                if self.plan["attack"] in OFFENSIVES and not rear:
+                    self.draw_offensive(desk)
+            finally:
+                if paused:
+                    self.pause(desk, False)
             if self.attacking:
-                # A new plan waits to be executed, like the first.
-                self.activate_at = time.monotonic()
+                # A new plan waits to be executed, like the first; after a paused redraw,
+                # the few seconds its planning bonus takes to build (15 days, 2% a day).
+                self.activate_at = time.monotonic() + (PLANNING if paused else 0)
             # The period counts from the redraw's end, so it never crowds out the rest.
             self.redraw_at = time.monotonic() + self.plan["redraw"]
             return True
@@ -842,7 +1028,49 @@ class Planner:
         return self.law_fails >= LAW_TRIES
 
 
-def incursion(blue, red, country):
+def ashore(front, blue, red, box, rgb=None, reach=11):
+    """The front points at least `reach` pixels from water inside the land box: lakes and
+    the sea, blobs of neither country's land thicker than the lines the map draws
+    between provinces, and darker than the countries' names written over the land (with
+    the map crop `rgb`: a grey lake sums to 330-440, the sea to about 140, the letters to
+    well over 500). All of them if none is."""
+    import cv2
+
+    if box is None:
+        return front
+    top, left, bottom, right = box
+    other = np.zeros(blue.shape, np.uint8)
+    other[top:bottom, left:right] = ~(blue | red)[top:bottom, left:right]
+    if rgb is not None:
+        other &= (rgb.astype(np.int32).sum(-1) < 450).astype(np.uint8)
+    water = cv2.morphologyEx(other, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    near = cv2.dilate(water, np.ones((2 * reach + 1, 2 * reach + 1), np.uint8)).astype(bool)
+    dry = [(x, y) for x, y in front if not near[y, x]]
+    return dry or front
+
+
+def apart(front, gap=15, least=0.1):
+    """The front's separate stretches, largest first: points closer than `gap` pixels are
+    one stretch. Stretches under `least` of the points are dropped (specks where the map
+    draws a line). A plain border is one stretch."""
+    import cv2
+
+    if not front:
+        return [front]
+    xs = np.array([p[0] for p in front])
+    ys = np.array([p[1] for p in front])
+    x0, y0 = xs.min(), ys.min()
+    grid = np.zeros((ys.max() - y0 + 1, xs.max() - x0 + 1), np.uint8)
+    grid[ys - y0, xs - x0] = 1
+    grid = cv2.dilate(grid, np.ones((gap, gap), np.uint8))
+    count, labels = cv2.connectedComponents(grid, connectivity=8)
+    label = labels[ys - y0, xs - x0]
+    stretches = [[p for p, k in zip(front, label, strict=True) if k == i] for i in range(1, count)]
+    stretches = [s for s in stretches if len(s) >= least * len(front)]
+    return sorted(stretches, key=len, reverse=True) or [front]
+
+
+def incursion(blue, red, country, home=None):
     """The share of `country`'s home half of the arena that its enemy holds, from the
     land masks of a full view: the half of the land box on its own side of the seam.
 
@@ -851,12 +1079,16 @@ def incursion(blue, red, country):
     89%, as the AI's last divisions walked into the empty rear and took its victory
     points; in a win that swung back it reached 22%.
     """
+    own, enemy = (blue, red) if country == "BLU" else (red, blue)
+    if home is not None and home.shape == own.shape and home.any():
+        # The land the player held at the start, which on an arena whose border bends is
+        # not the half on its side of the middle.
+        return float((enemy & home).sum() / home.sum())
     box = land_box(blue, red)
     if box is None:
         return 0.0
     top, left, bottom, right = box
     seam = (left + right) // 2
-    own, enemy = (blue, red) if country == "BLU" else (red, blue)
     half = slice(left, seam) if country == "BLU" else slice(seam, right)
     held = enemy[top:bottom, half].sum()
     return float(held / max(1, held + own[top:bottom, half].sum()))
@@ -932,6 +1164,7 @@ TEMPLATES = {
     "ready": "artifacts/screens-1080p/plan-ready.png",
     "recruit_title": "artifacts/screens-1080p/recruit-title.png",
     "no_location": "artifacts/screens-1080p/no-location.png",
+    "front_tool": "artifacts/screens-1080p/front-tool-active.png",
 }
 
 
@@ -987,6 +1220,10 @@ def win_rate(results):
     for arena in sorted({g["arena"] for g in played if g.get("arena")}):
         report[f"arena_{arena}"] = tally([g for g in played if g.get("arena") == arena])
         report[f"best_arena_{arena}"] = tally([g for g in best if g.get("arena") == arena])
+        # And by side: an arena may favour one, and the first tests were all played as Red.
+        for side in ("BLU", "RED"):
+            chosen = [g for g in played if g.get("arena") == arena and g["started_as"] == side]
+            report[f"arena_{arena}_{side}"] = tally(chosen)
     for attack in ATTACKS:
         report[attack] = tally([g for g in played if (g.get("plan") or {}).get("attack") == attack])
     for law in CONSCRIPTION:

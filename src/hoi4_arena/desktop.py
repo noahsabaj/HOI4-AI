@@ -292,7 +292,9 @@ class Desktop:
             parse_cursor(meta.get("cursor"))
         except ValueError as error:
             raise DesktopError(str(error)) from error
-        return Frame(rgb, meta, time.monotonic_ns(), views=seen, crops=crops)
+        # perf_counter, not monotonic: on Windows before Python 3.13 monotonic ticks in
+        # steps of 15.6 ms, coarser than a frame's journey here.
+        return Frame(rgb, meta, time.perf_counter_ns(), views=seen, crops=crops)
 
     def arm(self, *, setup=False):
         self.request("arm", mode="setup" if setup else "match")

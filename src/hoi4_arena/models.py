@@ -700,6 +700,22 @@ class Policy(nn.Module):
         return summary, self.cells(grid, quadrants), self.foveal(fovea).mean((-2, -1))
 
 
+_ACTION_SCALES = {}
+
+
+def action_scales(like):
+    """The largest value of each action field, as a tensor like `like`, made once per device.
+
+    Made from a Python list at every step it was a copy from pageable host memory, and
+    such a copy first waits for everything queued on the device: one full stop per
+    decision, so the host never ran ahead of the GPU.
+    """
+    key = (like.device, like.dtype)
+    if key not in _ACTION_SCALES:
+        _ACTION_SCALES[key] = like.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
+    return _ACTION_SCALES[key]
+
+
 def fuse(module, summary, cells, centre, previous, speed, hidden, dtype=None):
     """One decision's inputs as one vector for the memory.
 
@@ -721,7 +737,7 @@ def fuse(module, summary, cells, centre, previous, speed, hidden, dtype=None):
     dtype = dtype or summary.dtype
     summary = F.layer_norm(summary.float(), summary.shape[-1:]).to(summary.dtype)
     centre = F.layer_norm(centre.float(), centre.shape[-1:]).to(centre.dtype)
-    scales = previous.new_tensor([len(VOCAB) - 1, GRID - 1, GRID - 1])
+    scales = action_scales(previous)
     prior = module.previous_action((previous / scales).flatten(1).to(dtype))
     attention = torch.einsum("bnc,bc->bn", cells, module.read(hidden).to(cells.dtype))
     weights = (attention.float() / math.sqrt(CELL_DIM)).softmax(-1).to(cells.dtype)

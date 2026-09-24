@@ -16,6 +16,7 @@ NO_TORCH = {
     "probe-peer",
     "capture",
     "win-rate",
+    "salvage",
 }
 
 
@@ -251,6 +252,16 @@ def main():
     )
     check.add_argument("source")
     check.add_argument("--sources", nargs="+", default=["human", "ai"])
+    rescue = sub.add_parser(
+        "salvage",
+        help="Finish recordings whose recorder was killed before it closed them, so training "
+        "takes them: rows past the video's end go, and the manifest says complete and "
+        "salvaged. What the recorder left is kept beside them; --undo puts it back. Skips "
+        "any recording that may still be recording.",
+    )
+    rescue.add_argument("paths", nargs="+", help="Recordings, or folders to search for them")
+    rescue.add_argument("--undo", action="store_true", help="Put salvaged recordings back")
+    rescue.add_argument("--dry-run", action="store_true", help="Say what would be done")
     train = sub.add_parser("train-bc")
     train.add_argument("data", help="A folder of recordings, each with its own manifest.")
     train.add_argument(
@@ -911,6 +922,14 @@ def _dispatch(command, args):
 
         games = [g for path in args["results"] for g in json.loads(Path(path).read_text())]
         result = win_rate(games)
+    elif command == "salvage":
+        from .recording import recordings, salvage, unsalvage
+
+        found = recordings(args["paths"])
+        if args["undo"]:
+            result = [unsalvage(root) for root in found]
+        else:
+            result = [salvage(root, dry_run=args["dry_run"]) for root in found]
     elif command == "check-session":
         from .dataset import sequence_starts, session_labels
 
