@@ -129,8 +129,13 @@ class Desktop:
         with self.pending_lock:
             self.reader_error = error
             boxes = list(self.pending.values())
+            sinks = list(getattr(self, "streams", {}).values())
         for box in boxes:
             box.put(error)
+        # A stream ends with its connection: tell whoever is writing it, so it keeps what
+        # it has instead of waiting for messages that cannot come.
+        for sink in sinks:
+            sink({"end": {"reason": f"connection lost: {error}"}})
 
     def _send(self, payload: bytes):
         self.process.stdin.write(payload)

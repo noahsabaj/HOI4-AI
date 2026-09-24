@@ -463,22 +463,31 @@ class StreamRecorder:
             (self.root / "trailing-events.json").write_text(json.dumps(trailing))
         rc = self._shut()
         frames = self.manifest["frames"]
-        encoded = end.get("encoded_frames")
         video = count_frames(self.root / "screen.mkv")
         # The rows and the video must agree frame for frame, or training reads the wrong
-        # frame for every decision after the first mismatch.
-        problem = None
-        if encoded is not None and encoded != frames:
-            problem = f"the encoder took {encoded} frames of {frames}"
-        elif video is not None and video != frames:
-            problem = f"the video holds {video} frames of {frames}"
-        elif self.write_error:
-            problem = self.write_error
-        elif end.get("exit") not in (0, None):
-            problem = f"the worker's encoder exited {end.get('exit')}: {end.get('errors')}"
+        # frame for every decision after the first mismatch. A stream cut short (its
+        # encoder or its connection lost) has rows for frames that never reached the video:
+        # those rows go, and everything before them is kept, since frame i of the video is
+        # row i. More video than rows cannot be matched up and is a fault.
+        problem = cut = None
+        if video is not None and video < frames:
+            cut = frames - video
+            rows = (self.root / "frames.jsonl").read_text(encoding="utf8").splitlines()
+            (self.root / "frames.jsonl").write_text(
+                "".join(line + "\n" for line in rows[:video]), encoding="utf8"
+            )
+            self.manifest["frames"] = frames = video
+            log.warning("the stream was cut short: %d rows past the video's end dropped", cut)
+        elif video is not None and video > frames:
+            problem = f"the video holds {video} frames but only {frames} rows"
+        if self.write_error:
+            problem = problem or self.write_error
+        if end.get("exit") not in (0, None):
+            log.warning("the worker's encoder exited %s: %s", end.get("exit"), end.get("errors"))
         self.manifest.update(
             complete=complete and rc == 0 and problem is None,
             reason=reason or problem,
+            rows_cut=cut,
             encoder_exit=end.get("exit"),
             muxer_exit=rc,
             video_frames=video,

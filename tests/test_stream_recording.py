@@ -130,13 +130,17 @@ def test_a_tick_that_found_the_game_away_reads_as_out_of_focus(tmp_path):
 
 
 @needs_ffmpeg
-def test_rows_the_video_does_not_hold_make_the_recording_incomplete(tmp_path):
+def test_a_stream_cut_short_keeps_the_frames_its_video_holds(tmp_path):
+    # Two rows arrived for frames that never reached the video (a lost connection, say):
+    # frame i of the video is row i, so the rows past the video's end go, and the rest train.
     rec = recording.StreamRecorder(
         tmp_path / "rec", _Desk(_Stream(frames=40, encoded=38)), game_speed=5, codec="nvenc"
     )
     rec.close()
-    manifest = json.loads((tmp_path / "rec" / "manifest.json").read_text())
-    assert not manifest["complete"] and "38 frames of 40" in manifest["reason"]
+    root = tmp_path / "rec"
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["complete"] and manifest["rows_cut"] == 2
+    assert manifest["frames"] == len(_rows(root)) == _decoded(root) == 38
 
 
 @needs_ffmpeg
