@@ -100,6 +100,10 @@ SHOWN = 0.9
 # Games loaded in a row before HOI4 is launched afresh anyway, and the seconds allowed for
 # clearing the end of a game until the menu opens.
 LOADS_PER_LAUNCH, MENU_SECONDS = 8, 30
+# More buttons that close a popup at the end of a game (open_menu), as SCREENS/<name>.png:
+# the winner's "equipment seized" popup's OK, in capitals. Its conference's Confirm and
+# Exit (conference-exit.png) is cropped short of where the pointer rests after a click.
+END_POPUPS = ("ok-capitals",)
 # Seconds between moving onto something and pressing it: longer than one 200 ms decision,
 # so a recorded click is always pressed where the pointer already was, as a player sees
 # the button light up before clicking it.
@@ -416,8 +420,14 @@ def open_menu(desk, templates, seconds=MENU_SECONDS):
     winner's peace conference (Confirm and Exit, then OK) and the events after it, as
     they come, then the menu button, until the menu shows. True if it did in time.
 
-    Four rounds were too few after a win, whose conference comes with its own popups:
-    33 of 36 loads after a win fell back to a launch (2026-09-24)."""
+    After a win, 33 of 36 loads fell back to a launch (2026-09-24): the winner's
+    conference opens under an "equipment seized" popup, whose button reads OK in capitals,
+    which the popups' Ok templates missed (END_POPUPS), and that popup blocks every other
+    click."""
+    templates = [*templates, *(
+        np.asarray(Image.open(path).convert("RGB"))
+        for path in (SCREENS / f"{name}.png" for name in END_POPUPS) if path.exists()
+    )]  # fmt: skip
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         rgb = screen(desk)
