@@ -574,6 +574,24 @@ use per process (Windows' GPU Engine counters) and for the card (NVML: busy, vid
 encoder, memory, temperature, power), disks, the network, the game window (responding,
 in front, on which screen) and the capture's timing.
 
+**Each HOI4 launch leaks memory there** (measured 2026-09-24). Over a night of scripted
+games the second PC's committed memory rose about 1 GB an hour, from 29.95 GB to 33.79 GB,
+against a limit of 34.57 GB. Its RAM stayed 21 GB free all along. At the limit, Windows
+refuses allocations unless it can grow the pagefile, so the game or a recording can crash
+mid-game. The game, the worker, ffmpeg and the bridge stayed flat from game to game. What
+grows is left behind by each launch:
+- 20 cycles of connecting, attaching, capturing and closing, each a fresh worker with its
+  own desktop duplication, changed nothing.
+- 5 quit-and-launch cycles added about 100 MB each to the memory committed with no game
+  running, 25 MB of it in dwm.exe.
+
+Only a logoff or a reboot gives it back. Its pagefile is managed by Windows (2 GB on 2026-09-24), so the limit can
+grow as far as its disk allows. It does not sign in by itself after a restart, so after a
+reboot someone must sign in there before the worker runs again. `control report` shows both. Relaunching less often would stop the growth,
+for instance by loading the next start from inside the running game. `telemetry` now
+prints the commit charge and warns above 90% of the limit, and a stream recording logs a
+warning when its PC is past that.
+
 ## Recording where the game runs (2026-09-24)
 
 Frames used to be pulled one request at a time: every 200 ms the recorder asked the
@@ -605,6 +623,13 @@ One AI game each on the second PC, same camera and worker, 2026-09-24:
 
 The game itself took 3.4-3.5 cores, 3.2 GB and 30% of the GPU either way. x264 is now
 capped at 4 threads: its default here took 80 threads and 2 GB for the same 5 fps.
+
+**In production.** The scripted player's 14 games from 03:45 to 05:30 each held 5.0 fps
+with no late or skipped tick. Tick lateness was 0.6-0.7 ms p95 (2.5 ms at worst), and
+frame intervals were 201 ms p95. The whole scripted player process on this PC used 0.24
+cores. `record --peer --codec nvenc`, the human path, was checked live for 30 s: 153 rows
+and 153 video frames, rows arriving 1.2 / 3.6 ms p50 / p95 after capture, and intervals of
+203 ms p95.
 
 **Is the video as good?** Against 452 lossless 1080p frames (a clip, and screenshots of
 menus, maps and scripted games, each held three frames), each candidate encoded and then
@@ -981,6 +1006,28 @@ beat (`win-rate`).
 - **Tests of new arenas draw their side at random** (all of the first eight had been
   Red), and `win-rate` counts each arena by side. The best plan so far on the v6 arenas:
   river, plains and passes won; marsh, bay and salient lost (before the guard).
+- **The record (2026-09-24, 06:30).** The best plan (broad offensives after a 120-240 s
+  hold, All Adults Serve, paused redraws, the guard) won 11 of 13 decided games since
+  03:00 (85%, 95% interval 58-96%): 8 of 8 as Blue, 3 of 5 as Red, 6 of 6 on the v4
+  arena. Both losses were as Red on arenas where HOI4 spreads the divisions badly (marsh
+  and salient). The random exploring plans won 1 of 7. Since the fixes of 2026-09-23 the
+  script has won 26 of 41 decided games in all.
+- **Loading inside the running game.** Every HOI4 launch on the second PC left about
+  100 MB of commit charge behind until a reboot (found by the worker's telemetry): with a
+  34.6 GB limit, a 27 GB baseline and 5.2 GB for a game, launches ran out after a night of
+  games. The next game on the same arena now loads its start save from inside the
+  running one: the winner's peace conference is left (Confirm and Exit, then OK),
+  popups are cleared, the menu at the top right opens Load Game, the save is found in
+  the list by its name (scrolling down to it) and loaded. It took 3.3 s to the paused
+  map, at speed 1 like a fresh start, and the arena log is then read from where it
+  stood before the war was declared. HOI4 is still launched afresh every 8 games, after
+  any failure, and for another arena; `--main-only` keeps a run on its given arenas, and
+  otherwise the main arena takes two pairs of games in every three, so that runs of four
+  games load in place.
+- **A memory guard.** Before a game the recorder reads the second PC's commit charge
+  from its telemetry: before loading in the running game, the charge as it is; before a
+  launch, after quitting, the charge plus the 5.3 GB a game takes. At 95% of the limit
+  it starts no game, writes MEMORY-STOP into the run's folder and stops.
 
 ## A learned player from the scripted games (2026-09-24)
 
@@ -1065,6 +1112,25 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
 
 ## The memory study (2026-09-24)
 
+**Withdrawn: the GRU arms were dead.** A check after the study found every GRU arm's
+memory saturated, so the verdicts below compare broken models, and a fair rerun is needed.
+- **The cause:** the vision tower's summary enters the fusion unnormalised. Its RMS is
+  71, against 1-3 for every other input, so it makes up 35-48 of the fusion's
+  pre-activation RMS.
+- **What that did to the GRUs:** 80-98% of their gates were saturated, 88-90% of units
+  never moved during a game, and their outputs' spread over time was 0.003. One step
+  from an empty memory landed within 3% of the carried state.
+- **The other cells:** Mamba-3, with its own normalisation, was alive (71% from empty).
+  Gated DeltaNet-2's memory added about 2% to a swamped input.
+
+This explains why clearing the GRU's memory changed nothing, and why the GRU trained from
+empty lost to no memory. The same flaw left `bc-v2s5` and the first scripted-game
+policy with a memory that never changed. The fix is a parameter-free layer norm on the
+summary and fovea inside `fuse`, which every arm uses. The rerun uses the same cache and
+rule, and treats any arm whose memory is dead as invalid rather than ranking it.
+
+The original write-up follows, for the record.
+
 Which memory should the policy have, and how should it be trained?
 `scripts/memory_study.py` trained six arms, five seeds each, with `train_memory` on one
 cache of frozen perception features (`artifacts/bc-v2s5` reading the 44 speed-5 AI
@@ -1120,9 +1186,11 @@ hand-recorded play.
    (`train-state-value`), weight the scripted games' decisions by advantage
    (`advantage --state-value`), and train the policy on them (`train-bc --advantage`).
    Judge it by win rate against the AI and against the scripted player, not by loss.
-3. **Train the memory carried through whole games.** The study is done: carrying beats
-   starting each window empty, and the GRU stays (see "The memory study"). Next, train
-   the policy that way on the scripted games, and repeat the GRU against Mamba-3 there.
+3. **Rerun the memory study with a live memory.** Its GRU arms were dead (see "The
+   memory study"), so which memory to use, and whether to carry it, are open again. First
+   normalise the summary in `fuse`, and record each run's memory movement and gate
+   saturation. Then rerun all six arms, and repeat the best against Mamba-3 on the
+   scripted games.
 4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
    with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
    closed through its worker (`launch`, `quit`) and encoded there on its own clock

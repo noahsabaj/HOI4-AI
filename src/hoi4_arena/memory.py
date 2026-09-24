@@ -67,6 +67,17 @@ class GRUMemory(nn.GRUCell):
         h = super().forward(x, state[0].to(x.dtype))
         return h, (h,)
 
+    def gates(self, x, state):
+        """One step's reset and update gates and candidate state, as the cell computes them
+        (PyTorch's order: reset, update, new), in float32, to see how many are saturated."""
+        with torch.autocast(x.device.type, enabled=False):
+            x, h = x.float(), state[0].float()
+            i_r, i_z, i_n = F.linear(x, self.weight_ih, self.bias_ih).chunk(3, -1)
+            h_r, h_z, h_n = F.linear(h, self.weight_hh, self.bias_hh).chunk(3, -1)
+            reset = torch.sigmoid(i_r + h_r)
+            update = torch.sigmoid(i_z + h_z)
+            return {"reset": reset, "update": update, "candidate": torch.tanh(i_n + reset * h_n)}
+
 
 class NoMemory(nn.Module):
     """No history: a residual MLP of about the GRU's size."""

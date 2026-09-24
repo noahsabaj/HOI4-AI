@@ -80,6 +80,23 @@ CENTRED = 0.03
 VIEW_NEAR, VIEW_FAR, ZOOM_TERRAIN, ZOOM_MAX = 9, 20, 22, 26
 # Seconds to wait for a start save to load onto its paused map, from the launch.
 SAVE_LOAD = 150
+# The share of the second PC's commit limit at which no new game is started, and the
+# commit charge a running arena game takes there (about 5.2 GB, 2026-09-24).
+MEMORY_LIMIT, GAME_MB = 0.95, 5300
+# Loading the next game from inside the running one (load_in_game), 1080p: the menu
+# button at the top right, the menu's Load Game, the winner's peace conference's Confirm
+# and Exit, the load dialog's Load, and a point over its list of saves. Each HOI4 launch
+# on the second PC left about 100 MB of commit charge behind until a reboot
+# (2026-09-24); a load from the menu took 3.3 s to the paused map.
+MENU_BUTTON, MENU_LOAD_GAME = (1900 / 1920, 15 / 1080), (960 / 1920, 340 / 1080)
+CONFERENCE_EXIT, LOAD_BUTTON = (1770 / 1920, 54 / 1080), (1042 / 1920, 790 / 1080)
+SAVE_LIST, CONFIRM_OK = (960 / 1920, 600 / 1080), (1052 / 1920, 676 / 1080)
+SCREENS = Path("artifacts/screens-1080p")
+# The least TM_CCOEFF_NORMED at which these screens count as shown: 1.00 where each
+# showed, at most 0.79 on every other screen tried.
+SHOWN = 0.9
+# Games loaded in a row before HOI4 is launched afresh anyway.
+LOADS_PER_LAUNCH = 8
 # Seconds between moving onto something and pressing it: longer than one 200 ms decision,
 # so a recorded click is always pressed where the pointer already was, as a player sees
 # the button light up before clicking it.
@@ -358,6 +375,67 @@ def picked(rgb, box=PICKER_FLAG):
     x0, y0, x1, y1 = box
     r, _, b = rgb[y0:y1, x0:x1].reshape(-1, 3).mean(0)
     return "RED" if r - b > 40 else "BLU" if b - r > 40 else None
+
+
+def shown(rgb, name, threshold=SHOWN):
+    """Where a calibrated screen element (SCREENS/<name>.png) is, as fractions, or None."""
+    import cv2
+
+    template = np.asarray(Image.open(SCREENS / f"{name}.png").convert("RGB"))
+    scores = cv2.matchTemplate(rgb, template, cv2.TM_CCOEFF_NORMED)
+    _, best, _, (x, y) = cv2.minMaxLoc(scores)
+    if best < threshold:
+        return None
+    h, w = template.shape[:2]
+    return (x + w / 2) / rgb.shape[1], (y + h / 2) / rgb.shape[0]
+
+
+def can_load(save):
+    """Whether a start save can be picked from the load dialog: its name is calibrated."""
+    return bool(save) and (SCREENS / f"save-{save}.png").exists()
+
+
+def load_in_game(desk, save, templates, rules, failure_shot):
+    """The next game from inside the running one: the end-of-game screens cleared (the
+    popups' Ok, the winner's peace conference: Confirm and Exit, then OK), the menu, Load
+    Game, the save picked from the list by its name (scrolling down to it), Load, and the
+    paused map. Raises RuntimeError where a screen does not show."""
+    for _ in range(4):
+        rgb = screen(desk)
+        popup = next((f for t in templates if (f := find_template(rgb, t, OK_MATCH))), None)
+        if popup is not None:
+            click(desk, *popup)
+            time.sleep(0.8)
+            continue
+        if shown(rgb, "conference-exit") is None:
+            break
+        click(desk, *CONFERENCE_EXIT)
+        time.sleep(1)
+        click(desk, *CONFIRM_OK)
+        time.sleep(1)
+    click(desk, *MENU_BUTTON)
+    time.sleep(1)
+    if shown(screen(desk), "menu-load-game") is None:
+        raise RuntimeError("the game menu did not open")
+    click(desk, *MENU_LOAD_GAME)
+    time.sleep(1.5)
+    if shown(screen(desk), "load-dialog-load") is None:
+        raise RuntimeError("the load dialog did not open")
+    for _ in range(12):
+        # Off the list first: a row under the pointer shows a tooltip over the next ones.
+        act(desk, [{"kind": "move", "x": 0.3, "y": 0.5}])
+        time.sleep(0.4)
+        name = shown(screen(desk), f"save-{save}", 0.93)
+        if name is not None:
+            break
+        wheel = [{"kind": "wheel", "delta": -120}] * 3
+        act(desk, [{"kind": "move", "x": SAVE_LIST[0], "y": SAVE_LIST[1]}, *wheel], 0.05)
+    else:
+        raise RuntimeError(f"no save called {save} in the load dialog")
+    click(desk, *name)
+    time.sleep(0.6)
+    click(desk, *LOAD_BUTTON)
+    wait_paused(desk, rules, failure_shot, 90)
 
 
 def menu_ready(desk, seconds=60, still=2.0):
@@ -734,6 +812,8 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
                 if planner is not None and planner.due():
                     try:
                         moved = planner.step(desk)
+                    except (ValueError, OSError):
+                        return  # The game ended and its connection closed mid-order.
                     except RuntimeError as error:
                         say(station, "planner:", error)
                         planner.failures.append({"frame": planner.frame(), "error": str(error)})
@@ -765,6 +845,8 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
                 if zoom < VIEW_NEAR or zoom > VIEW_FAR + 2:
                     # Drifted out of the counters' range: come back into it.
                     wheel(rng.randint(VIEW_NEAR + 1, VIEW_FAR) - zoom, here)
+            except (ValueError, OSError):
+                return  # The game ended and its connection closed.
             except DesktopError as error:
                 say(station, "camera:", error)
                 try:
@@ -775,12 +857,21 @@ def camera(desk, stop, station, popups, overview_every=(20, 60), rng=None, plann
     finally:
         try:
             desk.release()
-        except DesktopError:
+        except (DesktopError, ValueError, OSError):
             pass
 
 
 def play(
-    desk, root, popups, settings, station, country="BLU", speed=4, player=None, start_save=None
+    desk,
+    root,
+    popups,
+    settings,
+    station,
+    country="BLU",
+    speed=4,
+    player=None,
+    start_save=None,
+    log_from=None,
 ):
     """Record one game to its end. With `player` (a plan, templates and screen rules), the
     scripted player fights it from its paused start; without, the game's AI plays both.
@@ -820,6 +911,9 @@ def play(
     )
     # A scripted game starts paused, and no weekly report comes until it runs.
     arena = ArenaLog(desk, silence=None if planner else WEEK_SILENCE)
+    if log_from is not None:
+        # A game loaded inside a running one: the log holds the games before it.
+        arena.offset = log_from
     start = deadline = next_poll = time.monotonic()
     late, ending = 0, None
     # Each mod line with the number of frames recorded when it was read, which aligns the
@@ -937,16 +1031,17 @@ def game_arena(mods, index, accepted=()):
     """The arena of a station's `index`-th game, played as both countries in turn
     (game_plan alternates them game by game), so arena and side are not confounded.
 
-    The arenas the recorder was given take every other pair of games, and the arenas
-    accepted from the test queue take turns in the rest: the main arena keeps half the
-    games, where its record is measured, however many new ones join.
+    The arenas the recorder was given take two pairs of games in every three, and the
+    arenas accepted from the test queue take turns in the rest: the main arena keeps two
+    thirds of the games, where its record is measured, however many new ones join, and
+    four games in a row on one arena can load inside one running game (load_in_game).
     """
     pair = index // 2
     if not accepted:
         return mods[pair % len(mods)]
-    if pair % 2 == 0:
-        return mods[pair // 2 % len(mods)]
-    return accepted[pair // 2 % len(accepted)]
+    if pair % 3 != 2:
+        return mods[(pair - pair // 3) % len(mods)]
+    return accepted[pair // 3 % len(accepted)]
 
 
 def latest_versions(arenas):
@@ -1069,6 +1164,36 @@ def parse_saves(specs):
             raise ValueError(f"a start save's country is BLU or RED, not {country}")
         saves[(arena, country)] = save
     return saves
+
+
+class MemoryStop(Exception):
+    """No game started: the second PC's commit charge is too near its limit."""
+
+
+def memory_pressure(station, need_mb=0):
+    """The share of the second PC's commit limit in use, with `need_mb` more, from its
+    worker's telemetry, or None where there is none to read. Each HOI4 launch there left
+    about 100 MB behind until a reboot (2026-09-24), and a failed allocation could crash
+    a game mid-game."""
+    if not station.peer:
+        return None
+    try:
+        from .telemetry import open_observer
+
+        with open_observer(station.peer) as desk:
+            memory = desk.telemetry().get("memory") or {}
+    except Exception:  # noqa: BLE001 - no reading: carry on as before.
+        return None
+    if not memory.get("commit_limit_mb"):
+        return None
+    return (memory["commit_mb"] + need_mb) / memory["commit_limit_mb"]
+
+
+def check_memory(station, need_mb=0):
+    """Raise MemoryStop if a game would take the second PC past MEMORY_LIMIT."""
+    pressure = memory_pressure(station, need_mb)
+    if pressure is not None and pressure >= MEMORY_LIMIT:
+        raise MemoryStop(f"commit charge would be {pressure:.0%} of the limit")
 
 
 def take_reservation(root, settle=2.0):
@@ -1236,6 +1361,9 @@ def run_station(station, out_root, rules, templates, settings, end):
     queue = settings.get("queue")
     rng = random.Random()
     rotation, baseline = 0, False
+    # The arena of the game the last game left running, when it ended cleanly, and how
+    # many games have been loaded inside it since HOI4 was launched.
+    running, loads = None, 0
     path = out_root / f"results-{station.name}-{time.strftime('%Y%m%d-%H%M%S')}.json"
     # A game needs about 3 minutes to launch and most end within 10; do not start one
     # that cannot plausibly finish.
@@ -1261,6 +1389,8 @@ def run_station(station, out_root, rules, templates, settings, end):
         else:
             # Read afresh each game: another recorder may have accepted an arena since.
             accepted = latest_versions(accepted_arenas(queue)) if queue else []
+            if settings.get("main_only"):
+                accepted = []
             accepted = [m for m in accepted if m not in settings["mods"]]
             mod = game_arena(settings["mods"], rotation, accepted)
             rotation += 1
@@ -1299,17 +1429,35 @@ def run_station(station, out_root, rules, templates, settings, end):
         opening = round(rng.uniform(*settings["opening"]), 2) if settings["opening"] else 0.0
         entry["opening"] = opening
         stages = {"loaded": False, "started": False, "shots": {}}
+        failure_shot = out_root / f"{name}-start-failed.png"
         try:
             deploy_mod(station, mod, settings)
-            station.quit()
-            station.launch(mod, save=save)
+            reused = False
+            if running == entry["arena"] and can_load(save) and loads < LOADS_PER_LAUNCH:
+                check_memory(station)  # With the running game's own memory in it.
+                try:
+                    with station.connect() as desk:
+                        focus(desk)
+                        load_in_game(desk, save, templates, rules, failure_shot)
+                    reused, loads = True, loads + 1
+                except Exception as error:  # noqa: BLE001 - launched afresh instead.
+                    say(station.name, "loading in the game failed:", error, "- launching")
+            running = None
+            if not reused:
+                station.quit()
+                check_memory(station, GAME_MB)  # What is left, and what a game takes.
+                station.launch(mod, save=save)
+                loads = 0
+            entry["loaded_in_game"] = reused
             stages["loaded"] = True
             with station.connect() as desk:
                 if not focus(desk):
                     raise RuntimeError("could not bring the game window to the front")
+                # Where this game's log lines begin, before its declaration is logged.
+                log_from = desk.game_log(0)[1] if reused else None
                 try:
                     start_game(
-                        desk, rules, out_root / f"{name}-start-failed.png", country, speed,
+                        desk, rules, failure_shot, country, speed,
                         observe=not scripted, declarer=entry["declare_drawn"],
                         saved=bool(save), opening=opening, save_as=save_as,
                     )  # fmt: skip
@@ -1339,7 +1487,12 @@ def run_station(station, out_root, rules, templates, settings, end):
                     speed,
                     player,
                     start_save=save,
+                    log_from=log_from,
                 )
+        except MemoryStop as stop:
+            say(station.name, "memory:", stop, "- no more games")
+            (out_root / "MEMORY-STOP").write_text(f"{time.strftime('%H:%M:%S')} {stop}" + chr(10))
+            break
         except Exception as error:  # noqa: BLE001 - reported, then the next game is tried.
             say(station.name, "start failed:", error)
             entry["error"] = f"{type(error).__name__}: {error}"
@@ -1359,6 +1512,8 @@ def run_station(station, out_root, rules, templates, settings, end):
                 manifest["declarer"],
                 reason or "",
             )
+            if not reason:
+                running = entry["arena"]
             entry.update(
                 winner=outcome,
                 seconds=manifest["seconds"],
@@ -1413,6 +1568,7 @@ def record_ai_games(
     eval_dir=None,
     start_saves=None,
     opening=None,
+    main_only=False,
 ):
     """Record on this PC, the second PC, or both at once, until `minutes` run out.
 
@@ -1454,6 +1610,7 @@ def record_ai_games(
         # Start saves made by games that came through the menus, beside the arena queue.
         "save_registry": arena_queue and Path(arena_queue).parent / "saves-peer.json",
         "opening": tuple(opening) if opening else None,
+        "main_only": main_only,
         "queue_stations": list(queue_stations or ("here", "peer")),
         "hz": hz,
         "codec": codec,
