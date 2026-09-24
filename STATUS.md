@@ -585,7 +585,9 @@ grows is left behind by each launch:
 - 5 quit-and-launch cycles added about 100 MB each to the memory committed with no game
   running, 25 MB of it in dwm.exe.
 
-Only a logoff or a reboot gives it back. Relaunching less often would stop the growth,
+Only a logoff or a reboot gives it back. Its pagefile is managed by Windows (2 GB on 2026-09-24), so the limit can
+grow as far as its disk allows. It does not sign in by itself after a restart, so after a
+reboot someone must sign in there before the worker runs again. `control report` shows both. Relaunching less often would stop the growth,
 for instance by loading the next start from inside the running game. `telemetry` now
 prints the commit charge and warns above 90% of the limit, and a stream recording logs a
 warning when its PC is past that.
