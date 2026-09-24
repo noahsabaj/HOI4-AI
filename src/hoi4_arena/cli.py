@@ -17,6 +17,8 @@ NO_TORCH = {
     "capture",
     "win-rate",
     "salvage",
+    # Its Gaussian process imports torch itself, on the CPU; the GPU is left alone.
+    "tune",
 }
 
 
@@ -164,6 +166,18 @@ def main():
         '<dir>/queue/<name>.json ({"minutes": N}) is answered by <dir>/granted/<name>.json '
         "with HOI4 closed, and play resumes at <dir>/done/<name>.json or after N+15 minutes.",
     )
+    ai.add_argument(
+        "--tune",
+        help="A tuning study's SQLite file (tuning.py): the scripted player's exploring games "
+        "play the best plan with the settings its Gaussian process asks for, and report "
+        "their scores to it.",
+    )
+    ai.add_argument(
+        "--tune-skip",
+        nargs="+",
+        help="Arenas (folder names) whose exploring games are not tuned, such as one every "
+        "plan loses on.",
+    )
     tower = sub.add_parser(
         "cache-tower",
         help="Run a checkpoint's frozen vision tower once over every frame of the "
@@ -251,6 +265,15 @@ def main():
         help="The scripted player's record against the game's AI, from record-ai results",
     )
     rate.add_argument("results", nargs="+", help="results-*.json files written by record-ai")
+    tune = sub.add_parser(
+        "tune",
+        help="The study behind record-ai --tune: ask it for a plan's settings, seed it with "
+        "the best plan's earlier games, or show it",
+    )
+    tune.add_argument("study", help="The study's SQLite file")
+    tune.add_argument("action", choices=["ask", "seed", "show"])
+    tune.add_argument("roots", nargs="*", help="seed: run folders whose games to add")
+    tune.add_argument("--skip", nargs="+", default=[], help="seed: arenas to leave out")
     check = sub.add_parser(
         "check-session",
         help="Check that a recording can train, and count its decisions. Training reads "
@@ -935,6 +958,15 @@ def _dispatch(command, args):
 
         games = [g for path in args["results"] for g in json.loads(Path(path).read_text())]
         result = win_rate(games)
+    elif command == "tune":
+        from . import tuning
+
+        if args["action"] == "ask":
+            result = tuning.ask(args["study"])
+        elif args["action"] == "seed":
+            result = {"added": tuning.seed(args["study"], args["roots"], set(args["skip"]))}
+        else:
+            result = tuning.show(args["study"])
     elif command == "salvage":
         from .recording import recordings, salvage, unsalvage
 

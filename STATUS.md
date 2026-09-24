@@ -1026,8 +1026,27 @@ beat (`win-rate`).
   games load in place.
 - **A memory guard.** Before a game the recorder reads the second PC's commit charge
   from its telemetry: before loading in the running game, the charge as it is; before a
-  launch, after quitting, the charge plus the 5.3 GB a game takes. At 95% of the limit
-  it starts no game, writes MEMORY-STOP into the run's folder and stops.
+  launch, after quitting, the charge plus the 5.3 GB a game takes. Since #90 the limit
+  is what Windows can grow its pagefile to (up to 3x RAM, an eighth of its drive), and a
+  game also needs free RAM; short of either (95% of that limit) it starts no game, writes
+  MEMORY-STOP into the run's folder and stops.
+- **The guard during the attack (#91, #92).** The guard now looks at the home land every
+  30 s during the attack too, not only at redraws: in a loss as Blue the AI's last two
+  divisions had taken two home states 41 s before the next redraw. A pocket the army
+  cannot clear, whose share holds within 0.05 over three looks, is left behind and the
+  attack goes on: two games had timed out with an army three times the AI's guarding a
+  fifth of its home land for over a year, since the front drawn round it follows the whole
+  border.
+- **Tuning the best plan (2026-09-24).** At about 9 games an hour, with win or loss as
+  the result, telling a 95% plan from a 90% one takes about 430 games of each. So
+  `record-ai --tune STUDY.db` gives the explore share of the games to Optuna's GPSampler
+  (Optuna 5), which fits a Gaussian process, noise included, to every game's score and
+  picks the next settings to try: the hold (90-300 s), the redraw period (20-90 s), the
+  guard's share, the broad line's depth, the conscription goal and recruitment. The score
+  is the enemy's surrender progress minus the player's at the end, from the daily lines.
+  `hoi4-arena tune STUDY.db seed artifacts/scripted-*` adds the best plan's earlier games
+  (51, averaging +0.84 on arenas but marsh); on those, the redraw period and the hold
+  explain most of the score (importance 0.57 and 0.38). `tune STUDY.db show` reports it.
 
 ## A learned player from the scripted games (2026-09-24)
 
