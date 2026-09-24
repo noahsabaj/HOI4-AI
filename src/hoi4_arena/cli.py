@@ -88,8 +88,9 @@ def main():
     ai.add_argument(
         "--codec",
         choices=["ffv1", "x264", "nvenc", "nvenc-hevc", "x264-source", "ffv1-source"],
-        default="x264",
-        help="As for record: nvenc and the -source codecs are encoded where the game runs.",
+        default="nvenc",
+        help="As for record. nvenc (the default) is recorded on the worker's clock and "
+        "encoded where the game runs; x264 is the old way, a request per frame, encoded here.",
     )
     ai.add_argument("--cap-minutes", type=float, default=45)
     ai.add_argument(
