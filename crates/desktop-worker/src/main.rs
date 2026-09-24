@@ -383,6 +383,27 @@ fn observer_allows(op: &str, cmd: &serde_json::Value) -> bool {
     }
 }
 
+/// When each event of a timed `apply` is due, in microseconds from the batch's start: one
+/// offset per event, in milliseconds on the wire, none past a second and none going back.
+/// None for an ordinary apply, whose events go at once.
+fn batch_offsets(value: &serde_json::Value, events: usize) -> Result<Option<Vec<u64>>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let list: Vec<f64> = serde_json::from_value(value.clone()).map_err(|_| "invalid_offsets")?;
+    let bad = list.len() != events
+        || list
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.0 || *v > 1000.0)
+        || list.windows(2).any(|w| w[1] < w[0]);
+    if bad {
+        return Err("invalid_offsets".into());
+    }
+    Ok(Some(
+        list.iter().map(|v| (v * 1000.0).round() as u64).collect(),
+    ))
+}
+
 /// A recording stream's key, which tags every message of that stream: short, and plain.
 fn valid_stream_key(key: &str) -> bool {
     (1..=32).contains(&key.len())
@@ -2292,6 +2313,50 @@ mod platform {
                 state.armed = false;
             }
         });
+        // Timed applies: a decision's events, each at its own offset, applied on this PC's
+        // clock. A policy on the other PC sends one request a tick instead of one per
+        // 25 ms slot, and no slot waits for the network or for a capture's reply to finish.
+        // Every event gets the same checks as an ordinary apply, when it is applied.
+        let (timed_tx, timed_rx) = mpsc::channel::<(serde_json::Value, Vec<Event>, Vec<u64>)>();
+        let timed_state = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("timed-apply".into())
+            .spawn(move || {
+                for (cmd, events, offsets) in timed_rx {
+                    let start = Instant::now();
+                    let mut times = Vec::with_capacity(events.len());
+                    let result = (|| -> Result<(serde_json::Value, Vec<u8>), String> {
+                        for (event, micros) in events.iter().zip(&offsets) {
+                            let due = start + Duration::from_micros(*micros);
+                            let now = Instant::now();
+                            if due > now {
+                                thread::sleep(due - now);
+                            }
+                            let mut state = timed_state.lock().map_err(|_| "input_lock")?;
+                            if !state.armed || STOP.load(Ordering::SeqCst) || !foreground() {
+                                state.held.release();
+                                state.armed = false;
+                                return Err("focus_lost_during_batch".into());
+                            }
+                            if !valid_event(event, state.setup) {
+                                return Err("invalid_event_batch".into());
+                            }
+                            state.held.apply(event)?;
+                            state.last = Instant::now();
+                            times.push(ns());
+                        }
+                        Ok((
+                            serde_json::json!({"applied": events.len(), "t_ns": ns(), "times_ns": times}),
+                            vec![],
+                        ))
+                    })();
+                    if result.is_err() {
+                        disarm(&timed_state);
+                    }
+                    respond(&cmd, result);
+                }
+            })
+            .map_err(|e| format!("timed_thread_failed: {e}"))?;
         // Unbounded: a capture in progress must not stop the reader from pulling the
         // next apply off stdin. A bounded send here would freeze the slots behind the blit.
         let (tx, rx) = mpsc::channel();
@@ -2317,6 +2382,33 @@ mod platform {
                 if op == "capture" || op == "attach" || op == "stream" {
                     if tx.send(cmd).is_err() {
                         break;
+                    }
+                    continue;
+                }
+                if op == "apply" && !cmd["at_ms"].is_null() {
+                    let checked = (|| -> Result<(Vec<Event>, Vec<u64>), String> {
+                        let state = reader_state.lock().map_err(|_| "input_lock")?;
+                        if !state.armed || STOP.load(Ordering::SeqCst) || !foreground() {
+                            return Err("input_not_armed_or_focus_lost".into());
+                        }
+                        let events: Vec<Event> = serde_json::from_value(cmd["events"].clone())
+                            .map_err(|e| e.to_string())?;
+                        if events.len() > 64 || !events.iter().all(|e| valid_event(e, state.setup))
+                        {
+                            return Err("invalid_event_batch".into());
+                        }
+                        let offsets =
+                            batch_offsets(&cmd["at_ms"], events.len())?.ok_or("invalid_offsets")?;
+                        Ok((events, offsets))
+                    })();
+                    match checked {
+                        Ok((events, offsets)) => {
+                            let _ = timed_tx.send((cmd, events, offsets));
+                        }
+                        Err(error) => {
+                            disarm(&reader_state);
+                            respond(&cmd, Err(error));
+                        }
                     }
                     continue;
                 }
@@ -3081,6 +3173,29 @@ mod tests {
                 "job",
                 &serde_json::json!({"action": action})
             ));
+        }
+    }
+    #[test]
+    fn timed_batches_take_one_offset_per_event_within_a_second() {
+        let offsets = |v: serde_json::Value, n| batch_offsets(&v, n);
+        assert_eq!(offsets(serde_json::Value::Null, 3), Ok(None));
+        assert_eq!(
+            offsets(serde_json::json!([0, 25, 50.5]), 3),
+            Ok(Some(vec![0, 25_000, 50_500]))
+        );
+        for bad in [
+            serde_json::json!([0, 25]),
+            serde_json::json!([0, 25, 1001]),
+            serde_json::json!([0, -1, 5]),
+            serde_json::json!([50, 25, 75]),
+            serde_json::json!(["0", 1, 2]),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                offsets(bad.clone(), 3),
+                Err("invalid_offsets".into()),
+                "{bad}"
+            );
         }
     }
     #[test]

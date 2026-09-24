@@ -334,10 +334,26 @@ class Desktop:
     def arm(self, *, setup=False):
         self.request("arm", mode="setup" if setup else "match")
 
-    def apply(self, events: list[dict]):
+    def apply(self, events: list[dict], at_ms=None):
+        """Give input: `events` now, or each at its offset in `at_ms` (milliseconds from when
+        the worker takes the request, at most 1000), applied on the worker's own clock.
+
+        A timed batch replaces one request per 25 ms slot with one per decision: no slot
+        waits on the network. Workers before protocol 2 would apply a timed batch at once,
+        so it is refused for them here.
+        """
+        kwargs = {}
         # Short on purpose. A slot that blocks longer than this has lost the worker,
         # and the dispatch join is waiting to stop the interval.
-        reply = self.request("apply", timeout=2, events=events)
+        timeout = 2
+        if at_ms is not None:
+            if getattr(self, "_protocol", None) is None:
+                self._protocol = self.protocol()
+            if self._protocol < 2:
+                raise DesktopError("this worker applies every event at once; redeploy it")
+            kwargs["at_ms"] = [float(t) for t in at_ms]
+            timeout += max(kwargs["at_ms"], default=0) / 1000
+        reply = self.request("apply", timeout=timeout, events=events, **kwargs)
         reply.pop("payload", None)
         return reply
 
