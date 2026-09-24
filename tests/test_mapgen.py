@@ -507,3 +507,17 @@ def test_the_audit_catches_a_hub_cut_off_from_its_capital(preset_arenas):
     finally:
         path.write_text(original)
     assert any("no railway joins" in p for p in problems), problems
+
+
+def test_ground_colours_stay_bright_and_neutral_enough_to_read_as_land():
+    """The scripted player tells land by tint at full zoom-out, and only above a
+    brightness sum of 250 on screen. Forest and marsh at a colour-map sum near 180 drew
+    at about 220 and read as holes; the screen sum came out at about 1.8 times the colour
+    map's minus 84. A red cast would also blunt Blue's tint (blue minus red above 10)."""
+    from hoi4_arena.arenas import GROUND
+
+    for index, (r, g, b) in GROUND.items():
+        assert 1.8 * (r + g + b) - 84 >= 300, index
+        # No warmer than the plain arena's grass (red minus blue 16), which it was
+        # calibrated on.
+        assert r - b <= 18, index

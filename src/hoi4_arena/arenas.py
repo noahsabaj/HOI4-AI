@@ -116,11 +116,11 @@ CITY_LIGHTS = (200, 110)
 # of the threshold under fog of war and night shading.
 GROUND = {
     PLAINS: (80, 88, 62),
-    FARMLAND: (88, 88, 60),
+    FARMLAND: (86, 88, 68),
     DARK_FOREST: (74, 86, 60),
     LIGHT_FOREST: (78, 90, 62),
-    ROLLING_HILLS: (84, 86, 64),
-    RIDGED_HILLS: (88, 88, 66),
+    ROLLING_HILLS: (82, 86, 64),
+    RIDGED_HILLS: (86, 86, 68),
     GREEN_MOUNTAIN: (88, 88, 72),
     ROCK: (104, 102, 94),
     MARSH: (76, 88, 68),
