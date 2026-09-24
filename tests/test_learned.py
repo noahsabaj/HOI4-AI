@@ -679,3 +679,23 @@ def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
         same = head(memory, cells, actions)[1], head(memory, cells, actions, temperature=0.2)[1]
     assert cold > warm, "the likeliest input gains"
     assert torch.equal(*same), "a demonstration's likelihood does not depend on it"
+
+
+def test_what_the_memory_takes_in_does_not_grow_with_the_tower_s_loudness():
+    """The Qwen3.5 tower's summary is about 50 in size. Unnormalized, training grew the
+    fusion to about 25 and saturated every gate of the memory, which then never changed
+    over a game: the policy acted the same everywhere. Normalized, a louder tower (or a
+    fovea reader) leaves what the memory takes in as it was."""
+    from test_unroll import _Screen
+
+    from hoi4_arena.models import fuse
+
+    torch.manual_seed(0)
+    policy = Policy(_Screen(), memory_dim=32)
+    summary, centre = torch.randn(3, 8), torch.randn(3, 256)
+    cells = torch.randn(3, GRID, 256)
+    previous, speed = torch.zeros(3, SLOTS, 3, dtype=torch.long), torch.full((3,), 5)
+    hidden = torch.zeros(3, 32)
+    quiet = fuse(policy, summary, cells, centre, previous, speed, hidden)
+    loud = fuse(policy, summary * 50 + 3, cells, centre * 20, previous, speed, hidden)
+    assert torch.allclose(quiet, loud, atol=1e-4)
