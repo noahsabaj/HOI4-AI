@@ -208,6 +208,10 @@ def wait_while_paused(output, poll=5.0, sleep=None):
     flag = Path(output) / "pause"
     if not flag.exists():
         return False
+    # Hand back the activations' cached memory while waiting; the weights and the
+    # optimizer's state stay.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     while flag.exists():
         sleep(poll)
     return True
@@ -335,8 +339,15 @@ def train_bc(
     ).to(device)
     from .privileged import DIM as STATE_DIM
 
-    state_head = torch.nn.Linear(policy.memory_dim, STATE_DIM).to(device)
-    order_head = OrderHead(policy.memory_dim).to(device)
+    state_head = torch.nn.Linear(policy.memory_dim, STATE_DIM)
+    order_head = OrderHead(policy.memory_dim)
+    if init is not None:
+        # The read-outs saved beside the checkpoint start where they left off too.
+        for head, prefix in ((state_head, "state-head-"), (order_head, "order-head-")):
+            saved_head = Path(init).with_name(Path(init).name.replace("epoch-", prefix))
+            if saved_head.exists():
+                head.load_state_dict(torch.load(saved_head, map_location="cpu", weights_only=True))
+    state_head, order_head = state_head.to(device), order_head.to(device)
     trained = [*policy.parameters(), *aux.parameters()]
     if state_weight > 0:
         trained += list(state_head.parameters())

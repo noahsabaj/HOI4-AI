@@ -394,6 +394,14 @@ def test_behaviour_cloning_on_scripted_games_learns_the_true_state_beside_the_ac
     assert (tmp_path / "out" / "state-head-0000.pt").exists()
     config = json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]
     assert config["lead_in"] == 0 and config["drop_keys"] == [0x20]
+    # Fine-tuning from it starts from its weights and its read-outs.
+    train.train_bc(
+        data, "model", tmp_path / "tuned", sources=("scripted",), sequence=2, burn_in=1,
+        workers=0, lead_in=0, drop_keys=(0x20,), state_weight=0.5, order_weight=0.2,
+        look_before_click=True, init=tmp_path / "out" / "epoch-0000.pt", lr=1e-5,
+    )  # fmt: skip
+    tuned = json.loads((tmp_path / "tuned" / "epoch-0000.json").read_text())["config"]
+    assert tuned["init"].endswith("epoch-0000.pt") and tuned["lr"] == 1e-5
 
 
 def test_an_aimed_move_is_one_a_press_follows_before_any_other_move():
