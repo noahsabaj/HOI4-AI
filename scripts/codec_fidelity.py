@@ -255,14 +255,22 @@ def compare(truth, path, names, found, temps, rule_set):
 
 
 def decode_seconds(path):
-    """The training reader's decode, alone, output discarded."""
-    start = time.perf_counter()
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "pipe:1"],
-        stdout=subprocess.DEVNULL, check=True,
-    )  # fmt: skip
-    return time.perf_counter() - start
+    """Seconds to read every frame the way the training reader does (dataset._Stream): the
+    same ffmpeg command, its default threads, and a read of one frame at a time from the
+    pipe, the views left out. The best of three, as other work on the PC adds noise."""
+    best = float("inf")
+    for _ in range(3):
+        start = time.perf_counter()
+        decoder = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "pipe:1"],
+            stdout=subprocess.PIPE,
+        )  # fmt: skip
+        while len(decoder.stdout.read(SIZE)) == SIZE:
+            pass
+        decoder.wait()
+        best = min(best, time.perf_counter() - start)
+    return best
 
 
 def main(argv=None):
