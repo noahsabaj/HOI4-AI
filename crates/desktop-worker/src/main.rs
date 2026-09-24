@@ -704,7 +704,7 @@ mod platform {
         mem::{size_of, zeroed},
         ptr::null_mut,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
             mpsc, Arc, Mutex, OnceLock,
         },
         thread,
@@ -719,6 +719,10 @@ mod platform {
 
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     static TARGET: AtomicUsize = AtomicUsize::new(0);
+    /// The process that owned TARGET when it was attached. When the game exits, its window
+    /// handle can come back for another program's window, which must never pass for the
+    /// game's: not for input, not for capture, not for focus.
+    static TARGET_PID: AtomicU32 = AtomicU32::new(0);
     static STOP: AtomicBool = AtomicBool::new(false);
     static OVERFLOW: AtomicBool = AtomicBool::new(false);
     static EVENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
@@ -856,9 +860,32 @@ mod platform {
         ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
     }
     fn foreground() -> bool {
+        let target = TARGET.load(Ordering::Relaxed);
         unsafe {
-            GetForegroundWindow() as usize == TARGET.load(Ordering::Relaxed)
-                && TARGET.load(Ordering::Relaxed) != 0
+            target != 0
+                && GetForegroundWindow() as usize == target
+                && window_pid(target as HWND) == TARGET_PID.load(Ordering::Relaxed)
+        }
+    }
+    unsafe fn window_pid(hwnd: HWND) -> u32 {
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        pid
+    }
+    /// Why the attached game cannot be recorded, apart from focus: it has exited (its
+    /// window is gone, or the handle now names another program's window), or it has hung
+    /// (Windows calls a window hung after 5 s without handling its messages; what shows
+    /// then is a frozen ghost of it).
+    unsafe fn window_trouble(hwnd: HWND) -> Option<&'static str> {
+        if hwnd.is_null()
+            || IsWindow(hwnd) == 0
+            || window_pid(hwnd) != TARGET_PID.load(Ordering::Relaxed)
+        {
+            Some("game_exited")
+        } else if IsHungAppWindow(hwnd) != 0 {
+            Some("game_not_responding")
+        } else {
+            None
         }
     }
     /// Where the pointer is in client pixels, including positions outside the window.
@@ -1680,6 +1707,12 @@ mod platform {
         thread::spawn(move || {
             let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
             unsafe {
+                // A game that has exited has no window to bring forward, and the Alt
+                // below would go to whatever is in front instead (its crash reporter).
+                if window_trouble(hwnd) == Some("game_exited") {
+                    respond(&cmd, Err("game_window_gone".into()));
+                    return;
+                }
                 if IsIconic(hwnd) != 0 {
                     ShowWindow(hwnd, SW_RESTORE);
                 }
@@ -1937,6 +1970,7 @@ mod platform {
             state.armed = false;
             let hwnd = unsafe { select()? };
             state.held.hwnd = hwnd as usize;
+            TARGET_PID.store(unsafe { window_pid(hwnd) }, Ordering::Relaxed);
             TARGET.store(hwnd as usize, Ordering::Relaxed);
             hwnd
         };
@@ -2217,7 +2251,12 @@ mod platform {
         let (next, skipped) = crate::next_tick(scheduled, s.period, Instant::now());
         s.next = next;
         let hwnd = TARGET.load(Ordering::Relaxed) as HWND;
-        let grabbed = capturer.grab(hwnd, true);
+        // A game that exited or hung is a gap that says so, not one out of focus: the
+        // recording shows why it stopped, and a hung game's frozen ghost is never recorded.
+        let grabbed = match unsafe { window_trouble(hwnd) } {
+            Some(reason) => Err(reason.to_string()),
+            None => capturer.grab(hwnd, true),
+        };
         let scheduled_ns = scheduled
             .checked_duration_since(*ORIGIN.get_or_init(Instant::now))
             .map_or(0, |d| d.as_nanos() as u64);
@@ -2808,6 +2847,23 @@ mod platform {
             .held
             .release();
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_game_whose_window_is_gone_has_exited_and_is_never_in_front() {
+            unsafe {
+                assert_eq!(window_trouble(null_mut()), Some("game_exited"));
+                // A handle that names no window, as the game's does once it has exited.
+                assert_eq!(window_trouble(0x7FFF_FFF0 as HWND), Some("game_exited"));
+                // A window of another process (no game is attached here, so none is its).
+                assert_eq!(window_trouble(GetDesktopWindow()), Some("game_exited"));
+            }
+            assert!(!foreground());
+        }
     }
 }
 

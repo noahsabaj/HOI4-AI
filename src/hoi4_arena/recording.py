@@ -292,11 +292,16 @@ class StreamRecorder:
         )  # fmt: skip
         self.changed = threading.Condition()
         # How long each frame's row took from the worker's capture to this process: the
-        # worker's clock mapped onto this one through a few status round trips.
+        # worker's clock mapped onto this one through a few status round trips, measured
+        # again with each telemetry sample, since two PCs' clocks drift apart (by about
+        # 5 ppm here: 2 ms over a game).
         self.delivery_ms = []
+        self.clock = None  # (this PC's time, offset) of the first mapping, for the drift.
         try:
             self.offset_ns, rtt = desk.clock_offset()
             self.manifest["clock_rtt_ms"] = round(rtt / 1e6, 3)
+            self.manifest["clock_offset_ns"] = self.offset_ns
+            self.clock = (time.perf_counter_ns(), self.offset_ns)
         except (DesktopError, AttributeError, TypeError, KeyError):
             self.offset_ns = None
         self.views = None  # The newest frame's views, when the stream brings them.
@@ -353,6 +358,25 @@ class StreamRecorder:
                 }  # fmt: skip
                 out.write(json.dumps(row) + "\n")
                 out.flush()
+                self._resync()
+
+    def _resync(self):
+        """Map the worker's clock onto this one again. Only a quick round trip is trusted:
+        the mapping is good to half of it."""
+        if self.clock is None:
+            return
+        try:
+            offset, rtt = self.desk.clock_offset()
+        except Exception as error:  # noqa: BLE001 - the old mapping stays.
+            log.warning("clock: %s", error)
+            return
+        if rtt > 5_000_000:
+            return
+        self.offset_ns = offset
+        since, first = self.clock
+        elapsed = time.perf_counter_ns() - since
+        if elapsed > 0:
+            self.manifest["clock_drift_ppm"] = round((offset - first) / elapsed * 1e6, 2)
 
     def _manifest(self):
         temp = self.root / "manifest.tmp"
@@ -365,7 +389,7 @@ class StreamRecorder:
             message = self.stream.messages.get()
             if "frame" in message:
                 arrived = time.perf_counter_ns()
-                row = {**message["frame"], "received_ns": time.monotonic_ns()}
+                row = {**message["frame"], "received_ns": arrived}
                 if self.offset_ns is not None and "t_ns" in row:
                     self.delivery_ms.append((arrived - row["t_ns"] - self.offset_ns) / 1e6)
                 try:
@@ -456,7 +480,7 @@ class StreamRecorder:
                 self.gaps_seen = self.gap_count
                 gap = self.last_gap or {}
                 return Frame(
-                    None, {"foreground": False, "gap": gap.get("reason")}, time.monotonic_ns()
+                    None, {"foreground": False, "gap": gap.get("reason")}, time.perf_counter_ns()
                 )
             raise DesktopError(f"the worker's stream ended: {self.end}")
 

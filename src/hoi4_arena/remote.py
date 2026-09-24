@@ -48,6 +48,13 @@ class RemoteDesktop(Desktop):
         # request is outstanding, and a 10 s idle read would drop a healthy match.
         self.socket.settimeout(None)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Requests are small and go out at once, not after the last one is acknowledged.
+        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS") and hasattr(self.socket, "ioctl"):
+            # Windows probes an idle connection only after two hours by default: a peer
+            # that vanished would leave the reader waiting that long. Probe after 10 s of
+            # quiet, every 2 s.
+            self.socket.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10_000, 2_000))
         self.stream = self.socket.makefile("rwb")
         # Same id-demuxed protocol as a local worker. Apply and capture are in flight
         # together, and a half-open peer has to fail the request instead of blocking
