@@ -106,6 +106,62 @@ def imitation_loss(score, weight):
     return -(score * weight.flatten().to(score.dtype)).mean()
 
 
+def presses(actions):
+    """Per decision (N, SLOTS, 3), whether any slot presses a key or a mouse button."""
+    from .actions import VOCAB
+
+    down = torch.tensor(
+        [bool(e) and e["kind"] in ("button", "key") and e["down"] for e in VOCAB],
+        device=actions.device,
+    )
+    return down[actions[..., 0]].any(-1)
+
+
+def state_r2(predicted, truth):
+    """Explained variance of each group of true-state targets, over the known ones.
+
+    Groups: each side's army numbers, who holds each state, divisions in each state, and
+    the date. One minus the squared error over the variance around the mean, pooled over
+    the group's targets; None for a group with no variance.
+    """
+    from .privileged import NAMES
+
+    groups = {
+        "own": [i for i, n in enumerate(NAMES) if n.startswith("own_") and "_at_" not in n],
+        "enemy": [i for i, n in enumerate(NAMES) if n.startswith("enemy_") and "_at_" not in n],
+        "held": [i for i, n in enumerate(NAMES) if n.startswith("held_")],
+        "at": [i for i, n in enumerate(NAMES) if "_at_" in n],
+        "year": [NAMES.index("year")],
+    }
+    report = {}
+    for name, index in groups.items():
+        p, t = predicted[:, index].float(), truth[:, index].float()
+        known = torch.isfinite(t)
+        if not known.any():
+            continue
+        t0 = torch.nan_to_num(t)
+        count = known.sum(0).clamp_min(1)
+        mean = (t0 * known).sum(0) / count
+        variance = (((t0 - mean) ** 2) * known).sum()
+        error = (((p - t0) ** 2) * known).sum()
+        report[name] = round(float(1 - error / variance), 4) if float(variance) > 0 else None
+    return report
+
+
+def state_loss(head, memory, target):
+    """Squared error of the true state (privileged.NAMES) read from the memory.
+
+    Mean over the known targets only: a recording without the arena's daily reports has
+    none, and then the loss is zero.
+    """
+    prediction = head(memory.float())
+    known = torch.isfinite(target)
+    if not known.any():
+        return prediction.sum() * 0
+    error = (prediction - torch.nan_to_num(target.float())).square()
+    return (error * known).sum() / known.sum()
+
+
 def train_bc(
     data,
     model_path,
@@ -137,6 +193,12 @@ def train_bc(
     chunk=CHUNK,
     save_every=600.0,
     resume=False,
+    lead_in=None,
+    drop_keys=(),
+    loser_weight=1.0,
+    state_weight=0.0,
+    lr=1e-4,
+    init=None,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -158,6 +220,13 @@ def train_bc(
     trains (see `window_loader`); 0 does it on this thread, the views on the GPU, in
     exactly the order training has always seen. Clips are read only for an encoder that
     reads them: the default Qwen3.5 tower reads the quadrants alone.
+
+    `lead_in`, `drop_keys` and `loser_weight` pass to dataset.session_labels.
+    `state_weight` > 0 adds the privileged-state loss: a linear read-out of the memory
+    predicts the arena's true state at each decision (privileged.NAMES), from the
+    arena log, weighted by it; the read-out is saved beside the policy and never used to
+    act. `init` starts the policy from a checkpoint's weights (fine-tuning), `lr` sets
+    the learning rate.
     """
     if not 0 < idm_weight <= 1:
         raise ValueError("idm_weight must be in (0, 1]")
@@ -178,6 +247,10 @@ def train_bc(
         "idm_weight": idm_weight,
         "advantage": advantage,
         "look_before_click": look_before_click,
+        "lead_in": lead_in,
+        "drop_keys": tuple(drop_keys),
+        "loser_weight": loser_weight,
+        "state": state_weight > 0,
     }
     dataset = VideoSessions(data, **common)
     validation = VideoSessions(data, split="validation", **common)
@@ -193,7 +266,11 @@ def train_bc(
         encoder.load_state_dict(
             torch.load(student, map_location="cpu", weights_only=True)["encoder"]
         )
-    policy = Policy(encoder, latents=xm_latents, look=look_before_click).to(device)
+    policy = Policy(encoder, latents=xm_latents, look=look_before_click)
+    if init is not None:
+        saved = torch.load(init, map_location="cpu", weights_only=True)
+        policy.load_state_dict(saved["policy"])
+    policy = policy.to(device)
     xm = {"candidates": xm_candidates, "form": xm_form}
     aux = PredictiveAuxiliary(
         feature_dim=encoder.dim,
@@ -202,8 +279,14 @@ def train_bc(
         temporal_jaccard=temporal_jaccard,
         projections=projections,
     ).to(device)
-    params = [p for p in [*policy.parameters(), *aux.parameters()] if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=1e-4)
+    from .privileged import DIM as STATE_DIM
+
+    state_head = torch.nn.Linear(policy.memory_dim, STATE_DIM).to(device)
+    trained = [*policy.parameters(), *aux.parameters()]
+    if state_weight > 0:
+        trained += list(state_head.parameters())
+    params = [p for p in trained if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=lr)
     config = {
         "variant": variant,
         "auxiliary": auxiliary,
@@ -225,10 +308,16 @@ def train_bc(
         "advantage": advantage,
         "pointer_sigma": pointer_sigma,
         "look_before_click": look_before_click,
+        "lead_in": lead_in,
+        "drop_keys": list(drop_keys),
+        "loser_weight": loser_weight,
+        "state_weight": state_weight,
+        "lr": lr,
+        "init": str(Path(init).resolve()) if init else None,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)
-    modules = {"policy": policy, "auxiliary": aux}
+    modules = {"policy": policy, "auxiliary": aux, "state_head": state_head}
     first_epoch, skip = progress.start(modules, optimizer)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
     with (output / "metrics.jsonl").open("a") as log:
@@ -253,6 +342,9 @@ def train_bc(
                     bc = imitation_loss(score, batch["weight"][:, burn_in:])
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
                     loss = bc + 0.1 * predictive
+                    if state_weight > 0:
+                        truth = state_loss(state_head, memory, batch["state"][:, burn_in:])
+                        loss = loss + state_weight * truth
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training objective")
                 loss.backward()
@@ -265,11 +357,13 @@ def train_bc(
                     "predictive": predictive.item(),
                     "loss": loss.item(),
                 }
+                if state_weight > 0:
+                    row["state"] = truth.item()
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 progress.tick(epoch, step + 1, modules, optimizer)
             policy.eval()
-            validation_losses = []
+            validation_losses, acting, predicted, truths = [], [], [], []
             with torch.no_grad():
                 for batch in window_loader(validation, batch_size, workers=workers, device=device):
                     batch = batch_to_device(batch, device)
@@ -282,17 +376,28 @@ def train_bc(
                         # makes, not a score of candidates the optimizer never saw.
                         score = imitation_score(policy, memory, cells, labels, objective, xm)
                         validation_losses.extend((-score).float().cpu().tolist())
-            log.write(
-                json.dumps(
-                    {
-                        "epoch": epoch,
-                        "validation_nll": sum(validation_losses) / len(validation_losses),
-                        "selection_requires_held_out_games": True,
-                    }
-                )
-                + "\n"
-            )
+                        acting.extend(presses(labels.flatten(0, 1)).cpu().tolist())
+                        if state_weight > 0:
+                            predicted.append(state_head(memory.float()).flatten(0, 1).cpu())
+                            truths.append(batch["state"][:, burn_in:].flatten(0, 1).cpu())
+            report = {
+                "epoch": epoch,
+                "validation_nll": sum(validation_losses) / len(validation_losses),
+                "validation_decisions": len(validation_losses),
+                "selection_requires_held_out_games": True,
+            }
+            pressed = [x for x, a in zip(validation_losses, acting, strict=True) if a]
+            if pressed:
+                # The decisions that press a key or a button: the orders themselves,
+                # against the many that only wait or move the camera.
+                report["validation_nll_presses"] = sum(pressed) / len(pressed)
+                report["validation_presses"] = len(pressed)
+            if predicted:
+                report["validation_state_r2"] = state_r2(torch.cat(predicted), torch.cat(truths))
+            log.write(json.dumps(report) + "\n")
             log.flush()
+            if state_weight > 0:
+                torch.save(state_head.state_dict(), output / f"state-head-{epoch:04d}.pt")
             save_checkpoint(
                 output / f"epoch-{epoch:04d}.pt",
                 policy,

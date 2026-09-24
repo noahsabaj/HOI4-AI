@@ -99,6 +99,38 @@ def main():
         "fights the recorder's country through the interface, with a random strategy each "
         "game, against the AI (needs an arena v3 or later for its daily state reports).",
     )
+    live = sub.add_parser(
+        "play-policy",
+        help="A trained policy plays arena games against the game's AI on the second PC, "
+        "from pixels, recorded; prints its record with 95%% intervals.",
+    )
+    live.add_argument("checkpoint")
+    live.add_argument("output", help="A folder for the recorded games and results-peer.json")
+    live.add_argument("--peer", required=True, help="The second PC's pairing file")
+    live.add_argument("--games", type=int, default=2)
+    live.add_argument("--minutes", type=float, required=True, help="Time budget for all games")
+    live.add_argument("--mod", default="arena-12x8-v4", help="The arena, as deployed there")
+    live.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    live.add_argument(
+        "--reservation",
+        help="Reserve the second PC from the scripted player's agent under this name first "
+        "(artifacts/eval/queue), and hand it back after (artifacts/eval/done).",
+    )
+    live.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    live.add_argument("--cap-minutes", type=float, default=15.0)
+    live.add_argument(
+        "--setup-seconds",
+        type=float,
+        default=90.0,
+        help="Start the paused game after this long if the policy has not clicked + by then",
+    )
+    live.add_argument(
+        "--memory-window",
+        type=int,
+        help="Run the memory afresh over the last N decisions at each one, as in training",
+    )
+    live.add_argument("--model", dest="model_path")
+    live.add_argument("--seed", type=int)
     heat = sub.add_parser(
         "heatmap",
         help="Draw where a policy wants to point, as a heat map over a recording's frames, "
@@ -109,6 +141,12 @@ def main():
     heat.add_argument("output", help="A folder for the images and heatmaps.json")
     heat.add_argument("--decisions", type=int, nargs="+", help="Decision indices to draw")
     heat.add_argument("--count", type=int, default=24, help="Else this many, spread over moves")
+    heat.add_argument(
+        "--targets",
+        choices=["moves", "clicks"],
+        default="moves",
+        help="Spread over every move, or only the aimed ones: moves onto something pressed",
+    )
     heat.add_argument("--model")
     rate = sub.add_parser(
         "win-rate",
@@ -127,10 +165,11 @@ def main():
     train.add_argument(
         "--sources",
         nargs="+",
-        choices=["human", "ai", "scripted", "idm"],
+        choices=["human", "ai", "scripted", "policy", "idm"],
         default=["human"],
         help="Whose inputs are demonstrations: the player's, the AI games' scripted "
-        "camera and popup clicks, and inputs the inverse dynamics model labelled.",
+        "camera and popup clicks, the scripted player's, a learned policy's own games "
+        "(play-policy), and inputs the inverse dynamics model labelled.",
     )
     train.add_argument("output")
     train.add_argument("--model", default="models/qwen3-vit-88m")
@@ -248,6 +287,36 @@ def main():
         help="Frames the vision tower reads at once. Larger is faster until the backward "
         "pass's recomputation no longer fits the card.",
     )
+    train.add_argument(
+        "--lead-in",
+        type=int,
+        help="Decision intervals of video before a recording's first decision (default: a "
+        "clip and one more, 9). 0 suits an encoder that reads no clip: the scripted player "
+        "forms its army in the first 2.5 s.",
+    )
+    train.add_argument(
+        "--drop-keys",
+        type=lambda v: int(v, 0),
+        nargs="+",
+        default=[],
+        help="Key codes left out of the labels, such as 0x20: space unpauses the game, which "
+        "the harness does when a learned policy plays.",
+    )
+    train.add_argument(
+        "--loser-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight of every decision of a game the recording's player did not win.",
+    )
+    train.add_argument(
+        "--state-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the privileged-state loss: the memory predicts the arena's true state "
+        "(from its log) at each decision. Training only; 0 is off.",
+    )
+    train.add_argument("--lr", type=float, default=1e-4)
+    train.add_argument("--init", help="Start from this checkpoint's policy weights.")
     weigh = sub.add_parser(
         "advantage",
         help="Offline RL: value every decision of a player's recording with a trained "
@@ -650,6 +719,11 @@ def _dispatch(command, args):
         from .ai_games import record_ai_games
 
         result = record_ai_games(args.pop("output"), **args)
+    elif command == "play-policy":
+        from .play import evaluate_policy
+
+        args["countries"] = tuple(args["countries"])
+        result = evaluate_policy(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "heatmap":
         from .heatmap import draw_heatmaps
 
@@ -660,6 +734,7 @@ def _dispatch(command, args):
             decisions=args["decisions"],
             count=args["count"],
             model_path=args["model"],
+            targets=args["targets"],
         )
     elif command == "win-rate":
         from .scripted import win_rate
