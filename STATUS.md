@@ -527,6 +527,16 @@ beat (`win-rate`).
   26 s wait, redraw every 51 s) and lost to the AI in 141 s. The game logged 596 daily
   reports and 14 changes of control. The recording trains: 697 decisions, 84 windows,
   `--sources scripted`.
+- **Lost all of the first 10 games**, in 138 to 164 s, on both sides. The daily reports
+  showed why: the AI raises its conscription law once it can afford it, and its
+  deployed manpower rose from 15k to 16-21k while the script's only fell. The script
+  now does the same through the political screen (Q, the law slot, the law, OK), to a
+  law drawn per game; a fifth of games keep the starting law, to measure it. In the
+  first game with it, as Red, the script moved to Limited in late April 1936 and
+  Extensive in late June, its deployed manpower rose from 14k to 32k by January 1937,
+  and it was stronger than the AI's army by the game's own estimate (1.6 to 1) from
+  September to April. It still lost, in 249 s: the AI took the map's top and bottom
+  edges while the script's divisions were split between its front and its offensives.
 
 ## Open work
 
