@@ -146,6 +146,9 @@ switch ($Action) {
         }
         $job.exit = $code
         $job.ended = (Get-Date).ToString('o')
+        # The log's whole length: a reader through the share sees a growing file's size
+        # seconds late, and reads on until it has this many bytes (peer).
+        $job.log_bytes = if (Test-Path -LiteralPath $log) { (Get-Item -LiteralPath $log).Length } else { 0 }
         Write-Job $job
     }
     'stop' {

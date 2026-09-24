@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -113,12 +114,19 @@ def test_following_a_job_prints_its_log_until_it_ends(tmp_path):
             with open(jobs / "j.log", "a") as log:
                 log.write(line)
             time.sleep(0.1)
-        (jobs / "j.json").write_text(json.dumps({"state": "done", "exit": 0}), encoding="utf-8-sig")
+        # Ended, with the log's whole length, while the share still shows it short (it
+        # caches a file's size): the last line comes into view only after the end.
+        length = (jobs / "j.log").stat().st_size + len("saved\n".encode()) + (len(os.linesep) - 1)
+        final = {"state": "done", "exit": 0, "log_bytes": length}
+        (jobs / "j.json").write_text(json.dumps(final), encoding="utf-8-sig")
+        time.sleep(0.3)
+        with open(jobs / "j.log", "a") as log:
+            log.write("saved\n")
 
     threading.Thread(target=work).start()
     out = io.StringIO()
     assert peer.follow(cfg, "j", poll=0.05, out=out)["state"] == "done"
-    assert out.getvalue() == "epoch 1\nepoch 2\n"
+    assert out.getvalue() == "epoch 1\nepoch 2\nsaved\n"
 
 
 def test_a_job_the_gpu_cannot_hold_reserves_the_pc_first(monkeypatch):
@@ -191,6 +199,7 @@ def test_run_job_runs_a_project_s_own_command_in_its_folder(tmp_path):
         if path.exists():
             state = json.loads(path.read_text(encoding="utf-8-sig"))
     assert state.get("state") == "done" and state.get("project") == "demo"
+    assert state.get("log_bytes") == (tmp_path / "jobs" / "t1.log").stat().st_size
     log = (tmp_path / "jobs" / "t1.log").read_text(encoding="utf-8", errors="replace")
     assert "ran in demo ['a b', 'x;y']" in log
     # A project that was never pushed, or a name that is a path, is refused at once.

@@ -103,6 +103,17 @@ public static class Hoi4Bridge {
     private const int PrimaryWaitMs = 8000;
     private static readonly SemaphoreSlim primary = new SemaphoreSlim(1, 1);
     private static readonly object gate = new object();
+    // Every connection's worker writes its stderr lines through here, one line at a time.
+    // Each connection had opened its log file for itself, and a second observer at the
+    // same time found observer-stderr.log locked and lost its connection: on 2026-09-24
+    // a recording's memory check did, while the live view watched, and the recorder hung.
+    private static readonly object logGate = new object();
+    private static void AppendLog(string path, string line) {
+        lock (logGate) {
+            try { File.AppendAllText(path, line + Environment.NewLine); }
+            catch (Exception) {}  // A log that cannot be written costs the line, never the connection.
+        }
+    }
     private static int connections = 0;
     private static int observers = 0;
     private static int workers = 0;
@@ -159,7 +170,6 @@ public static class Hoi4Bridge {
                 client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
             } catch (Exception error) { Console.WriteLine("Keepalive not set: " + error.Message); }
             Process worker = null;
-            StreamWriter errorLog = null;
             Task errors = null;
             bool holding = false, watching = false, started = false;
             try {
@@ -201,14 +211,13 @@ public static class Hoi4Bridge {
                     workers++;
                     started = true;
                 }
-                errorLog = new StreamWriter(Path.Combine(Path.GetDirectoryName(exe), observer ? "observer-stderr.log" : "worker-stderr.log"), true);
-                var log = errorLog;
+                var log = Path.Combine(Path.GetDirectoryName(exe), observer ? "observer-stderr.log" : "worker-stderr.log");
                 var process = worker;
                 errors = Task.Run(() => {
                     string text;
                     while ((text = process.StandardError.ReadLine()) != null) {
                         Console.Error.WriteLine(text);
-                        lock (log) { log.WriteLine(text); log.Flush(); }
+                        AppendLog(log, text);
                     }
                 });
                 var input = Pump(tls, worker.StandardInput.BaseStream);
@@ -221,12 +230,9 @@ public static class Hoi4Bridge {
                     try { if (!worker.WaitForExit(2000)) worker.Kill(); } catch (Exception) {}
                 }
                 // The worker has exited, so stderr reaches EOF. Let the reader write a
-                // crash's last lines before the log closes under it.
+                // crash's last lines.
                 if (errors != null) {
                     try { errors.Wait(2000); } catch (Exception) {}
-                }
-                if (errorLog != null) {
-                    try { lock (errorLog) { errorLog.Dispose(); } } catch (Exception) {}
                 }
                 if (worker != null) worker.Dispose();
                 if (started) lock (gate) { workers--; }

@@ -193,22 +193,44 @@ def text(chunk):
     return chunk.decode("utf-8", "replace").replace("\r\n", "\n")
 
 
-def follow(cfg, job, poll=2.0, out=None):
-    """Print a job's log as it grows until the job ends; its final state."""
+def follow(cfg, job, poll=2.0, out=None, settle=20.0):
+    """Print a job's log as it grows until the job ends, and all of it; its final state.
+
+    Windows shows a file on the share by a size it caches for up to ~10 s, so a log read
+    as its job ends can look shorter than it is: a job of 4 s printed nothing on
+    2026-09-24. The job's end records the log's length (log_bytes), and reading goes on
+    until that much has come, for at most `settle` seconds."""
     out = out or sys.stdout
     log = cfg["share"] / "jobs" / f"{job}.log"
     offset = 0
+
+    def read_more():
+        nonlocal offset
+        if not log.exists():
+            return 0
+        with open(log, "rb") as file:
+            file.seek(offset)
+            chunk = file.read()
+        offset += len(chunk)
+        if chunk:
+            out.write(text(chunk))
+            out.flush()
+        return len(chunk)
+
     while True:
         state = job_state(cfg, job)
-        if log.exists():
-            with open(log, "rb") as file:
-                file.seek(offset)
-                chunk = file.read()
-            offset += len(chunk)
-            if chunk:
-                out.write(text(chunk))
-                out.flush()
+        read_more()
         if state.get("state") in FINAL:
+            want = state.get("log_bytes")
+            deadline = time.monotonic() + settle
+            quiet = 0
+            # With the length known, until it has all come; without (a stopped job's or an
+            # older worker's), until a few quiet reads in a row.
+            while time.monotonic() < deadline and (
+                offset < want if want is not None else quiet < 3
+            ):
+                time.sleep(min(poll, 0.5))
+                quiet = 0 if read_more() else quiet + 1
             return state
         time.sleep(poll)
 
