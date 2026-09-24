@@ -745,6 +745,49 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   counted in the game's manifest, and the games are recorded as data (source "policy").
   The second PC is reserved from the scripted player's recorder (`--reservation`).
 
+## The memory study (2026-09-24)
+
+Which memory should the policy have, and how should it be trained?
+`scripts/memory_study.py` trained six arms, five seeds each, with `train_memory` on one
+cache of frozen perception features (`artifacts/bc-v2s5` reading the 44 speed-5 AI
+games). Every arm got the same decisions per update and the same passes. Each was scored
+on held-out imitation loss with the memory carried from the start of each game, as the
+policy plays. The rule for switching was written into the script before any run.
+
+| Arm | Held-out loss | Loss, memory cleared every 18 decisions | Time since zoom-out, R² |
+|---|---|---|---|
+| GRU, 16-decision windows, memory carried | **3.109 ± 0.003** | 3.108 | 0.010 |
+| Mamba-3, 256, carried | 3.120 ± 0.009 | 3.257 | 0.151 |
+| GRU, 256, carried | 3.123 ± 0.006 | 3.123 | 0.019 |
+| No memory | 3.129 ± 0.004 | 3.129 | 0.032 |
+| Gated DeltaNet-2, 256, carried | 3.134 ± 0.016 | 3.134 | 0.051 |
+| GRU, 16, from empty (how `train-bc` trains) | 3.169 ± 0.008 | 3.169 | 0.005 |
+
+The verdict, by the rule:
+- **Train with the memory carried through whole games.** The 256-decision GRU beats the
+  old way, where each window starts from an empty memory, by far more than twice the
+  noise. The 16-decision GRU with its memory carried is better still.
+- **The GRU stays.** Neither Mamba-3 nor Gated DeltaNet-2 beats the 256-decision GRU by
+  twice the noise.
+
+What the numbers say besides:
+- **The new cells do hold more.** A linear read-out of Mamba-3's memory recovers how long
+  since the camera zoomed out (R² 0.15, against 0.01-0.02 for the GRUs). And clearing
+  its memory costs it 0.14, while it costs the GRU nothing. But on these games that
+  knowledge does not help predict the next input: the AI games' camera moves at random,
+  so there is little for a long memory to find.
+- **Carrying matters, though the GRU uses only a few seconds.** Clearing the carried
+  GRU's memory every 18 decisions (3.6 s) during evaluation changes nothing. Yet the GRU
+  trained from empty windows scores worse than no memory at all (3.169 against 3.129),
+  whether its memory is cleared or not. Why training from empty hurts this much is not
+  understood yet.
+- **Nobody predicts the winner.** Every arm's read-out matches the base rate (0.63).
+- **Timings are not comparable.** This PC was shared with other work, and seed 4 ran up
+  to 2x slower than seeds 1-3.
+
+Next: train the policy with its memory carried, and repeat the GRU against Mamba-3 on the
+scripted player's games, whose plans run for minutes, before closing the question.
+
 ## Open work
 
 In order. Since 2026-09-23 the scripted player comes first: it gives a win rate to beat
@@ -759,14 +802,9 @@ hand-recorded play.
    (`train-state-value`), weight the scripted games' decisions by advantage
    (`advantage --state-value`), and train the policy on them (`train-bc --advantage`).
    Judge it by win rate against the AI and against the scripted player, not by loss.
-3. **Train memory on long windows.** Freeze a behaviour-cloned policy's perception,
-   cache what it reads from every decision of the recordings, and train the memory,
-   the action head and the value on windows of 128–512 decisions instead of 16. Then
-   compare the cells on those cached features, same budget, five seeds: no memory, the
-   GRU at 16 and at 256 decisions, Gated DeltaNet-2 and Mamba-3 at 256. They are
-   scored on held-out imitation loss, on the win prediction, and on probes of what the
-   memory holds (where the pointer was, how long since the camera last zoomed out).
-   The rule for switching is written down before the runs.
+3. **Train the memory carried through whole games.** The study is done: carrying beats
+   starting each window empty, and the GRU stays (see "The memory study"). Next, train
+   the policy that way on the scripted games, and repeat the GRU against Mamba-3 there.
 4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
    with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
    closed through its worker (`launch`, `quit`) and its frames recorded here: a full
