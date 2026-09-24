@@ -372,16 +372,28 @@ fn control_action(op: &str) -> Option<&'static str> {
     }
 }
 
-/// What an observer connection may ask for: to look and to measure, never to give input,
-/// start or stop anything, or record. `report`, `saves` and a job's `status` only read;
-/// a `view` only watches, on a capture of its own (start_view).
-fn observer_allows(op: &str, cmd: &serde_json::Value) -> bool {
-    match op {
-        "attach" | "capture" | "status" | "telemetry" | "game_log" | "pointer" | "release" => true,
-        "report" | "saves" | "view" => true,
-        "job" => cmd["action"] == "status",
-        _ => false,
-    }
+/// What an observer connection may ask for: to look and to measure, and to run compute
+/// jobs, never to give input, launch or quit the game, or record. `report` and `saves`
+/// only read; a `view` only watches, on a capture of its own (start_view). Jobs touch
+/// no game: since 2026-09-24 any project on the coordinator reaches this PC through
+/// them (`peer`), beside a recording that holds the one full connection, which a job
+/// would otherwise wait for until the game ended. The token is the same for both kinds
+/// of connection, so this lets no one new in.
+fn observer_allows(op: &str, _cmd: &serde_json::Value) -> bool {
+    matches!(
+        op,
+        "attach"
+            | "capture"
+            | "status"
+            | "telemetry"
+            | "game_log"
+            | "pointer"
+            | "release"
+            | "report"
+            | "saves"
+            | "view"
+            | "job"
+    )
 }
 
 /// When each event of a timed `apply` is due, in microseconds from the batch's start: one
@@ -560,6 +572,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The longest job spec, in hex: pwsh's whole command line must stay under Windows'
+/// 32,767 characters, and Run-Job checks the same length.
+const JOB_SPEC_HEX: usize = 30_000;
+
 /// The arguments after `pwsh -File Run-Job.ps1` for one compute job operation.
 ///
 /// Approved by the user on 2026-09-23 so the second PC's GPU can train and act: start
@@ -567,6 +583,12 @@ fn hex(bytes: &[u8]) -> String {
 /// hoi4-arena command, or a study script) detached, with its output in the share's jobs
 /// folder; stop ends one by id; status lists them. The kinds and commands are fixed in
 /// Run-Job; here every value is checked before pwsh starts, as for launch.
+///
+/// Since 2026-09-24 a `project` job runs any program with any arguments in another
+/// project's folder, compute\projects\<project>, which `peer push` fills. The user asked
+/// for "a universal bus" so that every project on the coordinator can train here, and
+/// gave "full permission for the bridge access". Its arguments cross as JSON inside hex,
+/// so no shell ever reads them.
 fn job_arguments(cmd: &serde_json::Value) -> Result<Vec<String>, String> {
     let action = cmd["action"].as_str().unwrap_or("");
     if !matches!(action, "start" | "stop" | "status") {
@@ -584,6 +606,10 @@ fn job_arguments(cmd: &serde_json::Value) -> Result<Vec<String>, String> {
     args.extend(["-Id".into(), id.into()]);
     if action == "start" {
         let kind = cmd["kind"].as_str().unwrap_or("");
+        if kind == "project" {
+            args.extend(["-Spec".into(), project_spec(cmd)?]);
+            return Ok(args);
+        }
         if !matches!(kind, "setup" | "run" | "script") {
             return Err("invalid_job_kind".into());
         }
@@ -606,6 +632,35 @@ fn job_arguments(cmd: &serde_json::Value) -> Result<Vec<String>, String> {
         args.extend(["-Spec".into(), hex(spec.to_string().as_bytes())]);
     }
     Ok(args)
+}
+
+/// A project job's spec, in hex: its project (a folder name, as a job id) and its
+/// command, a program and its arguments, each any text but NUL, at most 256 of them.
+fn project_spec(cmd: &serde_json::Value) -> Result<String, String> {
+    let project = cmd["project"].as_str().unwrap_or("");
+    if !valid_job_id(project) {
+        return Err("invalid_project".into());
+    }
+    let list = match &cmd["args"] {
+        serde_json::Value::Array(items) if !items.is_empty() && items.len() <= 256 => items,
+        _ => return Err("invalid_job_arguments".into()),
+    };
+    let mut command = Vec::with_capacity(list.len());
+    for item in list {
+        match item.as_str() {
+            Some(arg) if !arg.contains('\0') => command.push(arg.to_string()),
+            _ => return Err("invalid_job_argument".into()),
+        }
+    }
+    if command[0].is_empty() {
+        return Err("invalid_job_argument".into());
+    }
+    let spec = serde_json::json!({"kind": "project", "project": project, "args": command});
+    let spec = hex(spec.to_string().as_bytes());
+    if spec.len() > JOB_SPEC_HEX {
+        return Err("job_command_too_long".into());
+    }
+    Ok(spec)
 }
 
 /// A folder name in the mods directory: ASCII letters, digits, `_`, `.` and `-`, as
@@ -3506,15 +3561,65 @@ mod tests {
         ] {
             assert!(!observer_allows(op, &status), "{op} should be refused");
         }
-        assert!(observer_allows(
-            "job",
-            &serde_json::json!({"action": "status"})
-        ));
-        for action in ["start", "stop"] {
-            assert!(!observer_allows(
+        // Compute jobs touch no game, so an observer runs them beside a recording.
+        for action in ["start", "stop", "status"] {
+            assert!(observer_allows(
                 "job",
                 &serde_json::json!({"action": action})
             ));
+        }
+    }
+    #[test]
+    fn a_project_job_runs_its_own_command_in_its_folder() {
+        let mods = Path::new("D:\\worker\\mods");
+        let start = serde_json::json!({"op": "job", "action": "start", "job": "stocks-1",
+            "kind": "project", "project": "stocks",
+            "args": ["uv", "run", "train.py", "--symbols", "AAPL MSFT", "--note=a;b|c"]});
+        let args = control_arguments("job", &start, mods).unwrap();
+        assert_eq!(args[..4], ["-Action", "start", "-Id", "stocks-1"]);
+        let spec = (0..args[5].len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&args[5][i..i + 2], 16).unwrap())
+            .collect::<Vec<u8>>();
+        let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+        assert_eq!(spec["kind"], "project");
+        assert_eq!(spec["project"], "stocks");
+        // Any text reaches the program as one argument, never through a shell.
+        assert_eq!(spec["args"][4], "AAPL MSFT");
+        assert_eq!(spec["args"][5], "--note=a;b|c");
+        let long = vec![serde_json::json!("x".repeat(8000)); 3];
+        for (cmd, error) in [
+            (
+                serde_json::json!({"action": "start", "job": "a", "kind": "project",
+                    "project": "../hoi4", "args": ["uv"]}),
+                "invalid_project",
+            ),
+            (
+                serde_json::json!({"action": "start", "job": "a", "kind": "project",
+                    "project": "p", "args": []}),
+                "invalid_job_arguments",
+            ),
+            (
+                serde_json::json!({"action": "start", "job": "a", "kind": "project",
+                    "project": "p", "args": [""]}),
+                "invalid_job_argument",
+            ),
+            (
+                serde_json::json!({"action": "start", "job": "a", "kind": "project",
+                    "project": "p", "args": ["uv", "a\u{0}b"]}),
+                "invalid_job_argument",
+            ),
+            (
+                serde_json::json!({"action": "start", "job": "a", "kind": "project",
+                    "project": "p", "args": long}),
+                "job_command_too_long",
+            ),
+        ] {
+            assert_eq!(
+                control_arguments("job", &cmd, mods).unwrap_err(),
+                error,
+                "{cmd}"
+            );
         }
     }
     #[test]
