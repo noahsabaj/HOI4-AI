@@ -288,6 +288,12 @@ def main():
     )
     live.add_argument("--out", help="Where the stream is written (default: temp/hoi4-live).")
     live.add_argument("--port", type=int, default=8765)
+    live.add_argument(
+        "--peer",
+        help="The second PC's pairing file: show its own view of the game window (smooth, "
+        "menus included) instead of following the recording at 5 frames a second.",
+    )
+    live.add_argument("--hz", type=int, default=30, help="The view's frames a second.")
     check = sub.add_parser(
         "check-session",
         help="Check that a recording can train, and count its decisions. Training reads "
@@ -984,7 +990,9 @@ def _dispatch(command, args):
     elif command == "live":
         from .live import watch
 
-        result = watch(args["runs"], out=args["out"], port=args["port"])
+        result = watch(
+            args["runs"], out=args["out"], port=args["port"], peer=args["peer"], hz=args["hz"]
+        )
     elif command == "salvage":
         from .recording import recordings, salvage, unsalvage
 

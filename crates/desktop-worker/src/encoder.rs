@@ -8,9 +8,11 @@
 //! its stdout, which the worker forwards. Only the video crosses the network.
 //!
 //! What ffmpeg may be asked to do is fixed here: a few named encoder profiles, each with one
-//! quality number, reading a pipe and writing a pipe. Nothing from a request reaches its
-//! command line except that name and number, both checked, so the worker still exposes no
-//! command and writes no file.
+//! quality number, reading a pipe and writing a pipe, and a live view (view_arguments)
+//! capturing the attached window by its handle and writing a pipe. Nothing from a request
+//! reaches its command line except that name and number and a view's rate, all checked
+//! (the window handle is the worker's own), so the worker still exposes no command and
+//! writes no file.
 
 #![cfg(windows)]
 
@@ -388,9 +390,143 @@ impl Drop for Encoder {
     }
 }
 
+/// ffmpeg's arguments for a live view of the window `hwnd`, for someone watching from a
+/// phone: Windows Graphics Capture of the window alone (its pointer drawn) at `hz` frames
+/// a second, encoded on the GPU as H.264 4:2:0, which any browser plays, and written as
+/// MPEG-TS for the viewer to cut into HLS without encoding it again. A keyframe every 2 s,
+/// where the viewer's segments begin.
+pub fn view_arguments(hwnd: usize, hz: u32) -> Vec<String> {
+    let source = format!("gfxcapture=hwnd={hwnd}:max_framerate={hz}:capture_cursor=1");
+    let (rate, gop) = (hz.to_string(), (2 * hz).to_string());
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-f",
+        "lavfi",
+        "-i",
+        &source,
+        "-fps_mode",
+        "cfr",
+        "-r",
+        &rate,
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p4",
+        "-tune",
+        "ll",
+        "-rc",
+        "vbr",
+        "-b:v",
+        "5M",
+        "-maxrate",
+        "8M",
+        "-bufsize",
+        "10M",
+        "-g",
+        &gop,
+        "-bf",
+        "0",
+        "-f",
+        "mpegts",
+        "-flush_packets",
+        "1",
+        "pipe:1",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
+}
+
+/// A live view: ffmpeg capturing and encoding by itself, apart from the recording's clock
+/// and capture, its output handed to `on_data` chunk by chunk and then its end (why, from
+/// ffmpeg's last error line) to `on_end`. Dropped, it is stopped; the job stops it with
+/// the worker too.
+pub struct View {
+    pub pid: u32,
+    child: Child,
+    _job: Option<Job>,
+}
+
+impl View {
+    pub fn start(
+        ffmpeg: &Path,
+        args: &[String],
+        mut on_data: impl FnMut(&[u8]) + Send + 'static,
+        on_end: impl FnOnce(String) + Send + 'static,
+    ) -> Result<Self, String> {
+        let mut child = Command::new(ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("view_start_failed: {e}"))?;
+        let job = kill_on_close(&child);
+        let pid = child.id();
+        let mut stdout = child.stdout.take().ok_or("view_stdout")?;
+        let stderr = child.stderr.take().ok_or("view_stderr")?;
+        let last = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&last);
+        thread::Builder::new()
+            .name("view-err".into())
+            .spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if let Ok(mut last) = sink.lock() {
+                        *last = line;
+                    }
+                }
+            })
+            .map_err(|e| format!("view_thread_failed: {e}"))?;
+        thread::Builder::new()
+            .name("view-out".into())
+            .spawn(move || {
+                let mut buffer = vec![0u8; 1 << 16];
+                while let Ok(n @ 1..) = stdout.read(&mut buffer) {
+                    on_data(&buffer[..n]);
+                }
+                // The error thread may still be reading ffmpeg's last words.
+                thread::sleep(Duration::from_millis(100));
+                let why = last.lock().map(|l| l.clone()).unwrap_or_default();
+                on_end(if why.is_empty() {
+                    "view_ended".into()
+                } else {
+                    why
+                });
+            })
+            .map_err(|e| format!("view_thread_failed: {e}"))?;
+        Ok(Self {
+            pid,
+            child,
+            _job: job,
+        })
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_view_captures_the_window_on_the_gpu_as_mpeg_ts() {
+        let args = view_arguments(0x1234, 30);
+        let joined = args.join(" ");
+        assert!(joined.contains("gfxcapture=hwnd=4660:max_framerate=30:capture_cursor=1"));
+        assert!(joined.contains("-c:v h264_nvenc") && joined.contains("-g 60"));
+        assert!(joined.ends_with("-f mpegts -flush_packets 1 pipe:1"));
+        // Nothing of the recording's 4:4:4 profile: phones play 4:2:0 alone.
+        assert!(!joined.contains("444"));
+    }
 
     #[test]
     fn profiles_take_only_a_checked_quality() {
