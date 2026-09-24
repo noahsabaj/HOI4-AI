@@ -1042,8 +1042,26 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   training step. A test holds the cached path to the running tower's outputs.
 - **Memory carried through a game** (`--carry`): each batch slot plays one game window
   after window in order, and its memory goes on from one window to the next (truncated
-  backpropagation through time). In the memory study on the AI games this was the
-  largest effect: held-out loss 3.109 against 3.169 with each window started empty.
+  backpropagation through time). It was chosen from the memory study's verdict, which is
+  withdrawn until a fair rerun: the study's GRU arms had the same dead memory. Carrying
+  stays the default because the live policy carries its memory through the game.
+- **Weighing the decisions that act** (`--press-weight 4`): a decision that presses a key
+  or button, or moves onto what the next three decisions press, counts four times in the
+  loss (about 3% of a scripted game's decisions). With the memory fixed, one epoch
+  without it left the policy's probability of the scripted player's press, at the
+  moment of the press, at the base rate (0.0025). With it, the held-out loss of the
+  pressing decisions fell from 9.04 to 7.19 after one epoch and 6.50 after two (a
+  know-nothing model scores 9.49), and the read-out of the next order began to move
+  (accuracy 0.32, the majority class, to 0.38).
+- **The first live games** (the dead-memory policy, 2026-09-24): both lost, as Blue in
+  203 s and as Red in 219 s, against 152 s for a player that does nothing. The policy
+  made none of the setup's clicks (the harness started both games at its 90 s limit),
+  pressed Q, Z and X at random, and clicked at the corners of cells near the middle of
+  the screen: taking the likeliest cell and the likeliest place inside it (`--point`)
+  goes to a cell's corner when the place inside is flat. Each live game now counts the
+  scripted player's steps it made (`milestones` in its result): the alert, the create
+  button, the commander, the law slot, confirmations, the bin, the army card, the plan's
+  arrow, fronts (Z then a click) and offensives (X then a right-click).
 
 ## The memory study (2026-09-24)
 
