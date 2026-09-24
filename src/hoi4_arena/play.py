@@ -37,9 +37,9 @@ import numpy as np
 from .actions import GRID, PERIOD, SLOTS, decode
 from .ai_games import SPEED_UP, Station, act, focus, on_screen, start_game, tap
 from .arena_log import ArenaLog
-from .dataset import VIEW_SIZE
+from .dataset import DETAIL_SIZE, FOVEA_SIZE, VIEW_SIZE
 from .desktop import DesktopError, EmergencyStop
-from .recording import open_recorder
+from .recording import STREAM_CODECS, Recorder, StreamRecorder, StreamUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -319,9 +319,9 @@ def play_policy_game(
     actor.reset_episode()
     first = on_screen(desk.capture(full=True))
     # With a worker of protocol 2 the game is recorded where it runs, on the worker's own
-    # clock (open_recorder), and the policy asks only for its views (~45 ms against ~86 ms
-    # for a whole 1080p frame over the network); its slots go in one timed request.
-    rec = open_recorder(desk, root, first, game_speed=speed, source="policy", hz=hz, codec=codec)
+    # 5 Hz clock, and each frame of that stream carries the policy's views, so one clock
+    # paces both the video and the policy (open_stream); its slots go in one timed request.
+    rec = open_stream(desk, root, first, speed=speed, hz=hz, codec=codec)
     streamed = bool(getattr(rec, "streamed", False))
     height, width = first.rgb.shape[:2]
     timed = _protocol(desk) >= 2
@@ -332,6 +332,7 @@ def play_policy_game(
     stamped, timings = [], []
     outcome, reason, ending = "timeout", None, None
     late = away = 0
+    last_index = None
     start = deadline = next_poll = clock()
     try:
         if not streamed:
@@ -341,14 +342,23 @@ def play_policy_game(
             # The interval in flight keeps applying while the next frame is taken and
             # read, as in ArenaEnv.step: the loop holds 5 Hz, and an action goes out
             # about 150 ms after the frame it answers.
-            time.sleep(max(0.0, deadline - clock()))
+            if not streamed:
+                time.sleep(max(0.0, deadline - clock()))
             begin = clock()
-            if begin - deadline > 0.005:
+            if not streamed and begin - deadline > 0.005:
                 late += 1
             deadline = begin + 1 / hz
             try:
                 if streamed:
-                    captured_frame = desk.capture(views=VIEW_SIZE)
+                    # The stream's next frame, or its newest if the loop fell behind (then
+                    # the frames between are skipped, and counted).
+                    captured_frame = rec.next_frame(timeout=10)
+                    index = captured_frame.meta.get("index")
+                    if index is not None and last_index is not None and index > last_index + 1:
+                        late += index - last_index - 1
+                    last_index = index if index is not None else last_index
+                    if captured_frame.views is None and captured_frame.meta.get("foreground"):
+                        captured_frame = desk.capture(views=VIEW_SIZE)
                 else:
                     captured_frame = desk.capture(full=True)
             except EmergencyStop:
@@ -476,6 +486,21 @@ def play_policy_game(
         )
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
+
+
+def open_stream(desk, root, first, *, speed, hz, codec):
+    """A recording clocked and encoded by the worker whose frames carry the policy's views
+    (StreamRecorder), when the worker can; else the classic recording, here, in x264."""
+    if codec in STREAM_CODECS and _protocol(desk) >= 2:
+        try:
+            return StreamRecorder(
+                root, desk, game_speed=speed, source="policy", hz=hz, codec=codec,
+                views=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE,
+            )  # fmt: skip
+        except StreamUnavailable as error:
+            log.warning("no recording stream (%s); recording here in x264", error)
+    codec = "x264" if codec in STREAM_CODECS else codec
+    return Recorder(root, first, game_speed=speed, source="policy", hz=hz, codec=codec)
 
 
 def _protocol(desk):
