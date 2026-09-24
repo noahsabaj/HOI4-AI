@@ -297,17 +297,23 @@ class Follower:
 def view_command(ffmpeg, out, number=0):
     """ffmpeg cutting the second PC's live view (MPEG-TS on its stdin, keyframes every
     2 s) into the playlist as it comes, without encoding it again, after a discontinuity,
-    with latest.jpg once a second."""
+    with latest.jpg once a second.
+
+    One thread each decodes, filters and encodes the snapshot. Left to choose, ffmpeg
+    sized every pool to this PC's 28 threads (84 threads in all) and held ~900 MB a game
+    for work one thread does at 13% of a core; capped, the peak was 83 MB (2026-09-24).
+    """
     out = Path(out)
     flags = "append_list+delete_segments+discont_start+omit_endlist+independent_segments"
     return [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "mpegts", "-i", "pipe:0",
+        "-threads", "1", "-f", "mpegts", "-i", "pipe:0",
         "-map", "0:v", "-c:v", "copy",
         "-f", "hls", "-hls_time", str(SEGMENT), "-hls_list_size", str(SEGMENTS),
         "-hls_delete_threshold", "5", "-hls_flags", flags, "-start_number", str(number),
         "-hls_segment_filename", str(out / "seg%06d.ts"), str(out / "live.m3u8"),
-        "-map", "0:v", "-vf", "fps=1", "-q:v", "4", "-update", "1", str(out / "latest.jpg"),
+        "-map", "0:v", "-filter_threads", "1", "-threads", "1",
+        "-vf", "fps=1", "-q:v", "4", "-update", "1", str(out / "latest.jpg"),
     ]  # fmt: skip
 
 

@@ -172,6 +172,29 @@ def test_the_second_pc_s_view_is_cut_into_the_playlist_without_encoding_again(tm
     assert "-f mpegts -i pipe:0" in joined and "-c:v copy" in joined
     assert command[command.index("-start_number") + 1] == "12"
     assert command[-1].endswith("latest.jpg")
+    # One thread per stage: ffmpeg's own pools held ~900 MB for a 1-a-second snapshot.
+    assert "-threads 1 -f mpegts -i pipe:0" in joined
+    assert "-filter_threads 1 -threads 1 -vf fps=1" in joined
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_the_view_command_runs_on_a_stream_like_the_second_pc_s(tmp_path):
+    """ffmpeg takes every option, as a failed start would leave the page without a view."""
+    ffmpeg = shutil.which("ffmpeg")
+    stream = subprocess.run(
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=5", "-t", "5",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", "-bf", "0", "-f", "mpegts",
+         "pipe:1"],
+        check=True, capture_output=True,
+    ).stdout  # fmt: skip
+    out = tmp_path / "out"
+    out.mkdir()
+    done = subprocess.run(
+        live.view_command(ffmpeg, out, number=3), input=stream, capture_output=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr.decode(errors="replace")
+    assert "seg000003.ts" in (out / "live.m3u8").read_text()
+    assert (out / "latest.jpg").read_bytes()[:2] == b"\xff\xd8"
 
 
 def test_the_view_steps_aside_while_a_new_worker_waits(tmp_path):
