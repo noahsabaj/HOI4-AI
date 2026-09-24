@@ -779,3 +779,27 @@ def test_a_second_copy_of_a_run_refuses_its_folder_and_a_dead_owner_s_lock_is_ta
     (tmp_path / "run.lock").write_text("999999")  # A run killed without cleaning up.
     with RunLock(tmp_path):
         assert (tmp_path / "run.lock").read_text() == str(os.getpid())
+
+
+def test_a_live_game_starts_only_with_commit_room_on_the_second_pc(monkeypatch):
+    readings = iter([{"commit_mb": 36000, "commit_limit_mb": 38000},
+                     {"commit_mb": 29000, "commit_limit_mb": 38000}])  # fmt: skip
+
+    class Station:
+        def connect(self, attach=True):
+            class Desk:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    pass
+
+                def telemetry(self, timeout=15):
+                    return {"memory": next(readings)}
+
+            return Desk()
+
+    monkeypatch.setattr(play.time, "sleep", lambda s: None)
+    assert play.room_for_a_game(Station(), tries=2), "room once the lender's game has closed"
+    readings = iter([{"commit_mb": 36000, "commit_limit_mb": 38000}] * 2)
+    assert not play.room_for_a_game(Station(), tries=2)

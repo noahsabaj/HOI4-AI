@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -562,6 +563,33 @@ def milestones(events, width=1920, height=1080):
     return counts
 
 
+# What a game needs on the second PC: HOI4 takes 5.3-5.9 GB of commit and the stream's
+# encoder about 1 GB; allocations past the commit limit fail and can crash the game.
+GAME_COMMIT_MB = 6.5 * 1024
+COMMIT_SHARE = float(os.environ.get("HOI4_COMMIT_SHARE", "0.95"))
+
+
+def room_for_a_game(station, tries=10, wait=30.0):
+    """Whether the second PC's commit, with HOI4 closed, leaves room for a game: its commit
+    plus GAME_COMMIT_MB under COMMIT_SHARE of the limit. Waits and looks again a few times
+    (the recorder that lent the PC may still be closing its game). The reading, logged."""
+    reading = {}
+    for _ in range(tries):
+        try:
+            with station.connect(attach=False) as desk:
+                reading = desk.telemetry(timeout=15).get("memory") or {}
+        except Exception as error:  # noqa: BLE001 - no reading is no room.
+            log.warning("[peer] telemetry failed: %s", error)
+            reading = {}
+        commit, limit = reading.get("commit_mb"), reading.get("commit_limit_mb")
+        if commit and limit and commit + GAME_COMMIT_MB < COMMIT_SHARE * limit:
+            log.info("[peer] room for a game: commit %s of %s MB", commit, limit)
+            return True
+        log.warning("[peer] no room for a game yet: commit %s of %s MB", commit, limit)
+        time.sleep(wait)
+    return False
+
+
 def reserve(name, minutes, *, root=EVAL, wait_minutes=90.0, clock=time.monotonic):
     """Ask the scripted player's agent for the second PC, and wait until it grants it.
 
@@ -661,6 +689,8 @@ def evaluate_policy(
             entry["start_save"] = save
             try:
                 station.quit()
+                if not room_for_a_game(station):
+                    raise RuntimeError("the second PC has no commit room for a game")
                 station.launch(mod, save=save)
                 if not save:
                     time.sleep(25)
@@ -696,6 +726,11 @@ def evaluate_policy(
                 log.info("[peer] %s: winner %s after %s s", name, outcome, manifest["seconds"])
             results.append(entry)
             (out_root / "results-peer.json").write_text(json.dumps(results, indent=2))
+            if entry.get("reason") and "no commit room" not in str(entry.get("error", "")):
+                # A game that ended early (the game exited or crashed, the worker was lost)
+                # ends the test: no second game on a PC that just failed one.
+                log.warning("[peer] %s ended early (%s); stopping the test", name, entry["reason"])
+                break
     finally:
         try:
             station.quit()
