@@ -76,6 +76,9 @@ MAP_TOP, MAP_BOTTOM = 80, 120
 PICKER_FLAG, TOP_FLAG = (1480, 25, 1545, 60), (10, 10, 50, 40)
 # Close enough to the middle, as a fraction of the screen.
 CENTRED = 0.03
+# The least share of its bounding box a patch of land fills to be the arena, zoomed out:
+# lit cloud fills about 0.12, the arena 0.4 to 0.7 (arena_offset, 2026-09-25).
+SOLID = 1 / 3
 # Camera zoom in mouse-wheel notches in from fully out, measured at 1080p (see camera).
 # Unit counters show from 9; past 22 the map is terrain; 26 is the closest.
 VIEW_NEAR, VIEW_FAR, ZOOM_TERRAIN, ZOOM_MAX = 9, 20, 22, 26
@@ -413,17 +416,46 @@ def hold(desk, vk, seconds):
 
 
 def arena_offset(rgb):
-    """Where the middle of the arena is, as (down, right) fractions from the screen centre.
+    """Where the middle of the arena is, as (down, right) fractions from the screen centre,
+    for a camera fully zoomed out (recentre).
 
     None when no country's land is on screen, such as over a menu.
+
+    Two things away from the arena read as it on 2026-09-25, and kept the camera over the
+    sea for 80 s, holding Up at the top of the map:
+    - Lit cloud along the map's top edge passes for Blue's land, in a patch wider than
+      the arena's. Cloud is wisps: it fills about an eighth of its bounding box, and the
+      arena, zoomed out, more than half. So the arena is the largest patch that fills a
+      third of its box (vision.country_pixels keeps the largest patch of all, which is
+      right close in, where forest breaks the land up).
+    - The map wraps around east to west, and a camera pushed far enough sideways shows the
+      arena split across the wrap, one end at each edge of the screen. Split so, the arena
+      lies past the edge with more of it, and the offset points half a screen that way.
     """
+    import cv2
+
     top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
-    blue, red = country_pixels(rgb[top:bottom])
+    blue, red = country_pixels(rgb[top:bottom], largest=False)
     if blue is None or not (blue | red).any():
         return None
-    ys, xs = np.nonzero(blue | red)
-    centre = ((ys.min() + ys.max()) / 2 + top, (xs.min() + xs.max()) / 2)
-    return centre[0] / rgb.shape[0] - 0.5, centre[1] / rgb.shape[1] - 0.5
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (blue | red).astype(np.uint8), connectivity=4
+    )
+    x, y, w, h, area = stats[1:].T
+    solid = area >= SOLID * w * h
+    pick = np.flatnonzero(solid) if solid.any() else np.arange(count - 1)
+    best = pick[np.argmax(area[pick])]
+    height, width = rgb.shape[0], rgb.shape[1]
+    down = (top + y[best] + h[best] / 2) / height - 0.5
+    # Solid patches at both side edges, big enough to be the arena's ends: split by the wrap.
+    ends = [k for k in pick if area[k] >= area[best] / 4]
+    left = max((w[k] for k in ends if x[k] == 0), default=0)
+    right = max((w[k] for k in ends if x[k] + w[k] == width), default=0)
+    if left and right and left + right < width:
+        tall = [k for k in ends if x[k] == 0 or x[k] + w[k] == width]
+        y0, y1 = min(y[k] for k in tall), max(y[k] + h[k] for k in tall)
+        return (top + (y0 + y1) / 2) / height - 0.5, 0.5 if right >= left else -0.5
+    return down, (x[best] + w[best] / 2) / width - 0.5
 
 
 def recentre(desk, tries=10):

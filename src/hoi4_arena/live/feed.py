@@ -152,7 +152,7 @@ class Narrator:
             where = self.labels.get(card["station"], card["station"])
             if said is None:
                 said = self.games[name] = {"frame": -1, "marks": set(), "owned": {},
-                                           "steps": {}, "station": card["station"]}  # fmt: skip
+                                           "start": {}, "steps": {}, "station": card["station"]}  # fmt: skip
                 plan = (card.get("plan") or {}).get("variant") or "?"
                 self.event(card, f"{where}: {arena_name(card['arena'])} as "
                            f"{SIDE.get(card['side'], card['side'])}, {plan} plan")  # fmt: skip
@@ -174,10 +174,15 @@ class Narrator:
                         said["marks"].add((side, mark))
                         self.event(card, f"{SIDE.get(side, side)} is {int(mark * 100)}% of the way "
                                    "to surrender")  # fmt: skip
+                # The report's `states` are the side's states now, lost ones gone, so the
+                # count to hold out of is the most it has had (2026-09-25: "7 of 7 held").
                 owned, before = report.get("owned"), said["owned"].get(side)
+                start = said["start"][side] = max(
+                    said["start"].get(side, 0), report.get("states") or 0, owned or 0
+                )
                 if owned is not None and before is not None and owned < before:
                     self.event(card, f"{SIDE.get(side, side)} lost a state "
-                               f"({owned} of {report.get('states')} held)")  # fmt: skip
+                               f"({owned} of {start} held)")  # fmt: skip
                 if owned is not None:
                     said["owned"][side] = owned
         for name in [n for n in self.games if n not in live]:
