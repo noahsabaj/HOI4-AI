@@ -439,6 +439,16 @@ def session_labels(
     if setup_weight != 1.0:
         setup = decisions < setup_end(manifest, times, setup_seconds)
         weight = weight * np.where(setup, np.float32(setup_weight), np.float32(1))
+    # Where the recorder knocked its camera astray unrecorded (ai_games.camera `kicks`), the
+    # frames moved with no input: those decisions weigh nothing. Their windows stay, so the
+    # recovery just after keeps its labels.
+    for kick in manifest.get("camera_kicks") or []:
+        begun, ended = kick.get("from_frame"), kick.get("to_frame")
+        if begun is None or ended is None:
+            continue
+        last = len(times) - 1
+        pushed = (decisions >= times[min(begun, last)]) & (decisions <= times[min(ended, last)])
+        weight = weight * np.where(pushed, np.float32(0), np.float32(1))
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the

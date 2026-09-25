@@ -175,6 +175,15 @@ def main():
         "with HOI4 closed, and play resumes at <dir>/done/<name>.json or after N+15 minutes.",
     )
     ai.add_argument(
+        "--camera-kicks",
+        nargs=2,
+        type=float,
+        metavar=("LOW", "HIGH"),
+        help="Every LOW to HIGH seconds, knock the camera off an edge of the map or right in "
+        "on a random spot, unrecorded as input, so the recording shows it finding the front "
+        "again: recovery for a learned camera to imitate.",
+    )
+    ai.add_argument(
         "--tune",
         help="A tuning study's SQLite file (tuning.py): the scripted player's exploring games "
         "play the best plan with the settings its Gaussian process asks for, and report "

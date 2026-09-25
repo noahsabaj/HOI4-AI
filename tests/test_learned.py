@@ -74,6 +74,17 @@ def test_training_drops_the_old_camera_per_recording(tmp_path):
     assert pressed == {"old": False, "new": True}
 
 
+def test_the_decisions_a_camera_kick_spans_weigh_nothing(tmp_path):
+    """The recorder's camera kicks (ai_games.kick_camera) move the frames with no input."""
+    _scripted(tmp_path / "game", camera_kicks=[{"kind": "edge", "from_frame": 10, "to_frame": 20}])
+    labels = session_labels(tmp_path / "game", sources=("scripted",), lead_in=0)
+    times, decisions = labels["times"], labels["decisions"]
+    pushed = (decisions >= times[10]) & (decisions <= times[20])
+    assert pushed.any() and (~pushed).any()
+    assert (labels["weight"][pushed] == 0).all() and (labels["weight"][~pushed] == 1).all()
+    assert labels["valid"][pushed].all(), "their windows stay, for the recovery after"
+
+
 def test_a_lost_game_counts_for_its_loser_weight(tmp_path):
     _scripted(tmp_path / "won", winner="BLU", started_as="BLU", players=["BLU"])
     _scripted(tmp_path / "lost", winner="BLU", started_as="RED", players=["RED"])
