@@ -144,7 +144,7 @@ def test_the_feed_narrates_a_game_and_keeps_watchers_messages(tmp_path):
             "sides": {"RED": {"surrender": 0.3, "owned": 8, "states": 8}}}  # fmt: skip
     narrator.step({"peer": card}, lambda name: None)
     orders = [*card["orders"], {"frame": 60, "seconds": 12, "order": "general"}]
-    card = {**card, "orders": orders, "sides": {"RED": {"surrender": 0.6, "owned": 7, "states": 8}}}
+    card = {**card, "orders": orders, "sides": {"RED": {"surrender": 0.6, "owned": 7, "states": 7}}}
     narrator.step({"peer": card}, lambda name: None)
     texts = [m["text"] for m in feed.since()]
     assert texts[0] == "Lent PC: bay as Blue, best plan"

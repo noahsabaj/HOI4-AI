@@ -133,7 +133,7 @@ BLUE = (40, 100, 220)
 RED = (220, 60, 60)
 
 
-def country_pixels(crop):
+def country_pixels(crop, largest=True):
     """Masks of the pixels that read as Blue's and as Red's land.
 
     The map draws country colour faintly over terrain, so the land is nowhere near the
@@ -144,7 +144,8 @@ def country_pixels(crop):
 
     Lit cloud reads as bluish land too, so only the largest connected patch counts:
     the arena is one piece, because the two countries share a border, and clouds drift
-    over the sea as separate patches.
+    over the sea as separate patches. With `largest` False every patch is kept, for a
+    caller that tells them apart itself (ai_games.arena_offset).
     """
     import cv2
 
@@ -158,7 +159,7 @@ def country_pixels(crop):
     # measured about twice as fast. Label 0 is the background in both.
     count, labels = cv2.connectedComponents((blue | red).astype(np.uint8), connectivity=4)
     count -= 1
-    if count > 1:
+    if largest and count > 1:
         sizes = np.bincount(labels.ravel())
         sizes[0] = 0
         arena = labels == int(sizes.argmax())

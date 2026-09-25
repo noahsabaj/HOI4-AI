@@ -59,6 +59,47 @@ def test_the_arena_offset_points_from_the_screen_centre_to_the_arena_centre():
     assert arena_offset(chrome) is None
 
 
+def _wisps(frame, rows, cols):
+    """Lit cloud, as vision.country_pixels sees it: bluish, and in wisps (every eighth
+    row and sixteenth column of the box: about a fifth of it), wider than the arena."""
+    for r in range(rows[0], rows[1], 8):
+        frame[r, cols[0] : cols[1]] = BLUE_LAND
+    for c in range(cols[0], cols[1], 16):
+        frame[rows[0] : rows[1], c] = BLUE_LAND
+
+
+def test_the_arena_offset_is_not_drawn_to_cloud_along_the_top_of_the_map():
+    # 2026-09-25: a band of lit cloud under the top bar outweighed the arena, and the
+    # camera held Up at the top of the map for 80 s.
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = SEA
+    _wisps(frame, (MAP_TOP, MAP_TOP + 260), (0, 1830))
+    # A smaller patch than the cloud's, as the arena was then.
+    frame[600:800, 700:850] = BLUE_LAND
+    frame[600:800, 850:1000] = RED_LAND
+    down, right = arena_offset(frame)
+    assert down == pytest.approx((700 - 540) / 1080, abs=1e-3)
+    assert right == pytest.approx((850 - 960) / 1920, abs=1e-3)
+
+
+def test_an_arena_split_across_the_maps_wrap_points_past_its_larger_end():
+    # A camera pushed sideways far enough shows Red's east end at the screen's left edge
+    # and Blue's west end at its right, sea between, and cloud above (2026-09-25).
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = SEA
+    _wisps(frame, (MAP_TOP, MAP_TOP + 260), (0, 1830))
+    frame[400:700, :170] = RED_LAND
+    frame[400:700, 1690:] = BLUE_LAND
+    down, right = arena_offset(frame)
+    assert right == 0.5, "more of it shows at the right edge, so it lies past there"
+    assert down == pytest.approx((550 - 540) / 1080, abs=1e-3)
+    frame[400:700, :400] = RED_LAND
+    assert arena_offset(frame)[1] == -0.5
+    # Land from edge to edge with no sea between is one patch, not a split.
+    frame[400:700] = BLUE_LAND
+    assert arena_offset(frame)[1] == pytest.approx(0, abs=1e-3)
+
+
 def test_picking_a_country_clicks_its_land_until_its_flag_shows(monkeypatch):
     frame = np.zeros((1080, 1920, 3), np.uint8)
     frame[:] = SEA
