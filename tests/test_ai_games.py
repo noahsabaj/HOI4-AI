@@ -543,7 +543,9 @@ def test_a_kick_knocks_the_camera_off_the_map_or_right_in(monkeypatch):
         kinds[ai_games.kick_camera(world, random.Random(seed), 11)] = world.applied
     assert set(kinds) == {("edge", 11), ("close", ai_games.ZOOM_MAX)}
     edge = kinds[("edge", 11)]
-    assert [e["kind"] for e in edge] == ["key", "key"] and edge[0]["vk"] in (0x25, 0x26, 0x27, 0x28)
+    assert {e["kind"] for e in edge} == {"key"} and edge[0]["vk"] in (0x25, 0x26, 0x27, 0x28)
+    # Held in half-second pieces, each well inside the worker's 750 ms arming.
+    assert 8 <= len(edge) <= 16 and [e["down"] for e in edge[:2]] == [True, False]
     close = kinds[("close", ai_games.ZOOM_MAX)]
     assert close[0]["kind"] == "move" and len(close) == 1 + ai_games.ZOOM_MAX - 11
 

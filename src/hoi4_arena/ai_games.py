@@ -841,7 +841,12 @@ def kick_camera(desk, rng, zoom):
     corrections get recorded is DART (Laskey et al., 2017).
     """
     if rng.random() < 0.6:
-        hold(desk, rng.choice((0x25, 0x26, 0x27, 0x28)), rng.uniform(2.0, 4.0))
+        # In holds of half a second: the worker disarms input after 750 ms without any, and
+        # a single 2-4 s hold lost its key's release to that (2026-09-25).
+        key, left = rng.choice((0x25, 0x26, 0x27, 0x28)), rng.uniform(2.0, 4.0)
+        while left > 0:
+            hold(desk, key, min(0.5, left))
+            left -= 0.5
         return "edge", zoom
     desk.arm(setup=True)
     at = {"kind": "move", "x": rng.uniform(0.1, 0.9), "y": rng.uniform(0.15, 0.85)}
