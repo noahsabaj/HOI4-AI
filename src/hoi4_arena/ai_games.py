@@ -830,7 +830,39 @@ def near_front(points, front, reach=0.06):
     return [p for p in points if np.hypot(*(f - p).T).min() < reach]
 
 
-def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, planner=None):
+def kick_camera(desk, rng, zoom):
+    """Knock the camera where a learned camera gets lost: off an edge of the map (an arrow
+    held 2-4 s), or right in on a random spot. Returns what it did and the zoom after.
+
+    The recorder's camera (camera) calls it with the unlogged desktop, so the push is no
+    label, and what the recording shows next is the camera finding the front again, which
+    a policy can learn. A live policy walked its camera off the top of the map and had
+    never seen the way back (2026-09-24). Disturbing the demonstrator so that its
+    corrections get recorded is DART (Laskey et al., 2017).
+    """
+    if rng.random() < 0.6:
+        hold(desk, rng.choice((0x25, 0x26, 0x27, 0x28)), rng.uniform(2.0, 4.0))
+        return "edge", zoom
+    desk.arm(setup=True)
+    at = {"kind": "move", "x": rng.uniform(0.1, 0.9), "y": rng.uniform(0.15, 0.85)}
+    for event in [at] + [{"kind": "wheel", "delta": 120}] * (ZOOM_MAX - zoom):
+        desk.apply([event])
+        time.sleep(0.05)
+    return "close", ZOOM_MAX
+
+
+def camera(
+    desk,
+    stop,
+    station,
+    popups,
+    overview_every=(40, 80),
+    rng=None,
+    planner=None,
+    kicks=None,
+    kicked=None,
+    frame=None,
+):
     """Watch the war like a commander: the front in view with its counters, close looks at
     its battles, and the whole map now and then.
 
@@ -855,10 +887,15 @@ def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, plann
     With a scripted player's `planner`, the planner first sets the paused game up and
     starts it, then gives its later orders between the camera's moves. A setup that fails
     is left in `planner.error`, which ends the game; a later order that fails is retried.
+
+    `kicks`, (low, high) seconds, knocks the camera astray that often (see kick), and notes
+    each push in `kicked` with the frames it spanned (`frame()` counts them).
     """
     rng = rng or random.Random()
     zoom = 0
     next_overview = time.monotonic() + rng.uniform(*overview_every)
+    next_kick = time.monotonic() + rng.uniform(*kicks) if kicks else None
+    raw = getattr(desk, "desk", desk)  # Logged's own desktop: what it applies is no label.
     # Screen fractions an arrow key pans the camera in a second, across and down, learnt
     # from each pan; and the last pan, to learn from.
     speed, last_pan = [1.25, 1.25], None
@@ -978,6 +1015,15 @@ def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, plann
                 return
         wheel(-notches, at)
 
+    def kick():
+        nonlocal zoom
+        begun = frame() if frame else None
+        kind, zoom = kick_camera(raw, rng, zoom)
+        if kicked is not None:
+            kicked.append(
+                {"kind": kind, "from_frame": begun, "to_frame": frame() if frame else None}
+            )
+
     def sweep(front):
         """Run the pointer along the front, reading its provinces."""
         picks = rng.sample(front, min(len(front), rng.randint(3, 6)))
@@ -1017,6 +1063,10 @@ def camera(desk, stop, station, popups, overview_every=(40, 80), rng=None, plann
                 if time.monotonic() >= next_overview:
                     overview()
                     next_overview = time.monotonic() + rng.uniform(*overview_every)
+                    continue
+                if next_kick is not None and time.monotonic() >= next_kick:
+                    kick()
+                    next_kick = time.monotonic() + rng.uniform(*kicks)
                     continue
                 rgb = screen(desk)
                 front = front_points(rgb)
@@ -1079,6 +1129,7 @@ def play(
 
     stop = threading.Event()
     inputs = Logged(desk)
+    kicked = []
     outcome, reason = "timeout", None
     first = desk.capture()
     hz = settings["hz"]
@@ -1104,7 +1155,12 @@ def play(
     mover = threading.Thread(
         target=camera,
         args=(inputs, stop, station, popups),
-        kwargs={"planner": planner},
+        kwargs={
+            "planner": planner,
+            "kicks": settings.get("camera_kicks"),
+            "kicked": kicked,
+            "frame": lambda: rec.manifest["frames"],
+        },
         daemon=True,
     )
     # A scripted game starts paused, and no weekly report comes until it runs.
@@ -1202,6 +1258,9 @@ def play(
             # as scripted_events.
             labels="scripted_events",
             station=station,
+            # Where the camera was knocked astray unrecorded (camera `kicks`): the frames
+            # moved with no input, so training weighs those decisions 0.
+            camera_kicks=kicked,
         )
         if planner:
             rec.manifest.update(
@@ -1823,6 +1882,7 @@ def record_ai_games(
     main_only=False,
     tune=None,
     tune_skip=None,
+    camera_kicks=None,
 ):
     """Record on this PC, the second PC, or both at once, until `minutes` run out.
 
@@ -1845,6 +1905,9 @@ def record_ai_games(
     With `tune`, a tuning study's SQLite file (tuning.py), the scripted player's exploring
     games play the best plan with the settings the study asks for, except on the arenas
     in `tune_skip`, and each reports its score to the study (pick_plan).
+
+    `camera_kicks`, (low, high) seconds, knocks the camera astray that often, unrecorded,
+    so the recordings show it finding the front again (camera's `kick`).
     """
     from .scripted import TEMPLATES, load_templates
 
@@ -1878,6 +1941,7 @@ def record_ai_games(
         "buttons": load_templates(TEMPLATES) if player == "scripted" else None,
         "tuner": None,
         "tune_skip": set(tune_skip or ()),
+        "camera_kicks": tuple(camera_kicks) if camera_kicks else None,
     }
     if tune and player == "scripted":
         from .tuning import Tuner

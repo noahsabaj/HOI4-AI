@@ -1,5 +1,6 @@
 import random
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -444,13 +445,15 @@ class ToyMap:
     """A 1080p view of a toy arena for the camera, 2400 x 800 world units: Blue's land to
     the left of FRONT_X, Red's to its right, sea around. Wheel notches zoom about the
     pointer, 1.105 times a notch (the arena fills half the screen at 0, a third of it the
-    screen at 18, as measured), and an arrow key pans a screen a second."""
+    screen at 18, as measured), and an arrow key pans a screen a second. As in the game,
+    the camera's centre stops at the map's edge: 600 units of sea around the land."""
 
     FRONT_X = 1200
 
     def __init__(self, cx, cy, zoom):
         self.cx, self.cy, self.zoom, self.pointer, self.down = cx, cy, zoom, (0.5, 0.5), {}
         self.seen = []  # (zoom, the front's x on screen) at each capture
+        self.applied = []  # every input, logged by the recorder or not
 
     def scale(self):
         return 0.4 * 1.105**self.zoom
@@ -470,6 +473,7 @@ class ToyMap:
     def apply(self, events):
         import time
 
+        self.applied.extend(events)
         for e in events:
             if e["kind"] == "move":
                 self.pointer = (e["x"], e["y"])
@@ -486,6 +490,9 @@ class ToyMap:
                 down = {0x26: -1, 0x28: 1}.get(e["vk"], 0)
                 self.cx += across * seconds * 1920 / self.scale()
                 self.cy += down * seconds * 1080 / self.scale()
+            self.cx = min(3000, max(-600, self.cx))
+            self.cy = min(1400, max(-600, self.cy))
+        return {"t_ns": time.monotonic_ns()}  # As the worker replies, for Logged.
 
     def capture(self, full=True):
         from types import SimpleNamespace
@@ -526,6 +533,57 @@ def test_the_camera_finds_the_front_and_keeps_it_in_the_middle():
     assert max(zoom for zoom, _ in world.seen) < ai_games.ZOOM_TERRAIN, "never past the counters"
     zoom, x = world.seen[-1]
     assert 0 <= x <= 1, "the front on screen at the end"
+
+
+def test_a_kick_knocks_the_camera_off_the_map_or_right_in(monkeypatch):
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    kinds = {}
+    for seed in range(12):
+        world = ToyMap(cx=1200, cy=400, zoom=11)
+        kinds[ai_games.kick_camera(world, random.Random(seed), 11)] = world.applied
+    assert set(kinds) == {("edge", 11), ("close", ai_games.ZOOM_MAX)}
+    edge = kinds[("edge", 11)]
+    assert [e["kind"] for e in edge] == ["key", "key"] and edge[0]["vk"] in (0x25, 0x26, 0x27, 0x28)
+    close = kinds[("close", ai_games.ZOOM_MAX)]
+    assert close[0]["kind"] == "move" and len(close) == 1 + ai_games.ZOOM_MAX - 11
+
+
+def test_the_camera_finds_the_front_again_after_a_kick_that_is_no_label():
+    """The recorder knocks its camera astray through the desktop it does not log, so the
+    recording shows the camera move with no input and then its way back (DART)."""
+    import threading
+
+    world = ToyMap(cx=1200, cy=400, zoom=11)
+    logged = ai_games.Logged(world)
+    stop, kicked = threading.Event(), []
+
+    class NoPopups:
+        def due(self):
+            return None
+
+    low, high = ai_games.FRONT_ZOOM
+
+    def on_front():
+        x = 0.5 + (world.FRONT_X - world.cx) * world.scale() / 1920
+        return low <= world.zoom <= high and 0 <= x <= 1
+
+    kwargs = {"rng": random.Random(3), "kicks": (4.0, 20.0), "kicked": kicked}
+    kwargs["frame"] = lambda: len(world.seen)
+    run = threading.Thread(target=ai_games.camera, args=(logged, stop, "toy", NoPopups()),
+                           kwargs=kwargs)  # fmt: skip
+    run.start()
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline and not (kicked and on_front()):
+        time.sleep(0.05)
+    found = bool(kicked) and on_front()
+    stop.set()
+    run.join(10)
+    assert not run.is_alive() and kicked, "knocked astray at least once"
+    first = kicked[0]
+    assert first["kind"] in ("edge", "close") and first["from_frame"] <= first["to_frame"]
+    assert found, "the front found again, at the zoom that shows its counters"
+    labelled = [e["event"] for e in logged.take()]
+    assert len(labelled) < len(world.applied), "the kick's inputs are no label"
 
 
 def test_a_plan_line_is_no_front_and_battles_are_the_green_badges_on_it():
