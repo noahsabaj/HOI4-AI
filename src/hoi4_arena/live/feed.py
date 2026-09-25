@@ -125,9 +125,9 @@ class Feed:
             return [m for m in self.messages if m["id"] > after][-limit:]
 
 
-def say(path, text, who="Claude"):
+def say(path, text, who="Claude", kind="claude"):
     """A message from outside the running view, appended to its feed's file."""
-    message = {"t": round(time.time(), 1), "who": who, "kind": "claude", "text": text[:LONGEST]}
+    message = {"t": round(time.time(), 1), "who": who, "kind": kind, "text": text[:LONGEST]}
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with Path(path).open("a", encoding="utf-8") as file:
         file.write(json.dumps(message) + "\n")

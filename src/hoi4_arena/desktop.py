@@ -342,7 +342,10 @@ class Desktop:
         A windowed game started on the second PC does not take focus by itself, and the
         worker refuses input and capture until it has it. Refused while armed.
         """
-        return bool(self.request("focus")["foreground"])
+        reply = self.request("focus")
+        # What is in front instead (the worker's foreground_owner), for whoever waits on it.
+        self.front = reply.get("owner")
+        return bool(reply["foreground"])
 
     def clock_offset(self, tries=3):
         """(offset, round trip) in ns: add the offset to a worker time (`t_ns`) to get
