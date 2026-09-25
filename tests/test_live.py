@@ -50,80 +50,205 @@ def test_the_stream_follows_the_file_from_near_its_end_and_numbers_on(tmp_path):
     assert live.next_segment(tmp_path) == 43
 
 
-def test_the_status_names_the_game_and_the_run_s_record_newest_first(tmp_path):
-    run = tmp_path / "scripted-f12"
-    game = recording(run, "scripted-peer-2", started_ago=95)
-    entry = {"game": game.name, "arena": "arena-bay-v6", "started_as": "BLU"}
-    (run / "live.json").write_text(json.dumps({**entry, "plan": {"variant": "tuned"}}))
-    finished = [
-        {"arena": "arena-bay-v6", "started_as": "RED", "winner": "RED", "seconds": 370},
-        {"arena": "arena-bay-v6", "started_as": "BLU", "winner": "RED", "seconds": 434},
-        {"arena": "arena-river-v6", "started_as": "RED", "winner": "timeout", "seconds": 600},
-        {"arena": "arena-river-v6", "started_as": "BLU", "error": "start failed"},
-    ]
-    (run / "results-peer-1.json").write_text(json.dumps(finished))
-    found = (game, json.loads((game / "manifest.json").read_text()))
-    shown = live.status(found, [str(tmp_path / "*")])
-    assert shown["live"] and shown["arena"] == "arena-bay-v6" and shown["side"] == "BLU"
-    assert shown["plan"] == "tuned" and 94 <= shown["elapsed"] <= 97
-    assert [g["result"] for g in shown["record"]] == ["timeout", "loss", "win"]
-    # Between games: the latest run's record.
-    idle = live.status(None, [str(tmp_path / "*")])
-    assert not idle["live"] and idle["run"] == "scripted-f12" and len(idle["record"]) == 3
+def playing(run, name, state, **manifest):
+    """A game being recorded, with the live state its recorder publishes each second."""
+    game = recording(run, name, **manifest)
+    (game / "live-state.json").write_text(json.dumps(state))
+    return game
+
+
+DAY = "13:00, 1 February, 1937"
+STATE = {
+    "station": "peer", "arena": "arena-bay-v6", "started_as": "BLU", "hz": 5,
+    "plan": {"variant": "tuned", "wait": 300, "redraw": 20},
+    "days": {
+        "BLU": {"date": DAY, "surrender": 0.1, "states": 8, "owned": 7, "divisions": 8},
+        "RED": {"date": DAY, "surrender": 0.55, "states": 8, "owned": 5, "divisions": 3},
+    },
+    "orders": [{"frame": 30, "order": "army"}, {"frame": 127, "order": "offensive", "attack": "broad"}],
+    "kicks": 1,
+}  # fmt: skip
+
+
+def test_each_pc_s_game_is_found_and_described(tmp_path):
+    peer = playing(
+        tmp_path / "scripted-f14", "scripted-peer-20260925-173110", STATE, started_ago=95
+    )
+    here = recording(tmp_path / "scripted-f15", "scripted-here-20260925-173500")
+    found = live.live_games([str(tmp_path / "*")])
+    assert set(found) == {"peer", "here"} and found["peer"][0] == peer and found["here"][0] == here
+    card = live.game_card(peer, found["peer"][1])
+    assert card["station"] == "peer" and card["arena"] == "arena-bay-v6" and card["side"] == "BLU"
+    assert card["plan"]["variant"] == "tuned" and 94 <= card["elapsed"] <= 97
+    assert card["date"] == DAY and card["sides"]["RED"]["surrender"] == 0.55
+    assert [(o["seconds"], o["order"]) for o in card["orders"]] == [(6, "army"), (25, "offensive")]
+    assert card["orders"][1]["attack"] == "broad" and card["kicks"] == 1
+    # Without a live state (a recorder from before it), the run's live.json still names it.
+    entry = {"game": here.name, "arena": "arena-12x8-v4"}
+    assert live.game_card(here, found["here"][1], entry)["arena"] == "arena-12x8-v4"
 
 
 def test_the_learned_player_s_live_games_are_followed_too(tmp_path):
-    """play-policy records one level down (artifacts/learned/<test>/<game>) and names its
-    game in live.json as record-ai does, so the page says LIVE for it, not between games."""
+    """play-policy records one level down (artifacts/learned/<test>/<game>)."""
     run = tmp_path / "learned" / "live-bc4c-e1"
-    game = recording(run, "policy-peer-1", started_ago=40)
-    entry = {"game": game.name, "arena": "arena-12x8-v4", "started_as": "BLU"}
-    (run / "live.json").write_text(json.dumps({**entry, "plan": {"variant": "learned"}}))
+    game = recording(run, "policy-peer-20260924-192149", started_ago=40)
     assert live.live_game([str(tmp_path / "*")]) is None, "a level above the games"
-    runs = [str(tmp_path / "*"), str(tmp_path / "learned" / "*")]
-    shown = live.status(live.live_game(runs), runs)
-    assert shown["live"] and shown["run"] == "live-bc4c-e1" and shown["plan"] == "learned"
-    assert shown["arena"] == "arena-12x8-v4" and shown["side"] == "BLU"
+    assert live.live_game([str(tmp_path / "*"), str(tmp_path / "learned" / "*")])[0] == game
+
+
+def results(run, games):
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "results-peer-1.json").write_text(json.dumps(games))
+
+
+def test_the_games_played_are_listed_newest_first_with_their_times(tmp_path):
+    results(tmp_path / "scripted-f13", [
+        {"game": "scripted-peer-20260924-181935", "arena": "arena-plains-v6", "started_as": "RED",
+         "winner": "timeout", "seconds": 603, "plan": {"variant": "best"}},
+        {"game": "scripted-peer-20260924-183018", "arena": "arena-plains-v6", "started_as": "BLU",
+         "winner": "BLU", "seconds": 456, "plan": {"variant": "tuned"}},
+        {"game": "scripted-peer-20260924-183915", "started_as": "RED", "error": "start failed"},
+    ])  # fmt: skip
+    played = live.History([str(tmp_path / "*")]).games()
+    assert [(g["plan"], g["result"]) for g in played] == [("tuned", "win"), ("best", "timeout")]
+    assert played[0]["ended_unix"] - played[0]["started_unix"] == 456
+    assert played[0]["path"] == str(tmp_path / "scripted-f13" / "scripted-peer-20260924-183018")
+
+
+def test_the_page_says_when_runs_have_stopped_not_between_games(tmp_path, monkeypatch):
+    from hoi4_arena.live import state
+
+    game = {"game": "scripted-peer-20260924-232952", "arena": "arena-bay-v6", "started_as": "RED",
+            "winner": "RED", "seconds": 463}  # fmt: skip
+    results(tmp_path / "scripted-f13", [game])
+    app = live.LiveApp([str(tmp_path / "*")], tmp_path / "out", "ffmpeg", feed=tmp_path / "feed")
+    monkeypatch.setattr(state, "recorders", lambda: [])
+    app.round()
+    ended = app.played[0]["ended_unix"]
+    assert app.status["idle_since"] == ended and app.status["running"] == []
+    assert not any(s["streaming"] or s["game"] for s in app.status["stations"])
+    # A recorder still running: between games, not stopped.
+    monkeypatch.setattr(
+        state, "recorders", lambda: [{"kind": "record-ai", "output": "scripted-f14"}]
+    )
+    app.recorders_at = 0
+    app.round()
+    assert app.status["idle_since"] is None and app.status["last_end"] == ended
+
+
+def test_the_feed_narrates_a_game_and_keeps_watchers_messages(tmp_path):
+    feed = live.Feed(tmp_path / "chat.jsonl")
+    narrator = live.Narrator(feed, {"peer": "Lent PC"})
+    card = {"game": "g1", "station": "peer", "arena": "arena-bay-v6", "side": "BLU",
+            "plan": {"variant": "best"}, "orders": [{"frame": 30, "seconds": 6, "order": "army"}],
+            "sides": {"RED": {"surrender": 0.3, "owned": 8, "states": 8}}}  # fmt: skip
+    narrator.step({"peer": card}, lambda name: None)
+    orders = [*card["orders"], {"frame": 60, "seconds": 12, "order": "general"}]
+    card = {**card, "orders": orders, "sides": {"RED": {"surrender": 0.6, "owned": 7, "states": 8}}}
+    narrator.step({"peer": card}, lambda name: None)
+    texts = [m["text"] for m in feed.since()]
+    assert texts[0] == "Lent PC: bay as Blue, best plan"
+    assert texts.count("0:06 formed the army") == 1 and "0:12 gave the army its general" in texts
+    assert "Red is 25% of the way to surrender" in texts
+    assert "Red is 50% of the way to surrender" in texts
+    assert "Red lost a state (7 of 8 held)" in texts
+    # Its end, once its results are written.
+    done = {"result": "win", "side": "BLU", "arena": "arena-bay-v6", "seconds": 463}
+    narrator.step({}, lambda name: done)
+    assert feed.since()[-1]["text"] == "Lent PC: Blue won on bay in 7:43"
+    # Watchers and Claude; the file keeps them all, and a new feed reads them back.
+    feed.add("watcher", "  go   blue  ")
+    live.say(tmp_path / "chat.jsonl", "the guard just redrew")
+    feed.absorb()
+    assert [m["text"] for m in feed.since()[-2:]] == ["go blue", "the guard just redrew"]
+    assert feed.since()[-1]["kind"] == "claude"
+    after = feed.since()[-2]["id"]
+    again = live.Feed(tmp_path / "chat.jsonl").since(after)
+    assert [m["text"] for m in again] == ["the guard just redrew"]
 
 
 def test_the_server_gives_the_page_s_files_and_nothing_else(tmp_path):
-    for name, body in {"index.html": "<p>", "live.m3u8": "#EXTM3U", "notes.txt": "x"}.items():
-        (tmp_path / name).write_text(body)
-    server = live.serve(tmp_path, port=0)
+    app = live.LiveApp(
+        [str(tmp_path / "runs" / "*")], tmp_path / "out", "ffmpeg", feed=tmp_path / "feed"
+    )
+    (tmp_path / "out" / "peer" / "live.m3u8").write_text("#EXTM3U")
+    (tmp_path / "out" / "notes.txt").write_text("x")
+    app.replays.path("scripted-peer-1").write_bytes(bytes(range(256)) * 4)
+    server = live.serve(app, 0)
     base = f"http://127.0.0.1:{server.server_port}"
+
+    def post(path, body):
+        request = urllib.request.Request(base + path, json.dumps(body).encode(), method="POST")
+        with urllib.request.urlopen(request) as answer:
+            return json.loads(answer.read())
+
     try:
         with urllib.request.urlopen(base + "/") as page:
-            assert page.read() == b"<p>"
-        with urllib.request.urlopen(base + "/live.m3u8?123") as playlist:
+            assert b"HOI4 Live" in page.read()
+        from hoi4_arena.live.server import PAGE
+
+        built = next((PAGE / "_app" / "immutable" / "entry").glob("*.js"))
+        with urllib.request.urlopen(base + "/_app/immutable/entry/" + built.name) as script:
+            assert script.headers["Content-Type"].startswith("text/javascript")
+            assert "immutable" in script.headers["Cache-Control"]
+        with urllib.request.urlopen(base + "/s/peer/live.m3u8?123") as playlist:
             assert playlist.headers["Content-Type"] == "application/vnd.apple.mpegurl"
             assert playlist.headers["Cache-Control"] == "no-cache"
-        head = urllib.request.Request(base + "/live.m3u8", method="HEAD")
+        head = urllib.request.Request(base + "/s/peer/live.m3u8", method="HEAD")
         with urllib.request.urlopen(head) as probed:
             assert probed.headers["Content-Length"] == "7" and probed.read() == b""
-        # The status comes from memory, not a file Windows may hold while it is replaced.
-        server.status = {"live": True, "game": "scripted-peer-9"}
-        with urllib.request.urlopen(base + "/status.json") as shown:
-            assert json.loads(shown.read()) == server.status
-        for path in ("/notes.txt", "/../live.m3u8", "/latest.jpg"):
+        app.status = {"stations": [], "note": "from memory"}
+        with urllib.request.urlopen(base + "/api/status") as shown:
+            assert json.loads(shown.read()) == app.status
+        # A replay in byte ranges, as Safari asks for it.
+        ranged = urllib.request.Request(
+            base + "/replays/scripted-peer-1.mp4", headers={"Range": "bytes=10-19"}
+        )
+        with urllib.request.urlopen(ranged) as part:
+            assert part.status == 206 and part.read() == bytes(range(10, 20))
+            assert part.headers["Content-Range"] == "bytes 10-19/1024"
+        assert post("/api/chat", {"who": "watcher", "text": "hello"})["ok"]
+        flag = {"who": "watcher", "game": "scripted-peer-1", "seconds": 75, "note": "stuck"}
+        assert post("/api/flag", flag)["ok"]
+        with urllib.request.urlopen(base + "/api/chat?after=0") as chat:
+            texts = [m["text"] for m in json.loads(chat.read())]
+        assert texts == ["hello", "flagged scripted-peer-1 at 1:15: stuck"]
+        assert json.loads((tmp_path / "feed" / "flags.jsonl").read_text())["note"] == "stuck"
+        refused_paths = (
+            "/notes.txt", "/../out/notes.txt", "/s/peer/../notes.txt", "/s/PEER/live.m3u8",
+            "/replays/..%5Cnotes.txt", "/api/nothing", "/_app/../index.html",
+            "/_app/%2e%2e/index.html", "/_app/version.txt",
+        )  # fmt: skip
+        for path in refused_paths:
             with pytest.raises(urllib.error.HTTPError) as refused:
                 urllib.request.urlopen(base + path)
-            assert refused.value.code == 404
+            assert refused.value.code == 404, path
     finally:
         server.shutdown()
 
 
+def test_a_stream_that_stops_leaves_no_playlist_to_replay(tmp_path):
+    for name in ("live.m3u8", "seg000001.ts", "latest.jpg"):
+        (tmp_path / name).write_bytes(b"x")
+    live.clear_stream(tmp_path)
+    assert [p.name for p in tmp_path.iterdir()] == ["latest.jpg"], "what the screen showed last"
+
+
 def test_the_watcher_says_when_no_game_is_being_recorded(tmp_path):
     runs = [str(tmp_path / "runs" / "*")]
-    shown = live.watch(runs, out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=1)
-    assert shown["live"] is False
-    assert "HOI4 Live" in (tmp_path / "out" / "index.html").read_text()
+    shown = live.watch(runs, out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=1,
+                       feed=tmp_path / "feed")  # fmt: skip
+    assert not any(s["game"] for s in shown["stations"])
+    assert (tmp_path / "out" / "manifest.webmanifest").exists()
 
 
 def test_the_page_installs_as_an_app_with_its_icons(tmp_path):
     from PIL import Image
 
+    from hoi4_arena.live.server import PAGE
+
     live.install_app(tmp_path)
-    page = (tmp_path / "index.html").read_text()
+    page = (PAGE / "index.html").read_text()
     assert 'rel="manifest"' in page and 'rel="apple-touch-icon"' in page
     assert "apple-mobile-web-app-capable" in page and "viewport-fit=cover" in page
     manifest = json.loads((tmp_path / "manifest.webmanifest").read_text())
@@ -136,28 +261,45 @@ def test_the_page_installs_as_an_app_with_its_icons(tmp_path):
     # Blue on the left, Red on the right, the play mark white in the middle.
     blue, red = touch.getpixel((50, 90)), touch.getpixel((130, 90))
     assert blue[2] > blue[0] and red[0] > red[2] and min(touch.getpixel((90, 90))) > 200
-    server = live.serve(tmp_path, port=0)
-    try:
-        base = f"http://127.0.0.1:{server.server_port}"
-        with urllib.request.urlopen(base + "/manifest.webmanifest") as served:
-            assert served.headers["Content-Type"] == "application/manifest+json"
-        with urllib.request.urlopen(base + "/apple-touch-icon.png") as served:
-            assert served.headers["Content-Type"] == "image/png"
-    finally:
-        server.shutdown()
 
 
 def test_the_watcher_goes_on_past_a_round_that_fails(tmp_path, monkeypatch):
+    from hoi4_arena.live import state
+
     calls = []
 
     def flaky(runs, now=None):
         calls.append(runs)
         if len(calls) == 1:
             raise PermissionError("held by a scanner for a moment")
+        return {}
 
-    monkeypatch.setattr(live, "live_game", flaky)
-    shown = live.watch(["runs/*"], out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=2)
-    assert len(calls) == 2 and shown["live"] is False
+    monkeypatch.setattr(state, "live_games", flaky)
+    live.watch(["runs/*"], out=tmp_path / "out", port=0, poll=0, ffmpeg="ffmpeg", rounds=2,
+               feed=tmp_path / "feed")  # fmt: skip
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_a_replay_is_made_from_the_recording_on_request(tmp_path):
+    game = tmp_path / "scripted-peer-1"
+    game.mkdir()
+    subprocess.run(
+        [shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=5",
+         "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv444p", str(game / "screen.mkv")],
+        check=True,
+    )  # fmt: skip
+    (game / "manifest.json").write_text(json.dumps({"frames": 15}))
+    replays = live.Replays(tmp_path / "replays", shutil.which("ffmpeg"), encoder="libx264")
+    answer = replays.request(game)
+    assert answer["state"] in ("working", "ready")
+    deadline = time.monotonic() + 60
+    while answer["state"] == "working" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        answer = replays.request(game)
+    assert answer == {"state": "ready", "url": "replays/scripted-peer-1.mp4"}
+    assert replays.path("scripted-peer-1").read_bytes()[4:8] == b"ftyp"
+    assert replays.request(tmp_path / "no-such-game")["state"] == "error"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
@@ -262,7 +404,9 @@ def fake_worker(monkeypatch, requests, refuse=False):
         processes.append(FakeProcess())
         return processes[-1]
 
-    monkeypatch.setattr(live.subprocess, "Popen", popen)
+    from hoi4_arena.live import media
+
+    monkeypatch.setattr(media.subprocess, "Popen", popen)
     return processes
 
 

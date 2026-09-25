@@ -27,6 +27,7 @@ NO_TORCH = {
     # Its Gaussian process imports torch itself, on the CPU; the GPU is left alone.
     "tune",
     "live",
+    "live-say",
 }
 
 
@@ -305,8 +306,9 @@ def main():
     tune.add_argument("--skip", nargs="+", default=[], help="seed: arenas to leave out")
     live = sub.add_parser(
         "live",
-        help="Watch the games from a phone: follow the game being recorded and serve it "
-        "as a live stream on 127.0.0.1 (publish it with tailscale serve), until stopped",
+        help="Watch the games from a phone: each PC's game live, what is going on, a feed "
+        "like a stream's chat, replays and the record, served on 127.0.0.1 (publish it with "
+        "tailscale serve), until stopped",
     )
     live.add_argument(
         "--runs",
@@ -323,6 +325,18 @@ def main():
         "menus included) instead of following the recording at 5 frames a second.",
     )
     live.add_argument("--hz", type=int, default=30, help="The view's frames a second.")
+    live.add_argument(
+        "--label",
+        nargs="+",
+        default=[],
+        metavar="STATION=NAME",
+        help='What the page calls a PC, e.g. peer="Lent PC" (default: Second PC, This PC)',
+    )
+    live.add_argument("--feed", default="artifacts/live", help="Where the chat and flags are kept")
+    say = sub.add_parser("live-say", help="Post a message to the live view's chat, as Claude")
+    say.add_argument("text")
+    say.add_argument("--who", default="Claude")
+    say.add_argument("--feed", default="artifacts/live")
     check = sub.add_parser(
         "check-session",
         help="Check that a recording can train, and count its decisions. Training reads "
@@ -1071,9 +1085,15 @@ def _dispatch(command, args):
     elif command == "live":
         from .live import watch
 
+        labels = dict(item.split("=", 1) for item in args["label"])
         result = watch(
-            args["runs"], out=args["out"], port=args["port"], peer=args["peer"], hz=args["hz"]
-        )
+            args["runs"], out=args["out"], port=args["port"], peer=args["peer"], hz=args["hz"],
+            labels=labels, feed=args["feed"],
+        )  # fmt: skip
+    elif command == "live-say":
+        from .live import say
+
+        result = say(Path(args["feed"]) / "chat.jsonl", args["text"], who=args["who"])
     elif command == "salvage":
         from .recording import recordings, salvage, unsalvage
 

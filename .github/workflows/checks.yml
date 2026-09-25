@@ -60,3 +60,26 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+
+  web:
+    # The live view's page (web/live, SvelteKit), built into the Python package that serves
+    # it: the build committed there must be the one the source makes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/live
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/live/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - name: The committed build is current
+        run: |
+          git status --porcelain -- ../../src/hoi4_arena/live/page
+          test -z "$(git status --porcelain -- ../../src/hoi4_arena/live/page)"

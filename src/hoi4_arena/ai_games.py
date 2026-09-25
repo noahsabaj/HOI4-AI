@@ -1114,6 +1114,18 @@ def camera(
             pass
 
 
+def publish(path, state):
+    """Write `state` as JSON to `path` whole (a temporary file renamed over it), for the
+    live view (live.py) to read while the game goes on. A failure is only a missed update."""
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(json.dumps(state, default=str))
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def play(
     desk,
     root,
@@ -1214,6 +1226,17 @@ def play(
                 arena.poll()
                 frames = rec.manifest["frames"]
                 stamped.extend({"frame": frames, "line": line} for line in arena.lines[seen:])
+                # The game as it stands, for the live view: its latest daily reports, the
+                # scripted player's orders and the camera's kicks so far.
+                publish(Path(root) / "live-state.json", {
+                    "station": station, "arena": Path(settings["mod"]).name,
+                    "started_as": country, "started_unix": rec.manifest["recorder"]["started_unix"],
+                    "updated_unix": time.time(), "frames": frames, "hz": hz,
+                    "seconds": round(now - start), "plan": player["plan"] if player else None,
+                    "declarer": arena.declarer, "days": arena.days, "weeks": arena.weeks,
+                    "orders": planner.orders[-60:] if planner else [], "kicks": len(kicked),
+                    "winner": arena.winner, "surrendered": arena.surrendered,
+                })  # fmt: skip
                 if arena.winner and ending is None:
                     # Keep a few seconds of the surrender on screen, then stop.
                     ending = now + 2

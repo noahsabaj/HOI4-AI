@@ -1,0 +1,98 @@
+:root {
+	color-scheme: dark;
+	--bg: #101214;
+	--panel: #1b1e22;
+	--line: #2a2e33;
+	--fg: #e8e8e8;
+	--muted: #9aa0a6;
+	--win: #66bb6a;
+	--loss: #ef5350;
+	--draw: #ffca28;
+	--live: #e53935;
+	--blue: #5b8def;
+	--red: #e06666;
+	--claude: #c3a6ff;
+	--flag: #ffb74d;
+}
+* {
+	box-sizing: border-box;
+}
+[hidden] {
+	display: none !important;
+}
+html,
+body {
+	background: var(--bg);
+	overscroll-behavior: none;
+}
+body {
+	margin: 0;
+	color: var(--fg);
+	-webkit-text-size-adjust: 100%;
+	font:
+		15px/1.4 -apple-system,
+		BlinkMacSystemFont,
+		'Segoe UI',
+		sans-serif;
+	padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+		env(safe-area-inset-left);
+}
+button,
+input {
+	font: inherit;
+	color: inherit;
+}
+.pills {
+	display: flex;
+	gap: 6px;
+	flex-wrap: wrap;
+	padding: 4px 16px 8px;
+}
+.pills button,
+.chip {
+	background: var(--panel);
+	border: 1px solid var(--line);
+	border-radius: 999px;
+	padding: 4px 12px;
+	font-size: 13px;
+	cursor: pointer;
+}
+.pills button.on {
+	background: #2c3440;
+	border-color: #4a5a70;
+}
+.muted {
+	color: var(--muted);
+}
+.row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-top: 8px;
+}
+.tag {
+	background: var(--panel);
+	border-radius: 6px;
+	padding: 2px 8px;
+	font-size: 13px;
+}
+time {
+	color: var(--muted);
+	font-variant-numeric: tabular-nums;
+	margin-right: 8px;
+}
+.BLU {
+	color: var(--blue);
+}
+.RED {
+	color: var(--red);
+}
+.win {
+	color: var(--win);
+}
+.loss {
+	color: var(--loss);
+}
+.timeout {
+	color: var(--draw);
+}

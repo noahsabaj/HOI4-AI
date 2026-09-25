@@ -445,6 +445,19 @@ def play_policy_game(
                 stamped.extend({"frame": frames, "line": line} for line in fresh)
                 if any(line.startswith("day") for line in fresh):
                     referee.saw_day()
+                # The game as it stands, for the live view (live.py): the arena's latest
+                # daily reports, and the steps of the scripted player's setup made so far.
+                from .ai_games import publish
+
+                publish(Path(root) / "live-state.json", {
+                    "station": station, "arena": arena_name, "started_as": country,
+                    "started_unix": (rec.manifest.get("recorder") or {}).get("started_unix"),
+                    "updated_unix": time.time(), "frames": frames, "hz": hz,
+                    "seconds": round(now - start), "plan": {"variant": "learned"},
+                    "declarer": arena.declarer, "days": arena.days, "weeks": arena.weeks,
+                    "milestones": milestones(watch.events), "presses": watch.presses,
+                    "winner": arena.winner, "surrendered": arena.surrendered,
+                })  # fmt: skip
                 if arena.winner and ending is None:
                     ending = now + after_surrender
             if ending is not None and now >= ending:
