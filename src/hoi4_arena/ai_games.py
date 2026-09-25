@@ -279,6 +279,65 @@ class Logged:
         return taken
 
 
+# Minutes a launched game waits for the foreground before it is given up and launched
+# again, and the live view's feed, where the wait is said.
+FOCUS_WAIT = 10
+FEED = Path("artifacts/live/chat.jsonl")
+
+
+def describe_front(owner):
+    """What holds the foreground, in words, from the worker's foreground_owner."""
+    if not owner:
+        return "something"
+    if owner.get("desktop") is None:
+        return "the lock screen or a UAC prompt"
+    if not owner.get("title") and owner.get("window", 0) is None:
+        return "no window"
+    name = f"'{owner.get('title') or owner.get('class') or '?'}'"
+    facts = [owner.get("exe") or f"pid {owner.get('pid')}"]
+    if owner.get("elevated"):
+        facts.append("elevated")
+    if owner.get("cloaked"):
+        facts.append("hidden by Windows")
+    return f"{name} ({', '.join(facts)})"
+
+
+def await_focus(desk, station, minutes=FOCUS_WAIT, clock=time.monotonic, sleep=time.sleep):
+    """Bring the game to the front, and while something else holds it, wait with the game
+    open, trying every 10 s, rather than launching it again.
+
+    On 2026-09-25 the second PC refused the game the foreground for an hour, and each game
+    was launched afresh every 20 s to the same end: from the outside, what was in front
+    could not be told. What is in front is said in the log and in the live view's feed, once
+    each time it changes. False after `minutes`."""
+    if focus(desk):
+        return True
+    end, said = clock() + minutes * 60, None
+    while clock() < end:
+        front = describe_front(getattr(desk, "front", None))
+        if front != said:
+            say(station, "waiting for the game window:", front, "is in front of it")
+            tell(f"{station}: waiting for the game window, {front} is in front of it")
+            said = front
+        sleep(10)
+        if focus(desk, tries=1):
+            say(station, "the game window is in front again")
+            tell(f"{station}: the game window is in front again")
+            return True
+    return False
+
+
+def tell(text):
+    """A line in the live view's feed, if it has one here; never an error."""
+    if FEED.parent.exists():
+        from .live.feed import say as post
+
+        try:
+            post(FEED, text, who="recorder", kind="event")
+        except OSError:
+            pass
+
+
 def focus(desk, tries=5):
     for _ in range(tries):
         try:
@@ -1784,7 +1843,7 @@ def run_station(station, out_root, rules, templates, settings, end):
             entry["loaded_in_game"] = reused
             stages["loaded"] = True
             with station.connect() as desk:
-                if not focus(desk):
+                if not await_focus(desk, station.name):
                     raise RuntimeError("could not bring the game window to the front")
                 # Where this game's log lines begin, before its declaration is logged.
                 log_from = log_end(desk) if reused else None

@@ -766,6 +766,7 @@ mod platform {
         thread,
         time::{Duration, Instant},
     };
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows_sys::Win32::{
         Foundation::*,
         Graphics::Gdi::*,
@@ -1743,7 +1744,11 @@ mod platform {
     /// started by a background process does not take focus, and nobody may be at the
     /// second PC to click it. Windows only lets a process that has just sent input change
     /// the foreground window, so this taps Alt first; the tap goes to whatever window had
-    /// focus, before the game has it.
+    /// focus, before the game has it. If that is not enough, the worker's thread borrows
+    /// the foreground window's input queue for a moment (AttachThreadInput), which lets
+    /// it hand the foreground over. When the game is still not in front, the reply says
+    /// what is (foreground_owner): on 2026-09-25 every launch on the second PC failed for
+    /// an hour, and what held the foreground could not be told from the outside.
     ///
     /// It waits 150 ms for the switch, on its own thread and without the input lock:
     /// holding the lock through the wait held up a stream's ticks, which read the window
@@ -1780,13 +1785,137 @@ mod platform {
                 }
                 SendInput(2, alt.as_ptr(), size_of::<INPUT>() as i32);
                 SetForegroundWindow(hwnd);
+                thread::sleep(Duration::from_millis(50));
+                let front = GetForegroundWindow();
+                if front != hwnd && !front.is_null() {
+                    let theirs = GetWindowThreadProcessId(front, null_mut());
+                    let ours = GetCurrentThreadId();
+                    if theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, 1) != 0 {
+                        BringWindowToTop(hwnd);
+                        SetForegroundWindow(hwnd);
+                        AttachThreadInput(ours, theirs, 0);
+                    }
+                }
             }
             thread::sleep(Duration::from_millis(150));
+            let front = foreground();
+            let owner = if front {
+                serde_json::Value::Null
+            } else {
+                unsafe { foreground_owner() }
+            };
             respond(
                 &cmd,
-                Ok((serde_json::json!({"foreground": foreground()}), vec![])),
+                Ok((
+                    serde_json::json!({"foreground": front, "owner": owner}),
+                    vec![],
+                )),
             );
         });
+    }
+
+    /// What holds the foreground when the game does not: its window's title and class, its
+    /// program, whether that runs elevated (a normal process can neither take the foreground
+    /// from an elevated one nor send it input), whether Windows hides it (a suspended
+    /// Settings window still counts as visible to EnumWindows), and the desktop that takes
+    /// input (None while the screen is locked or a UAC prompt is up: that desktop cannot
+    /// be opened).
+    unsafe fn foreground_owner() -> serde_json::Value {
+        let desktop = input_desktop();
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return serde_json::json!({"window": null, "desktop": desktop});
+        }
+        let mut title = [0u16; 256];
+        let t = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
+        let mut class = [0u16; 128];
+        let c = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        let pid = window_pid(hwnd);
+        let (exe, elevated) = process_facts(pid);
+        let mut cloaked: u32 = 0;
+        let hidden = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED as _,
+            &mut cloaked as *mut u32 as *mut _,
+            size_of::<u32>() as u32,
+        ) == 0
+            && cloaked != 0;
+        serde_json::json!({
+            "title": String::from_utf16_lossy(&title[..t]),
+            "class": String::from_utf16_lossy(&class[..c]),
+            "pid": pid,
+            "exe": exe,
+            "elevated": elevated,
+            "cloaked": hidden,
+            "desktop": desktop,
+        })
+    }
+
+    /// A process's program name, and whether it runs elevated; None for what cannot be
+    /// asked (a protected process, or an elevated one from a normal worker).
+    unsafe fn process_facts(pid: u32) -> (Option<String>, Option<bool>) {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return (None, None);
+        }
+        let mut name = [0u16; 520];
+        let mut len = name.len() as u32;
+        let exe = if QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut len) != 0 {
+            let path = String::from_utf16_lossy(&name[..len as usize]);
+            Some(path.rsplit('\\').next().unwrap_or(&path).to_string())
+        } else {
+            None
+        };
+        let mut token: HANDLE = null_mut();
+        let mut elevated = None;
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0 {
+            let mut facts: TOKEN_ELEVATION = zeroed();
+            let mut got = 0u32;
+            if GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut facts as *mut TOKEN_ELEVATION as *mut _,
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut got,
+            ) != 0
+            {
+                elevated = Some(facts.TokenIsElevated != 0);
+            }
+            CloseHandle(token);
+        }
+        CloseHandle(process);
+        (exe, elevated)
+    }
+
+    /// The name of the desktop that takes input ("Default" for the user's), or None when
+    /// it cannot be opened: the lock screen's or a UAC prompt's secure desktop.
+    unsafe fn input_desktop() -> Option<String> {
+        use windows_sys::Win32::System::StationsAndDesktops::{
+            CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS,
+            UOI_NAME,
+        };
+        let desk = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+        if desk.is_null() {
+            return None;
+        }
+        let mut name = [0u16; 64];
+        let mut got = 0u32;
+        let ok = GetUserObjectInformationW(
+            desk as HANDLE,
+            UOI_NAME,
+            name.as_mut_ptr() as *mut _,
+            (name.len() * 2) as u32,
+            &mut got,
+        );
+        CloseDesktop(desk);
+        if ok == 0 {
+            return None;
+        }
+        let n = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        Some(String::from_utf16_lossy(&name[..n]))
     }
 
     fn fast_op(
@@ -2985,6 +3114,26 @@ mod platform {
                 assert_eq!(window_trouble(GetDesktopWindow()), Some("game_exited"));
             }
             assert!(!foreground());
+        }
+
+        #[test]
+        fn what_holds_the_foreground_can_be_told() {
+            unsafe {
+                // This process itself: its program, and whether it runs elevated.
+                let (exe, elevated) = process_facts(std::process::id());
+                assert!(exe.is_some_and(|name| name.ends_with(".exe")));
+                assert!(elevated.is_some());
+                assert_eq!(process_facts(u32::MAX), (None, None), "no such process");
+                // Whatever is in front on the machine running the tests (on CI, maybe
+                // nothing), described without failing.
+                let owner = foreground_owner();
+                assert!(owner.get("desktop").is_some());
+                if !GetForegroundWindow().is_null() {
+                    for key in ["title", "class", "pid", "exe", "elevated", "cloaked"] {
+                        assert!(owner.get(key).is_some(), "{key}");
+                    }
+                }
+            }
         }
     }
 }

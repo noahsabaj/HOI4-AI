@@ -126,7 +126,9 @@ if ($Action -eq 'report') {
         $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         $auto = try { Get-ItemPropertyValue -LiteralPath $winlogon -Name AutoAdminLogon -ErrorAction Stop } catch { $null }
         "signs in by itself after a restart: $(if ($auto -eq '1') { 'yes' } else { 'no' })"
-        # Every visible titled window, including dialogs a process's main window hides.
+        # Every visible titled window, including dialogs a process's main window hides, and
+        # which of them Windows hides all the same (cloaked: a suspended Settings window still
+        # counts as visible), and what holds the foreground.
         Add-Type @'
 using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
 public static class Windows {
@@ -135,20 +137,33 @@ public static class Windows {
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int n);
+  static bool Cloaked(IntPtr h) { int v; return DwmGetWindowAttribute(h, 14, out v, 4) == 0 && v != 0; }
+  static string Line(IntPtr h, StringBuilder title) {
+    uint pid; GetWindowThreadProcessId(h, out pid);
+    return pid + "\t" + title + (Cloaked(h) ? " (hidden by Windows)" : "");
+  }
   public static List<string> Visible() {
     var found = new List<string>();
     EnumWindows((h, p) => {
       var title = new StringBuilder(256);
-      if (IsWindowVisible(h) && GetWindowText(h, title, 256) > 0) {
-        uint pid; GetWindowThreadProcessId(h, out pid);
-        found.Add(pid + "\t" + title);
-      }
+      if (IsWindowVisible(h) && GetWindowText(h, title, 256) > 0) found.Add(Line(h, title));
       return true;
     }, IntPtr.Zero);
     return found;
   }
+  public static string Foreground() {
+    var h = GetForegroundWindow();
+    if (h == IntPtr.Zero) return "0\t(none: the screen is locked, or a UAC prompt is up)";
+    var title = new StringBuilder(256);
+    GetWindowText(h, title, 256);
+    return Line(h, title);
+  }
 }
 '@
+        $id, $title = [Windows]::Foreground() -split "`t", 2
+        "Foreground window: {0} {1} {2}" -f $id, (Get-Process -Id $id -ErrorAction SilentlyContinue).ProcessName, $title
         'Visible windows (pid, title):'
         [Windows]::Visible() | ForEach-Object {
             $id, $title = $_ -split "`t", 2

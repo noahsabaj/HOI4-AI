@@ -1,3 +1,4 @@
+import json
 import random
 import sys
 import time
@@ -626,3 +627,55 @@ def test_a_game_loaded_in_game_reads_the_log_from_its_end():
     assert ai_games.log_end(Desk()) == 10
     log.clear()
     assert ai_games.log_end(Desk()) == 0
+
+
+def test_a_game_kept_from_the_front_waits_open_and_says_what_is_in_front(monkeypatch, tmp_path):
+    """On 2026-09-25 the second PC refused the game the foreground for an hour, and each
+    game was launched again every 20 s: now it waits, saying what holds the foreground."""
+    installer = {"title": "Visual Studio Installer", "exe": "setup.exe", "elevated": True,
+                 "cloaked": False, "desktop": "Default", "pid": 7}  # fmt: skip
+    assert ai_games.describe_front(installer) == "'Visual Studio Installer' (setup.exe, elevated)"
+    assert (
+        ai_games.describe_front({"window": None, "desktop": None})
+        == "the lock screen or a UAC prompt"
+    )
+    hidden = {
+        "title": "Settings",
+        "exe": "ApplicationFrameHost.exe",
+        "cloaked": True,
+        "desktop": "Default",
+    }
+    assert (
+        ai_games.describe_front(hidden)
+        == "'Settings' (ApplicationFrameHost.exe, hidden by Windows)"
+    )
+
+    class Desk:
+        def __init__(self, free_after):
+            self.tries, self.free_after, self.front = 0, free_after, None
+
+        def focus(self):
+            self.tries += 1
+            self.front = None if self.tries > self.free_after else installer
+            return self.tries > self.free_after
+
+    feed = tmp_path / "live" / "chat.jsonl"
+    feed.parent.mkdir()
+    monkeypatch.setattr(ai_games, "FEED", feed)
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    now = [0.0]
+
+    def clock():
+        now[0] += 10
+        return now[0]
+
+    desk = Desk(free_after=8)
+    assert ai_games.await_focus(desk, "peer", minutes=10, clock=clock, sleep=lambda s: None)
+    said = [json.loads(line)["text"] for line in feed.read_text().splitlines()]
+    assert said == [
+        "peer: waiting for the game window, 'Visual Studio Installer' (setup.exe, elevated) is in front of it",
+        "peer: the game window is in front again",
+    ], "each change said once"
+    # Still held when the wait runs out: given up, to be launched again.
+    assert not ai_games.await_focus(Desk(free_after=10**6), "peer", minutes=1, clock=clock,
+                                    sleep=lambda s: None)  # fmt: skip
