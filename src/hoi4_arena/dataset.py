@@ -614,7 +614,8 @@ class _Stream:
         self.tower = None
         if labels.get("tower"):
             self.tower = tuple(
-                np.load(labels["tower"][key], mmap_mode="r") for key in ("summary", "grid")
+                np.load(labels["tower"][key], mmap_mode="r") if key in labels["tower"] else None
+                for key in ("summary", "grid", "scale")
             )
 
     def close(self):
@@ -645,11 +646,12 @@ class _Stream:
             if key in labels:
                 window[key] = torch.from_numpy(labels[key][start : start + n].copy())
         if self.tower is not None:
-            from .tower_cache import from_bits
+            from .tower_cache import from_bits, read_grid
 
             frames = labels["frame_ids"][start : start + n]
-            window["tower_summary"] = from_bits(self.tower[0][frames])
-            window["tower_grid"] = from_bits(self.tower[1][frames])
+            summary, grid, scale = self.tower
+            window["tower_summary"] = from_bits(summary[frames])
+            window["tower_grid"] = read_grid(grid[frames], None if scale is None else scale[frames])
         if self.clips:
             window["clips"] = torch.stack(
                 [torch.stack([self.globals[int(i)] for i in labels["clip_ids"][d]]) for d in steps]

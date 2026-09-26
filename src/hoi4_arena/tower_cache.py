@@ -34,6 +34,12 @@ from .dataset import normalize, parse_cursor, views
 from .models import CELLS
 
 GRID_FILE, SUMMARY_FILE, DONE = "tower-grid.npy", "tower-summary.npy", "done.json"
+# With `int8`, the grid is kept as int8 with a scale per frame and channel (its largest
+# magnitude over the cells / 127), half of bfloat16. The Qwen3.5-4B model's tower's cache
+# for 218 games would be ~700 GB in bfloat16, more than the drives hold; read back from
+# int8, its text and pointer probes scored as from bfloat16 (39.8% against 40.6% and
+# 85.4% both, 2026-09-26).
+SCALE_FILE = "tower-grid-scale.npy"
 log = logging.getLogger(__name__)
 
 
@@ -63,8 +69,26 @@ def from_bits(array):
     return torch.from_numpy(np.ascontiguousarray(array)).view(torch.bfloat16)
 
 
-def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
-    """Every frame of one recording through the frozen tower, into `target`."""
+def as_int8(grid):
+    """(int8 grid, float16 scale per frame and channel) of a (N, C, H, W) grid."""
+    grid = grid.float()
+    scale = grid.abs().amax((-2, -1)).clamp_min(1e-6) / 127
+    values = (grid / scale[..., None, None]).round().clamp(-127, 127).to(torch.int8)
+    return values.cpu().numpy(), scale.to(torch.float16).cpu().numpy()
+
+
+def read_grid(grid, scale=None):
+    """A cached grid as bfloat16: its bits (from_bits), or int8 values times their scale."""
+    if scale is None:
+        return from_bits(grid)
+    values = torch.from_numpy(np.ascontiguousarray(grid)).float()
+    factor = torch.from_numpy(np.ascontiguousarray(scale)).float()
+    return (values * factor[..., None, None]).to(torch.bfloat16)
+
+
+def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=False):
+    """Every frame of one recording through the frozen tower, into `target` (the grid as
+    int8 and its scales with `int8`)."""
     manifest = json.loads((Path(root) / "manifest.json").read_text())
     rows = [json.loads(line) for line in (Path(root) / "frames.jsonl").read_text().splitlines()]
     count, width, height = manifest["frames"], manifest["width"], manifest["height"]
@@ -72,9 +96,17 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
         raise ValueError(f"{root}: {len(rows)} frame rows for {count} frames")
     target.mkdir(parents=True, exist_ok=True)
     (target / DONE).unlink(missing_ok=True)
+    kind = np.int8 if int8 else np.int16
     grids = np.lib.format.open_memmap(
-        target / GRID_FILE, "w+", np.int16, (count, encoder.dim, CELLS, CELLS)
+        target / GRID_FILE, "w+", kind, (count, encoder.dim, CELLS, CELLS)
     )
+    scales = None
+    if int8:
+        scales = np.lib.format.open_memmap(
+            target / SCALE_FILE, "w+", np.float16, (count, encoder.dim)
+        )
+    else:
+        (target / SCALE_FILE).unlink(missing_ok=True)
     summaries = np.lib.format.open_memmap(
         target / SUMMARY_FILE, "w+", np.int16, (count, encoder.dim)
     )
@@ -118,7 +150,12 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
         with torch.no_grad(), torch.autocast(**autocast):
             summary, grid = read_frozen(encoder, normalize(quads).permute(0, 1, 4, 2, 3))
         first = pending[0][0]
-        grids[first : first + len(pending)] = as_bits(grid)
+        if int8:
+            values, scale = as_int8(grid)
+            grids[first : first + len(pending)] = values
+            scales[first : first + len(pending)] = scale
+        else:
+            grids[first : first + len(pending)] = as_bits(grid)
         summaries[first : first + len(pending)] = as_bits(summary)
         pending = []
 
@@ -137,7 +174,9 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None):
         reader.join(timeout=10)
     grids.flush()
     summaries.flush()
-    (target / DONE).write_text(json.dumps({"frames": count, "tower": stamp}))
+    if scales is not None:
+        scales.flush()
+    (target / DONE).write_text(json.dumps({"frames": count, "tower": stamp, "int8": int8}))
     return count
 
 
@@ -159,6 +198,7 @@ def _cache_tower(
     sources=None,
     spill=None,
     keep_free_gb=30.0,
+    int8=False,
 ):
     """The frozen tower's reading of every frame of every recording in `data`.
 
@@ -166,16 +206,19 @@ def _cache_tower(
     Recordings already cached for this tower are skipped. With `spill`, a recording that
     would leave less than `keep_free_gb` free on the output's drive goes there instead:
     the fast drive takes what it can hold, and tower_paths finds the rest. Returns what
-    was done.
+    was done. With `model_path` naming another tower than the checkpoint's, that tower is
+    cached in its own pretrained weights (train.load_carried). `int8` keeps the grid as
+    int8 (SCALE_FILE).
     """
     from .models import Policy, build_encoder
+    from .train import load_carried
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
     config = saved["config"]
     encoder = build_encoder(model_path or config["model_path"], config["variant"])
     policy = Policy(encoder)
-    policy.load_state_dict(saved["policy"])
+    load_carried(policy, saved["policy"])
     encoder = policy.encoder.to(device).eval().requires_grad_(False)
     stamp = fingerprint(encoder)
     output = Path(output)
@@ -193,13 +236,15 @@ def _cache_tower(
         if found is not None and found.get("tower") == stamp:
             skipped += 1
             continue
-        size = manifest["frames"] * encoder.dim * (CELLS * CELLS + 1) * 2
+        size = manifest["frames"] * encoder.dim * (CELLS * CELLS * (1 if int8 else 2) + 4)
         target = output / name
         if spill and shutil.disk_usage(output).free - size < keep_free_gb * 2**30:
             target = Path(spill) / name
             spilled += 1
         started = time.monotonic()
-        frames += cache_recording(encoder, manifest_path.parent, target, device, stamp=stamp)
+        frames += cache_recording(
+            encoder, manifest_path.parent, target, device, stamp=stamp, int8=int8
+        )
         seconds = max(time.monotonic() - started, 1e-6)
         log.info(
             "%s: %d frames in %.0f s, %.0f MB/s written to %s",
@@ -231,9 +276,12 @@ def tower_paths(cache, root):
     for target in places:
         marker = target / DONE
         if marker.exists():
-            return {
+            found = {
                 "grid": target / GRID_FILE,
                 "summary": target / SUMMARY_FILE,
                 **json.loads(marker.read_text()),
             }
+            if found.get("int8"):
+                found["scale"] = target / SCALE_FILE
+            return found
     return None

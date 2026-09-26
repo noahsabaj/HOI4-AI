@@ -211,6 +211,10 @@ def main():
         help="Where recordings go once the output's drive would keep less than --keep-free",
     )
     tower.add_argument("--keep-free", type=float, default=30.0, help="GB to leave free")
+    tower.add_argument(
+        "--int8", action="store_true",
+        help="Keep the grid as int8 with a scale per frame and channel: half the space",
+    )  # fmt: skip
     drill = sub.add_parser(
         "practice",
         help="A trained policy practises the setup on the second PC: short episodes from the "
@@ -1064,6 +1068,7 @@ def _dispatch(command, args):
             sources=args["sources"],
             spill=args["spill"],
             keep_free_gb=args["keep_free"],
+            int8=args["int8"],
         )
     elif command == "practice":
         from .practice import practice
