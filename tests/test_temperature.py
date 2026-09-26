@@ -126,7 +126,7 @@ def test_a_practice_summary_names_the_temperatures_played_at():
     mixed = practice.summary([_episode(True, **at), _episode(True)])
     assert mixed["temperature"] == [0.5, 1.0], "episodes before it was recorded played at 1"
     assert practice.summary([]) == {"episodes": 0, **{s: "0/0" for s in practice.STEPS},
-                                    "own_steps_mean": None}  # fmt: skip
+                                    "complete": "0/0", "own_steps_mean": None}  # fmt: skip
 
 
 def _scoreboard():
@@ -170,6 +170,7 @@ def test_the_scoreboard_scores_each_checkpoint_at_each_temperature(tmp_path):
     text = board.table(scores)
     assert "| bc6-e0000 | 0.5 | 0.5 | 3 | 3/3 |" in text
     assert "| bc6-e0000 | 1 | 1 | 2 | 1/2 |" in text
+    assert (sharp["complete"], sharp["live_complete"]) == (0, 0), "no front, no milestones"
     rows = board.as_rows(scores)
     assert {(r["checkpoint"], r["temperature"], r["pointer_temperature"]) for r in rows} == set(
         scores

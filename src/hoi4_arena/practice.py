@@ -192,9 +192,65 @@ def coach_managed(done):
     return done.get("by") == "coach" and done.get("confirmed", True) is not None
 
 
+def setup_complete(game, own=True):
+    """Whether a practice episode or a live game completed the setup: an army with a
+    general, a front drawn and an offensive. None when it says too little to tell (an
+    episode or game that errored). Wins are too rare to steer by (0 of 14 live games by
+    2026-09-26); this is the progress measure every route reports beside them.
+
+    Where a coach watched (practice.practice's episodes), the army, its general and its
+    front are its screen checks (Coach.done): each seen done by the policy itself with
+    `own`, or by the policy or a takeover the screen confirmed (coach_managed) without.
+    The coach never draws an offensive and no screen check sees one, so the offensive is
+    the policy's own presses (play.milestones' "offensive": X, then a right press within
+    3 s). A 90 s episode ends before the scripted player would execute its plan (120 to
+    240 s after the start), so it is not asked to.
+
+    Anything else (play-policy's results-peer.json games, a manifest) is judged on its
+    milestones, the policy's own presses: an army (the alert and the +, or its card), its
+    general (the portrait or a commander), a front, and an offensive drawn and executed
+    (an offensive and the plan's arrow)."""
+    marks = game.get("milestones") or {}
+    steps = (game.get("setup") or {}).get("steps")
+    if steps:
+
+        def done(step):
+            record = steps.get(step) or {}
+            return record.get("by") == "policy" or (not own and coach_managed(record))
+
+        return all(done(s) for s in ("army", "general", "front")) and marks.get("offensive", 0) > 0
+    if not marks or game.get("error"):
+        return None
+
+    def made(*names):
+        return any(marks.get(name, 0) > 0 for name in names)
+
+    army = (made("alert") and made("plus")) or made("army_card")
+    return (
+        army
+        and made("portrait", "commander")
+        and made("front")
+        and made("offensive")
+        and made("arrow")
+    )
+
+
+def setup_rate(games, own=True):
+    """setup_complete over `games` (episodes or live games): how many could be told, how
+    many completed, and the share, None with none told."""
+    told = [c for c in (setup_complete(g, own) for g in games) if c is not None]
+    done = sum(told)
+    return {
+        "games": len(told),
+        "complete": done,
+        "rate": round(done / len(told), 3) if told else None,
+    }
+
+
 def summary(results):
     """How often the policy did each step itself, over the episodes that played, how often
-    the coach managed a step it took over (`coach_<step>`), and the temperatures played at."""
+    it completed the whole setup itself (setup_complete, `complete`), how often the coach
+    managed a step it took over (`coach_<step>`), and the temperatures played at."""
     played = [r for r in results if r.get("setup")]
     out = {"episodes": len(played)}
     # The temperatures the policy played at (one session, one actor, so one of each).
@@ -205,6 +261,7 @@ def summary(results):
     for step in STEPS:
         own = sum(1 for r in played if (r["setup"]["steps"].get(step) or {}).get("by") == "policy")
         out[step] = f"{own}/{len(played)}"
+    out["complete"] = f"{sum(bool(setup_complete(r)) for r in played)}/{len(played)}"
     for step in ("army", "general", "front"):
         done = [r["setup"]["steps"].get(step) or {} for r in played]
         tried = sum(1 for d in done if d.get("by") in ("coach", "nobody"))
