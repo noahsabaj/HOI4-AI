@@ -508,7 +508,8 @@ p50 and 44.7-46.9 ms p95 over three runs of 300-600 decisions, 367 MiB of GPU at
 about 4 GB of commit charge for the process. The same checkpoint deciding live on this PC,
 beside the bc6 trainer, in that morning's practice from here: 68.7 ms p50, 87.6 ms p95
 (3031 decisions), and each tick's capture across the network another 127 ms p50. So
-`hoi4-arena on-peer` runs practice, drills and play-policy on the second PC itself.
+practice, drills and play-policy run on the second PC itself, as sessions of its station
+(a fleet service, `scripts/station.py`).
 
 **`train-memory`, 2026-09-24.** One seed of the memory study's six arms (seed 1, 8
 epochs each, cache on the NVMe) took 64.1 min before and 21.2 min after. Every run was
@@ -589,23 +590,29 @@ Things to know:
 
 ## Second PC
 
-The second PC runs the worker from one shared folder. From this PC,
-`scripts/Deploy-Peer.ps1` builds and copies the worker, its scripts and the pairing
-files there, skipping unchanged files. `hoi4-arena control` launches, closes and
-inspects HOI4 there through the worker. On the second PC, `Start-Worker.ps1
--Install` (PowerShell 7.5+) starts the worker at every logon. After that it applies
-updates by itself, but only between connections, never mid-match. See the README.
+Since 2026-09-26 the second PC is a fleet node, and this project runs there as two
+fleet services in one pushed project folder: the worker's bridge (`hoi4-worker`,
+`Start-Worker.ps1 -Service`, on that PC's loopback only) and the station
+(`hoi4-station`, `scripts/station.py`), whose sessions play against that worker and which
+lends the GPU to fleet jobs between them. This PC reaches the worker through `fleet
+tunnel` with `artifacts/pairing/peer-fleet.json`. `scripts/collect_station.py deploy`
+pushes the code, data, arenas and plan (`--worker` a new worker too), and `collect` brings
+finished sessions back. `hoi4-arena control` launches, closes and inspects HOI4 there
+through the worker. A service restarts for an update only while idle, never mid-match.
+The share, the at-logon bridge, `Deploy-Peer.ps1`, the worker's compute jobs
+(`Run-Job.ps1`, `hoi4-arena job`, `on-peer`) and the evaluation reservation files were
+retired then. See the README.
 
 Since 2026-09-24 the bridge there takes one connection that holds the game (a recording,
 a match, a launch) and up to four read-only observers beside it. An observer's worker
-hooks no input and refuses input, launches, jobs and recording, so `hoi4-arena telemetry
+hooks no input and refuses input, launches and recording, so `hoi4-arena telemetry
 --peer ...` and `control report --peer ...` work while a game is recorded. Before, the
 bridge took one connection at a time, and a report during a game timed out on the TLS
 handshake. A second full connection now waits 8 s for the first to finish, then is told
 `worker_busy`.
 
 `telemetry` reads, once a second: CPU and memory of the PC and of the processes that
-matter (the game, the workers, ffmpeg, the bridge, compute jobs, the busiest others), GPU
+matter (the game, the workers, ffmpeg, the bridge, the sessions, the busiest others), GPU
 use per process (Windows' GPU Engine counters) and for the card (NVML: busy, video
 encoder, memory, temperature, power), disks, the network, the game window (responding,
 in front, on which screen) and the capture's timing.
@@ -623,7 +630,7 @@ grows is left behind by each launch:
 
 Only a logoff or a reboot gives it back. Its pagefile is managed by Windows (2 GB on 2026-09-24), so the limit can
 grow as far as its disk allows. It does not sign in by itself after a restart, so after a
-reboot someone must sign in there before the worker runs again. `control report` shows both. Relaunching less often would stop the growth,
+reboot someone must sign in there before fleet's node, and so the worker, runs again. `control report` shows both. Relaunching less often would stop the growth,
 for instance by loading the next start from inside the running game. `telemetry` now
 prints the commit charge and warns above 90% of the limit, and a stream recording logs a
 warning when its PC is past that.
@@ -1103,9 +1110,9 @@ beat (`win-rate`).
   logged (counted by the worker's report, and once a run on the main arena to compare),
   and screenshots: the start, a full view mid-game, the end, and eight close-ups zoomed
   into the terrain view over both countries. Arenas that pass join the rotation in every
-  other pair of games, newest versions only. `--eval-dir` lends the second PC between
-  games to a live evaluation that reserves it (queue, granted, done). A claim names its
-  process, and a recorder that starts offers the claims of dead ones again. A `DRAIN`
+  other pair of games, newest versions only. Under fleet with `--yields` (the station's
+  recording run), the GPU is lent between games to a fleet job that asks for it. A claim
+  names its process, and a recorder that starts offers the claims of dead ones again. A `DRAIN`
   file in the output folder ends a run between games. Popups are searched on their own
   thread at half size, confirmed at full size: two full-frame searches had taken about
   350 ms on the capture thread and cost frames. Each run writes its own results file.
@@ -1233,7 +1240,7 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   is paused (the scripted player's last setup step), or after 90 s, the harness presses
   space and sets speed 5; it does so again if the daily reports stop. Every such step is
   counted in the game's manifest, and the games are recorded as data (source "policy").
-  The second PC is reserved from the scripted player's recorder (`--reservation`).
+  On the second PC it runs as one of the station's evaluation sessions.
 - **The UI never moves on the second PC.** In all 31 games the unassigned-divisions
   alert was at (825, 57) and the create-army + at (988, 1013), so the setup clicks are
   the same pixels every game.
@@ -1438,8 +1445,8 @@ hand-recorded play.
    normalise the summary in `fuse`, and record each run's memory movement and gate
    saturation. Then rerun all six arms, and repeat the best against Mamba-3 on the
    scripted games.
-4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on both PCs at once
-   with `--peer artifacts/pairing/peer.json`. The second PC's games are launched and
+4. **Record AI-vs-AI games in bulk** with `hoi4-arena record-ai`, on the second PC as
+   the station's recording run (`collect_station.py deploy --record`). Its games are launched and
    closed through its worker (`launch`, `quit`) and encoded there on its own clock
    (`--codec nvenc`, "Recording where the game runs"). Both monitors must stay
    switched on (brightness can be zero): a monitor switched off disconnects on

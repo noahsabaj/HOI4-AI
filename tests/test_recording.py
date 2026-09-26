@@ -123,19 +123,6 @@ def test_an_arena_recording_stops_after_the_surrender(tmp_path, monkeypatch):
     assert manifest["declarer"] == "BLU" and manifest["players"] == ["RED"]
 
 
-def test_a_job_request_keeps_the_reply_id_free():
-    """The request's own id routes the reply; the job's name travels as `job`."""
-    from hoi4_arena.desktop import Desktop
-
-    sent = {}
-    desk = Desktop.__new__(Desktop)
-    desk.request = lambda op, timeout=None, **kw: (
-        sent.update(op=op, **kw) or {"exit": 0, "output": "ok"}
-    )
-    assert desk.job("start", "memory-s0", "run", ["train-memory"]) == "ok"
-    assert "id" not in sent and sent["job"] == "memory-s0" and sent["op"] == "job"
-
-
 def test_a_silent_peer_is_asked_for_its_log_once(monkeypatch):
     """A failed request asks for the log to explain itself; that must not recurse."""
     from collections import deque

@@ -7,8 +7,13 @@ log, so a game ends when the log names a surrender and its winner, or at the cap
 game whose weekly report stops has a stuck clock.
 
 With a peer, the second PC records its own games at the same time, driven over its worker
-connection; its frames are recorded here. The second PC's worker must be running and the
-arena deployed to it (Deploy-Peer.ps1 -Mod), which this does itself.
+connection; its frames are recorded here. The second PC's worker is the fleet service
+`hoi4-worker`, and its arenas are the ones its project holds (scripts/collect_station.py
+deploy ships them). Full games recorded there for data are the recording run of its
+station (scripts/station.py's `record`), which runs this on that PC with --peer-only.
+
+Run under fleet with --yields (as the station is), the recorder lends the GPU between
+games when fleet asks for it (lend_if_wanted).
 
 The recordings carry the camera's own inputs as labels, but none of the AI's orders. They are
 for the encoder, for predicting who wins, for camera control and clearing popups, and for
@@ -45,7 +50,6 @@ from .vision import ScreenRules, country_pixels, find_template
 
 log = logging.getLogger(__name__)
 
-SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 # The game runs in a 1920x1080 window (Test-ArenaLoad -Window), and these are fractions of
 # it, measured on 2026-09-22.
 WINDOW = "1920x1080"
@@ -122,11 +126,6 @@ LOOK = (0.25, 0.45)
 
 def say(station, *parts):
     log.info("[%s] %s", station, " ".join(str(p) for p in parts))
-
-
-def pwsh(*args, timeout=300):
-    command = ["pwsh", "-NoProfile", *args]
-    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
 
 class Popups:
@@ -1493,8 +1492,8 @@ def alive(pid):
 
 def reoffer(queue):
     """Put back every request a recorder claimed and died holding (`<name>.<station>-<pid>
-    .taken` whose process is gone): a run stopped between claiming a reservation and
-    granting it lost one on 2026-09-24. The names put back, in order."""
+    .taken` whose process is gone): a run stopped between claiming a request and answering
+    it lost one on 2026-09-24. The names put back, in order."""
     queue = Path(queue)
     back = []
     for claimed in sorted(queue.glob("*.taken")) if queue.is_dir() else []:
@@ -1572,54 +1571,24 @@ def check_memory(station, need_mb=0):
         raise MemoryStop(reason)
 
 
-def take_reservation(root, settle=2.0):
-    """A request to have the second PC for a live evaluation, claimed, or None.
-
-    Whoever evaluates a learned player writes `<root>/queue/<name>.json` holding
-    {"minutes": N}. It comes before every game of the recorder's own (lend). The fleet
-    project's `fleet` reserves the PC the same way for a job needing more of the GPU than
-    a run leaves, so queue/, granted/ and done/ are its interface too: keep them
-    compatible, or tell the user before changing them.
-    """
-    queue = Path(root) / "queue"
-    if not queue.is_dir():
-        return None
-    for path in sorted(queue.glob("*.json"), key=lambda p: p.stat().st_mtime):
-        if time.time() - path.stat().st_mtime < settle:
-            continue
-        claimed = path.with_name(f"{path.stem}.{owner('peer')}.taken")
-        try:
-            path.rename(claimed)
-        except OSError:
-            continue
-        try:
-            minutes = float(json.loads(claimed.read_text(encoding="utf-8-sig"))["minutes"])
-        except (ValueError, KeyError, TypeError):
-            minutes = 30.0  # Unreadable: lend the PC for half an hour rather than refuse.
-        return {"name": path.stem, "minutes": minutes, "claimed": claimed}
-    return None
-
-
-def lend(station, root, reservation, poll=5.0, clock=time.monotonic, sleep=time.sleep):
-    """Hand `station` over for a live evaluation: HOI4 closed, then `granted/<name>.json`
-    written. It is taken back once `done/<name>.json` appears, or once the minutes asked
-    for and 15 more have passed."""
-    name, minutes = reservation["name"], reservation["minutes"]
+def lend_if_wanted(station, poll=10.0, sleep=time.sleep, environ=None):
+    """Between games, when the recorder runs under fleet with --yields (a station session on
+    the second PC): if the file FLEET_YIELD_WANTED names exists, a GPU job waits for this
+    PC, so HOI4 is closed, FLEET_YIELD_LENT is created, and play waits until WANTED is
+    gone, then deletes LENT. Returns whether it lent. Outside fleet it never does."""
+    environ = os.environ if environ is None else environ
+    wanted = environ.get("FLEET_YIELD_WANTED")
+    if not wanted or not Path(wanted).exists():
+        return False
     station.quit()
-    granted = Path(root) / "granted"
-    granted.mkdir(parents=True, exist_ok=True)
-    note = {"station": station.name, "minutes": minutes, "granted": time.strftime("%H:%M:%S")}
-    (granted / f"{name}.json").write_text(json.dumps(note))
-    say(station.name, "lent for an evaluation:", name, f"({minutes:g} min)")
-    done = Path(root) / "done" / f"{name}.json"
-    deadline = clock() + (minutes + 15) * 60
-    while clock() < deadline and not done.exists():
+    lent = Path(environ["FLEET_YIELD_LENT"])
+    lent.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    say(station.name, "fleet wants the GPU: HOI4 closed and the GPU lent")
+    while Path(wanted).exists():
         sleep(poll)
-    reservation["claimed"].unlink(missing_ok=True)
-    say(
-        station.name, "back from the evaluation", name, "(done)" if done.exists() else "(timed out)"
-    )
-    return done.exists()
+    lent.unlink(missing_ok=True)
+    say(station.name, "the GPU is back")
+    return True
 
 
 def answer(queue, name, result):
@@ -1662,17 +1631,12 @@ def local_mod(mod, mods_dir=None):
 
 
 def deploy_mod(station, mod, settings):
-    """The arena ready to launch on `station`: mirrored to the second PC, linked here."""
+    """The arena ready to launch on `station`: linked into artifacts/mods here. The second
+    PC's worker launches the arenas its project holds (collect_station.py deploy ships
+    them), and one it lacks fails at its launch."""
     if mod in settings["deployed"].setdefault(station.name, set()):
         return
-    if station.peer:
-        deploy = pwsh(
-            "-File", str(SCRIPTS / "Deploy-Peer.ps1"), "-SkipBuild", "-PeerConfig", station.peer,
-            "-Mod", mod,
-        )  # fmt: skip
-        if deploy.returncode:
-            raise RuntimeError(f"Deploy-Peer failed: {deploy.stdout}{deploy.stderr}")
-    else:
+    if not station.peer:
         local_mod(mod)
     settings["deployed"][station.name].add(mod)
 
@@ -1799,12 +1763,10 @@ def run_station(station, out_root, rules, templates, settings, end):
         if (out_root / "DRAIN").exists():
             say(station.name, "draining: no more games")
             break
-        # A live evaluation that reserved the second PC comes before anything else.
-        if station.peer and settings.get("eval"):
-            reservation = take_reservation(settings["eval"])
-            if reservation:
-                lend(station, settings["eval"], reservation)
-                continue
+        # A fleet job that waits for this PC's GPU comes before anything else.
+        if lend_if_wanted(station):
+            running, loads = None, 0  # HOI4 was closed: the next game launches it.
+            continue
         # An arena someone asked to have tested comes next, played to the best plan, but
         # never two in a row: the station's own games come first (2026-09-24).
         request = None
@@ -1998,7 +1960,6 @@ def record_ai_games(
     player="observe",
     arena_queue=None,
     queue_stations=None,
-    eval_dir=None,
     start_saves=None,
     opening=None,
     main_only=False,
@@ -2017,8 +1978,8 @@ def record_ai_games(
     Arenas that pass are listed in its `accepted.json` and join the turn. Only the
     stations named in `queue_stations` serve the queue (default: all of them).
 
-    With `eval_dir`, the second PC is lent out between games to whoever reserves it in
-    `<eval_dir>/queue` (take_reservation, lend).
+    Under fleet with --yields, the GPU is lent between games whenever fleet asks for it
+    (lend_if_wanted).
 
     `start_saves` ("ARENA:COUNTRY:SAVE") launch a game straight into a save made paused at
     the start of a new game, skipping the menus. `opening` is a range of seconds the game
@@ -2047,7 +2008,6 @@ def record_ai_games(
         "mods": mods,
         "deployed": {},
         "queue": arena_queue,
-        "eval": eval_dir,
         "saves": parse_saves(start_saves or []),
         "broken_saves": set(),
         # Start saves made by games that came through the menus, beside the arena queue.
@@ -2078,10 +2038,9 @@ def record_ai_games(
         for arena in mods:
             deploy_mod(station, arena, settings)
     # Requests claimed by a recorder that was stopped before answering them.
-    for queue in (arena_queue, eval_dir and Path(eval_dir) / "queue"):
-        if queue:
-            for name in reoffer(queue):
-                say("recorder", "offered again:", name)
+    if arena_queue:
+        for name in reoffer(arena_queue):
+            say("recorder", "offered again:", name)
     end = time.monotonic() + minutes * 60
     results = {}
 

@@ -222,45 +222,29 @@ def test_an_arena_kept_elsewhere_is_linked_into_the_mods_folder(tmp_path):
         ai_games.local_mod(other, mods)
 
 
-def test_the_second_pc_is_lent_out_until_the_evaluation_is_done(tmp_path):
-    import json
-    import os
+def test_the_gpu_is_lent_between_games_while_fleet_wants_it(tmp_path):
     from unittest.mock import Mock
 
-    root = tmp_path / "eval"
-    (root / "queue").mkdir(parents=True)
-    (root / "queue" / "bc-v3.json").write_text(json.dumps({"minutes": 20}))
-    os.utime(root / "queue" / "bc-v3.json", (1, 1))
-    reservation = ai_games.take_reservation(root)
-    assert reservation["name"] == "bc-v3" and reservation["minutes"] == 20
-    assert ai_games.take_reservation(root) is None
     station = Mock()
     station.name = "peer"
-    clock = [0.0]
+    wanted, lent = tmp_path / "wanted", tmp_path / "lent"
+    environ = {"FLEET_YIELD_WANTED": str(wanted), "FLEET_YIELD_LENT": str(lent)}
+    # Outside fleet, or while no job waits, play goes on.
+    assert not ai_games.lend_if_wanted(station, environ={})
+    assert not ai_games.lend_if_wanted(station, environ=environ)
+    station.quit.assert_not_called()
+    wanted.write_text("")
+    seen = []
 
     def sleep(seconds):
-        clock[0] += seconds
-        if clock[0] >= 600:  # The evaluation ends after ten minutes.
-            (root / "done").mkdir(exist_ok=True)
-            (root / "done" / "bc-v3.json").write_text("{}")
+        seen.append(lent.exists())
+        if len(seen) == 3:  # The job has its GPU and finishes.
+            wanted.unlink()
 
-    assert ai_games.lend(station, root, reservation, clock=lambda: clock[0], sleep=sleep)
+    assert ai_games.lend_if_wanted(station, sleep=sleep, environ=environ)
     station.quit.assert_called_once()
-    assert json.loads((root / "granted" / "bc-v3.json").read_text())["minutes"] == 20
-    assert 600 <= clock[0] < 620 and not reservation["claimed"].exists()
-    # One that never says it is done gets the PC for its minutes and 15 more.
-    (root / "queue" / "slow.json").write_text(json.dumps({"minutes": 5}))
-    os.utime(root / "queue" / "slow.json", (1, 1))
-    clock[0] = 0.0
-    slow = ai_games.take_reservation(root)
-    assert not ai_games.lend(
-        station,
-        root,
-        slow,
-        clock=lambda: clock[0],
-        sleep=lambda s: None or clock.__setitem__(0, clock[0] + s),
-    )
-    assert clock[0] >= 20 * 60
+    assert seen == [True, True, True], "lent, with HOI4 closed, until the job is done"
+    assert not lent.exists(), "and taken back"
 
 
 def test_start_saves_are_named_per_arena_and_side():

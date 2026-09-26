@@ -121,8 +121,8 @@ if ($Action -eq 'report') {
         $gpu.GetEnumerator() | Sort-Object { $_.Value.committed } -Descending | Select-Object -First 8 | ForEach-Object {
             "{0,6} {1,-32} {2,7} {3,7} {4,7}" -f $_.Key, $names[$_.Key], [math]::Round($_.Value.dedicated / 1MB), [math]::Round($_.Value.shared / 1MB), [math]::Round($_.Value.committed / 1MB)
         }
-        # Whether this PC signs in by itself after a restart, so the worker starts at logon
-        # with nobody there. Only that one value is read.
+        # Whether this PC signs in by itself after a restart, so fleet's node and the worker
+        # service start with nobody there. Only that one value is read.
         $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         $auto = try { Get-ItemPropertyValue -LiteralPath $winlogon -Name AutoAdminLogon -ErrorAction Stop } catch { $null }
         "signs in by itself after a restart: $(if ($auto -eq '1') { 'yes' } else { 'no' })"

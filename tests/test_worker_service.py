@@ -1,7 +1,7 @@
 """The desktop worker as a fleet service on the second PC (scripts/Start-Worker.ps1
--Service, shipped by scripts/collect_station.py deploy --worker), and its clients: the
-station there on the loopback, and this PC through `fleet tunnel`, which connect again
-while the service or the tunnel restarts."""
+-Service, shipped by scripts/collect_station.py deploy --worker), its pairing (bundle-peer),
+and its clients: the station there on the loopback, and this PC through `fleet tunnel`,
+which connect again while the service or the tunnel restarts."""
 
 import importlib.util
 import json
@@ -94,31 +94,38 @@ def test_the_pairing_says_how_long_to_wait_and_a_caller_may_say_otherwise(tmp_pa
         raise ConnectionRefusedError("stop here")
 
     monkeypatch.setattr(remote, "open_tls", open_tls)
-    lan, fleet = tmp_path / "peer.json", tmp_path / "peer-fleet.json"
-    lan.write_text(json.dumps({"host": "second-pc", "port": 47941}))
+    plain, fleet = tmp_path / "plain.json", tmp_path / "peer-fleet.json"
+    plain.write_text(json.dumps({"host": "127.0.0.1", "port": 47941}))
     fleet.write_text(json.dumps({"host": "127.0.0.1", "port": 47941, "reconnect_seconds": 60}))
-    for config, wait in ((lan, None), (fleet, None), (fleet, 0)):
+    for config, wait in ((plain, None), (fleet, None), (fleet, 0)):
         with pytest.raises(ConnectionRefusedError):
             remote.RemoteDesktop(config, attach=False, observer=True, wait=wait)
     assert asked == [0.0, 60.0, 0]
-    assert remote.is_loopback({"host": "127.0.0.1"}) and remote.is_loopback({"host": "::1"})
-    assert not remote.is_loopback({"host": "second-pc"}) and not remote.is_loopback({})
 
 
-# The station uses the service once it has shipped.
+def test_a_pairing_is_the_worker_on_the_loopback_for_both_pcs(tmp_path):
+    made = remote.bundle(tmp_path / "pairing", 47941)
+    client = json.loads(Path(made["client_config"]).read_text())
+    server = json.loads((tmp_path / "pairing" / "second-pc" / "server.json").read_text())
+    assert Path(made["client_config"]).name == "peer-fleet.json"
+    assert client["host"] == "127.0.0.1" and client["port"] == server["port"] == 47941
+    assert client["token"] == server["token"] and len(client["certificate_sha256"]) == 64
+    assert client["reconnect_seconds"] == remote.RECONNECT_SECONDS
+    assert (tmp_path / "pairing" / "second-pc" / "worker.pfx").stat().st_size > 0
+    with pytest.raises(FileExistsError):
+        remote.bundle(tmp_path / "pairing", 47941)  # Never over a pairing in use.
 
 
-def test_the_station_uses_the_fleet_pairing_once_it_is_there(tmp_path, monkeypatch):
+# The station uses the service on its own PC.
+
+
+def test_the_station_uses_the_fleet_pairing(tmp_path, monkeypatch):
     station = load_script("station")
     monkeypatch.chdir(tmp_path)
-    assert station.peer() == station.PEER, "the old bridge until the cutover"
-    Path(station.FLEET_PEER).parent.mkdir(parents=True)
-    Path(station.FLEET_PEER).write_text("{}")
-    assert station.peer() == station.FLEET_PEER
     ran = []
     monkeypatch.setattr(station, "FINISHED", tmp_path / "finished.jsonl")
     station.session("drills", "out", [], run=lambda *a: ran.append(a) or 1)
-    assert ran == [("drills", "out", "--peer", station.FLEET_PEER)]
+    assert ran == [("drills", "out", "--peer", "artifacts/pairing/peer-fleet.json")]
 
 
 # Deploying the worker.
@@ -136,8 +143,8 @@ def collect(tmp_path, monkeypatch):
     (stage / "scripts" / "Start-Worker.ps1").write_text("bridge")
     pairing = root / "artifacts" / "pairing"
     (pairing / "second-pc").mkdir(parents=True)
-    (pairing / "peer.json").write_text(
-        json.dumps({"host": "second-pc", "port": 47941, "token": "t", "certificate_sha256": "c"})
+    (pairing / "peer-fleet.json").write_text(
+        json.dumps({"host": "127.0.0.1", "port": 47941, "token": "t", "certificate_sha256": "c"})
     )
     (pairing / "second-pc" / "server.json").write_text("{}")
     (pairing / "second-pc" / "worker.pfx").write_bytes(b"pfx")
@@ -151,26 +158,37 @@ def collect(tmp_path, monkeypatch):
     return module
 
 
-def test_the_fleet_pairing_is_the_lan_one_on_the_loopback(collect):
-    path = collect.fleet_pairing()
-    spec = json.loads(path.read_text())
-    assert spec == {"host": "127.0.0.1", "port": 47941, "token": "t", "certificate_sha256": "c",
-                    "reconnect_seconds": collect.RECONNECT_SECONDS}  # fmt: skip
-    written = path.stat().st_mtime_ns
-    time.sleep(0.02)
-    collect.fleet_pairing()
-    assert path.stat().st_mtime_ns == written, "unchanged, so the next push sends nothing"
-
-
-def test_the_worker_ships_with_its_pairing_arenas_and_the_station_s_pairing(collect):
+def test_the_worker_ships_with_its_pairing(collect):
     collect.stage_worker()
     stage = collect.STAGE
     assert (stage / collect.WORKER_EXE).read_bytes() == b"MZ worker 1"
-    for relative in [*collect.WORKER_PAIRING, collect.FLEET_PEER]:
+    for relative in collect.WORKER_PAIRING:
         assert (stage / relative).exists(), relative
+
+
+def test_every_deploy_ships_the_pairing_the_arenas_and_a_recording_run(collect, monkeypatch):
+    monkeypatch.setattr(
+        collect.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="same-commit\n"),
+    )
+    monkeypatch.setattr(collect, "fleet", lambda *a, **k: None)
+    record = {"name": "sv6", "minutes": 120,
+              "args": ["--player", "scripted", "--mod", "artifacts/mods/arena-new-v7"]}  # fmt: skip
+    collect.deploy(record=record)
     station = load_script("station")
-    assert collect.FLEET_PEER == station.FLEET_PEER, "where the station looks for it"
-    assert sorted(collect.mirrored) == [f"artifacts/mods/{a}" for a in sorted(set(station.ARENAS))]
+    assert collect.FLEET_PEER == station.PEER, "where the station looks for it"
+    assert (collect.STAGE / collect.FLEET_PEER).exists()
+    arenas = sorted({*station.ARENAS, "arena-new-v7"})
+    assert sorted(set(collect.mirrored) - set(collect.DATA_FOLDERS)) == [
+        f"artifacts/mods/{a}" for a in arenas
+    ]
+    plan = json.loads((collect.STAGE / station.PLAN).read_text())
+    assert plan == {"record": record}
+    # A checkpoint's deploy keeps the recording run the plan already names.
+    collect.stage_plan("artifacts/learned/bc7/epoch-0000.pt")
+    plan = json.loads((collect.STAGE / station.PLAN).read_text())
+    assert plan["record"] == record and plan["name"] == "bc7"
 
 
 def test_deploying_the_worker_restarts_its_service_only_when_it_changed(collect, monkeypatch):
@@ -226,10 +244,8 @@ def test_the_service_bridge_serves_the_loopback_and_restarts_only_when_let(tmp_p
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    monkeypatch.setattr(remote, "worker_executable", lambda: str(worker_exe()))
-    remote.bundle(project / "artifacts" / "pairing", "127.0.0.1", "127.0.0.1", port)
-    peer = project / "artifacts" / "pairing" / "peer.json"
-    peer.write_text(json.dumps({**json.loads(peer.read_text()), "reconnect_seconds": 60}))
+    remote.bundle(project / "artifacts" / "pairing", port)
+    peer = project / "artifacts" / "pairing" / "peer-fleet.json"
     restart = tmp_path / "restart-wanted"
     env = {**os.environ, "FLEET_RESTART_WANTED": str(restart)}
     bridge = subprocess.Popen(

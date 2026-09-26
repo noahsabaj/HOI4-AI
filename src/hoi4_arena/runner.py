@@ -79,7 +79,7 @@ def ppo_exclusion(meta):
 def tower_folder(named):
     """Where the tower a checkpoint names is on this PC: where it says, or else models/ with
     the same folder name. A checkpoint names the absolute folder of the PC that trained it,
-    and the second PC keeps its towers in its compute folder's models/ (on-peer)."""
+    and the second PC keeps its towers in its project's models/ (collect_station.py)."""
     if Path(named).exists():
         return named
     here = Path("models") / PureWindowsPath(named).name

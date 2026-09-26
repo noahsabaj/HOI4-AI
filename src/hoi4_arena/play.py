@@ -60,7 +60,6 @@ SPEED_CLICKS = 4
 # How long after the policy's first click on + the harness starts the game, so that its
 # other clicks (the scripted player clicks three times) land first.
 RUN_DELAY = 1.0
-EVAL = Path("artifacts/eval")
 # The longest the policy may hold a key or button down before the harness lets it go, in
 # seconds. The scripted games it learns from never hold a key past 0.8 s or the left
 # button past 0.4 s; the right button, drawing fronts, up to 2.6 s (scripted-v5, measured
@@ -736,41 +735,6 @@ def room_for_a_game(station, tries=10, wait=30.0):
     return False
 
 
-def reserve(name, minutes, *, root=EVAL, wait_minutes=90.0, clock=time.monotonic):
-    """Ask the scripted player's agent for the second PC, and wait until it grants it.
-
-    Writes queue/<name>.json; that agent quits HOI4 between its games and answers with
-    granted/<name>.json. A request already queued or granted under that name (made ahead,
-    so the grant's wait overlaps other work) is not made again. Raises TimeoutError after
-    `wait_minutes`.
-    """
-    root = Path(root)
-    for folder in ("queue", "granted", "done"):
-        (root / folder).mkdir(parents=True, exist_ok=True)
-    granted = root / "granted" / f"{name}.json"
-    queued = root / "queue" / f"{name}.json"
-    taken = root / "queue" / f"{name}.taken"
-    if not (granted.exists() or queued.exists() or taken.exists()):
-        queued.write_text(
-            json.dumps({"minutes": minutes, "requested": time.strftime("%Y-%m-%d %H:%M:%S")})
-        )
-    until = clock() + wait_minutes * 60
-    while not granted.exists():
-        if clock() > until:
-            raise TimeoutError(f"the second PC was not granted within {wait_minutes} min")
-        time.sleep(10)
-    log.info("the second PC is granted: %s", granted.read_text())
-
-
-def hand_back(name, summary, *, root=EVAL):
-    """Tell the scripted player's agent the second PC is free again (HOI4 left closed)."""
-    done = Path(root) / "done"
-    done.mkdir(parents=True, exist_ok=True)
-    (done / f"{name}.json").write_text(
-        json.dumps({"finished": time.strftime("%Y-%m-%d %H:%M:%S"), **summary}, indent=2)
-    )
-
-
 def evaluate_policy(
     checkpoint,
     output,
@@ -780,7 +744,6 @@ def evaluate_policy(
     peer,
     mod="arena-12x8-v4",
     rules="artifacts/calibration-1080p/rules.json",
-    reservation=None,
     countries=("BLU", "RED"),
     cap_minutes=15.0,
     setup_seconds=90.0,
@@ -795,9 +758,7 @@ def evaluate_policy(
 ):
     """Play up to `games` games (or until `minutes` run out) on the second PC and record them.
 
-    With `reservation`, the second PC is first reserved from the scripted player's agent
-    (reserve) and handed back when done, with HOI4 closed. Countries alternate. Returns
-    the results, as record-ai writes them, so win-rate reads them too. `saves`, {country:
+    HOI4 is left closed at the end. Countries alternate. Returns the results, as record-ai writes them, so win-rate reads them too. `saves`, {country:
     save name}, launches each game straight into a save made paused at the start of a new
     game as that country, as record-ai does, skipping the menus. `temperature`,
     `pointer_temperature` and `point` are how it samples (runner.resolve_temperatures),
@@ -811,8 +772,6 @@ def evaluate_policy(
     out_root.mkdir(parents=True, exist_ok=True)
     screen_rules = ScreenRules(rules)
     rng = random.Random(seed)
-    if reservation:
-        reserve(reservation, minutes)
     results, summary = [], {}
     station = Station("peer", peer)
     end = time.monotonic() + minutes * 60
@@ -897,6 +856,4 @@ def evaluate_policy(
         except Exception as error:  # noqa: BLE001 - the games are saved.
             log.warning("quit failed: %s", error)
         summary = win_rate(results) if results else {}
-        if reservation:
-            hand_back(reservation, {"games": len(results), "record": summary.get("all")})
     return {"results": results, "win_rate": summary}

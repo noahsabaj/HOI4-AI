@@ -3,24 +3,32 @@
     fleet service add hoi4-station --on <second-pc-node> --name hoi4-ai --yields -- \
         uv run --frozen python scripts/station.py
 
-Round after round: setup drills, then, once the plan names a learned checkpoint, that
-checkpoint's one-off evaluation sessions and its coached practice. Each session is a
-`hoi4-arena` command run here against this PC's own worker (peer()), and each finished session's
-folder is listed in artifacts/station/finished.jsonl for scripts/collect_station.py on the
-training PC, which pulls it back and deletes it here.
+Round after round: a recording run the plan asks for (once), setup drills, then, once the
+plan names a learned checkpoint, that checkpoint's one-off evaluation sessions and its
+coached practice. Each session is a `hoi4-arena` command run here against this PC's own
+worker, the fleet service `hoi4-worker` on its loopback (PEER), and each finished
+session's folder is listed in artifacts/station/finished.jsonl for
+scripts/collect_station.py on the training PC, which pulls it back and deletes it here.
 
 Between sessions it answers fleet:
 - FLEET_YIELD_WANTED (a GPU job waits for this PC): HOI4 is closed, FLEET_YIELD_LENT is
-  created, and the loop waits until WANTED is gone, then deletes LENT and goes on.
+  created, and the loop waits until WANTED is gone, then deletes LENT and goes on. A
+  recording run answers it between its games (ai_games.lend_if_wanted).
 - FLEET_RESTART_WANTED (new code pushed): the loop exits, and fleet starts it again.
 - artifacts/station/DRAIN: the loop ends after the session in progress.
 
-The plan (artifacts/station/plan.json, pushed from the training PC; read before each
-session, so it changes without a restart):
+The plan (artifacts/station/plan.json, pushed from the training PC by collect_station.py
+deploy; read before each session, so it changes without a restart):
     {"checkpoint": "artifacts/learned/bc6/epoch-0000.pt", "name": "bc6-e0000",
      "practice": ["--held-previous"],
      "evaluate": [{"name": "t05", "command": "practice", "args": ["--temperature", "0.5"]}, ...],
+     "record": {"name": "scripted-v6", "minutes": 240,
+                "args": ["--player", "scripted", "--mod", "artifacts/mods/arena-12x8-v4"]},
      "drill_minutes": 30, "practice_minutes": 30, "arenas": [...]}
+`record` is a run of full games for data (record-ai --peer-only, into
+artifacts/record-<name>), played once per name before the next round's drills. It holds
+the PC for its minutes: a restart waits for it, and <its folder>/DRAIN ends it after the
+game in progress.
 A session that plays nothing (its summary counts no drill, episode or game) makes the
 loop wait 10 minutes, still answering fleet, rather than start the next one at once.
 """
@@ -38,17 +46,16 @@ STATION = Path("artifacts/station")
 PLAN = STATION / "plan.json"
 FINISHED = STATION / "finished.jsonl"
 DRAIN = STATION / "DRAIN"
-PEER = "artifacts/pairing/peer.json"
-# The worker as fleet's service `hoi4-worker` on this PC's own loopback, once
-# `collect_station.py deploy --worker` has shipped it (the cutover); until then the old
-# at-logon bridge, at this PC's LAN address.
-FLEET_PEER = "artifacts/pairing/peer-fleet.json"
+# The worker, as fleet's service `hoi4-worker` on this PC's own loopback (the pairing
+# bundle-peer writes, shipped by collect_station.py deploy).
+PEER = "artifacts/pairing/peer-fleet.json"
 ARENAS = ["arena-12x8-v4", "arena-bay-v6", "arena-12x8-v4", "arena-river-v6", "arena-12x8-v4",
           "arena-plains-v6", "arena-12x8-v4", "arena-passes-v6", "arena-12x8-v4",
           "arena-marsh-v6", "arena-12x8-v4", "arena-salient-v6", "arena-12x8-v4",
           "arena-ford-v6"]  # fmt: skip
+# What each session writes, as a glob in its folder: its summary, or record-ai's results.
 SUMMARIES = {"practice": "practice-peer.json", "drills": "drills-peer.json",
-             "play-policy": "results-peer.json"}  # fmt: skip
+             "play-policy": "results-peer.json", "record-ai": "results-peer-*.json"}  # fmt: skip
 
 
 def log(text):
@@ -59,11 +66,6 @@ def flag(name):
     """The file fleet names in environment variable `name`, if it exists now."""
     path = os.environ.get(name)
     return Path(path) if path and Path(path).exists() else None
-
-
-def peer():
-    """The pairing this session's commands use, looked at before each one."""
-    return FLEET_PEER if Path(FLEET_PEER).exists() else PEER
 
 
 def hoi4(*args):
@@ -77,7 +79,7 @@ def lend_if_wanted(poll=10.0, quit_game=None):
     if wanted is None:
         return False
     log("fleet wants the GPU: closing HOI4 and lending it")
-    (quit_game or (lambda: hoi4("control", "quit", "--peer", peer())))()
+    (quit_game or (lambda: hoi4("control", "quit", "--peer", PEER)))()
     lent = Path(os.environ["FLEET_YIELD_LENT"])
     lent.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
     while wanted.exists():
@@ -98,20 +100,29 @@ def should_stop():
 
 
 def played(command, output):
-    try:
-        written = json.loads((Path(output) / SUMMARIES[command]).read_text())
-    except (OSError, ValueError):
-        return False
-    if isinstance(written, list):
-        return bool(written)
-    summary = written.get("summary") or {}
-    return bool(summary.get("complete" if command == "drills" else "episodes"))
+    """Whether the session's summary counts a drill, an episode or a game (for record-ai,
+    one that ended: a win, a loss or the time cap)."""
+    for path in sorted(Path(output).glob(SUMMARIES[command])):
+        try:
+            written = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(written, list):
+            if command == "record-ai":
+                written = [game for game in written if game.get("winner")]
+            if written:
+                return True
+            continue
+        summary = written.get("summary") or {}
+        if summary.get("complete" if command == "drills" else "episodes"):
+            return True
+    return False
 
 
 def session(command, output, args, run=hoi4):
     """One session here; its folder is listed for collection whatever happened."""
     log(f"{command} {output} {' '.join(args)}")
-    code = run(command, output, "--peer", peer(), *args)
+    code = run(command, output, "--peer", PEER, *args)
     STATION.mkdir(parents=True, exist_ok=True)
     ok = code == 0 and played(command, output)
     with FINISHED.open("a", encoding="utf-8") as handle:
@@ -136,12 +147,29 @@ def plan():
         return {}
 
 
+def record(entry, run=hoi4):
+    """The plan's recording run, once per name: full games for data, played here
+    (record-ai --peer-only). Returns whether it ran."""
+    done = STATION / f"recorded-{entry['name']}"
+    if done.exists():
+        return False
+    args = ["--peer-only", "--minutes", str(entry.get("minutes", 60)), *entry.get("args", [])]
+    session("record-ai", f"artifacts/record-{entry['name']}", args, run=run)
+    done.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    return True
+
+
 def main():
     STATION.mkdir(parents=True, exist_ok=True)
     log(f"started (pid {os.getpid()})")
     while not should_stop():
         lend_if_wanted()
         now = plan()
+        if now.get("record") and record(now["record"]):
+            if should_stop():
+                break
+            lend_if_wanted()
+            now = plan()
         stamp = time.strftime("%Y%m%d-%H%M")
         arenas = now.get("arenas") or ARENAS
         args = ["--episodes", "60", "--minutes", str(now.get("drill_minutes", 30)),

@@ -1,16 +1,8 @@
 #Requires -Version 7.5
 # PowerShell 7.5+ (.NET 9+): the bridge loads its certificate with X509CertificateLoader.
 #
-# .\Start-Worker.ps1            Run the worker bridge here, restarting it after updates.
-# .\Start-Worker.ps1 -Install   Also start it hidden at every logon, and (re)start it now.
-#                               Undo with -Uninstall.
-# .\Start-Worker.ps1 -Stop      Stop a running at-logon bridge, hidden or not, and its workers.
-# .\Start-Worker.ps1 -Uninstall -Stop, and remove its "HOI4 Worker" shortcut from shell:startup.
-#                               -DryRun with either lists what it would stop and remove.
-# The worker has no window to close by accident. Its output goes to worker.log beside this
-# script, which the first PC can read through the share.
-#
-# .\Start-Worker.ps1 -Service   The bridge as a fleet service, run from the project's folder:
+# The second PC's worker bridge, as the fleet service hoi4-worker, run from the project's
+# folder (scripts/collect_station.py deploy --worker ships the worker and the pairing):
 #     fleet service add hoi4-worker --on <second-pc-node> --name hoi4-ai -- \
 #         pwsh -NoProfile -File scripts/Start-Worker.ps1 -Service
 #   It listens on 127.0.0.1 only: sessions on that PC connect there, and other PCs through
@@ -23,7 +15,6 @@
 #   folder; -Port replaces the pairing's; -QuietSeconds is how long a restart waits after
 #   the last game connection, and how old an observer must be not to hold one back.
 param(
-    [switch]$Install, [switch]$Stop, [switch]$Uninstall, [switch]$DryRun, [switch]$Bridge,
     [switch]$Service,
     [string]$Pairing = 'artifacts\pairing\second-pc',
     [string]$Worker = 'artifacts\worker\hoi4-desktop-worker.exe',
@@ -33,94 +24,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+if (-not $Service) {
+    throw 'Start-Worker.ps1 runs the worker bridge as the fleet service hoi4-worker: pass -Service (see its header).'
+}
 $pwsh = (Get-Process -Id $PID).Path
-$log = Join-Path $PSScriptRoot 'worker.log'
-$shortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'HOI4 Worker.lnk'
-
-function Get-AtLogonBridge {
-    # The at-logon bridge, wherever its script is: the pwsh supervisor and bridge running a
-    # script of this name (never a fleet service's, nor another -Stop or -Install), and the
-    # workers those bridges started. Workers of anything else, such as a fleet service's
-    # bridge or a recorder on this PC, are not its.
-    $script = Split-Path $PSCommandPath -Leaf
-    $all = @(Get-CimInstance Win32_Process)
-    $bridges = @($all | Where-Object {
-            $_.Name -eq 'pwsh.exe' -and $_.ProcessId -ne $PID -and $_.CommandLine -like "*$script*" -and
-            $_.CommandLine -notmatch ' -(Service|Install|Stop|Uninstall)\b'
-        })
-    $ids = @($bridges | ForEach-Object ProcessId)
-    $workers = @($all | Where-Object { $_.Name -eq 'hoi4-desktop-worker.exe' -and $ids -contains $_.ParentProcessId })
-    [pscustomobject]@{ Bridges = $bridges; Workers = $workers }
-}
-
-function Stop-Worker {
-    $found = Get-AtLogonBridge
-    foreach ($process in @($found.Bridges) + @($found.Workers)) {
-        $line = "$($process.Name) $($process.ProcessId): $($process.CommandLine)"
-        if ($DryRun) { Write-Output "would stop $line"; continue }
-        # The supervisor first, so it cannot start the bridge again.
-        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-        Write-Output "stopped $line"
-    }
-    if (-not @($found.Bridges).Count) { Write-Output 'No at-logon bridge is running.' }
-}
-
-if ($Stop -or $Uninstall) {
-    Stop-Worker
-    if ($Uninstall) {
-        if (-not (Test-Path -LiteralPath $shortcut)) { Write-Output "No $shortcut." }
-        elseif ($DryRun) { Write-Output "would remove $shortcut" }
-        else { Remove-Item -LiteralPath $shortcut; Write-Output "removed $shortcut" }
-    }
-    if (-not $DryRun) { Write-Output 'Stopped the HOI4 worker.' }
-    return
-}
-
-if ($Install) {
-    # A path that survives PowerShell updates: the Store build's own path names its version.
-    $stable = @(
-        (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe')
-    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
-    $link.TargetPath = if ($stable) { $stable } else { $pwsh }
-    $link.Arguments = "-NoProfile -WindowStyle Hidden -File `"$PSCommandPath`""
-    $link.WorkingDirectory = $PSScriptRoot
-    $link.WindowStyle = 7  # Minimized, for the moment before -WindowStyle hides it.
-    $link.Save()
-    # Replace a running copy, such as one started by an older, windowed shortcut.
-    Stop-Worker
-    Start-Process -FilePath $shortcut
-    Write-Output "Installed $shortcut and started the worker hidden. Its log is $log."
-    return
-}
-
-if (-not $Bridge -and -not $Service) {
-    # One supervisor per session: a second one would only fail to bind the port forever.
-    $mutex = [Threading.Mutex]::new($false, 'Local\HOI4Worker')
-    if (-not $mutex.WaitOne(0)) {
-        Write-Output 'The HOI4 worker is already running.'
-        return
-    }
-    if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -gt 1MB) {
-        Move-Item -LiteralPath $log -Destination "$log.old" -Force
-    }
-    function Write-Log($text) { Add-Content -LiteralPath $log "$(Get-Date -Format s) $text" }
-    Write-Log "Supervisor started (PID $PID)."
-    # Supervisor. The bridge runs in a child pwsh because a compiled type cannot be
-    # reloaded in place. An idle bridge exits with code 3 when Deploy-Peer replaces this
-    # script or the pairing, and starts again from the new files. Any other exit, such as
-    # the network not being up yet at logon, is retried.
-    while ($true) {
-        & $pwsh -NoProfile -File $PSCommandPath -Bridge *>> $log
-        if ($LASTEXITCODE -eq 3) {
-            Write-Log 'Update deployed. Restarting the bridge.'
-            continue
-        }
-        Write-Log "Bridge stopped (exit $LASTEXITCODE). Retrying in 10 s."
-        Start-Sleep -Seconds 10
-    }
-}
 
 # The bridge accepts only raw worker requests. It exposes no shell or filesystem API.
 # Launching, closing and inspecting HOI4 are worker operations too; the worker runs
@@ -165,8 +72,8 @@ public static class Hoi4Bridge {
     private static int connections = 0;
     private static int observers = 0;
     private static int workers = 0;
-    // For a service's restart (RunService): the connections open now, by number, with when
-    // each opened and whether it is an observer; when the last one that was not an
+    // For the service's restart (RunService): the connections open now, by number, with
+    // when each opened and whether it is an observer; when the last one that was not an
     // observer ended; and the workers running, stopped when the bridge exits.
     private static readonly ConcurrentDictionary<long, Tuple<long, bool>> open = new ConcurrentDictionary<long, Tuple<long, bool>>();
     private static long opened = 0;
@@ -183,15 +90,6 @@ public static class Hoi4Bridge {
             await destination.WriteAsync(buffer, 0, count);
             await destination.FlushAsync();
         }
-    }
-    // Content hashes, not timestamps: Copy-Item keeps the source's write time.
-    private static string Stamp(string[] files) {
-        var stamp = new StringBuilder();
-        foreach (var file in files) {
-            stamp.Append(File.Exists(file) ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))) : "missing");
-            stamp.Append('|');
-        }
-        return stamp.ToString();
     }
     // The first line after the handshake: the token, then " observer" for a read-only
     // connection. At most 128 bytes.
@@ -211,10 +109,9 @@ public static class Hoi4Bridge {
         try { stream.Write(line, 0, line.Length); stream.Flush(); } catch (Exception) {}
         Say("Refused a connection: " + why);
     }
-    // Connections come from the coordinator, or from this PC itself: a session that runs
-    // here plays this PC's game through the bridge like any other, so it holds the one full
-    // connection, a recording from the coordinator is told worker_busy meanwhile, and its
-    // worker is counted before an update swaps in. `allowed` says which addresses may
+    // Connections come from this PC itself: a session that runs here, or another PC's
+    // through fleet's tunnel. A session holds the one full connection, and anyone else
+    // wanting the game is told worker_busy meanwhile. `allowed` says which addresses may
     // connect; `args` go on each worker's command line after --observer.
     private static void Serve(long id, TcpClient client, X509Certificate2 cert, Func<IPAddress, bool> allowed, string token, string exe, string[] args) {
         bool observer = false;
@@ -261,13 +158,6 @@ public static class Hoi4Bridge {
                         holding = true;
                     }
                     lock (gate) {
-                        // Deploy-Peer stages a new worker beside the running one. It is swapped
-                        // in only while no worker runs, never under a connection. (A service
-                        // takes its worker at start instead: none is staged beside its copy.)
-                        if (workers == 0 && File.Exists(exe + ".new")) {
-                            try { File.Move(exe + ".new", exe, true); Say("Updated worker."); }
-                            catch (Exception error) { Say("Worker update deferred: " + error.Message); }
-                        }
                         worker = new Process();
                         worker.StartInfo = new ProcessStartInfo(exe) {
                             UseShellExecute=false, CreateNoWindow=true,
@@ -327,33 +217,6 @@ public static class Hoi4Bridge {
             finally { Interlocked.Decrement(ref connections); }
         });
     }
-    // The at-logon bridge. True when the watched files changed and the caller should
-    // restart from them.
-    public static bool Run(string bind, int port, string peer, string pfx, string password, string token, string exe, string[] watch) {
-        var stamp = Stamp(watch);
-        var cert = X509CertificateLoader.LoadPkcs12FromFile(pfx, password, X509KeyStorageFlags.UserKeySet);
-        var coordinator = IPAddress.Parse(peer);
-        var self = IPAddress.Parse(bind);
-        Func<IPAddress, bool> allowed = from => from.Equals(coordinator) || from.Equals(self);
-        var listener = new TcpListener(self, port);
-        listener.Start(16);
-        Say("HOI4 worker ready at " + bind + ":" + port + ". F12 stops game input. Observers welcome.");
-        try {
-            for (int tick = 0; ; tick++) {
-                if (listener.Pending()) {
-                    Accept(listener, cert, allowed, token, exe, new string[0]);
-                    continue;
-                }
-                // Updates are picked up only with no connection open, never during a match.
-                if (tick % 8 == 7 && Volatile.Read(ref connections) == 0) {
-                    string now;
-                    try { now = Stamp(watch); } catch (IOException) { now = stamp; }
-                    if (now != stamp) return true;
-                }
-                Thread.Sleep(125);
-            }
-        } finally { listener.Stop(); cert.Dispose(); }
-    }
     // Why a wanted restart must wait, or null. A connection that holds the game (or has not
     // yet said what it is) holds it back, and so does one that ended less than `quiet` ms
     // ago: a session opens the next within seconds. So does an observer younger than that:
@@ -408,42 +271,33 @@ public static class Hoi4Bridge {
 }
 '@
 
-if ($Service) {
-    # Relative paths are the project's: fleet starts a service in its project's folder.
-    $pairingDir = (Resolve-Path -LiteralPath $Pairing).Path
-    $spec = Get-Content -LiteralPath (Join-Path $pairingDir 'server.json') -Raw | ConvertFrom-Json
-    $listen = if ($Port) { $Port } else { [int]$spec.port }
-    # The worker that shipped with the project runs from a copy named by its contents: a
-    # running program cannot be replaced, so a push of a new one would fail on it. A new
-    # one is taken at the next start; older copies go once nothing runs them.
-    $shipped = (Resolve-Path -LiteralPath $Worker).Path
-    $hash = (Get-FileHash -LiteralPath $shipped -Algorithm SHA256).Hash.Substring(0, 12).ToLowerInvariant()
-    $home_ = Split-Path $shipped -Parent
-    $folder = Join-Path $home_ "run-$hash"
-    $exe = Join-Path $folder (Split-Path $shipped -Leaf)
-    if (-not (Test-Path -LiteralPath $exe)) {
-        New-Item -ItemType Directory -Force -Path $folder | Out-Null
-        Copy-Item -LiteralPath $shipped -Destination "$exe.tmp" -Force
-        Move-Item -LiteralPath "$exe.tmp" -Destination $exe -Force
-    }
-    foreach ($old in Get-ChildItem -LiteralPath $home_ -Directory -Filter 'run-*') {
-        if ($old.FullName -ne $folder) {
-            try { Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction Stop } catch { }
-        }
-    }
-    # The worker runs Game-Control.ps1 with the pwsh it finds on PATH: this one.
-    $env:PATH = (Split-Path $pwsh -Parent) + [IO.Path]::PathSeparator + $env:PATH
-    New-Item -ItemType Directory -Force -Path $Mods | Out-Null
-    $arguments = @('--scripts', $PSScriptRoot, '--mods', (Resolve-Path -LiteralPath $Mods).Path)
-    [Hoi4Bridge]::Say("Bridge started (PID $PID): worker $hash, scripts $PSScriptRoot, mods $($arguments[3]).")
-    [Hoi4Bridge]::RunService($listen, (Join-Path $pairingDir 'worker.pfx'), $spec.pfx_password, $spec.token,
-        $exe, $arguments, $env:FLEET_RESTART_WANTED, $QuietSeconds)
-    exit 0
+# Relative paths are the project's: fleet starts a service in its project's folder.
+$pairingDir = (Resolve-Path -LiteralPath $Pairing).Path
+$spec = Get-Content -LiteralPath (Join-Path $pairingDir 'server.json') -Raw | ConvertFrom-Json
+$listen = if ($Port) { $Port } else { [int]$spec.port }
+# The worker that shipped with the project runs from a copy named by its contents: a
+# running program cannot be replaced, so a push of a new one would fail on it. A new
+# one is taken at the next start; older copies go once nothing runs them.
+$shipped = (Resolve-Path -LiteralPath $Worker).Path
+$hash = (Get-FileHash -LiteralPath $shipped -Algorithm SHA256).Hash.Substring(0, 12).ToLowerInvariant()
+$home_ = Split-Path $shipped -Parent
+$folder = Join-Path $home_ "run-$hash"
+$exe = Join-Path $folder (Split-Path $shipped -Leaf)
+if (-not (Test-Path -LiteralPath $exe)) {
+    New-Item -ItemType Directory -Force -Path $folder | Out-Null
+    Copy-Item -LiteralPath $shipped -Destination "$exe.tmp" -Force
+    Move-Item -LiteralPath "$exe.tmp" -Destination $exe -Force
 }
-
-$spec = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server.json') -Raw | ConvertFrom-Json
-$pairing = Join-Path $PSScriptRoot 'server.json'
-$pfx = Join-Path $PSScriptRoot 'worker.pfx'
-$restart = [Hoi4Bridge]::Run($spec.bind, $spec.port, $spec.coordinator, $pfx, $spec.pfx_password, $spec.token,
-    (Join-Path $PSScriptRoot 'hoi4-desktop-worker.exe'), @($PSCommandPath, $pairing, $pfx))
-if ($restart) { exit 3 }
+foreach ($old in Get-ChildItem -LiteralPath $home_ -Directory -Filter 'run-*') {
+    if ($old.FullName -ne $folder) {
+        try { Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction Stop } catch { }
+    }
+}
+# The worker runs Game-Control.ps1 with the pwsh it finds on PATH: this one.
+$env:PATH = (Split-Path $pwsh -Parent) + [IO.Path]::PathSeparator + $env:PATH
+New-Item -ItemType Directory -Force -Path $Mods | Out-Null
+$arguments = @('--scripts', $PSScriptRoot, '--mods', (Resolve-Path -LiteralPath $Mods).Path)
+[Hoi4Bridge]::Say("Bridge started (PID $PID): worker $hash, scripts $PSScriptRoot, mods $($arguments[3]).")
+[Hoi4Bridge]::RunService($listen, (Join-Path $pairingDir 'worker.pfx'), $spec.pfx_password, $spec.token,
+    $exe, $arguments, $env:FLEET_RESTART_WANTED, $QuietSeconds)
+exit 0

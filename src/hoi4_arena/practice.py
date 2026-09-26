@@ -249,7 +249,6 @@ def practice(
     seconds=90.0,
     countries=("BLU", "RED"),
     coach=True,
-    reservation=None,
     held_previous=False,
     temperature=1.0,
     pointer_temperature=None,
@@ -266,7 +265,7 @@ def practice(
     from PIL import Image
 
     from .ai_games import EVENT_OK, Station, focus, log_end, start_game
-    from .play import hand_back, play_policy_game, reserve, sampling_of
+    from .play import play_policy_game, sampling_of
     from .runner import Actor
     from .vision import ScreenRules
 
@@ -276,8 +275,6 @@ def practice(
     ok = [np.asarray(Image.open(path).convert("RGB")) for path in (
         "artifacts/screens-1080p/ok-button.png", EVENT_OK)]  # fmt: skip
     rng = random.Random(seed)
-    if reservation:
-        reserve(reservation, minutes)
     station = Station("peer", peer)
     end = time.monotonic() + minutes * 60
     results, running = [], False
@@ -346,8 +343,6 @@ def practice(
             station.quit()
         except Exception as error:  # noqa: BLE001 - the episodes are saved.
             log.warning("quit failed: %s", error)
-        if reservation:
-            hand_back(reservation, {"episodes": len(results), "summary": summary(results)})
     return {"summary": summary(results), "episodes": results}
 
 
@@ -479,7 +474,6 @@ def drills(
     scrambled=0.7,
     block=4,
     after=8.0,
-    reservation=None,
     rules="artifacts/calibration-1080p/rules.json",
     seed=None,
 ):
@@ -489,7 +483,6 @@ def drills(
     from PIL import Image
 
     from .ai_games import EVENT_OK, Station, focus, log_end, start_game
-    from .play import hand_back, reserve
     from .vision import ScreenRules
 
     out_root = Path(output)
@@ -502,8 +495,6 @@ def drills(
     arenas = [a for a in arenas if all((a, c) in saves for c in countries)]
     if not arenas:
         raise ValueError("no arena has start saves for every country")
-    if reservation:
-        reserve(reservation, minutes)
     station = Station("peer", peer)
     began = time.monotonic()
     end = began + minutes * 60
@@ -560,6 +551,4 @@ def drills(
             station.quit()
         except Exception as error:  # noqa: BLE001 - the drills are saved.
             log.warning("quit failed: %s", error)
-        if reservation:
-            hand_back(reservation, tally())
     return {"summary": tally(), "drills": results}

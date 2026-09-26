@@ -33,7 +33,6 @@ from .media import (
     next_segment,
     read_json,
     read_shared,
-    update_pending,
     view_command,
 )
 from .replay import Replays, replay_command
@@ -44,6 +43,6 @@ __all__ = [
     "Archive", "Feed", "Flags", "Follower", "History", "LiveApp", "LocalView", "Narrator",
     "PeerView", "Replays", "archive_command", "capture_command", "covering", "pieces", "clear_stream", "draw_icon", "game_card", "hls_command",
     "install_app", "live_game", "live_games", "next_segment", "read_json", "read_shared",
-    "replay_command", "result", "say", "serve", "station_of", "update_pending",
+    "replay_command", "result", "say", "serve", "station_of",
     "view_command", "watch",
 ]  # fmt: skip

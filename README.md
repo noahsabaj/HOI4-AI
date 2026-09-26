@@ -26,64 +26,54 @@ The worker only attaches to `hoi4.exe`. It requires foreground focus to apply in
 
 ## Second PC
 
-`bundle-peer` writes the pairing to the path you pass it: `peer.json` for this PC and a private `second-pc` folder for the other one. No Python is needed on the second PC, only PowerShell 7.5 or later (`pwsh`; Windows PowerShell 5.1 cannot load the bridge).
+The second PC is a node of the fleet project's `fleet` command, and everything of this project's there runs through it: two fleet services in one project folder, `hoi4-ai`, which this PC pushes.
 
-The second PC runs from one shared folder that this PC deploys into. Set it up once, on the second PC, in an elevated PowerShell 7:
+- `hoi4-worker` is the desktop worker's bridge (`scripts/Start-Worker.ps1 -Service`). It listens on that PC's loopback only and exits for a restart once nothing holds the game. PowerShell 7.5 or later runs it (Windows PowerShell 5.1 cannot load the bridge).
+- `hoi4-station` is the HOI4 loop (`scripts/station.py`): drills, a learned checkpoint's evaluations and practice, and recording runs, each a `hoi4-arena` session on that PC against its own worker. Between sessions, and between a recording run's games, it lends the GPU to fleet jobs that ask for it (`--yields`), with HOI4 closed.
 
-```powershell
-New-Item -ItemType Directory "$HOME\HOI4Worker"
-New-SmbShare -Name HOI4Worker -Path "$HOME\HOI4Worker" -ChangeAccess ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -EncryptData $true
-```
-
-If that account has no usable password (a Microsoft account signed in by PIN), create a local account for the share instead and grant it the share and the folder (`New-LocalUser`, `Grant-SmbShareAccess -AccessRight Change`, `icacls /grant <name>:(OI)(CI)M`).
-
-On this PC, save that account's sign-in once (`cmdkey` asks for the password), then deploy. `Deploy-Peer.ps1` builds the worker and copies it, its scripts and the pairing files into the share, skipping anything unchanged.
+`bundle-peer` makes the pairing once: a private `second-pc` folder (the worker's certificate and token) and `peer-fleet.json`, which names the worker at `127.0.0.1:<port>`. The same file serves both PCs. On the second PC the sessions reach the service directly; here `fleet tunnel` opens the same port, inside fleet's authenticated TLS, and `scripts/collect_station.py tunnel` keeps it open. Its `reconnect_seconds` lets a client wait out a service or node restart.
 
 ```powershell
-cmdkey /add:<second-pc-ip> /user:<second-pc-account> /pass
-.\scripts\Deploy-Peer.ps1
+.venv\Scripts\hoi4-arena.exe bundle-peer artifacts/pairing --port <port>
+cargo build --release --locked -p hoi4-desktop-worker
+.venv\Scripts\python.exe scripts\collect_station.py deploy --worker
+fleet service add hoi4-worker --on <second-pc-node> --name hoi4-ai -- pwsh -NoProfile -File scripts/Start-Worker.ps1 -Service
+fleet service add hoi4-station --on <second-pc-node> --name hoi4-ai --yields -- uv run --frozen python scripts/station.py
+.venv\Scripts\python.exe scripts\collect_station.py tunnel
+.venv\Scripts\python.exe scripts\collect_station.py collect
 ```
 
-Then on the second PC, once, in PowerShell 7: `& "$HOME\HOI4Worker\Start-Worker.ps1" -Install`. That starts the worker now and at every logon, hidden, so there is no window to close by accident. It writes `worker.log` in that folder, which this PC can read through the share (`HOI4 worker ready` means it is listening). `-Stop` stops it; undo the install with `-Stop` and by deleting `HOI4 Worker` from `shell:startup`. After that, deploys need nothing on the second PC: a new worker is swapped in before the next connection, and a changed script or pairing restarts the bridge once it is idle, never during a match. Keep the folder private: it contains pairing credentials.
+`collect_station.py deploy` stages a git worktree at `origin/main` beside this checkout with what the sessions read: the screen templates and rules, the start saves, the pairing, and the arena mods the station plays. It pushes that to the project and asks the station to restart at its next idle moment if the code changed. The game's `.mod` descriptors are written into its mod folder at each launch, pointing into the project; that is the one place outside the project folder it writes. `--checkpoint <ckpt> [--evaluate]` adds a checkpoint, its manifest and its tower, and names it in the station's plan (`artifacts/station/plan.json`). `--worker` also ships a new worker build and the pairing, and restarts the worker service once it is idle. `collect` (every 2 minutes) pulls each finished session's folder back to the same path here and deletes it there. `artifacts/station/DRAIN` on the second PC ends the loop after the session in progress.
 
-For a two-player match, `Deploy-Peer.ps1 -Mod artifacts\mods\<arena>` copies the arena there, and `control launch` asks the worker to start HOI4 with it and prints the outcome. It is refused if HOI4 is already running there. `control quit` closes HOI4, `control restart-discord` restarts Discord, and `control report` prints its windows, busiest processes and log ends. `control launch --save <name>` loads that save game at startup, skipping the main menu (the game's `-start_save`), so a match can start mid-game; `control saves` lists the save games there. Without `--peer` they act on this PC. The worker runs these through `Game-Control.ps1` and refuses them while input is armed.
+Full games for data are a recording run in the plan (`--record NAME`, with `record-ai`'s arguments after `--`). The station plays it once, as `record-ai --peer-only` on that PC, into `artifacts/record-NAME`, before its next round's drills. `collect` brings it back like any session.
 
 ```powershell
-.venv\Scripts\hoi4-arena.exe control launch --mod <arena> --peer artifacts/pairing/peer.json
-.venv\Scripts\hoi4-arena.exe probe-peer artifacts/pairing/peer.json
-.venv\Scripts\hoi4-arena.exe capture artifacts/peer.png --peer artifacts/pairing/peer.json
+.venv\Scripts\python.exe scripts\collect_station.py deploy --record scripted-v7 --record-minutes 240 -- --player scripted --mod artifacts/mods/arena-12x8-v4 --speeds 5
 ```
 
-The second PC's GPU can train too. `Deploy-Peer.ps1 -Compute` copies the package, its lock file, the study scripts, uv and ffmpeg into the share's `compute` folder (`-Data <folder>` mirrors data such as a feature cache to the same path there). `hoi4-arena job` then runs compute there through the worker's `job` operation and `Run-Job.ps1`. It can build the Python environment (`--kind setup`), run one of a fixed list of `hoi4-arena` training commands (`--kind run`), or run a study script (`--kind script`); `job stop` and `job status` (jobs, GPU, free disk) complete it. Jobs run hidden and detached, with their output in the share's `jobs` folder. Arguments may be flags, values or paths inside `compute`, nothing else, and the worker and the script both check them.
+Game control goes through the same worker. `control launch --mod <arena>` starts HOI4 there with an arena its project holds and prints the outcome. It is refused if HOI4 is already running there. `control quit` closes HOI4, `control restart-discord` restarts Discord, and `control report` prints its windows, busiest processes and log ends. `control launch --save <name>` loads that save game at startup, skipping the main menu (the game's `-start_save`), so a match can start mid-game; `control saves` lists the save games there. Without `--peer` they act on this PC. The worker runs these through `Game-Control.ps1` and refuses them while input is armed. A session running there holds the one full connection, so anything else wanting the game meanwhile is told `worker_busy`.
 
 ```powershell
-.venv\Scripts\hoi4-arena.exe job start --peer artifacts/pairing/peer.json --id setup-1 --kind setup
-.venv\Scripts\hoi4-arena.exe job start --peer artifacts/pairing/peer.json --id study --kind script -- memory_study.py artifacts/features artifacts/memory-study --seeds 3 4
-.venv\Scripts\hoi4-arena.exe job status --peer artifacts/pairing/peer.json
+.venv\Scripts\hoi4-arena.exe control launch --mod <arena> --peer artifacts/pairing/peer-fleet.json
+.venv\Scripts\hoi4-arena.exe probe-peer artifacts/pairing/peer-fleet.json
+.venv\Scripts\hoi4-arena.exe capture artifacts/peer.png --peer artifacts/pairing/peer-fleet.json
 ```
 
-Sessions that play the second PC's game (`practice`, `drills`, `play-policy`) can run there too, so the policy decides on that PC's GPU and this PC's is left to training. `hoi4-arena on-peer --peer <pairing> -- <session>` sends the code and what the session reads (its checkpoint and manifest, the tower under `models/`, the screen templates and rules, the start saves' registry, the pairing file) into `compute` with `Deploy-Peer.ps1 -ComputeOnly` (which leaves the worker, its scripts and the mods alone), builds the environment there if `uv.lock` changed, starts the session as a job, prints its log as it grows, and moves the session's folder back to the same path here when it ends. The session's own `--peer` names the same pairing file: its copy there reaches the bridge on its own PC, which takes connections from its own address as well as from this PC's, so the session holds the game exactly as one from here does (anything else wanting the game meanwhile is told `worker_busy`; the live view's observer watches as before). `--reservation <name>` books the second PC here first, as `play-policy --reservation` does, and hands it back after; a session given `--reservation` itself is refused, since the bookings are kept on this PC. A session that outlasts its `--minutes` by 30 is stopped there, and so is one whose `on-peer` is interrupted. Run it from the checkout whose code it sends.
+Training and other compute on the second PC's GPU are ordinary fleet jobs (`fleet run --on <second-pc-node> --gpu-gb N`); the station yields the GPU to them.
 
-```powershell
-.venv\Scripts\hoi4-arena.exe on-peer --peer artifacts/pairing/peer.json -- practice artifacts/learned/bc6/epoch-0000.pt artifacts/learned/practice-bc6 --peer artifacts/pairing/peer.json --episodes 20 --minutes 30
-.venv\Scripts\hoi4-arena.exe on-peer --peer artifacts/pairing/peer.json -- drills artifacts/drills/<time> --peer artifacts/pairing/peer.json --episodes 60 --minutes 30
-```
+While a session holds the second PC's worker, read-only observer connections still reach it: `hoi4-arena telemetry --peer artifacts/pairing/peer-fleet.json [--watch 5]` shows what that PC is doing (CPU, memory, GPU and its video encoder, disks and network, per process: the game, the worker, the encoder), and `control report` and `control saves` go through an observer too. The live view (`hoi4-arena live --peer artifacts/pairing/peer-fleet.json`) watches the same way. Without `--peer`, `telemetry` reads this PC.
 
-Other projects on this PC run their own jobs on the second PC (and other computers) with the fleet project's `fleet` command, which replaced this project's `peer` on 2026-09-25. Since 2026-09-26 it reaches the second PC through a node of its own there, not through this worker, and relies on one thing here: the evaluation reservation files (`--eval-dir`: `queue/`, `granted/`, `done/`), through which a job needing the GPU has the second PC's HOI4 work yield between games or sessions. Keep those compatible, or tell the user before changing them; `test_ai_games.py` holds them. The worker's `job` operation with kind `project` and `Run-Job.ps1`'s `jobs/` files, which fleet used until then, still work (`tests/test_fleet_contract.py`). Recording, game control and the live view stay this worker's own.
-
-While a recording or a match holds the second PC's worker, read-only observer connections still reach it: `hoi4-arena telemetry --peer artifacts/pairing/peer.json [--watch 5]` shows what that PC is doing (CPU, memory, GPU and its video encoder, disks and network, per process: the game, the worker, the encoder), and `control report` and `control saves` go through an observer too. Without `--peer`, `telemetry` reads this PC.
-
-The connection uses a pinned TLS certificate, a random token and the coordinator's source IP (or the second PC's own, for its own sessions). It exposes worker operations, not a remote shell: the compute jobs, approved on 2026-09-23 so the second GPU can work, start only the fixed commands above. Both addresses and the port are supplied to `bundle-peer` and stored in the generated config, which is ignored by Git; a DHCP change means regenerating it. No firewall rules are changed automatically. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed. Full screenshot round-trip p95 was 411 ms over 20 menu captures; the transport still needs optimization before the 5 Hz runtime gate.
+The connection uses a pinned TLS certificate and a random token, and the worker accepts it only from its own PC's loopback. Other PCs reach it only through fleet's tunnel. It exposes worker operations, not a remote shell, and no port or firewall rule is opened. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed.
 
 ## Demonstrations and learning
 
 Record 1–4 hours of human play, in complete sessions, with HOI4 in front. Reserve entire sessions for validation and test. Real input timestamps, the pointer position and frame capture times are stored beside the video; the video's frame rate is not the timing source. `--game-speed` is the speed the game is set to for the whole session. It is required and written into the manifest, and the policy is told it, so sessions at different speeds can train together.
 
-To play on the second PC instead, add `--peer artifacts/pairing/peer.json` and `--hz 5`: its worker captures the screen and your inputs there, and the video is written here. With `--codec nvenc` the worker records on its own clock and encodes on that PC's NVIDIA encoder (H.264 4:4:4, at least as faithful as x264 at CRF 18), and only the video crosses the network; `record-ai` does this by default. On an arena game, `record` also reads the mod's log, so the manifest names who declared, which country you played and who won, and the win predictor can learn from your games as it does from the AI's. Start recording before you start the game. It stops by itself 15 s after the log names a winner, or when you press F12 or Ctrl+C, and nothing recorded is lost to a mistake: while the game is out of focus (a click outside it, an alt-tab) recording pauses and resumes, and anything that ends it early keeps what it has, with the reason in the manifest's `ended`.
+To play on the second PC instead, add `--peer artifacts/pairing/peer-fleet.json` and `--hz 5`: its worker captures the screen and your inputs there, and the video is written here. With `--codec nvenc` the worker records on its own clock and encodes on that PC's NVIDIA encoder (H.264 4:4:4, at least as faithful as x264 at CRF 18), and only the video crosses the network; `record-ai` does this by default. On an arena game, `record` also reads the mod's log, so the manifest names who declared, which country you played and who won, and the win predictor can learn from your games as it does from the AI's. Start recording before you start the game. It stops by itself 15 s after the log names a winner, or when you press F12 or Ctrl+C, and nothing recorded is lost to a mistake: while the game is out of focus (a click outside it, an alt-tab) recording pauses and resumes, and anything that ends it early keeps what it has, with the reason in the manifest's `ended`.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe record data/raw/session-001 --seconds 1200 --hz 10 --split train --game-speed 4 --codec x264
-.venv\Scripts\hoi4-arena.exe record data/raw/session-002 --seconds 1800 --hz 5 --game-speed 5 --codec x264 --peer artifacts/pairing/peer.json
+.venv\Scripts\hoi4-arena.exe record data/raw/session-002 --seconds 1800 --hz 5 --game-speed 5 --codec x264 --peer artifacts/pairing/peer-fleet.json
 .venv\Scripts\hoi4-arena.exe check-session data/raw/session-001
 .venv\Scripts\hoi4-arena.exe train-bc data/raw artifacts/bc-none --auxiliary none
 ```
@@ -124,22 +114,22 @@ Offline reinforcement learning, before any live self-play: `advantage` has a tra
 .venv\Scripts\hoi4-arena.exe train-bc data/human artifacts/bc-awr --advantage
 ```
 
-A scripted player makes games whose recorded inputs do decide who wins, without anyone at the keyboard. `record-ai --player scripted` has it fight the recorder's country against the game's AI through the real interface. While the game is still paused it forms the divisions into an army (shift+click on the "Unassigned divisions" alert, then the green + in the army bar). It draws a front line on the border (Z, then a click) and an offensive into enemy land (X, then a right-drag). Then it runs the game and activates the plan (the arrow above the army card). Each game draws its strategy at random: a near or deep offensive, or none; a wait of 0 to 60 s before activating; and sometimes a new offensive every 40 to 120 s. Its inputs are stored as labels, like the camera's, and the manifest lists every order with the frame it was given at and the enemy state it aimed at. `win-rate` reads the results files and reports its record against the AI, overall, by side and by strategy, with 95% intervals. It is the first baseline a learned agent must beat. Its games train with `--sources scripted`.
+A scripted player makes games whose recorded inputs do decide who wins, without anyone at the keyboard. `record-ai --player scripted` has it fight the recorder's country against the game's AI through the real interface. While the game is still paused it forms the divisions into an army (shift+click on the "Unassigned divisions" alert, then the green + in the army bar). It draws a front line on the border (Z, then a click) and an offensive into enemy land (X, then a right-drag). Then it runs the game and activates the plan (the arrow above the army card). Each game draws its strategy at random: a near or deep offensive, or none; a wait of 0 to 60 s before activating; and sometimes a new offensive every 40 to 120 s. Its inputs are stored as labels, like the camera's, and the manifest lists every order with the frame it was given at and the enemy state it aimed at. `win-rate` reads the results files and reports its record against the AI, overall, by side and by strategy, with 95% intervals. It is the first baseline a learned agent must beat. Its games train with `--sources scripted`. On the second PC it runs as the station's recording run (Second PC, above).
 
 Since v4 (`arena-12x8-v4`) the recorder decides who declares the war with a fair coin, fired from the console, because the game's own flip at startup came out Red in 36 of 44 games. Arenas since v3 also report each side's true state every day in game.log: divisions in each state, the game's estimate of its army's strength against the enemy's, casualties, manpower, and rifles held against rifles needed. Recordings keep every mod line with the frame it was read at (`arena-log.jsonl`). `train-state-value` fits a small win predictor on that state, on the CPU in seconds. `advantage --state-value` then values each decision from the state rather than from the screen. Training may read the state; the agent never does, and a vanilla lobby has no mod.
 
 ```powershell
-.venv\Scripts\hoi4-arena.exe record-ai artifacts/scripted-games --minutes 240 --player scripted --mod artifacts/mods/arena-12x8-v4 --speeds 5 --peer artifacts/pairing/peer.json --peer-only
+.venv\Scripts\hoi4-arena.exe record-ai artifacts/scripted-games --minutes 240 --player scripted --mod artifacts/mods/arena-12x8-v4 --speeds 5
 .venv\Scripts\hoi4-arena.exe win-rate artifacts/scripted-games/results-peer-20260923.json
 .venv\Scripts\hoi4-arena.exe train-state-value artifacts/state-value.pt artifacts/scripted-games/scripted-peer-20260923-185544
 .venv\Scripts\hoi4-arena.exe advantage --state-value artifacts/state-value.pt artifacts/scripted-games/scripted-peer-20260923-185544
 ```
 
-A learned policy imitates the scripted player's games and then plays them itself. `--lead-in 0` starts a recording's decisions at its first frame (the Qwen tower reads no clip, and the scripted player forms its army in the first 2.5 s), and `--drop-keys 0x20` leaves the space bar out of the labels, since the harness presses it. `--state-weight` and `--order-weight` add training-only losses: the memory predicts the arena's true state from its log and the scripted player's next order. A `splits.json` in the data folder chooses the held-out games. `play-policy` then has a checkpoint play on the second PC against the game's AI, from the screen, recorded; it reserves that PC from the scripted player's recorder first (`artifacts/eval`), and `--point` places each move on its likeliest spot.
+A learned policy imitates the scripted player's games and then plays them itself. `--lead-in 0` starts a recording's decisions at its first frame (the Qwen tower reads no clip, and the scripted player forms its army in the first 2.5 s), and `--drop-keys 0x20` leaves the space bar out of the labels, since the harness presses it. `--state-weight` and `--order-weight` add training-only losses: the memory predicts the arena's true state from its log and the scripted player's next order. A `splits.json` in the data folder chooses the held-out games. `play-policy` then has a checkpoint play on the second PC against the game's AI, from the screen, recorded (the station's evaluations run it there), and `--point` places each move on its likeliest spot.
 
 ```powershell
 .venv\Scripts\hoi4-arena.exe train-bc data/scripted artifacts/bc-scripted --sources scripted --lead-in 0 --drop-keys 0x20 --look-before-click --state-weight 0.5 --order-weight 0.2
-.venv\Scripts\hoi4-arena.exe play-policy artifacts/bc-scripted/epoch-0000.pt artifacts/live --peer artifacts/pairing/peer.json --games 2 --minutes 40 --reservation first-look --point
+.venv\Scripts\hoi4-arena.exe play-policy artifacts/bc-scripted/epoch-0000.pt artifacts/live --peer artifacts/pairing/peer-fleet.json --games 2 --minutes 40 --point
 ```
 
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
@@ -236,7 +226,7 @@ Arguments after the script go to pytest. Keep `-n` equal to `--cpus`, because ea
 On Linux, the tests that need CUDA, PowerShell 7, NTFS junctions or Windows' file locking skip and say why. To run those without taking this PC, use the second PC's fleet node (Windows), with `-n 4`. Name the files, and never use `--mirror` there:
 
 ```powershell
-fleet run --on <second-pc-node> --name hoi4-ai-tests -- uv run --frozen --extra dev pytest -q -n 4 -p no:cacheprovider tests/test_salvage.py tests/test_fleet_contract.py
+fleet run --on <second-pc-node> --name hoi4-ai-tests -- uv run --frozen --extra dev pytest -q -n 4 -p no:cacheprovider tests/test_salvage.py tests/test_worker_service.py
 ```
 
 Model attribution and usage terms are in [NOTICE.md](NOTICE.md).

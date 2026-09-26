@@ -14,7 +14,7 @@
   },
   "right": {
     "country": "RED",
-    "peer": "artifacts/pairing/peer.json",
+    "peer": "artifacts/pairing/peer-fleet.json",
     "rules": "artifacts/calibration-right/rules.json",
     "recipe": "artifacts/calibration-right/reset.json"
   }

@@ -1,6 +1,6 @@
 """What a PC running the worker is doing, from the worker's `telemetry` operation.
 
-`hoi4-arena telemetry [--peer peer.json] [--watch 5]` prints it. On the second PC it goes
+`hoi4-arena telemetry [--peer artifacts/pairing/peer-fleet.json] [--watch 5]` prints it. On the second PC it goes
 through an observer connection, so it works while a recording holds the game there.
 """
 

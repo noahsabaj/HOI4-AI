@@ -1,5 +1,6 @@
 """The second PC's station loop (scripts/station.py): lending the GPU to fleet between
-sessions, stopping for a restart or a drain, and telling a session that played nothing."""
+sessions, stopping for a restart or a drain, telling a session that played nothing, and
+the plan's one-off recording run."""
 
 import importlib.util
 import json
@@ -68,6 +69,8 @@ def test_it_stops_between_sessions_for_a_restart_or_a_drain(station, tmp_path):
         ("play-policy", [], False),
         ("play-policy", [{"winner": "BLU"}], True),
         ("practice", None, False),
+        ("record-ai", [{"game": "a", "error": "no launch"}], False),
+        ("record-ai", [{"game": "a", "error": "x"}, {"game": "b", "winner": "timeout"}], True),
     ],
 )
 def test_a_session_counts_as_played_only_if_its_summary_says_so(
@@ -76,7 +79,8 @@ def test_a_session_counts_as_played_only_if_its_summary_says_so(
     folder = tmp_path / "out"
     folder.mkdir()
     if written is not None:
-        (folder / station.SUMMARIES[command]).write_text(json.dumps(written))
+        name = station.SUMMARIES[command].replace("*", "20260926-120000")
+        (folder / name).write_text(json.dumps(written))
     assert station.played(command, str(folder)) is played
 
 
@@ -88,3 +92,15 @@ def test_every_session_is_listed_for_collection(station):
     assert ok is False, "no summary: nothing played"
     listed = [json.loads(line) for line in station.FINISHED.read_text().splitlines()]
     assert listed[0]["output"] == "artifacts/drills/x" and listed[0]["played"] is False
+
+
+def test_the_plan_s_recording_run_plays_here_once_per_name(station):
+    ran = []
+    entry = {"name": "sv6", "minutes": 120, "args": ["--player", "scripted", "--speeds", "5"]}
+    assert station.record(entry, run=lambda *a: ran.append(a) or 0) is True
+    assert ran == [("record-ai", "artifacts/record-sv6", "--peer", station.PEER, "--peer-only",
+                    "--minutes", "120", "--player", "scripted", "--speeds", "5")]  # fmt: skip
+    assert station.record(entry, run=lambda *a: ran.append(a) or 0) is False, "once"
+    assert len(ran) == 1
+    listed = [json.loads(line) for line in station.FINISHED.read_text().splitlines()]
+    assert listed[0]["output"] == "artifacts/record-sv6", "collected like any session"
