@@ -42,8 +42,9 @@ jobs:
       # test that was executing, which is the one thing needed to tell a torch dispatch
       # problem from a bug of ours. (With -n, a crashed worker is named with its test.)
       # One test at a time took 9 of the job's 10 minutes; a dozen tests are 5 of those,
-      # so the workers steal work rather than split the files evenly.
-      - run: uv run pytest -v -n auto --dist worksteal
+      # so the workers steal work rather than split the files evenly. `auto` counts physical
+      # cores, 2 of the runner's 4 threads.
+      - run: uv run pytest -v -n logical --dist worksteal
       # Runs whatever the outcome, so a crashed run still says which machine it was on.
       - if: always()
         run: uv run python -c "import platform, torch; print(platform.processor()); print(torch.__config__.show())"
