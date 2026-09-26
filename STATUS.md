@@ -854,6 +854,18 @@ each change below is a flag measured against what it replaces.
   an 8 GB card in real time, and most are closed. What they teach is kept for later:
   emitting short chunks of actions, and thinking only now and then, which a paused
   game allows.
+- **Noted for later: Explorative Modeling (2607.27372, 2026-07).** Each training step
+  draws K candidates and trains only the one nearest the data, so a regression loss
+  stops averaging several valid answers into one blurred wrong one. It gains with scale
+  (the same image quality with 6.2x less data or 4.1x fewer FLOPs), overfits less on a
+  small dataset, and makes one-pass generators: a behaviour-cloning policy matches
+  Diffusion Policy with 1 network pass instead of 100, and a world model matches
+  Diffuser with 16-256x fewer. Our action head does not need it: it samples discrete
+  tokens (a cell, then a spot in it) with an exact likelihood, which already holds
+  several answers. It fits a model of the next screen's features for the reinforcement
+  learning phase: that is a regression, blur is its usual failure, and one pass a
+  decision would fit a 200 ms tick. The paper suggests pairing it with JEPA-style
+  feature world models.
 
 ## A scripted player and the true state (2026-09-23)
 
