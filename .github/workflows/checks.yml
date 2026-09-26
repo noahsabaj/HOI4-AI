@@ -40,11 +40,13 @@ jobs:
       # The crash is a hard fault, so pytest prints no summary and -q leaves only a row of
       # dots: the run that prompted this showed 25 of them and no test name. -v names the
       # test that was executing, which is the one thing needed to tell a torch dispatch
-      # problem from a bug of ours.
-      - run: uv run pytest -v
+      # problem from a bug of ours. (With -n, a crashed worker is named with its test.)
+      # One test at a time took 9 of the job's 10 minutes; a dozen tests are 5 of those,
+      # so the workers steal work rather than split the files evenly.
+      - run: uv run pytest -v -n 4 --dist worksteal
       # Runs whatever the outcome, so a crashed run still says which machine it was on.
       - if: always()
-        run: uv run python -c "import platform, torch; print(platform.processor()); print(torch.__config__.show())"
+        run: uv run python -c "import os, platform, torch; print(platform.processor(), os.cpu_count()); print(torch.__config__.show())"
 
   rust:
     # Must be Windows: the entire worker lives in `#[cfg(windows)] mod platform`, so
