@@ -13,10 +13,10 @@
 # certificate and token), and every job leaves its command, log and end in jobs\.
 #
 # The fleet project's `fleet` command (which replaced this project's `peer`, 2026-09-25)
-# relies on this: the `project` kind and its hex spec, jobs\<id>.json (its state, one of
-# starting, running, done, failed, stopped or lost; its project; and log_bytes, the log's
-# length once it has ended) and jobs\<id>.log. Keep them compatible, or tell the user
-# before changing them (tests/test_fleet_contract.py).
+# used this until 2026-09-26, when it moved to a node of its own on this PC: the `project`
+# kind and its hex spec, jobs\<id>.json (its state, one of starting, running, done, failed,
+# stopped or lost; its project; and log_bytes, the log's length once it has ended) and
+# jobs\<id>.log. Nothing relies on them now; tests/test_fleet_contract.py keeps them working.
 #
 # -Action start -Id <id> -Spec <hex of {"kind", "args"[, "project"]}>
 #   setup    Build the Python environment in compute\ with uv (compute\tools\uv.exe).
