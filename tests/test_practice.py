@@ -13,11 +13,15 @@ SCREEN = {"rgb": LAND}
 
 
 class _Planner:
-    """The scripted player's steps, as the test sets them."""
+    """The scripted player's steps and its template search, as the test sets them."""
 
     def __init__(self):
         self.steps = []
         self.fail = set()
+        self.shown = set()
+
+    def find(self, rgb, name, top=0.0):
+        return (0.5, 0.5) if name in self.shown else None
 
     def form_army(self, desk):
         self._do("army", desk)
@@ -102,6 +106,15 @@ def test_a_camera_off_the_arena_is_brought_back(coach, monkeypatch):
     coach.take_over(_Desk(), "camera", 9.0)
     assert recentred == [1] and coach.lost_since is None
     assert coach.coached[-1]["step"] == "camera"
+
+
+def test_an_army_counts_only_once_no_division_is_left_out(coach):
+    SCREEN["rgb"] = _card(False)
+    coach.planner.shown = {"unassigned"}  # an army of one division; the alert stays up
+    assert coach.look(_Desk(), 5.0, running=False) is None and "army" not in coach.done
+    coach.planner.shown = set()
+    coach.look(_Desk(), 9.0, running=False)
+    assert coach.done["army"] == {"at": 9.0, "by": "policy"}
 
 
 def test_a_step_the_coach_cannot_do_is_given_up_not_retried(coach):

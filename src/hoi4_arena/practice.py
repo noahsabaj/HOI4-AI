@@ -117,7 +117,9 @@ class Coach:
         self.next_look = seconds + self.look_every
         rgb = screen(desk)
         army, general = army_card(rgb)
-        if army:
+        # All its divisions, too: bc5 formed armies of one division of eight (a click on the
+        # unassigned alert without Shift), and the alert stayed up (2026-09-26).
+        if army and self.planner.find(rgb, "unassigned") is None:
             self.seen("army", seconds)
         if general:
             self.seen("general", seconds)
