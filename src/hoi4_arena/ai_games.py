@@ -111,6 +111,9 @@ SCREENS = Path("artifacts/screens-1080p")
 # The least TM_CCOEFF_NORMED at which these screens count as shown: 1.00 where each
 # showed, at most 0.79 on every other screen tried.
 SHOWN = 0.9
+# The main menu's Single Player button (menu-single-player.png): lower than SHOWN, since
+# it was cut on a Linux station and Windows may draw its text a little differently.
+MENU_SHOWN = 0.8
 # Games loaded in a row before HOI4 is launched afresh anyway, and the seconds allowed for
 # clearing the end of a game until the menu opens.
 LOADS_PER_LAUNCH, MENU_SECONDS = 8, 30
@@ -602,6 +605,19 @@ def menu_ready(desk, seconds=60, still=2.0):
     return False
 
 
+def main_menu(desk, seconds=60):
+    """Wait up to `seconds` for the main menu's Single Player button; False if it never
+    shows. The button scored 1.0 on the menu and at most 0.62 on the loading screen, the
+    first-launch news, the single-player menu and the picker (a Linux station, 1080p)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if shown(screen(desk), "menu-single-player", MENU_SHOWN) is not None:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(1)
+
+
 def own_land(crop, country):
     """The largest patch of `country`'s land colour in `crop`, or None if there is little.
 
@@ -761,6 +777,12 @@ def start_game(
         # Each menu was up within a second of its click on the second PC (2026-09-24),
         # where the recorder had waited 8, 40 and 40 s.
         menu_ready(desk)
+        # The first click waits for the main menu itself, its Single Player button, and
+        # is never made on anything else: clicks made early landed on the loading screen,
+        # and the picker's search for land then found the menu's blue store banner.
+        if not main_menu(desk):
+            Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
+            raise RuntimeError("the main menu is not showing; nothing was clicked")
         click(desk, *SINGLE_PLAYER)
         time.sleep(3)
         click(desk, *NEW_GAME)
