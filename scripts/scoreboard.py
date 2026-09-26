@@ -10,6 +10,9 @@ runs left in artifacts/learned:
   (practice-peer.json, practice.summary). The fast number: ~30 episodes an hour.
 - coach: how often the coach managed a step it took over, which sets how much each
   practice hour teaches.
+- complete: how often the policy completed the whole setup itself, in practice and in
+  live games (practice.setup_complete: an army with a general, a front, an offensive).
+  The progress measure reported beside wins, which are too rare to steer by.
 - live: games and wins against the game's AI (results-peer.json). The slow number.
 Then the setup drills (artifacts/drills/*/drills-peer.json): how many completed, and an hour.
 """
@@ -19,6 +22,8 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
+
+from hoi4_arena.practice import setup_complete
 
 STEPS = ("army", "general", "front", "running")
 
@@ -42,7 +47,7 @@ def sampled_at(game, default=None):
 def score(root):
     """{(checkpoint, temperature, pointer temperature): its practice and live scores}."""
     board = defaultdict(lambda: {"practice": 0, "own": defaultdict(int), "coach": defaultdict(lambda: [0, 0]),
-                                 "live": 0, "wins": 0})  # fmt: skip
+                                 "live": 0, "wins": 0, "complete": 0, "live_complete": 0})  # fmt: skip
     for path in sorted(Path(root).glob("practice-*/practice-peer.json")):
         run = json.loads(path.read_text())
         # Each episode names its own; a summary's are a list when its episodes differ.
@@ -58,6 +63,7 @@ def score(root):
                 continue
             entry = board[(checkpoint_of(path.parent), *sampled_at(episode, default))]
             entry["practice"] += 1
+            entry["complete"] += bool(setup_complete(episode))
             for step in STEPS:
                 by = (steps.get(step) or {}).get("by")
                 entry["own"][step] += by == "policy"
@@ -70,6 +76,7 @@ def score(root):
                 entry = board[(checkpoint_of(path.parent), *sampled_at(game))]
                 entry["live"] += 1
                 entry["wins"] += game["winner"] == game.get("started_as")
+                entry["live_complete"] += bool(setup_complete(game))
     return board
 
 
@@ -85,7 +92,8 @@ def drills(root):
 
 def table(board):
     head = "| checkpoint | temperature | pointer | practice | " + " | ".join(STEPS)
-    rows = [head + " | coach front | live wins |", "|" + "---|" * (len(STEPS) + 6)]
+    rows = [head + " | complete | coach front | live wins | live complete |"]
+    rows.append("|" + "---|" * (len(STEPS) + 8))
     for key in sorted(board):
         name, t, pointer = key
         e = board[key]
@@ -93,9 +101,11 @@ def table(board):
         own = [f"{e['own'][s]}/{n}" if n else "" for s in STEPS]
         won, tried = e["coach"]["front"]
         coach = f"{won}/{tried}" if tried else ""
+        done = f"{e['complete']}/{n}" if n else ""
         live = f"{e['wins']}/{e['live']}" if e["live"] else ""
+        live_done = f"{e['live_complete']}/{e['live']}" if e["live"] else ""
         at = f"| {name} | {t:g} | {pointer:g} | {n or ''} | "
-        rows.append(at + " | ".join(own) + f" | {coach} | {live} |")
+        rows.append(at + " | ".join(own) + f" | {done} | {coach} | {live} | {live_done} |")
     return "\n".join(rows)
 
 

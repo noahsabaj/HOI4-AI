@@ -139,8 +139,39 @@ def test_the_summary_counts_the_policy_s_own_steps():
     ]
     summary = practice.summary(episodes)
     assert summary == {"episodes": 2, "army": "1/2", "general": "0/2", "front": "0/2",
-                       "running": "1/2", "coach_army": "1/1", "own_steps_mean": 1.0,
+                       "running": "1/2", "complete": "0/2", "coach_army": "1/1", "own_steps_mean": 1.0,
                        "temperature": 1.0, "pointer_temperature": 1.0}  # fmt: skip
+
+
+def _steps(**by):
+    return {step: {"at": 1.0, "by": who} for step, who in by.items()}
+
+
+def test_setup_completes_with_an_army_a_general_a_front_and_an_offensive():
+    own = _steps(army="policy", general="policy", front="policy", running="policy")
+    drawn = {"offensive": 1}
+    assert practice.setup_complete({"setup": {"steps": own}, "milestones": drawn})
+    assert not practice.setup_complete({"setup": {"steps": own}, "milestones": {}}), "no offensive"
+    helped = {**own, "front": {"at": 60.0, "by": "coach", "confirmed": 63.0}}
+    episode = {"setup": {"steps": helped}, "milestones": drawn}
+    assert not practice.setup_complete(episode), "the coach's front is not the policy's own"
+    assert practice.setup_complete(episode, own=False)
+    failed = {**own, "front": {"at": 60.0, "by": "coach", "confirmed": None}}
+    assert not practice.setup_complete({"setup": {"steps": failed}, "milestones": drawn}, own=False)
+    assert practice.setup_complete({"error": "the game did not start"}) is None
+
+
+def test_a_live_game_s_setup_is_read_from_its_milestones():
+    marks = {"alert": 3, "plus": 1, "portrait": 1, "commander": 0, "front": 2, "offensive": 1,
+             "arrow": 1, "army_card": 0}  # fmt: skip
+    assert practice.setup_complete({"milestones": marks, "winner": "RED"})
+    assert not practice.setup_complete({"milestones": {**marks, "arrow": 0}}), "never executed"
+    assert not practice.setup_complete({"milestones": {**marks, "plus": 0}}), "no army"
+    assert practice.setup_complete({"milestones": {**marks, "plus": 0, "army_card": 2}})
+    assert not practice.setup_complete({"milestones": {**marks, "portrait": 0}}), "no general"
+    games = [{"milestones": marks}, {"milestones": {**marks, "front": 0}}, {"error": "crash"}]
+    assert practice.setup_rate(games) == {"games": 2, "complete": 1, "rate": 0.5}
+    assert practice.setup_rate([]) == {"games": 0, "complete": 0, "rate": None}
 
 
 def test_a_practice_game_teaches_only_what_the_coach_did(tmp_path):
