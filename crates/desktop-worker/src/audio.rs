@@ -284,8 +284,10 @@ mod live {
         let bytes = got.lock().unwrap().clone();
         let frames = bytes.len() / BYTES_PER_FRAME;
         let samples: Vec<i16> = bytes
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b))
             .collect();
         let loudest = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
         println!("{frames} frames in 2 s, loudest {loudest}");
