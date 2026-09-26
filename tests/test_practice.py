@@ -13,11 +13,15 @@ SCREEN = {"rgb": LAND}
 
 
 class _Planner:
-    """The scripted player's steps, as the test sets them."""
+    """The scripted player's steps and its template search, as the test sets them."""
 
     def __init__(self):
         self.steps = []
         self.fail = set()
+        self.shown = set()
+
+    def find(self, rgb, name, top=0.0):
+        return (0.5, 0.5) if name in self.shown else None
 
     def form_army(self, desk):
         self._do("army", desk)
@@ -104,6 +108,15 @@ def test_a_camera_off_the_arena_is_brought_back(coach, monkeypatch):
     assert coach.coached[-1]["step"] == "camera"
 
 
+def test_an_army_counts_only_once_no_division_is_left_out(coach):
+    SCREEN["rgb"] = _card(False)
+    coach.planner.shown = {"unassigned"}  # an army of one division; the alert stays up
+    assert coach.look(_Desk(), 5.0, running=False) is None and "army" not in coach.done
+    coach.planner.shown = set()
+    coach.look(_Desk(), 9.0, running=False)
+    assert coach.done["army"] == {"at": 9.0, "by": "policy"}
+
+
 def test_a_step_the_coach_cannot_do_is_given_up_not_retried(coach):
     coach.planner.fail = {"army"}
     assert coach.look(_Desk(), 21.0, running=False) == "army"
@@ -126,7 +139,7 @@ def test_the_summary_counts_the_policy_s_own_steps():
     ]
     summary = practice.summary(episodes)
     assert summary == {"episodes": 2, "army": "1/2", "general": "0/2", "front": "0/2",
-                       "running": "1/2", "own_steps_mean": 1.0}  # fmt: skip
+                       "running": "1/2", "coach_army": "1/1", "own_steps_mean": 1.0}  # fmt: skip
 
 
 def test_a_practice_game_teaches_only_what_the_coach_did(tmp_path):
@@ -138,3 +151,42 @@ def test_a_practice_game_teaches_only_what_the_coach_did(tmp_path):
     taught = (decisions >= times[10]) & (decisions <= times[20])
     assert taught.any() and (~taught).any()
     assert (labels["weight"][taught] == 1).all() and (labels["weight"][~taught] == 0).all()
+
+
+def test_drills_stay_on_an_arena_for_a_block_with_the_countries_alternating():
+    order = practice.drill_order(["a", "b"], ["BLU", "RED"], 6, 2)
+    assert order == [
+        ("a", "BLU"),
+        ("a", "RED"),
+        ("b", "BLU"),
+        ("b", "RED"),
+        ("a", "BLU"),
+        ("a", "RED"),
+    ]
+
+
+def test_every_arena_with_a_start_save_can_be_drilled(tmp_path):
+    registry = tmp_path / "saves.json"
+    registry.write_text(
+        json.dumps({"arena-bay-v6": {"BLU": "arenabayv6blu", "RED": "arenabayv6red"}})
+    )
+    saves = practice.drill_saves(registry)
+    assert saves[("arena-bay-v6", "RED")] == "arenabayv6red"
+    assert saves[(practice.MAIN_ARENA, "BLU")] == "arenav4blu", "the main arena's own"
+
+
+def test_a_scramble_goes_straight_to_the_desktop_and_says_what_it_did(monkeypatch):
+    import random
+
+    done = []
+    monkeypatch.setattr(
+        "hoi4_arena.ai_games.kick_camera", lambda desk, rng, zoom: done.append("camera")
+    )
+    monkeypatch.setattr("hoi4_arena.ai_games.click", lambda desk, x, y: done.append("click"))
+    monkeypatch.setattr("hoi4_arena.ai_games.act", lambda desk, events: done.append(events))
+    monkeypatch.setattr("hoi4_arena.practice.time.sleep", lambda s: None)
+    for seed in range(20):
+        done.clear()
+        kinds = practice.scramble(object(), random.Random(seed))
+        assert 1 <= len(kinds) <= 3 and len(done) == len(kinds)
+        assert set(kinds) <= set(practice.SCRAMBLES)

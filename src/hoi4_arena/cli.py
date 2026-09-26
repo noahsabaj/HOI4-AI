@@ -238,6 +238,26 @@ def main():
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill.add_argument("--model", dest="model_path")
     drill.add_argument("--seed", type=int)
+    drill = sub.add_parser(
+        "drills",
+        help="The scripted player's setup alone, over and over, on the second PC: recorded "
+        "demonstrations of the part of a game the learned player gets wrong, many from a "
+        "scrambled start (practice.drills).",
+    )
+    drill.add_argument("output", help="A folder for the drills and drills-peer.json")
+    drill.add_argument("--peer", required=True, help="The second PC's pairing file")
+    drill.add_argument("--episodes", type=int, default=40)
+    drill.add_argument("--minutes", type=float, required=True, help="Time budget for all")
+    drill.add_argument("--arenas", nargs="+", default=["arena-12x8-v4"])
+    drill.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    drill.add_argument(
+        "--scrambled", type=float, default=0.7, help="The share of drills from a scramble"
+    )
+    drill.add_argument("--block", type=int, default=4, help="Drills in a row on an arena")
+    drill.add_argument("--after", type=float, default=8.0, help="Seconds run after the setup")
+    drill.add_argument("--reservation", help="Reserve the second PC first, as play-policy")
+    drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    drill.add_argument("--seed", type=int)
     live = sub.add_parser(
         "play-policy",
         help="A trained policy plays arena games against the game's AI on the second PC, "
@@ -596,6 +616,12 @@ def main():
         action="store_true",
         help="Leave out the moves that only park the pointer so the scripted player can read "
         "the screen (dataset.parking_moves)",
+    )
+    train.add_argument(
+        "--balance",
+        action="store_true",
+        help="Weigh every (arena, side) group of recordings the same in the loss "
+        "(dataset.balance_weights)",
     )
     train.add_argument(
         "--held-previous",
@@ -1070,6 +1096,12 @@ def _dispatch(command, args):
             keep_free_gb=args["keep_free"],
             int8=args["int8"],
         )
+    elif command == "drills":
+        from .practice import drills
+
+        args["arenas"] = tuple(args["arenas"])
+        args["countries"] = tuple(args["countries"])
+        result = drills(args.pop("output"), **args)
     elif command == "practice":
         from .practice import practice
 
