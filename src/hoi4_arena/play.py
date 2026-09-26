@@ -425,7 +425,7 @@ def play_policy_game(
     if log_from is not None:
         arena.offset = log_from
     if coach is not None:
-        coach.attach(rec)
+        coach.attach(rec, root)
     watch = Watch(root, station, snap_every)
     stamped, timings = [], []
     outcome, reason, ending = "timeout", None, None
