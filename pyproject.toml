@@ -32,6 +32,10 @@ dependencies = [
     # 3.6 gives the eager head's log-likelihoods exactly, which PPO relies on; 3.8, the
     # newest, was no faster (38.5 against 38.6 ms a decision) and differed by 3.8e-6.
     "triton-windows>=3.6,<3.7; sys_platform == 'win32'",
+    # NVIDIA's video decoder for training's reader (nvdec.py): HEVC 4:4:4 into host memory
+    # at ~4 ms of CPU a frame. It loads only with an NVIDIA driver; without one the reader
+    # stays on ffmpeg.
+    "pynvvideocodec>=2.2; sys_platform == 'win32' or sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

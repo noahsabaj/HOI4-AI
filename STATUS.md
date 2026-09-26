@@ -762,6 +762,85 @@ open. It also leaves alone one its recorder closed as unusable. Salvaged copies 
 scripted game and an AI game loaded for training with as many decisions per frame as
 complete games.
 
+## Decoding recordings on the GPU (2026-09-26)
+
+Training read every frame with `ffmpeg -i screen.mkv -f rawvideo -pix_fmt rgb24` on the
+CPU, because NVIDIA's decoder (NVDEC) cannot read H.264 4:4:4, the recordings' codec. It
+can read HEVC 4:4:4 (Range Extensions), which NVENC encodes as cheaply.
+
+**Where the CPU went.** Per 1080p frame of a 500-frame game clip on this PC (CPU time of
+ffmpeg and of the Python reader together, through the reader's pipe, with other jobs
+running):
+
+| Path | ffmpeg CPU | Reader CPU |
+|---|---|---|
+| H.264 on the CPU, as RGB (before) | 41 ms | 7 ms |
+| H.264 on the CPU, as 4:4:4 planes | 24 ms | 7 ms |
+| HEVC on the CPU, as RGB | 64 ms | 7 ms |
+| HEVC on ffmpeg's CUDA decoder, as RGB | 31 ms | 7 ms |
+| HEVC on ffmpeg's CUDA decoder, as planes | 18.5 ms | 7.5 ms |
+| **HEVC on NVDEC through PyNvVideoCodec, planes into host memory** | none | **4.4 ms** (4.7 ms wall) |
+
+`ffmpeg -benchmark` splits the old path: decoding the H.264 is ~10 ms of CPU a frame, and
+swscale's conversion of its 4:4:4 YUV to RGB ~20 ms. Into GPU memory PyNvVideoCodec takes
+1.0 ms of CPU (2.0 ms wall), but a DataLoader worker cannot hand CUDA tensors to the
+trainer on Windows, so the planes come through host memory. PyNvVideoCodec 2.2.3 is a
+10 MB wheel with no dependencies; it refuses H.264 4:4:4 as NVDEC does. torchcodec is
+not installed and was not needed.
+
+**The same pixels.** swscale's yuv444p to rgb24 is a function of each pixel alone (full
+chroma, no dither at 8 bits), so `nvdec.rgb_table` asks the PC's own ffmpeg for all 2^24
+of its outputs once (0.8 s, 48 MB) and `to_rgb` looks every pixel up on the GPU in
+1.2 ms a frame (on the CPU it would take 33-99 ms). Checked on real recordings: the table
+gives ffmpeg's rgb24 for every frame (691 of 691); NVDEC's planes are ffmpeg's decode of
+the same HEVC (500 of 500); ffmpeg's CUDA decoder gives the CPU's RGB (691 of 691); and
+windows through `VideoSessions(gpu_views=True)` and `batch_to_device` on CUDA had the same
+quadrants, fovea and actions whether read the old way from the H.264, as planes from the
+H.264, as planes from NVDEC, or as RGB from the HEVC.
+
+**In training.** With `--gpu-views` on a GPU, frames now travel from the loader as their
+4:4:4 planes plus the pointer, and `batch_to_device` converts them and crops the fovea
+there. HEVC goes to NVDEC (when PyNvVideoCodec loads), H.264 to ffmpeg as planes. In the
+loader on real recordings, ffmpeg's CPU per decision went from 32 ms (the old path) to
+26 ms (H.264 planes) and 0 (HEVC). The loader process's own CPU, ~30 ms a decision in
+every mode on the busy PC, is now the larger part and not yet explained. Each NVDEC
+decoder holds 0.2-0.3 GB of the card for the first in a process and 0.1-0.2 GB for each
+more; the conversion adds the 48 MB table and ~130 MB for each 16 frames. Without
+`--gpu-views` the frames stay RGB, and HEVC goes to ffmpeg's CUDA decoder (as does
+`cache-tower`): decoded on the CPU, HEVC costs about twice H.264 (75-80 against 168
+frames/s on a laptop's CPU).
+
+**Recording in HEVC.** Against 399 lossless frames (133 of the repo's 1080p screenshots,
+each held three frames; `scripts/codec_fidelity.py`, encoded on this PC's GPU, scored on a
+fleet laptop):
+
+| | KB/frame | PSNR whole / top / bottom | Worst pixel, 99.9% | Template scores moved | Rules' error change |
+|---|---|---|---|---|---|
+| NVENC H.264 4:4:4, p7, QP 14 (before) | 148.7 | 43.98 / 43.95 / 44.34 dB | 51, 9 | 0.0055 | 1.52 |
+| **NVENC HEVC 4:4:4, p7, QP 12** | 147.4 | **44.77 / 44.56 / 45.17 dB** | **49, 7** | **0.0021** | 1.55 |
+| NVENC HEVC, p7, QP 13 | 138.3 | 44.39 / 44.18 / 44.78 dB | 62, 8 | 0.0037 | 1.59 |
+| NVENC HEVC, p7, QP 14 | 127.4 | 43.93 / 43.68 / 44.33 dB | 76, 8 | 0.0059 | 1.68 |
+| NVENC HEVC, p5, QP 14 | 133.0 | 43.83 / 43.45 / 44.24 dB | 68, 8 | 0.0039 | 1.68 |
+| NVENC HEVC lossless | 447.7 | 52.19 / 52.98 / 52.26 dB | 2, 1 | 0.0023 | 0.34 |
+
+282 sightings of 16 templates; none moved in any candidate. So the recorders' default
+(`record-ai`, `play`, `practice`) is now `nvenc-hevc`, HEVC 4:4:4 at p7 and QP 12. On real
+games, re-encoded through BGRA as the worker hands frames over (three 500-frame clips), it
+is 1.03-1.06x the bytes of H.264 at QP 14. The worker streams it through NUT and the
+recorder's Matroska remux unchanged (checked with the worker's arguments, 100 of 100
+frames through NVDEC). A worker that cannot encode it falls back to H.264 NVENC, then to
+x264 here, as before.
+
+**The recordings already made.** `scripts/reencode_hevc.py` re-encodes a dataset's H.264
+recordings as lossless HEVC 4:4:4: every decoded frame is the H.264's, bit for bit (it
+checks each one and the packets' timestamps before it swaps the file in), so labels and
+tower caches stay valid. Lossless HEVC is 3.0-3.2x the H.264's bytes (four recordings),
+~200 frames/s to encode and ~24 frames/s with the check on this busy PC. scripted-v6
+(218 recordings, 23.2 GB) would become ~72 GB, more than D:'s 53 GB free on 2026-09-26. A
+lossy re-encode adds its own error to the H.264's (47-49 dB against the H.264's frames at
+QP 4-8, for 1.2-1.6x the bytes), so the script does not offer one. Until the data moves,
+H.264 recordings train through the planes path (31 against 48 ms of CPU a frame).
+
 ## Recording AI games
 
 `hoi4-arena record-ai` (`hoi4_arena.ai_games`) plays AI-vs-AI games in observer mode and records them.

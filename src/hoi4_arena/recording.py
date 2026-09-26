@@ -180,12 +180,25 @@ class Recorder:
 # worker's encoder profile and quality for each. "nvenc" is H.264 in full-resolution colour
 # (High 4:4:4) on that PC's NVIDIA video encoder at QP 14, where its frames keep what the
 # policy reads better than x264 at CRF 18 did, at about the same size (STATUS.md).
+# "nvenc-hevc", the recorders' default since 2026-09-26, is HEVC 4:4:4 at QP 12: more
+# faithful again for 5% more bytes, and the GPU decodes it for training (nvdec.py).
 STREAM_CODECS = {
     "nvenc": ("h264_nvenc", 14),
-    "nvenc-hevc": ("hevc_nvenc", 16),
+    "nvenc-hevc": ("hevc_nvenc", 12),
     "x264-source": ("x264", 18),
     "ffv1-source": ("ffv1", 0),
 }
+# The stream codec tried next when a worker cannot record one: a PC whose encoder has no
+# HEVC 4:4:4 still records H.264 4:4:4 on its GPU before falling back to x264 here.
+STREAM_FALLBACK = {"nvenc-hevc": "nvenc"}
+
+
+def stream_codecs(codec):
+    """`codec` and the stream codecs to try after it, in order."""
+    chain = [codec]
+    while chain[-1] in STREAM_FALLBACK:
+        chain.append(STREAM_FALLBACK[chain[-1]])
+    return chain
 
 
 # How often a stream recording notes what its PC spends on it, and on what.
@@ -812,13 +825,16 @@ def open_recorder(desk, root, first, *, game_speed, source="human", hz=15, codec
     encoder on its PC) falls back to x264 encoded here, and the manifest says which ran.
     """
     if codec in STREAM_CODECS:
-        try:
-            if int(desk.protocol()) >= 2:
-                return StreamRecorder(root, desk, game_speed=game_speed, source=source, hz=hz,
-                                      codec=codec, **kw)  # fmt: skip
+        if int(desk.protocol()) >= 2:
+            for tried in stream_codecs(codec):
+                try:
+                    return StreamRecorder(root, desk, game_speed=game_speed, source=source,
+                                          hz=hz, codec=tried, **kw)  # fmt: skip
+                except StreamUnavailable as error:
+                    log.warning("no %s recording stream (%s)", tried, error)
+            log.warning("no recording stream; encoding here with x264")
+        else:
             log.warning("the worker predates recording streams; encoding here with x264")
-        except StreamUnavailable as error:
-            log.warning("no recording stream (%s); encoding here with x264", error)
         codec = "x264"
     return Recorder(root, first, game_speed=game_speed, source=source, hz=hz, codec=codec, **kw)
 

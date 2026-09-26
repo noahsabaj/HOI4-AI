@@ -100,9 +100,11 @@ def build_parser():
         choices=["ffv1", "x264", "nvenc", "nvenc-hevc", "x264-source", "ffv1-source"],
         default="ffv1",
         help="ffv1 is lossless. x264 is visually lossless (CRF 18, 4:4:4) at about a "
-        "hundredth of the size. nvenc (H.264 4:4:4 at least as faithful as x264 CRF 18) and "
-        "the -source codecs are encoded by the worker on the PC that captures, on its own "
-        "clock; only the video crosses the network (falls back to x264 here if it cannot).",
+        "hundredth of the size. nvenc (H.264 4:4:4 at least as faithful as x264 CRF 18), "
+        "nvenc-hevc (HEVC 4:4:4, as faithful again and smaller, which training decodes on "
+        "the GPU) and the -source codecs are encoded by the worker on the PC that captures, "
+        "on its own clock; only the video crosses the network (nvenc-hevc falls back to "
+        "nvenc, and those to x264 here, if the worker cannot).",
     )
     record.add_argument(
         "--game-speed",
@@ -137,9 +139,10 @@ def build_parser():
     ai.add_argument(
         "--codec",
         choices=["ffv1", "x264", "nvenc", "nvenc-hevc", "x264-source", "ffv1-source"],
-        default="nvenc",
-        help="As for record. nvenc (the default) is recorded on the worker's clock and "
-        "encoded where the game runs; x264 is the old way, a request per frame, encoded here.",
+        default="nvenc-hevc",
+        help="As for record. nvenc-hevc (the default) and nvenc are recorded on the worker's "
+        "clock and encoded where the game runs; x264 is the old way, a request per frame, "
+        "encoded here.",
     )
     ai.add_argument("--cap-minutes", type=float, default=45)
     ai.add_argument(
@@ -646,7 +649,9 @@ def build_parser():
         "--gpu-views",
         action="store_true",
         help="Loader workers only decode: each frame's quadrants are cut on the GPU "
-        "(dataset.quadrant_views), the same pixels, without the CPU's ~20 ms a frame",
+        "(dataset.quadrant_views), the same pixels, without the CPU's ~20 ms a frame. Frames "
+        "then travel as 4:4:4 YUV planes, HEVC decoded by the GPU's video decoder, and are "
+        "converted to RGB there, again the same pixels (nvdec.py)",
     )
     train.add_argument(
         "--balance",

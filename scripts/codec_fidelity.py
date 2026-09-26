@@ -2,6 +2,7 @@
 
     python scripts/codec_fidelity.py OUT --truth truth.mkv [--only NAME,...]
     python scripts/codec_fidelity.py OUT --build-truth SOURCE... (PNGs or lossless videos)
+    python scripts/codec_fidelity.py OUT --encode-only, then elsewhere OUT --reuse
 
 The truth is lossless 1080p video (ffv1, bgr0): the frames a recorder would have written,
 held in the pixel format the worker hands its encoder (BGRA). Each candidate encodes the
@@ -112,6 +113,16 @@ for _cq in (14, 16):
     ]  # fmt: skip
 CANDIDATES["h264nv-lossless"] = [
     "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "lossless", "-profile:v", "high444p",
+    "-pix_fmt", "yuv444p", "-bf", "0", "-g", "100",
+]  # fmt: skip
+# HEVC 4:4:4 at the slowest preset: the GPU's decoder reads it (nvdec.py), H.264 4:4:4 not.
+for _qp in (10, 11, 12, 13, 14):
+    CANDIDATES[f"hevcnv-p7-qp{_qp}"] = [
+        "-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq", "-profile:v", "rext",
+        "-pix_fmt", "yuv444p", "-rc", "constqp", "-qp", str(_qp), "-bf", "0", "-g", "100",
+    ]  # fmt: skip
+CANDIDATES["hevcnv-lossless"] = [
+    "-c:v", "hevc_nvenc", "-preset", "p5", "-tune", "lossless", "-profile:v", "rext",
     "-pix_fmt", "yuv444p", "-bf", "0", "-g", "100",
 ]  # fmt: skip
 
@@ -297,6 +308,13 @@ def main(argv=None):
     ap.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     ap.add_argument("--only", nargs="+", default=[], help="Candidate names (default: all)")
     ap.add_argument("--threads", type=int, default=4, help="Encoder and OpenCV threads")
+    ap.add_argument(
+        "--encode-only",
+        action="store_true",
+        help="Encode the candidates and stop: the GPU's encoder is on one PC, and the "
+        "comparison, all CPU, can run on another (with --reuse)",
+    )
+    ap.add_argument("--reuse", action="store_true", help="Keep candidates already encoded")
     a = ap.parse_args(argv)
     cv2.setNumThreads(a.threads)
     out = Path(a.out)
@@ -306,31 +324,41 @@ def main(argv=None):
     truth = Path(a.truth) if a.truth else out / "truth.mkv"
     names = json.loads(Path(a.names or truth.with_name("names.json")).read_text())
     print(f"{len(names)} truth frames", file=sys.stderr, flush=True)
-    temps = templates(a.templates)
-    rule_set = rules(a.rules)
-    found = sightings(truth, names, temps, out / "sightings.json")
-    kinds = sorted({s[0] for v in found.values() for s in v})
-    print(f"{sum(map(len, found.values()))} template sightings: {kinds}", file=sys.stderr)
     wanted = a.only or list(CANDIDATES)
-    results_path = out / "results.json"
-    results = json.loads(results_path.read_text()) if results_path.exists() else {}
+    encode_fps = {}
     for name in wanted:
         path = out / f"{name}.mkv"
+        if a.reuse and path.exists():
+            continue
         start = time.perf_counter()
         rc = subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-i", str(truth), "-an", *CANDIDATES[name],
              "-threads", str(a.threads), str(path)]
         ).returncode  # fmt: skip
-        encode = time.perf_counter() - start
         if rc:
             print(f"{name}: encoder exit {rc}", file=sys.stderr, flush=True)
+            path.unlink(missing_ok=True)
+            continue
+        encode_fps[name] = round(len(names) / (time.perf_counter() - start), 1)
+    if a.encode_only:
+        return
+    temps = templates(a.templates)
+    rule_set = rules(a.rules)
+    found = sightings(truth, names, temps, out / "sightings.json")
+    kinds = sorted({s[0] for v in found.values() for s in v})
+    print(f"{sum(map(len, found.values()))} template sightings: {kinds}", file=sys.stderr)
+    results_path = out / "results.json"
+    results = json.loads(results_path.read_text()) if results_path.exists() else {}
+    for name in wanted:
+        path = out / f"{name}.mkv"
+        if not path.exists():
             continue
         row = {
             "candidate": name,
             "kbytes_per_frame": round(path.stat().st_size / len(names) / 1024, 1),
         }
         row.update(compare(truth, path, names, found, temps, rule_set))
-        row["encode_fps"] = round(len(names) / encode, 1)
+        row["encode_fps"] = encode_fps.get(name)
         row["decode_fps"] = round(len(names) / decode_seconds(path), 1)
         results[name] = row
         results_path.write_text(json.dumps(results, indent=2))

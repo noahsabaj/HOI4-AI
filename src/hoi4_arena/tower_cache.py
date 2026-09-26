@@ -28,7 +28,6 @@ import logging
 import os
 import queue
 import shutil
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -39,6 +38,7 @@ import torch.nn.functional as F
 
 from .dataset import PERIOD_NS, normalize, parse_cursor, views
 from .models import CELLS
+from .nvdec import open_frames
 
 GRID_FILE, SUMMARY_FILE, DONE = "tower-grid.npy", "tower-summary.npy", "done.json"
 # The grid as int8 with a scale per frame and channel (its largest magnitude over the
@@ -155,12 +155,9 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=
     summaries = np.lib.format.open_memmap(
         target / SUMMARY_FILE, "w+", np.int16, (len(kept), encoder.dim)
     )
-    decoder = subprocess.Popen(
-        [shutil.which("ffmpeg"), "-v", "error", "-i", str(Path(root) / "screen.mkv"),
-         "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-        stdout=subprocess.PIPE, bufsize=0,
-    )  # fmt: skip
-    size = width * height * 3
+    # ffmpeg's RGB, HEVC decoded by ffmpeg's CUDA decoder where there is one: the same
+    # pixels for half the CPU of decoding it on the CPU (nvdec.open_frames).
+    decoder = open_frames(Path(root) / "screen.mkv", width, height)
     autocast = {"device_type": torch.device(device).type, "dtype": torch.bfloat16}
     # Frames are read and cut into views on a thread of their own while the tower runs:
     # read one after the other, the pipe and the views took about 20 ms of each 60.
@@ -169,16 +166,11 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=
     def read():
         try:
             for index in range(count):
-                buffer = bytearray(size)
-                view, got = memoryview(buffer), 0
-                while got < size:
-                    part = decoder.stdout.readinto(view[got:])
-                    if not part:
-                        raise ValueError(f"{root}: video ends at frame {index} of {count}")
-                    got += part
+                frame = decoder.read()
+                if frame is None:
+                    raise ValueError(f"{root}: video ends at frame {index} of {count}")
                 if rows[index] < 0:
                     continue
-                frame = np.frombuffer(buffer, np.uint8).reshape(height, width, 3)
                 cursor = parse_cursor(json.loads(lines[index]).get("cursor"))
                 seen = views(frame, None, device=device, cursor=cursor).quadrants
                 frames.put((int(rows[index]), seen))
@@ -216,9 +208,7 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=
                 flush()
         flush()
     finally:
-        if decoder.poll() is None:
-            decoder.kill()
-        decoder.wait()
+        decoder.close()
         reader.join(timeout=10)
     grids.flush()
     summaries.flush()

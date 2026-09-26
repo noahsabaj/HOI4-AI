@@ -162,6 +162,18 @@ def test_an_encoder_that_gives_no_video_falls_back_to_x264_here(tmp_path):
         rec = recording.open_recorder(desk, tmp_path / name, first, game_speed=5, codec="nvenc")
         assert not rec.streamed
         rec.close()
+
+    # A worker without HEVC 4:4:4 still records H.264 4:4:4 on its GPU.
+    class _NoHevc(_Desk):
+        def start_stream(self, hz, profile, quality=None, views=None, **sizes):
+            self.profiles = [*getattr(self, "profiles", []), profile]
+            return _Stream(fail=profile == "hevc_nvenc")
+
+    desk = _NoHevc()
+    rec = recording.open_recorder(desk, tmp_path / "h", first, game_speed=5, codec="nvenc-hevc")
+    assert rec.streamed and rec.manifest["codec"] == "nvenc"
+    assert desk.profiles == ["hevc_nvenc", "h264_nvenc"]
+    rec.close()
     # Not a stream codec: the classic recorder, without asking the worker anything.
     rec = recording.open_recorder(None, tmp_path / "x", first, game_speed=5, codec="x264")
     assert not rec.streamed

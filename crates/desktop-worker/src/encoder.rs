@@ -59,10 +59,15 @@ pub const PROFILES: [Profile; 4] = [
         quality: (0, 14, 51),
         hardware: true,
     },
-    // NVENC HEVC, 4:4:4 (Range Extensions): smaller, but slower to decode.
+    // NVENC HEVC, 4:4:4 (Range Extensions), the same slowest preset: the recordings' codec
+    // since 2026-09-26, because NVIDIA's decoder reads it (it cannot read H.264 4:4:4), so
+    // training decodes on the GPU instead of the CPU (nvdec.py). At QP 12 it keeps more of
+    // every frame than H.264 at QP 14 (PSNR 44.77 against 43.98 dB, templates scoring 2.6x
+    // closer to lossless) for 5% more bytes on real games (scripts/codec_fidelity.py,
+    // 2026-09-26).
     Profile {
         name: "hevc_nvenc",
-        quality: (0, 16, 51),
+        quality: (0, 12, 51),
         hardware: true,
     },
     // The recordings' own encoder until 2026-09-24, run beside the game instead: CRF 18,
@@ -124,7 +129,7 @@ pub fn arguments(name: &str, quality: Option<u32>, hz: u32) -> Result<(Vec<Strin
             "-c:v",
             "hevc_nvenc",
             "-preset",
-            "p5",
+            "p7",
             "-tune",
             "hq",
             "-profile:v",
@@ -564,6 +569,12 @@ mod tests {
         assert_eq!(args[at + 1], "14");
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv444p"]));
         assert!(args.windows(2).any(|w| w == ["-g", "100"]));
+        // The recordings' codec: HEVC 4:4:4, which the training PC's GPU decodes.
+        let (args, q) = arguments("hevc_nvenc", None, 5).unwrap();
+        assert_eq!(q, 12);
+        assert!(args.windows(2).any(|w| w == ["-profile:v", "rext"]));
+        assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv444p"]));
+        assert!(args.windows(2).any(|w| w == ["-preset", "p7"]));
         let (args, _) = arguments("x264", Some(18), 5).unwrap();
         assert!(args.windows(2).any(|w| w == ["-crf", "18"]));
         assert_eq!(
