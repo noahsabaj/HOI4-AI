@@ -217,4 +217,19 @@ cargo test --locked
 cargo clippy --locked -- -D warnings
 ```
 
+This PC trains, plays and records, so run the Python tests on the fleet's CPU-only Linux laptops instead, with the fleet project's `fleet` command. Run it from a git worktree, which holds only tracked files: `--mirror` copies the folder as it is and deletes whatever it no longer has from the node's copy. Never run it from the main checkout, whose ignored data folders would be copied too.
+
+```powershell
+fleet submit --mirror --wait --name hoi4-ai-tests --cpus 8 --ram-gb 12 -- sh scripts/test_on_linux.sh -n 8
+fleet submit --mirror --wait --name hoi4-ai-tests --cpus 4 --ram-gb 6 -- sh scripts/test_on_linux.sh -n 4 tests/test_live.py
+```
+
+Arguments after the script go to pytest. Keep `-n` equal to `--cpus`, because each worker runs one thread. The whole suite takes about 4.5 minutes at `-n 8`, against about 5.5 minutes for CI's job. [`scripts/test_on_linux.sh`](scripts/test_on_linux.sh) installs the locked environment with the CPU builds of torch and torchvision in place of the CUDA ones, and keeps it between runs.
+
+On Linux, the tests that need CUDA, PowerShell 7, NTFS junctions or Windows' file locking skip and say why. To run those without taking this PC, use the second PC's fleet node (Windows), with `-n 4`. Name the files, and never use `--mirror` there:
+
+```powershell
+fleet run --on <second-pc-node> --name hoi4-ai-tests -- uv run --frozen --extra dev pytest -q -n 4 -p no:cacheprovider tests/test_salvage.py tests/test_fleet_contract.py
+```
+
 Model attribution and usage terms are in [NOTICE.md](NOTICE.md).

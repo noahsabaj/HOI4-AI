@@ -1,0 +1,2 @@
+# Shell scripts run on the fleet's Linux computers, where a carriage return breaks them.
+*.sh text eol=lf
