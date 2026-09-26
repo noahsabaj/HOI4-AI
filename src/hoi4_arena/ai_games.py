@@ -264,14 +264,19 @@ class Logged:
         self.desk = desk
         self.lock = threading.Lock()
         self.events = []
+        # The skill the scripted player is carrying out (intents.doing), kept with each
+        # event, so a recording says exactly which inputs served which intent; None for
+        # the camera's own.
+        self.skill = None
 
     def __getattr__(self, name):
         return getattr(self.desk, name)
 
     def apply(self, events):
         reply = self.desk.apply(events)
+        tag = {"skill": self.skill} if self.skill is not None else {}
         with self.lock:
-            self.events.extend({"t_ns": reply["t_ns"], "event": e} for e in events)
+            self.events.extend({"t_ns": reply["t_ns"], "event": e, **tag} for e in events)
         return reply
 
     def take(self):
@@ -1010,12 +1015,15 @@ def camera(
     def clear_popup():
         at = popups.due()
         if at:
+            from .intents import doing
+
             press = [{"kind": "button", "button": 0, "down": d} for d in (True, False)]
-            do([{"kind": "move", "x": at[0], "y": at[1]}])
-            # Look, then click: the press comes a decision or more after the move, so the
-            # fovea has seen the button first (models.ActionHead `look`).
-            stop.wait(rng.uniform(*LOOK))
-            do(press)
+            with doing(desk, "popup"):
+                do([{"kind": "move", "x": at[0], "y": at[1]}])
+                # Look, then click: the press comes a decision or more after the move, so
+                # the fovea has seen the button first (models.ActionHead `look`).
+                stop.wait(rng.uniform(*LOOK))
+                do(press)
 
     def wait(seconds):
         """Wait, clearing popups as they come due. True once the game has ended."""

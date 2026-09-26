@@ -368,6 +368,13 @@ def build_parser():
     aim.add_argument("--radius", type=float, default=30.0, help="A hit's distance in pixels")
     aim.add_argument("--output", help="Also write the report to this JSON file")
     aim.add_argument("--model")
+    relabel = sub.add_parser(
+        "intents",
+        help="Relabel scripted recordings into intents and skill segments (intents.py): how "
+        "much of their input the vocabulary explains, and how many of the planner's orders",
+    )
+    relabel.add_argument("data", help="A recording, or a folder of them")
+    relabel.add_argument("--segments", help="Also write one recording's segments to this JSON file")
     rate = sub.add_parser(
         "win-rate",
         help="The scripted player's record against the game's AI, from record-ai results",
@@ -1171,6 +1178,17 @@ def _dispatch(command, args):
         )
         if args["output"]:
             Path(args["output"]).write_text(json.dumps(result, indent=2))
+    elif command == "intents":
+        from . import intents
+
+        data = Path(args["data"])
+        if (data / "manifest.json").exists():
+            segments, result = intents.recording_report(data)
+            if args["segments"]:
+                Path(args["segments"]).write_text(json.dumps(segments, indent=1))
+        else:
+            roots = [path.parent for path in sorted(data.glob("*/manifest.json"))]
+            result = intents.folder_report(roots)
     elif command == "win-rate":
         from .scripted import win_rate
 

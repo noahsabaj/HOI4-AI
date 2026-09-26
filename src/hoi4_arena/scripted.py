@@ -70,6 +70,7 @@ from pathlib import Path
 import numpy as np
 
 from .ai_games import LOOK, MAP_BOTTOM, MAP_TOP, act, recentre, run_at, screen, tap
+from .intents import doing, tagged
 from .vision import country_pixels
 
 # The least normalised correlation (TM_CCOEFF_NORMED, 1 an exact copy) at which a button
@@ -294,6 +295,17 @@ def state_at(u, v, layout=None):
     return first + (column // STATE_WIDTH) * STATE_ROWS + row // STATE_HEIGHT
 
 
+def state_centre(state, layout=None, steps=96):
+    """Where arena state `state` (1 to 16) lies, as (u, v) fractions of the land box: the
+    middle of the points state_at gives it. None for a state the arena has not."""
+    grid = (np.arange(steps) + 0.5) / steps
+    points = [(u, v) for v in grid for u in grid if state_at(u, v, layout) == state]
+    if not points:
+        return None
+    us, vs = zip(*points, strict=True)
+    return float(np.mean(us)), float(np.mean(vs))
+
+
 def clean(mask):
     """A land mask without the lines thinner than CLEAN pixels that the map draws."""
     import cv2
@@ -377,6 +389,7 @@ class Planner:
             press.append({"kind": "key", "vk": SHIFT, "down": False})
         act(desk, press)
 
+    @tagged("form_army")
     def form_army(self, desk, tries=4):
         """Every unassigned division into one new army, which is left selected."""
         for _ in range(tries):
@@ -420,6 +433,7 @@ class Planner:
             time.sleep(0.3)
         return self.selected(desk)
 
+    @tagged("survey")
     def overview(self, desk, tries=8):
         """Zoomed fully out over the arena: the land masks and their box, or Nones.
 
@@ -460,6 +474,7 @@ class Planner:
             self.home = blue if self.country == "BLU" else red
         return rgb, blue, red, box
 
+    @tagged("assign_general")
     def assign_general(self, desk, tries=3):
         """A commander for the army, as the AI gives its own. True once it has one."""
         for _ in range(tries):
@@ -474,6 +489,7 @@ class Planner:
             time.sleep(0.8)
         return False
 
+    @tagged("clear_orders")
     def clear_orders(self, desk):
         """Every order of the army deleted: a right-click on Delete Order, then OK."""
         if not self.select_army(desk):
@@ -492,10 +508,13 @@ class Planner:
         self.order("clear")
         return True
 
-    def draw_front(self, desk, tries=4, guard=None):
+    @tagged("draw_front")
+    def draw_front(self, desk, tries=4, guard=None, front_state=None):
         """A front line along the whole border, checked: the army card shows a plan. With
         `guard`, round the enemy's incursion instead, when there is one (stretches). True
-        if the front was drawn round an incursion.
+        if the front was drawn round an incursion. With `front_state` (an arena state, 1 to
+        16; intents.ARGS), the tool is clicked on the border nearest that state, and only
+        that stretch of it gets a front when water splits the border.
 
         The front line tool takes a click on the enemy's side of the border, on one of
         the fronts it highlights ("You cannot draw Front Line here" anywhere else, deep in
@@ -522,9 +541,15 @@ class Planner:
                 time.sleep(0.4)
             crop = rgb[MAP_TOP : rgb.shape[0] - MAP_BOTTOM]
             stretches, rear = self.stretches(blue, red, box, crop, guard)
+            aim = self.state_point(box, front_state) if front_state and not rear else None
+            if aim is not None:
+                distance = lambda p: (p[0] - aim[0]) ** 2 + (p[1] - aim[1]) ** 2  # noqa: E731
+                stretches = [min(stretches, key=lambda s: min(map(distance, s)))]
             front = stretches[0]
             # The border's middle first: the tool follows the whole border from there.
             middle = sorted(front, key=lambda p: p[1])[len(front) // 2]
+            if aim is not None:
+                middle = min(front, key=distance)
             x, y = middle if attempt == 0 else self.rng.choice(front)
             act(desk, tap(FRONT_LINE))
             self.click(desk, self.screen_point(rgb, x, y))
@@ -571,6 +596,7 @@ class Planner:
             stretches = [sum(stretches, [])]
         return stretches, False
 
+    @tagged("draw_front")
     def more_front(self, desk, rgb, box, stretch):
         """Another front line for the army, on a stretch of border the first did not
         reach; the tool is left off."""
@@ -608,6 +634,14 @@ class Planner:
 
     def screen_point(self, rgb, x, y):
         return x / rgb.shape[1], (y + MAP_TOP) / rgb.shape[0]
+
+    def state_point(self, box, state):
+        """Where arena `state` lies in the map crop, (x, y), from the land box; or None."""
+        centre = state_centre(state, self.layout)
+        if centre is None:
+            return None
+        top, left, bottom, right = box
+        return left + centre[0] * (right - left), top + centre[1] * (bottom - top)
 
     def box_point(self, box, x, y):
         top, left, bottom, right = box
@@ -649,8 +683,13 @@ class Planner:
                 points.append((float(x + sign * depth * abs(far - x)), float(y)))
         return points
 
-    def draw_offensive(self, desk):
-        """An offensive: the whole front forward ("broad"), or toward one enemy state."""
+    @tagged("draw_offensive")
+    def draw_offensive(self, desk, attack=None, target_state=None):
+        """An offensive: the whole front forward ("broad"), or toward one enemy state.
+
+        `attack` overrides the plan's; `target_state` (an arena state, 1 to 16;
+        intents.ARGS) aims the offensive at that state, from the front level with it."""
+        attack = attack or self.plan["attack"]
         rgb, blue, red, box = self.overview(desk)
         if box is None or not self.select_army(desk):
             raise RuntimeError("no arena or army to draw an offensive with")
@@ -659,7 +698,8 @@ class Planner:
         ys, xs = np.nonzero(enemy)
         if not front or not len(xs):
             raise RuntimeError("no front or enemy land on screen")
-        if self.plan["attack"] == "broad":
+        aim = self.state_point(box, target_state) if target_state else None
+        if attack == "broad" and aim is None:
             line = self.broad_line(front, box, self.plan.get("depth", BROAD_DEPTH))
             if len(line) < 2:
                 raise RuntimeError("no front to draw a broad offensive along")
@@ -677,10 +717,15 @@ class Planner:
         top, left, bottom, right = box
         seam = (left + right) / 2
         depth = np.abs(xs - seam) / max(1.0, (right - left) / 2)
-        pick = depth < 1 / 3 if self.plan["attack"] == "near" else depth > 2 / 3
-        if not pick.any():
-            pick = np.ones_like(depth, dtype=bool)
-        k = self.rng.choice(np.flatnonzero(pick).tolist())
+        if aim is not None:
+            # The enemy's land nearest the state's middle: an offensive line is drawn in
+            # enemy land.
+            k = int(np.argmin((xs - aim[0]) ** 2 + (ys - aim[1]) ** 2))
+        else:
+            pick = depth < 1 / 3 if attack == "near" else depth > 2 / 3
+            if not pick.any():
+                pick = np.ones_like(depth, dtype=bool)
+            k = self.rng.choice(np.flatnonzero(pick).tolist())
         target = xs[k], ys[k]
         # From just across the front, level with the target, so the line lies in enemy
         # land: one of the front's pixels nearest the target's row, a step into the enemy.
@@ -692,12 +737,13 @@ class Planner:
         u, v = self.box_point(box, *target)
         self.order(
             "offensive",
-            attack=self.plan["attack"],
+            attack=attack,
             start=self.box_point(box, *start),
             target=[u, v],
             target_state=state_at(u, v, self.layout),
         )
 
+    @tagged("execute")
     def activate(self, desk):
         """The plan executed: a click on the card's arrow while it is idle (dots) or
         ready (a green check), checked. True once the arrow is lit, that is executing.
@@ -721,6 +767,7 @@ class Planner:
         self.order("activate")
         return True
 
+    @tagged("execute")
     def lit(self, desk):
         """Whether the army's plan is executing: a plan shows and its arrow is lit.
 
@@ -775,6 +822,7 @@ class Planner:
             self.activate(desk)
         return True
 
+    @tagged("pause")
     def pause(self, desk, paused):
         """Pause or unpause the running game with Space, checked by the blinking pause mark
         (looked for over two seconds). True once it is as asked."""
@@ -852,7 +900,8 @@ class Planner:
         self.draw_front(desk)
         if self.plan["attack"] in OFFENSIVES:
             self.draw_offensive(desk)
-        run_at(desk, self.rules, self.speed)
+        with doing(desk, "run"):
+            run_at(desk, self.rules, self.speed)
         self.running = True
         self.order("run", speed=self.speed)
         self.start(time.monotonic())
@@ -978,6 +1027,7 @@ class Planner:
             time.sleep(0.8)
         return False
 
+    @tagged("recruit")
     def recruit(self, desk):
         """Training slots for more divisions of the army's template, deployed in one of
         the player's own states. True once they are queued with a place to deploy.
@@ -1009,6 +1059,7 @@ class Planner:
         self.panel(desk, "recruit_title", RECRUIT, False)
         return placed
 
+    @tagged("reinforce")
     def reinforce(self, desk):
         """New divisions into the army: shift+click on the Unassigned divisions alert
         selects them all, and a right-click on the army's card adds them. True if they
@@ -1031,6 +1082,7 @@ class Planner:
                 self.activate_at = time.monotonic()
         return joined
 
+    @tagged("set_law")
     def raise_conscription(self, desk):
         """One step up the conscription laws toward the plan's. True once it is there, or
         once a step has failed LAW_TRIES times running.
