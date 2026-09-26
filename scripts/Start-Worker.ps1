@@ -14,6 +14,11 @@
 #   -Pairing (server.json, worker.pfx), -Worker and -Mods are relative to the project's
 #   folder; -Port replaces the pairing's; -QuietSeconds is how long a restart waits after
 #   the last game connection, and how old an observer must be not to hold one back.
+#   fleet runs the service in a job object, and a forced stop (fleet stop, service restart
+#   --now, service remove) ends every process in it. The game and Discord are started
+#   outside it (the worker's control_outlives), so they outlive even that; the sessions that
+#   launch the game quit it. To retire the service mid-session, quit the game first
+#   (`hoi4-arena control quit --peer ...`).
 param(
     [switch]$Service,
     [string]$Pairing = 'artifacts\pairing\second-pc',
