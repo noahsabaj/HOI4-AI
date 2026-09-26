@@ -240,6 +240,21 @@ def summary(path):
     return written.get("summary")
 
 
+def played_nothing(result):
+    """Whether a session ended without one episode or game played: its job failed, or its
+    summary counts nothing done. A loop of sessions then stops or waits instead of starting
+    the next one at once: on 2026-09-26 every drill failed in a second for want of a file
+    there, and a loop started 186 empty sessions in 50 minutes."""
+    if result.get("state") != "done" or result.get("exit"):
+        return True
+    done = result.get("summary")
+    if not done:
+        return True
+    # play-policy's summary is its record, which has games only if some were played.
+    key = {"practice": "episodes", "drills": "complete"}.get(result.get("command"))
+    return key is not None and not done.get(key)
+
+
 def run_on_peer(
     session,
     peer,

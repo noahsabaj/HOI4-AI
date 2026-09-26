@@ -122,8 +122,10 @@ if ($Compute) {
     Copy-Mirror 'src' (Join-Path $root 'src') @('/XD', '__pycache__')
     Copy-Mirror 'third_party' (Join-Path $root 'third_party')
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'scripts'), (Join-Path $root 'tools') | Out-Null
-    foreach ($file in 'pyproject.toml', 'uv.lock', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE.md', 'README.md') {
-        Copy-Item -LiteralPath $file -Destination (Join-Path $root $file) -Force
+    # Not $file: PowerShell's names ignore case, so a loop variable $file overwrote the
+    # -File parameter, and a deploy with -Compute sent none of the files it was given.
+    foreach ($name in 'pyproject.toml', 'uv.lock', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE.md', 'README.md') {
+        Copy-Item -LiteralPath $name -Destination (Join-Path $root $name) -Force
     }
     Copy-Item -Path 'scripts\*.py' -Destination (Join-Path $root 'scripts') -Force
     foreach ($tool in 'uv', 'ffmpeg') {
