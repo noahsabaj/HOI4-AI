@@ -367,6 +367,7 @@ def session_labels(
     setup_weight=1.0,
     setup_seconds=30.0,
     held_previous=False,
+    rung=None,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -406,6 +407,12 @@ def session_labels(
     the count is returned as `parking`. `setup_weight` scales every decision of the setup
     (setup_end: before the run order, else the first `setup_seconds`), the clicks that
     form the army and give it its general, front and offensive.
+
+    `rung` (curriculum.RUNGS) cuts a whole game at the moment a rung save stands for
+    (curriculum.rung_start: the scripted player's order that completes it): the decisions
+    before it weigh nothing, as if the game had started from that rung's save. Their
+    windows stay, so the memory still reads the lead-up. A game recorded from a rung
+    save starts there already.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -503,6 +510,10 @@ def session_labels(
     if setup_weight != 1.0:
         setup = decisions < setup_end(manifest, times, setup_seconds)
         weight = weight * np.where(setup, np.float32(setup_weight), np.float32(1))
+    if rung is not None:
+        from .curriculum import rung_start
+
+        weight = weight * (decisions >= rung_start(manifest, times, rung)).astype(np.float32)
     # Where the recorder knocked its camera astray unrecorded (ai_games.camera `kicks`), the
     # frames moved with no input: those decisions weigh nothing. Their windows stay, so the
     # recovery just after keeps its labels.
@@ -965,7 +976,7 @@ class VideoSessions(_Resumable, IterableDataset):
     A `splits.json` in `root`, {recording folder name: split}, overrides the split each
     recording's manifest drew, so a study can choose its held-out games without touching
     the recordings. `lead_in`, `drop_keys`, `loser_weight`, `state`, `orders`,
-    `press_weight`, `drop_parking` and `setup_weight` pass to session_labels; a lead-in
+    `press_weight`, `drop_parking`, `setup_weight` and `rung` pass to session_labels; a lead-in
     shorter than a clip needs `clips` off. `tower`, a tower cache (tower_cache.py), adds
     each decision's frozen-tower reading to its window. `camera_since` (unix seconds)
     also drops the arrow keys from recordings made before it (camera_keys_dropped).
@@ -1004,6 +1015,7 @@ class VideoSessions(_Resumable, IterableDataset):
         gpu_views=False,
         balance=False,
         yuv=None,
+        rung=None,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -1043,6 +1055,7 @@ class VideoSessions(_Resumable, IterableDataset):
                     drop_parking=drop_parking,
                     setup_weight=setup_weight,
                     held_previous=held_previous,
+                    rung=rung,
                 )
             )
         if balance:

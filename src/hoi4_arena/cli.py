@@ -339,6 +339,54 @@ def build_parser():
     )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
+    rungs = sub.add_parser(
+        "make-ladder",
+        help="The curriculum's rung saves (curriculum.py): from each arena's start save, the "
+        "scripted player's setup steps while the game stays paused, saved after each (S1 the "
+        "army, S2 its general, S3 its front and offensive), on this PC or the second",
+    )
+    rungs.add_argument("output", help="A folder for each rung's picture and ladder.json")
+    rungs.add_argument("--peer", help="The second PC's pairing file (else this PC)")
+    rungs.add_argument("--arenas", nargs="+", default=["arena-12x8-v4"])
+    rungs.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    rungs.add_argument("--rungs", nargs="+", choices=["S1", "S2", "S3"], default=["S1", "S2", "S3"])
+    rungs.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    rungs.add_argument("--seed", type=int)
+    rungs = sub.add_parser(
+        "rung-games",
+        help="Full games from the curriculum's rung saves, by a checkpoint or the scripted "
+        "player, each rung's wins and setup reported, with the rung its record promotes to "
+        "(curriculum.rung_games)",
+    )
+    rungs.add_argument("checkpoint", help='A policy checkpoint, or "scripted"')
+    rungs.add_argument("output", help="A folder for the games and rung-games.json")
+    rungs.add_argument("--peer", help="The second PC's pairing file (else this PC)")
+    rungs.add_argument("--rungs", nargs="+", choices=["S0", "S1", "S2", "S3"], default=["S3"])
+    rungs.add_argument("--arenas", nargs="+", default=["arena-12x8-v4"])
+    rungs.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    rungs.add_argument("--games", type=int, default=10)
+    rungs.add_argument("--minutes", type=float, required=True, help="Time budget for all games")
+    rungs.add_argument("--cap-minutes", type=float, default=10.0)
+    rungs.add_argument(
+        "--setup-seconds", type=float,
+        help="Run a game the policy has not started by then (default 30 from S3, else 90)",
+    )  # fmt: skip
+    rungs.add_argument("--block", type=int, default=4, help="Games in a row on an arena")
+    rungs.add_argument(
+        "--schedule", choices=["fixed", "adaptive"], default="fixed",
+        help="fixed: arenas in blocks, sides alternating, rungs interleaved; adaptive: each "
+        "game where the student's success is nearest 50%% and changing most "
+        "(curriculum.frontier)",
+    )  # fmt: skip
+    rungs.add_argument(
+        "--history", nargs="+", default=[],
+        help="Globs of earlier rung-games.json files the adaptive schedule also counts",
+    )  # fmt: skip
+    rungs.add_argument("--held-previous", action="store_true", help="As play-policy's")
+    add_sampling(rungs)
+    rungs.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    rungs.add_argument("--model", dest="model_path")
+    rungs.add_argument("--seed", type=int)
     heat = sub.add_parser(
         "heatmap",
         help="Draw where a policy wants to point, as a heat map over a recording's frames, "
@@ -675,6 +723,13 @@ def build_parser():
         default=1.0,
         help="Loss weight of the setup's decisions, before the scripted player's run order "
         "(dataset.setup_end), on top of --press-weight",
+    )
+    train.add_argument(
+        "--rung",
+        choices=["S0", "S1", "S2", "S3"],
+        help="The curriculum's cut (curriculum.py): only what follows the moment this rung's "
+        "save stands for teaches (S3: after the scripted player's offensive; S2: its general; "
+        "S1: its army); a game recorded from a rung save starts there already",
     )
     train.add_argument(
         "--camera-since",
@@ -1140,6 +1195,18 @@ def _dispatch(command, args):
 
         args["countries"] = tuple(args["countries"])
         result = practice(args.pop("checkpoint"), args.pop("output"), **args)
+    elif command == "make-ladder":
+        from .curriculum import make_ladder
+
+        for key in ("arenas", "countries", "rungs"):
+            args[key] = tuple(args[key])
+        result = make_ladder(args.pop("output"), **args)
+    elif command == "rung-games":
+        from .curriculum import rung_games
+
+        for key in ("arenas", "countries", "rungs", "history"):
+            args[key] = tuple(args[key])
+        result = rung_games(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "play-policy":
         from .play import evaluate_policy
 

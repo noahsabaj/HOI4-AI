@@ -377,6 +377,7 @@ def _train_bc(
     held_previous=False,
     gpu_views=False,
     balance=False,
+    rung=None,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -399,8 +400,10 @@ def _train_bc(
     exactly the order training has always seen. Clips are read only for an encoder that
     reads them: the default Qwen3.5 tower reads the quadrants alone.
 
-    `lead_in`, `drop_keys`, `loser_weight`, `press_weight`, `drop_parking` and
-    `setup_weight` pass to dataset.session_labels, and `camera_since` to VideoSessions.
+    `lead_in`, `drop_keys`, `loser_weight`, `press_weight`, `drop_parking`,
+    `setup_weight` and `rung` (the curriculum's cut: only what follows the moment a rung
+    save stands for teaches) pass to dataset.session_labels, and `camera_since` to
+    VideoSessions.
     `state_weight` > 0 adds the privileged-state loss: a linear read-out of the memory
     predicts the arena's true state at each decision (privileged.NAMES), from the
     arena log, weighted by it; the read-out is saved beside the policy and never used to
@@ -453,6 +456,7 @@ def _train_bc(
         "held_previous": held_previous,
         "gpu_views": gpu_views,
         "balance": balance,
+        "rung": rung,
     }
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
@@ -560,6 +564,8 @@ def _train_bc(
         "camera_since": camera_since,
         "held_previous": held_previous,
         "balance": balance,
+        # Only when set, so runs saved before it existed still resume.
+        **({"rung": rung} if rung else {}),
     }
     output.mkdir(parents=True, exist_ok=True)
     # The loader's workers are not the model's, but a resume needs the same (Progress).

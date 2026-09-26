@@ -1260,6 +1260,8 @@ def play(
             frame=lambda: rec.manifest["frames"], layout=arena_layout(settings["mod"]),
         )  # fmt: skip
         planner.debug_dir = Path(root)
+        # A game from a rung save (curriculum.py) starts with these setup steps done.
+        planner.done = frozenset(player.get("done", ()))
         if player.get("shots"):
             # An arena under test: keep the planner's full views of the map, and the
             # first and last frames, for whoever built it.
