@@ -55,6 +55,69 @@ SPEED_CLICKS = 4
 # other clicks (the scripted player clicks three times) land first.
 RUN_DELAY = 1.0
 EVAL = Path("artifacts/eval")
+# The longest the policy may hold a key or button down before the harness lets it go, in
+# seconds. The scripted games it learns from never hold a key past 0.8 s or the left
+# button past 0.4 s; the right button, drawing fronts, up to 2.6 s (scripted-v5, measured
+# 2026-09-26). The policy sees only its previous decision's action, so a key held longer
+# is soon forgotten and never released: bc5 held Right for over three minutes and the
+# camera scrolled off the map. Past these limits the key goes up as a player's would.
+HOLD_LIMITS = {"key": 1.0, "button": 1.0, "button1": 4.0}
+
+
+def _held(event):
+    """The key or button an event presses or releases, or None."""
+    if event["kind"] == "key":
+        return ("key", event["vk"])
+    if event["kind"] == "button":
+        return ("button", event["button"])
+    return None
+
+
+class Holds:
+    """What the policy holds down, since which interval, and the releases HOLD_LIMITS call
+    for: at the start of the first interval past a key's limit, before the policy's own
+    slots. `forced` counts them, by key or button."""
+
+    def __init__(self, limits=HOLD_LIMITS):
+        self.limits = limits
+        self.since = {}
+        self.interval = 0
+        self.forced = {}
+
+    def limit(self, held):
+        kind, code = held
+        return self.limits.get(f"{kind}{code}", self.limits[kind])
+
+    def due(self):
+        """The release events due now, forgetting what they release."""
+        releases = []
+        for held, start in list(self.since.items()):
+            if (self.interval - start) * PERIOD >= self.limit(held) - 1e-9:
+                del self.since[held]
+                kind, code = held
+                name = f"{kind}{code}"
+                self.forced[name] = self.forced.get(name, 0) + 1
+                field = "vk" if kind == "key" else "button"
+                releases.append({"kind": kind, field: code, "down": False})
+        return releases
+
+    def follow(self, events):
+        """Keep track of the interval's own presses and releases, in order."""
+        for event in events:
+            held = _held(event)
+            if held is None:
+                continue
+            if event["down"]:
+                self.since.setdefault(held, self.interval)
+            else:
+                self.since.pop(held, None)
+
+    def advance(self):
+        self.interval += 1
+
+    def clear(self):
+        """Everything went up (the harness released the input)."""
+        self.since.clear()
 
 
 def lattice_to_pixels(x, y, width, height):
@@ -91,6 +154,7 @@ class Dispatcher:
         # each interval would also clear an F12 the capture had not yet reported.
         self.armed = False
         self.timed = timed
+        self.holds = Holds()
 
     def start(self, action, begin, pointer):
         self.pointer = pointer
@@ -105,10 +169,18 @@ class Dispatcher:
                 self._timed(action)
                 self.refused = 0
                 return
+            released = self.holds.due()
+            if released:
+                reply = self.desk.apply(released)
+                with self.lock:
+                    self.applied.extend(
+                        {"t_ns": reply["t_ns"], "event": e, "by": "harness"} for e in released
+                    )
             for index, token in enumerate(action):
                 time.sleep(max(0.0, begin + index * PERIOD / SLOTS - self.clock()))
                 events = decode(token)
                 self._follow(token, events)
+                self.holds.follow(events)
                 reply = self.desk.apply(events)
                 if events:
                     with self.lock:
@@ -120,7 +192,14 @@ class Dispatcher:
             self.error = str(error)
             self.armed = False
             return
+        finally:
+            self.holds.advance()
         self.refused = 0
+
+    def released(self):
+        """The harness let go of every input (desk.release): arm again, nothing held."""
+        self.armed = False
+        self.holds.clear()
 
     def _follow(self, token, events):
         """Where the pointer goes, and whether a press lands on the speed control's +."""
@@ -133,10 +212,13 @@ class Dispatcher:
                 self.speed_clicks += 1
 
     def _timed(self, action):
-        events, offsets = [], []
+        # Releases the limits call for go first, at the interval's start.
+        released = self.holds.due()
+        events, offsets = list(released), [0.0] * len(released)
         for index, token in enumerate(action):
             decoded = decode(token)
             self._follow(token, decoded)
+            self.holds.follow(decoded)
             events += decoded
             offsets += [index * PERIOD / SLOTS * 1000] * len(decoded)
         if not events:
@@ -147,7 +229,8 @@ class Dispatcher:
         times = reply.get("times_ns") or [reply["t_ns"]] * len(events)
         with self.lock:
             self.applied.extend(
-                {"t_ns": int(t), "event": e} for t, e in zip(times, events, strict=True)
+                {"t_ns": int(t), "event": e, **({"by": "harness"} if i < len(released) else {})}
+                for i, (t, e) in enumerate(zip(times, events, strict=True))
             )
 
     def on_speed_up(self):
@@ -381,7 +464,7 @@ def play_policy_game(
                     raise RuntimeError(f"the game was out of reach for 25 s ({dispatcher.error})")
                 dispatcher.join()
                 desk.release()
-                dispatcher.armed = False
+                dispatcher.released()
                 focus(desk, tries=2)
                 dispatcher.refused = 0
                 continue
@@ -406,7 +489,7 @@ def play_policy_game(
                 pointer = dispatcher.pointer or frame.meta["cursor"]
                 pointer = (pointer[0] / width, pointer[1] / height)
                 desk.release()
-                dispatcher.armed = False
+                dispatcher.released()
                 if wait == "start":
                     run_game(desk, pointer)
                     referee.started()
@@ -501,6 +584,7 @@ def play_policy_game(
             checkpoint=actor.digest,
             harness={"starts": referee.starts, "restarts": referee.restarts},
             presses=watch.presses,
+            forced_releases=dispatcher.holds.forced,
         )
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest

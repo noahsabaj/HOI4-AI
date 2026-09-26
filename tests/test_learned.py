@@ -702,6 +702,60 @@ def test_a_timed_dispatch_sends_the_slots_in_one_request_at_their_offsets():
     dispatcher.close()
 
 
+RIGHT_DOWN = {"kind": "key", "vk": 0x27, "down": True}
+RIGHT_UP = {"kind": "key", "vk": 0x27, "down": False}
+
+
+def test_a_key_held_past_its_limit_is_released_and_counted():
+    # bc5 held Right for three minutes (2026-09-26); the scripted player never past 0.8 s.
+    holds = play.Holds()
+    holds.follow([RIGHT_DOWN, {"kind": "button", "button": 1, "down": True}])
+    released = []
+    for _ in range(25):
+        holds.advance()
+        released.append(holds.due())
+    # The key goes up at the start of the fifth interval after its press (1 s), the right
+    # button (a front being drawn) at the twentieth (4 s).
+    assert released[4] == [RIGHT_UP] and not any(released[:4])
+    assert released[19] == [{"kind": "button", "button": 1, "down": False}]
+    assert holds.forced == {"key39": 1, "button1": 1} and not holds.since
+
+
+def test_a_key_the_policy_releases_itself_is_left_alone():
+    holds = play.Holds()
+    holds.follow([RIGHT_DOWN])
+    holds.advance()
+    holds.follow([RIGHT_UP, RIGHT_DOWN])  # released and pressed again: held from here
+    for _ in range(4):
+        holds.advance()
+        assert holds.due() == []
+    holds.advance()
+    assert holds.due() == [RIGHT_UP]
+    holds.follow([RIGHT_DOWN])
+    holds.clear()  # the harness let go of everything
+    for _ in range(9):
+        holds.advance()
+        assert holds.due() == []
+
+
+def test_a_timed_dispatch_releases_a_stuck_key_first_and_marks_it_the_harness_s():
+    desk = _TimedDesk()
+    dispatcher = play.Dispatcher(desk, clock=lambda: 0.0, timed=True)
+    press = np.zeros((SLOTS, 3), np.int64)
+    press[2] = _token(VOCAB.index(RIGHT_DOWN))
+    click = np.zeros((SLOTS, 3), np.int64)
+    click[0] = _token(VOCAB.index(CLICK))
+    for action in [press, *[np.zeros((SLOTS, 3), np.int64)] * 4, click]:
+        dispatcher.start(action, 0.0, (5.0, 5.0))
+        dispatcher.join()
+    events, offsets = desk.batches[-1]
+    assert events == [RIGHT_UP, CLICK] and offsets == pytest.approx([0.0, 0.0])
+    marks = [e.get("by") for e in dispatcher.take() if e["event"] in (RIGHT_UP, CLICK)]
+    assert marks == ["harness", None]
+    assert dispatcher.holds.forced == {"key39": 1}
+    dispatcher.close()
+
+
 def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
     from hoi4_arena.models import CELL_DIM, ActionHead
 
