@@ -650,10 +650,11 @@ class _Stream:
         # reads them: a memory map does not travel to a DataLoader worker.
         self.tower = None
         if labels.get("tower"):
+            found = labels["tower"]
             self.tower = tuple(
-                np.load(labels["tower"][key], mmap_mode="r") if key in labels["tower"] else None
+                np.load(found[key], mmap_mode="r") if key in found else None
                 for key in ("summary", "grid", "scale")
-            )
+            ) + ((np.load(found["rows"]) if "rows" in found else None),)
 
     def close(self):
         if self.decoder.poll() is None:
@@ -687,7 +688,16 @@ class _Stream:
             from .tower_cache import from_bits, read_grid
 
             frames = labels["frame_ids"][start : start + n]
-            summary, grid, scale = self.tower
+            summary, grid, scale, rows = self.tower
+            if rows is not None:
+                # The cache keeps only the frames decisions read (tower_cache.kept_frames).
+                missing = frames[rows[frames] < 0]
+                if len(missing):
+                    raise ValueError(
+                        f"{labels['root'].name}: frame {int(missing[0])} is not in the tower "
+                        "cache, which keeps only the frames on the decision interval"
+                    )
+                frames = rows[frames]
             window["tower_summary"] = from_bits(summary[frames])
             window["tower_grid"] = read_grid(grid[frames], None if scale is None else scale[frames])
         if self.clips:

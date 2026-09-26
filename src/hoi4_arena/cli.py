@@ -233,12 +233,22 @@ def build_parser():
     tower.add_argument("--sources", nargs="+")
     tower.add_argument(
         "--spill",
-        help="Where recordings go once the output's drive would keep less than --keep-free",
+        help="A second folder, on another drive, for the recordings the output's drive "
+        "cannot hold while keeping --keep-free. Without it a build that does not fit is "
+        "refused before it starts.",
     )
-    tower.add_argument("--keep-free", type=float, default=30.0, help="GB to leave free")
     tower.add_argument(
-        "--int8", action="store_true",
-        help="Keep the grid as int8 with a scale per frame and channel: half the space",
+        "--keep-free", type=float, default=30.0, help="GB to leave free on each drive"
+    )
+    tower.add_argument(
+        "--bf16", dest="int8", action="store_false",
+        help="Keep the grid in bfloat16, twice the space of the default int8 (a scale per "
+        "frame and channel)",
+    )  # fmt: skip
+    tower.add_argument("--int8", action="store_true", default=True, help=argparse.SUPPRESS)
+    tower.add_argument(
+        "--dry-run", action="store_true",
+        help="Work out the build's size and where it would go, and write nothing",
     )  # fmt: skip
     drill = sub.add_parser(
         "practice",
@@ -1147,6 +1157,7 @@ def _dispatch(command, args):
             spill=args["spill"],
             keep_free_gb=args["keep_free"],
             int8=args["int8"],
+            dry_run=args["dry_run"],
         )
     elif command == "drills":
         from .practice import drills
