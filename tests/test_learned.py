@@ -629,6 +629,116 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
                        tower_cache=tmp_path / "cache", **common)  # fmt: skip
 
 
+@needs_ffmpeg
+def test_the_pipelined_tower_cache_is_the_frame_at_a_time_build_bit_for_bit(tmp_path):
+    """cache_recording decodes, cuts, reads and writes on three threads, the quadrants cut
+    a batch at a time; what it keeps is what cutting and reading each frame in turn gave,
+    to the bit, a short last batch included."""
+    import copy
+    import subprocess
+
+    from hoi4_arena import tower_cache
+    from hoi4_arena.dataset import normalize, parse_cursor, views
+    from hoi4_arena.models import ScreenEncoder
+
+    _recording(tmp_path / "game", [3, 5], frames=40, shade=7)
+    torch.manual_seed(0)
+    encoder = ScreenEncoder(pretrained=False, size=(32, 64)).eval().requires_grad_(False)
+    # The build trims the tower (fast.lean_tower); the reference reads an untouched copy.
+    untouched = copy.deepcopy(encoder)
+    tower_cache.cache_recording(
+        encoder, tmp_path / "game", tmp_path / "cache" / "game", "cpu", batch=3
+    )
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(tmp_path / "game" / "screen.mkv"),
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+        capture_output=True, check=True,
+    ).stdout  # fmt: skip
+    frames = np.frombuffer(raw, np.uint8).reshape(40, 16, 16, 3)
+    times, lines = tower_cache.frame_times(tmp_path / "game")
+    kept = tower_cache.kept_frames(times)
+    assert len(kept) % 3, "the last batch is short"
+    quads = [
+        views(frames[i], None, cursor=parse_cursor(json.loads(lines[i])["cursor"])).quadrants
+        for i in kept
+    ]
+    grids, scales, summaries = [], [], []
+    for first in range(0, len(quads), 3):
+        batch = normalize(torch.stack(quads[first : first + 3])).permute(0, 1, 4, 2, 3)
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            summary, grid = tower_cache.read_frozen(untouched, batch)
+        values, scale, bits = tower_cache.quantised(summary, grid)
+        grids.append(values.numpy())
+        scales.append(scale.numpy())
+        summaries.append(bits.numpy())
+    found = tower_cache.tower_paths(tmp_path / "cache", "game")
+    assert np.array_equal(np.load(found["grid"]), np.concatenate(grids))
+    assert np.array_equal(np.load(found["scale"]), np.concatenate(scales))
+    assert np.array_equal(np.load(found["summary"]), np.concatenate(summaries))
+    assert found["fast"] is False and found["kept"] == len(kept)
+
+
+def test_a_fast_tower_read_that_overflows_is_read_again_the_plain_way():
+    from hoi4_arena.models import ScreenEncoder
+    from hoi4_arena.tower_cache import TowerReader
+
+    torch.manual_seed(0)
+    encoder = ScreenEncoder(pretrained=False, size=(32, 64)).eval().requires_grad_(False)
+    with pytest.raises(ValueError, match="GPU"):
+        TowerReader(encoder, "cpu", fast=True)
+    reader = TowerReader(encoder, "cpu")
+    quads = torch.randint(0, 255, (2, 4, 32, 32, 3), dtype=torch.uint8)
+    summary, grid, finite = reader.read(quads)
+    assert finite is None and grid.shape == (2, 768, 32, 32)
+    assert reader.checked(quads, None) is None and reader.fallbacks == 0
+    done = type("Done", (), {"synchronize": lambda self: None})()  # a CUDA event, as it were
+    assert reader.checked(quads, (torch.tensor(True), done)) is None
+    again = reader.checked(quads, (torch.tensor(False), done))
+    assert reader.fallbacks == 1
+    assert torch.equal(again[0], summary) and torch.equal(again[1], grid)
+
+
+def test_the_fast_attention_is_routed_only_the_calls_it_computes(monkeypatch):
+    """cache-tower --fast sends the tower's float16 attention on the GPU to a Triton
+    kernel; every other call, the plain bfloat16 build's included, goes to PyTorch's."""
+    import importlib
+
+    import torch.nn.functional as F
+
+    from hoi4_arena import fast_attention
+
+    modules = [importlib.import_module(name) for name in fast_attention.TIMM_ATTENTION]
+    for module in modules:
+        monkeypatch.setattr(module, "F", F)
+    fast_attention.install()
+    fast_attention.install()
+    for module in modules:
+        assert module.F is not F and module.F.layer_norm is F.layer_norm
+        assert module.F.scaled_dot_product_attention is fast_attention.scaled_dot_product_attention
+    # The towers' blocks attend with timm.layers.attention.AttentionRope.
+    from hoi4_arena.models import ScreenEncoder
+
+    tower = ScreenEncoder(pretrained=False, size=(32, 64))
+    attention = type(tower.model.blocks[0].attn)
+    assert importlib.import_module(attention.__module__) in modules
+    assert F.scaled_dot_product_attention is not fast_attention.scaled_dot_product_attention
+    q, k, v = torch.randn(3, 1, 2, 16, 64).unbind(0)
+    assert not fast_attention.handles(q, k, v), "not on the GPU"
+    assert torch.equal(
+        fast_attention.scaled_dot_product_attention(q, k, v),
+        F.scaled_dot_product_attention(q, k, v),
+    )
+    if not torch.cuda.is_available():
+        return
+    q, k, v = torch.randn(3, 2, 4, 300, 64, device="cuda", dtype=torch.float16).unbind(0)
+    assert fast_attention.handles(q, k, v)
+    assert not fast_attention.handles(q.bfloat16(), k.bfloat16(), v.bfloat16())
+    assert not fast_attention.handles(q, k, v, is_causal=True)
+    exact = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+    fast = fast_attention.scaled_dot_product_attention(q, k, v).float()
+    assert ((fast - exact).norm() / exact.norm()) < 5e-3
+
+
 def test_the_tower_cache_keeps_every_frame_a_decision_reads_whatever_the_lead_in(tmp_path):
     from hoi4_arena.tower_cache import kept_frames
 

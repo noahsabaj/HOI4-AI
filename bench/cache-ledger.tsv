@@ -1,0 +1,22 @@
+when	label	commit	options	repeats	fps_each	fps_median	gpu_util	peak_gb	cpu_s_per_frame	gate	identical	grid_max_steps	grid_rms_rel	summary_max_steps	notes
+2026-09-26 13:18	baseline	4321b36		3	8.04 8.07 8.06	8.06	91	2.03	0.178	reference					unmodified cache_recording, batch 8 profile {"decode_ms": 7.83, "views_ms": 1.2, "tower_ms": 115.52, "quantise_ms": 0.36, "write_ms": 1.45}
+2026-09-26 14:10	e1-precast	cf20130	{"precast": true}	3	8.16 8.20 8.00	8.16	91	1.39	0.178	pass	True	0.0	0.00e+00	0.0	Linear/Conv weights cast to bf16 once (autocast recast them every call)
+2026-09-26 14:18	e2-pipeline	cf20130+dirty	{"pipeline": true}	3	8.45 7.82 7.45	7.82	96	2.06	0.397	pass	True	0.0	0.00e+00	0.0	pinned whole-frame batches from a reader thread, quadrants cut on GPU per batch, async D2H, writer thread
+2026-09-26 14:25	fp32ref	cf20130+dirty	{"fp32": true}	1	2.61	2.61	97	2.51	0.456	reference					float32 tower (no autocast, no TF32): the accuracy reference for numeric modes
+2026-09-26 14:37	e2b-pipeline	558b900	{"pipeline": true}	3	7.89 8.00 8.18	8.00	96	2.06	0.170	pass	True	0.0	0.00e+00	0.0	e2 with blocking CUDA events (no spinning threads); clocks logged
+2026-09-26 14:45	e0b-baseline	f626ec4		3	7.82 6.87 7.29	7.29	93	2.03	0.192	pass	True	0.0	0.00e+00	0.0	baseline again right after e2b, clocks logged, for the thermal drift
+2026-09-26 14:52	e3-pipeline-precast	f626ec4	{"pipeline": true, "precast": true}	3	8.01 7.56 7.58	7.58	96	1.41	0.176	pass	True	0.0	0.00e+00	0.0	e2b plus e1
+2026-09-26 15:02	f1-compile	f626ec4	{"pipeline": true, "precast": true, "compile": true, "pad": true}	3	10.66 10.44 10.45	10.45	95	1.88	0.054	reference					fast: torch.compile of the tower (inductor fuses the norms, rope, gelu and casts), full batches padded
+2026-09-26 15:07	f2-compile-fp16acc	5ed0a76	{"pipeline": true, "compile": true, "pad": true, "half": "fp16acc"}	3	13.23 13.39 13.10	13.23	93	1.88	0.055	reference					fast: f1 in float16 with float16 accumulation in the matmuls
+2026-09-26 15:16	f6-f2-nopipe	5ed0a76	{"compile": true, "pad": true, "half": "fp16acc"}	3	12.15 12.66 12.61	12.61	79	2.50	0.153	FAIL	False	229.5644	8.96e-02	1.8903	fast: f2 without the pipeline (the plain reader thread, padded last batch)
+2026-09-26 15:22	f7-f2-batch16	5ed0a76	{"pipeline": true, "compile": true, "pad": true, "half": "fp16acc", "batch": 16}	3	14.06 14.11 13.97	14.06	90	2.43	0.056	FAIL	False	194.7966	8.89e-02	1.5012	fast: f2 at batch 16
+2026-09-26 15:40	e4-final-exact	2088fde		3	8.33 8.21 7.95	8.21	94	2.07	0.169	pass	True	0.0	0.00e+00	0.0	final code, default (exact) mode: the pipeline, bit-identical
+2026-09-26 15:45	f9b-fast-triton	6494f10	{"fast": true}	3	13.31 12.58 12.74	12.74	79	3.12	0.124	reference					f9 again, the fast reader released after each build (f9 leaked it and ran out of memory)
+2026-09-26 15:51	f10-fast-batch16	6494f10	{"fast": true, "batch": 16}	3	12.38 10.84 12.59	12.38	75	3.12	0.124	FAIL	False	194.7966	8.89e-02	1.5012	fast at batch 16
+2026-09-26 15:57	f11-fast-batch32	329906b	{"fast": true, "batch": 32}	3	13.22 12.87 13.17	13.17	88	4.25	0.109	FAIL	False	219.9861	8.95e-02	1.6593	fast at batch 32
+2026-09-26 16:18	f12-fast	8241333	{"fast": true}	3	17.68 17.98 18.20	17.98	86	3.12	0.056	reference					fast, final: compile + fp16/fp16-acc + Triton attention actually routed (timm AttentionRope; f9-f11 never reached it) + overflow flag read through a pinned copy and event (f9/f10 synced the whole stream)
+2026-09-26 16:23	f13-fast-batch16	8241333	{"fast": true, "batch": 16}	3	17.70 17.60 17.45	17.60	86	3.12	0.059	FAIL	False	195.1698	8.93e-02	1.7508	f12 at batch 16
+2026-09-26 16:35	e5-lean	00e4e34		3	8.85 8.96 8.95	8.95	95	3.57	0.161	pass	True	0.0	0.00e+00	0.0	default mode on main (#132 decoder, #135 fast.lean_tower applied to the plain reader: no rope cat copies, cached position tables, weights cast once)
+2026-09-26 16:39	f14-fast-rebased	00e4e34	{"fast": true}	3	18.14 18.35 18.34	18.34	86	3.80	0.056	FAIL	False	203.868	8.96e-02	1.3429	fast mode rebased on main (#132's open_frames decoder), lean plain fallback
+2026-09-26 16:47	e6-final	882d19a		3	9.04 8.94 8.89	8.94	95	1.51	0.159	pass	True	0.0	0.00e+00	0.0	final default: e5 plus the tower collected after each build (e5's peak grew 2.2 to 3.6 GB over repeats)
+2026-09-26 16:57	f15-final	a68ce0a	{"fast": true}	3	18.01 17.76 17.84	17.84	87	2.49	0.059	reference					final --fast, cache kept for the float32 comparison

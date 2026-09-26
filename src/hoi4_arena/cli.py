@@ -247,6 +247,13 @@ def build_parser():
     )  # fmt: skip
     tower.add_argument("--int8", action="store_true", default=True, help=argparse.SUPPRESS)
     tower.add_argument(
+        "--fast", action="store_true",
+        help="Read the tower in float16, compiled, with float16 accumulation and a Triton "
+        "attention kernel: twice the frames a second on the 4060 Ti, closer to the tower's "
+        "float32 reading than the default bfloat16, but not the same bits (needs a GPU)",
+    )  # fmt: skip
+    tower.add_argument("--batch", type=int, default=8, help="Frames the tower reads at once")
+    tower.add_argument(
         "--dry-run", action="store_true",
         help="Work out the build's size and where it would go, and write nothing",
     )  # fmt: skip
@@ -1111,6 +1118,8 @@ def _dispatch(command, args):
             spill=args["spill"],
             keep_free_gb=args["keep_free"],
             int8=args["int8"],
+            batch=args["batch"],
+            fast=args["fast"],
             dry_run=args["dry_run"],
         )
     elif command == "drills":

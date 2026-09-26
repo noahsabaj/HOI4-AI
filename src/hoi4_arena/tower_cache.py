@@ -22,6 +22,7 @@ training refuses a cache made from another tower. A recording is complete once i
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -36,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .dataset import PERIOD_NS, normalize, parse_cursor, views
+from .dataset import PERIOD_NS, normalize
 from .models import CELLS
 from .nvdec import open_frames
 
@@ -71,21 +72,8 @@ def read_frozen(encoder, quadrants):
     return summary, grid
 
 
-def as_bits(tensor):
-    """bfloat16 values as int16, the dtype numpy can store them in."""
-    return tensor.to(torch.bfloat16).view(torch.int16).cpu().numpy()
-
-
 def from_bits(array):
     return torch.from_numpy(np.ascontiguousarray(array)).view(torch.bfloat16)
-
-
-def as_int8(grid):
-    """(int8 grid, float16 scale per frame and channel) of a (N, C, H, W) grid."""
-    grid = grid.float()
-    scale = grid.abs().amax((-2, -1)).clamp_min(1e-6) / 127
-    values = (grid / scale[..., None, None]).round().clamp(-127, 127).to(torch.int8)
-    return values.cpu().numpy(), scale.to(torch.float16).cpu().numpy()
 
 
 def read_grid(grid, scale=None):
@@ -128,9 +116,148 @@ def frame_times(root):
     return np.array([json.loads(line)["t_ns"] for line in rows], np.int64), rows
 
 
-def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=True):
+class TowerReader:
+    """The frozen tower's (summary, grid resized to CELLS x CELLS) of a batch of uint8
+    quadrants (B, 4, h, w, 3) on the device: read_frozen under bfloat16 autocast.
+
+    `fast` (cache-tower --fast, on the GPU) reads in float16 instead: the tower compiled
+    (torch.compile fuses its norms, rotary positions, activations and casts, 44% of its
+    eager time), its matmuls accumulating in float16 (twice float32's rate on GeForce
+    cards) and its attention by fast_attention. On the Qwen3.5-4B model's tower the whole
+    build read 17.8 frames a second of recorded games where the plain one read 8.9
+    (scripts/bench_cache.py, 2026-09-26), and its grid came out closer to the tower's
+    float32 reading than the plain build's bfloat16: 4.6% RMS off against 8.5%, the
+    summary 0.29% against 0.42%. float16 carries three more bits than bfloat16, and this
+    tower's activations stay below ~5,000, far from float16's 65,504. A batch that
+    overflows all the same is read again the plain way (`fallbacks` counts them), so the
+    cache never holds one. It is not the plain build bit for bit, as nothing faster is:
+    bfloat16 rounded in another order alone moves ~60% of the int8 values.
+    """
+
+    def __init__(self, encoder, device, *, batch=8, fast=False):
+        import copy
+
+        from torch import nn
+
+        from .fast import lean_tower
+
+        self.encoder, self.batch, self.fast, self.fallbacks = encoder, batch, fast, 0
+        self.autocast = {"device_type": torch.device(device).type, "dtype": torch.bfloat16}
+        if fast:
+            if torch.device(device).type != "cuda":
+                raise ValueError("cache-tower --fast needs a GPU")
+            # A float16 copy, taken from the float32 weights before lean_tower rounds them.
+            self.half = copy.deepcopy(encoder)
+            for module in self.half.modules():
+                if isinstance(module, (nn.Linear, nn.Conv2d)):
+                    module.to(torch.float16)
+        # The plain reading without timm's per-call copies and casts, to the same bits
+        # (fast.lean_tower, which the live actor runs too).
+        lean_tower(encoder)
+        if not fast:
+            return
+        from .dataset import DETAIL_SIZE, hw
+        from .fast_attention import install
+
+        install()
+        self.compiled = torch.compile(self._half, dynamic=False)
+        began = time.perf_counter()
+        # Compiled here, before any recording's clock starts: a build pays it once.
+        self.read(torch.zeros((batch, 4, *hw(DETAIL_SIZE), 3), dtype=torch.uint8, device=device))
+        log.info("cache-tower --fast: the tower compiled in %.0f s", time.perf_counter() - began)
+
+    def close(self):
+        """Lets go of the float16 copy and what was compiled from it, which dynamo's cache
+        would keep on the GPU, and every earlier build's in the process with them."""
+        if self.fast:
+            self.half = self.compiled = None
+            torch._dynamo.reset()
+
+    def plain(self, quads):
+        with torch.no_grad(), torch.autocast(**self.autocast):
+            return read_frozen(self.encoder, normalize(quads).permute(0, 1, 4, 2, 3))
+
+    def _half(self, quads):
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+            return read_frozen(self.half, normalize(quads).permute(0, 1, 4, 2, 3))
+
+    def read(self, quads):
+        """(summary, grid, finite): `finite` says, once the GPU gets there, whether the
+        fast read overflowed (None for a plain read). Check it with `checked`."""
+        if not self.fast:
+            return (*self.plain(quads), None)
+        n = len(quads)
+        if n < self.batch:
+            # One shape for the compiled graph: the last batch is padded.
+            quads = torch.cat([quads, quads.new_zeros((self.batch - n, *quads.shape[1:]))])
+        was = torch.backends.cuda.matmul.allow_fp16_accumulation
+        torch.backends.cuda.matmul.allow_fp16_accumulation = True
+        try:
+            summary, grid = self.compiled(quads)
+        finally:
+            torch.backends.cuda.matmul.allow_fp16_accumulation = was
+        summary, grid = summary[:n], grid[:n]
+        # Copied to the host as the GPU gets there, with an event to wait on: reading the
+        # flag off the GPU would also wait for every batch queued after this one.
+        flag = torch.empty((), dtype=torch.bool, pin_memory=True)
+        flag.copy_(torch.isfinite(summary).all() & torch.isfinite(grid).all(), non_blocking=True)
+        return summary, grid, (flag, _event(True))
+
+    def checked(self, quads, finite):
+        """None when a read was sound, or the plain (summary, grid) of `quads` when a
+        fast read overflowed."""
+        if finite is None:
+            return None
+        flag, copied = finite
+        copied.synchronize()
+        if bool(flag):
+            return None
+        self.fallbacks += 1
+        log.warning("cache-tower --fast: a batch overflowed float16; read it in bfloat16")
+        return self.plain(quads)
+
+
+def quantised(summary, grid, int8=True):
+    """What the cache keeps of a batch, on its device: the grid as int8 and a float16 scale
+    per frame and channel (its largest magnitude over the cells / 127), or as bfloat16
+    bits; the summary as bfloat16 bits."""
+    bits = summary.to(torch.bfloat16).view(torch.int16)
+    if not int8:
+        return grid.to(torch.bfloat16).view(torch.int16), None, bits
+    grid = grid.float()
+    scale = grid.abs().amax((-2, -1)).clamp_min(1e-6) / 127
+    values = (grid / scale[..., None, None]).round().clamp(-127, 127).to(torch.int8)
+    return values, scale.to(torch.float16), bits
+
+
+def _host(shape, dtype, cuda):
+    """A host buffer, pinned for asynchronous copies when the GPU is used."""
+    return torch.empty(shape, dtype=dtype, pin_memory=cuda)
+
+
+def _event(cuda):
+    """An event marking the work queued on the GPU so far (None on the CPU); waiting on it
+    sleeps rather than spins."""
+    if not cuda:
+        return None
+    event = torch.cuda.Event(blocking=True)
+    event.record()
+    return event
+
+
+def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=True, reader=None):
     """The frames of one recording a decision can read (kept_frames) through the frozen
-    tower, into `target`: the grid as int8 and its scales, or with `int8` off as bfloat16."""
+    tower, into `target`: the grid as int8 and its scales, or with `int8` off as bfloat16.
+
+    A pipeline, so the GPU is not kept waiting: a thread decodes whole frames into pinned
+    batches, the GPU cuts their quadrants (dataset.quadrant_views, as views() does one
+    frame at a time), runs the tower (`reader`, a TowerReader) and quantises, and another
+    thread writes what comes back. Batches are the kept frames in order, `batch` at a
+    time, as they always were, so the cache is the one a frame at a time made, bit for bit.
+    """
+    from .dataset import quadrant_views
+
+    reader = reader or TowerReader(encoder, device, batch=batch)
     manifest = json.loads((Path(root) / "manifest.json").read_text())
     times, lines = frame_times(root)
     count, width, height = manifest["frames"], manifest["width"], manifest["height"]
@@ -141,81 +268,128 @@ def cache_recording(encoder, root, target, device, *, batch=8, stamp=None, int8=
     rows[kept] = np.arange(len(kept), dtype=np.int32)
     target.mkdir(parents=True, exist_ok=True)
     (target / DONE).unlink(missing_ok=True)
-    kind = np.int8 if int8 else np.int16
+    dim = encoder.dim
+    shape = (len(kept), dim, CELLS, CELLS)
     grids = np.lib.format.open_memmap(
-        target / GRID_FILE, "w+", kind, (len(kept), encoder.dim, CELLS, CELLS)
+        target / GRID_FILE, "w+", np.int8 if int8 else np.int16, shape
     )
     scales = None
     if int8:
-        scales = np.lib.format.open_memmap(
-            target / SCALE_FILE, "w+", np.float16, (len(kept), encoder.dim)
-        )
+        scales = np.lib.format.open_memmap(target / SCALE_FILE, "w+", np.float16, (len(kept), dim))
     else:
         (target / SCALE_FILE).unlink(missing_ok=True)
-    summaries = np.lib.format.open_memmap(
-        target / SUMMARY_FILE, "w+", np.int16, (len(kept), encoder.dim)
-    )
+    summaries = np.lib.format.open_memmap(target / SUMMARY_FILE, "w+", np.int16, (len(kept), dim))
     # ffmpeg's RGB, HEVC decoded by ffmpeg's CUDA decoder where there is one: the same
     # pixels for half the CPU of decoding it on the CPU (nvdec.open_frames).
     decoder = open_frames(Path(root) / "screen.mkv", width, height)
-    autocast = {"device_type": torch.device(device).type, "dtype": torch.bfloat16}
-    # Frames are read and cut into views on a thread of their own while the tower runs:
-    # read one after the other, the pipe and the views took about 20 ms of each 60.
-    frames = queue.Queue(maxsize=32)
+    cuda = torch.device(device).type == "cuda"
+    # Three batches of each kind of buffer: one being filled, one on the GPU, one spare.
+    frames_free, outputs_free = queue.Queue(), queue.Queue()
+    for _ in range(3):
+        frames_free.put((_host((batch, height, width, 3), torch.uint8, cuda), None))
+        outputs_free.put({
+            "grid": _host((batch, dim, CELLS, CELLS), torch.int8 if int8 else torch.int16, cuda),
+            "scale": _host((batch, dim), torch.float16, cuda),
+            "summary": _host((batch, dim), torch.int16, cuda),
+        })  # fmt: skip
+    ready, written = queue.Queue(), queue.Queue()
+    errors, stop = [], threading.Event()
 
     def read():
         try:
-            for index in range(count):
-                frame = decoder.read()
-                if frame is None:
-                    raise ValueError(f"{root}: video ends at frame {index} of {count}")
-                if rows[index] < 0:
-                    continue
-                cursor = parse_cursor(json.loads(lines[index]).get("cursor"))
-                seen = views(frame, None, device=device, cursor=cursor).quadrants
-                frames.put((int(rows[index]), seen))
+            index, first = 0, 0
+            while first < len(kept) and not stop.is_set():
+                buffer, uploaded = frames_free.get()
+                if buffer is None:
+                    return
+                if uploaded is not None:
+                    uploaded.synchronize()
+                host, n = buffer.numpy(), 0
+                while n < batch and first + n < len(kept):
+                    frame = decoder.read()
+                    if frame is None:
+                        raise ValueError(f"{root}: video ends at frame {index} of {count}")
+                    if rows[index] >= 0:
+                        host[n] = frame
+                        n += 1
+                    index += 1
+                ready.put((first, n, buffer))
+                first += n
         except Exception as error:  # noqa: BLE001 - handed to the tower's thread to raise.
-            frames.put(error)
-        frames.put(None)
+            ready.put(error)
+        ready.put(None)
 
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    pending = []
+    def write():
+        try:
+            while (item := written.get()) is not None:
+                first, n, done, out = item
+                if done is not None:
+                    done.synchronize()
+                grids[first : first + n] = out["grid"][:n].numpy()
+                if scales is not None:
+                    scales[first : first + n] = out["scale"][:n].numpy()
+                summaries[first : first + n] = out["summary"][:n].numpy()
+                outputs_free.put(out)
+        except Exception as error:  # noqa: BLE001 - raised by the tower's thread.
+            errors.append(error)
+            outputs_free.put(None)
 
-    def flush():
-        nonlocal pending
-        if not pending:
-            return
-        quads = torch.stack([q for _, q in pending])
-        with torch.no_grad(), torch.autocast(**autocast):
-            summary, grid = read_frozen(encoder, normalize(quads).permute(0, 1, 4, 2, 3))
-        first = pending[0][0]
-        if int8:
-            values, scale = as_int8(grid)
-            grids[first : first + len(pending)] = values
-            scales[first : first + len(pending)] = scale
-        else:
-            grids[first : first + len(pending)] = as_bits(grid)
-        summaries[first : first + len(pending)] = as_bits(summary)
-        pending = []
+    def store(out, summary, grid):
+        values, scale, bits = quantised(summary, grid, int8)
+        out["grid"][: len(values)].copy_(values, non_blocking=True)
+        if scale is not None:
+            out["scale"][: len(scale)].copy_(scale, non_blocking=True)
+        out["summary"][: len(bits)].copy_(bits, non_blocking=True)
+        return _event(cuda)
 
+    def finish(item):
+        """Hands a batch to the writer once its fast read is known to be sound."""
+        first, n, done, out, quads, finite = item
+        again = reader.checked(quads, finite)
+        if again is not None:
+            done = store(out, *again)
+        written.put((first, n, done, out))
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (read, write)]
+    for thread in threads:
+        thread.start()
+    previous = None
     try:
-        while (item := frames.get()) is not None:
+        while (item := ready.get()) is not None:
             if isinstance(item, Exception):
                 raise item
-            pending.append(item)
-            if len(pending) == batch:
-                flush()
-        flush()
+            first, n, buffer = item
+            # On the CPU .to() would hand back the buffer itself, which the reader refills.
+            frames = buffer[:n].to(device, non_blocking=True) if cuda else buffer[:n].clone()
+            frames_free.put((buffer, _event(cuda)))
+            quads = quadrant_views(frames)
+            summary, grid, finite = reader.read(quads)
+            out = outputs_free.get()
+            if out is None:
+                raise errors[0]
+            done = store(out, summary, grid)
+            # The batch before is checked only now, with this one queued behind it, so
+            # the GPU is not left idle while the host waits for it.
+            if previous is not None:
+                finish(previous)
+            previous = (first, n, done, out, quads, finite)
+        if previous is not None:
+            finish(previous)
     finally:
+        stop.set()
+        frames_free.put((None, None))
+        written.put(None)
+        threads[1].join()
         decoder.close()
-        reader.join(timeout=10)
+        threads[0].join(timeout=10)
+    if errors:
+        raise errors[0]
     grids.flush()
     summaries.flush()
     if scales is not None:
         scales.flush()
     np.save(target / ROWS_FILE, rows)
-    done = {"frames": count, "kept": len(kept), "tower": stamp, "int8": int8}
+    done = {"frames": count, "kept": len(kept), "tower": stamp, "int8": int8, "fast": reader.fast}
     (target / DONE).write_text(json.dumps(done))
     return count
 
@@ -293,8 +467,15 @@ def cache_tower(data, checkpoint, output, *, dry_run=False, **options):
 
     if dry_run:
         return _cache_tower(data, checkpoint, output, dry_run=True, **options)
-    with RunLock(output):
-        return _cache_tower(data, checkpoint, output, **options)
+    try:
+        with RunLock(output):
+            return _cache_tower(data, checkpoint, output, **options)
+    finally:
+        # lean_tower binds each attention's forward to its module, a cycle only the
+        # garbage collector frees: collected now, the tower leaves the GPU with the build.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _cache_tower(
@@ -308,6 +489,8 @@ def _cache_tower(
     spill=None,
     keep_free_gb=30.0,
     int8=True,
+    batch=8,
+    fast=False,
     dry_run=False,
 ):
     """The frozen tower's reading of every frame a decision reads, of every recording in
@@ -320,7 +503,8 @@ def _cache_tower(
     tower_paths finds them there. A build that does not fit is refused. Returns what was
     done. With `model_path` naming another tower than the checkpoint's, that tower is
     cached in its own pretrained weights (train.load_carried). `int8` off keeps the grid
-    in bfloat16, twice the space.
+    in bfloat16, twice the space. The tower reads `batch` frames at a time; `fast` reads
+    in float16, compiled, twice as fast and no less accurate (TowerReader).
     """
     from .models import Policy, build_encoder
     from .train import load_carried
@@ -385,6 +569,7 @@ def _cache_tower(
     if dry_run:
         return {"planned": len(todo), **report}
     encoder = encoder.to(device)
+    reader = TowerReader(encoder, device, batch=batch, fast=fast)
     output.mkdir(parents=True, exist_ok=True)
     spilled_to = spill or earlier
     note = {
@@ -394,32 +579,39 @@ def _cache_tower(
     }
     note_path.write_text(json.dumps(note))
     done = spilled = 0
-    began = time.monotonic()
+    began = time.perf_counter()
     margin = keep_free_gb * 2**30
-    for name, root, need in todo:
-        target = chosen[name]
-        # Other writers share the drives: check again, and stop rather than fill one.
-        room = _free(target) + _partial(target) - need
-        if room < margin:
-            raise RuntimeError(
-                f"{target.parent} has {(room + need) / gb:.1f} GB free now, too little for "
-                f"{name} ({need / gb:.1f} GB) and {keep_free_gb:g} GB to spare; stopped "
-                f"after {done} recordings (the build resumes where it stopped)"
+    try:
+        for name, root, need in todo:
+            target = chosen[name]
+            # Other writers share the drives: check again, and stop rather than fill one.
+            room = _free(target) + _partial(target) - need
+            if room < margin:
+                raise RuntimeError(
+                    f"{target.parent} has {(room + need) / gb:.1f} GB free now, too little for "
+                    f"{name} ({need / gb:.1f} GB) and {keep_free_gb:g} GB to spare; stopped "
+                    f"after {done} recordings (the build resumes where it stopped)"
+                )
+            spilled += target.parent != output
+            started = time.monotonic()
+            cache_recording(
+                encoder, root, target, device, batch=batch, stamp=stamp, int8=int8, reader=reader
             )
-        spilled += target.parent != output
-        started = time.monotonic()
-        cache_recording(encoder, root, target, device, stamp=stamp, int8=int8)
-        seconds = max(time.monotonic() - started, 1e-6)
-        log.info(
-            "%s: %.0f s, %.0f MB/s written to %s",
-            name, seconds, need / seconds / 2**20, target.parent,
-        )  # fmt: skip
-        done += 1
+            seconds = max(time.monotonic() - started, 1e-6)
+            log.info(
+                "%s: %.0f s, %.0f MB/s written to %s",
+                name, seconds, need / seconds / 2**20, target.parent,
+            )  # fmt: skip
+            done += 1
+    finally:
+        reader.close()
     return {
         **report,
         "recordings": done,
         "spilled": spilled,
-        "seconds": round(time.monotonic() - began),
+        "fast": fast,
+        "fallbacks": reader.fallbacks,
+        "seconds": round(time.perf_counter() - began, 2),
     }
 
 

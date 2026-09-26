@@ -585,6 +585,56 @@ Things to know:
   forward and backward, so an epoch of the 44 games takes at least 20 min however fast
   the frozen blocks and the data become.
 
+**`cache-tower`, 2026-09-26.** The Qwen3.5-4B model's tower is to be cached for bc7 over
+scripted-v6's 347k decision frames. `scripts/bench_cache.py` times the whole build on
+1016 frames of three games (the first 400 frames of each; a short game first, untimed,
+to warm up), and `scripts/check_cache.py` compares the cache with the unmodified build's.
+Every run is in `bench/cache-ledger.tsv`.
+
+| Build | Frames a second | scripted-v6 | Against the float32 tower (grid RMS, summary RMS) |
+|---|---|---|---|
+| Before | 8.06 | 12.0 h | 8.5%, 0.42% |
+| Pipelined, the same bits | 8.2 | 11.7 h | the same |
+| Default now: pipelined, timm's waste trimmed (`fast.lean_tower`), the same bits | 8.95 | 10.8 h | the same |
+| Compiled, bfloat16 | 10.45 | 9.2 h | 7.1%, 0.38% |
+| Compiled, float16 with float16 accumulation | 13.2 | 7.3 h | 4.5%, 0.29% |
+| `--fast`: the above plus a Triton attention kernel | **17.8** | **5.4 h** | 4.6%, 0.29% |
+
+- **The tower is the build.** It took 115 of the 124 ms a frame; decoding took 8 ms on
+  its own thread, and cutting, quantising and writing 3 ms. In its eager forward,
+  matmuls were 34% of the GPU's time, attention 21%, and 44% was norms, rotary
+  positions, activations and casts, which `torch.compile` fuses.
+- **Nothing faster keeps the bits.** Against a float32 build of the same frames, the
+  bfloat16 build is 8.5% RMS off, and ~60% of its int8 values differ: bfloat16's
+  rounding is far larger than an int8 step. Any change to the order of the arithmetic
+  moves the cache by as much, so the gate's "within one int8 step" cannot pass. What
+  passes is bit-identical: the pipeline, and `fast.lean_tower` from the live actor
+  (#135), which drops the copies timm makes around its rotary positions, makes the
+  position tables once and casts the weights to bfloat16 once: 11% together.
+- **float16 is the better half-precision here.** This tower's activations stay below
+  ~5,000 (the last block's; the rest below 250), so float16's range is enough, and its
+  three extra bits halve the error. Its matmuls may accumulate in float16, which the
+  GeForce cards run at twice the float32-accumulate rate, and still come out closer to
+  float32 than bfloat16 does. `--fast` checks every batch for overflow, one batch behind
+  so the GPU never waits, and reads one that overflowed again in bfloat16.
+- **Attention.** Compiled, it was 40% of the tower: PyTorch's memory-efficient kernel ran
+  at 32 TFLOP/s (flash attention is not built into torch on Windows). A Triton
+  flash-attention kernel with float16 accumulation (`fast_attention.py`) runs at 64, at
+  0.3% error. FlexAttention and cuDNN attention were no faster than PyTorch's.
+- **The card is power-bound.** Steady, the fast build holds the GPU at 100% and 155 W of
+  its 160 W cap. So a pipeline that only fills gaps barely helps (GPU busy 91% to 96%,
+  the same frames a second, since the clock falls as the power rises); what helps is
+  less work per frame. Run to run, the same build varied 7.3-8.2 frames a second with
+  the card's temperature.
+- **Not yet used live.** The live actor's `--fast` (above) attends through PyTorch's
+  kernel from its own lean attention, which `fast_attention.install` does not reach; the
+  same kernel would take about half its attention time.
+- Tried and dropped: batches of 4, 16 and 32 (8 is as fast), `max-autotune` (no faster),
+  CUDA graphs (the launch overhead is under 1%), float8 (per-row scaling is unsupported
+  on this card; per-tensor was slower and 20% off), float16 without the overflow check
+  one batch behind (a check that waited for the GPU left it idle 20% of the time and
+  cost 4%).
+
 Earlier, all on an RTX 4060 Ti with the game at 3840×2160 and the LeVJEPA encoder:
 
 | | Result |
