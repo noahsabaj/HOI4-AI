@@ -119,10 +119,10 @@ def test_views_centres_the_fovea_on_the_pointer_and_refuses_to_invent_one():
         views(_POINTER, size=3)
 
 
-def _recording(root, cursor, *, game_speed=4, frames=40, source="human", events=None):
+def _recording(root, cursor, *, game_speed=4, frames=40, source="human", events=None, shade=0):
     """A recording as Recorder writes it: manifest, frames.jsonl, and ffv1 video.
 
-    Frame i is a flat image of value i, so any view of it can be traced back to it.
+    Frame i is a flat image of value `shade` + i, so any view of it can be traced back to it.
     """
     root.mkdir()
     manifest = {
@@ -157,7 +157,7 @@ def _recording(root, cursor, *, game_speed=4, frames=40, source="human", events=
         stdin=subprocess.PIPE,
     )
     for i in range(frames):
-        encoder.stdin.write(np.full((16, 16, 3), i, np.uint8).tobytes())
+        encoder.stdin.write(np.full((16, 16, 3), shade + i, np.uint8).tobytes())
     encoder.stdin.close()
     assert encoder.wait(timeout=30) == 0
 
@@ -416,6 +416,145 @@ def test_each_worker_reads_its_own_recordings_and_every_window_once(tmp_path, mo
     # Real worker processes, which on Windows start fresh and are sent the dataset.
     loader = dataset.window_loader(sessions, 1, workers=2)
     assert Counter(_key(w) for w in loader) == every
+
+
+def _same(a, b):
+    assert a.keys() == b.keys()
+    for name, value in a.items():
+        # Bit for bit; a game with no winner has NaN outcomes, which equal nothing.
+        assert value.dtype == b[name].dtype and value.shape == b[name].shape, name
+        assert torch.equal(value.view(torch.uint8), b[name].view(torch.uint8)), name
+
+
+# Five games of different lengths, told apart by their speed and their pixels: frame i of
+# the one at speed s is the flat value 50 * (s - 1) + i.
+_GAMES = {1: 40, 2: 48, 3: 44, 4: 36, 5: 42}
+
+
+def _games(root):
+    for speed, frames in _GAMES.items():
+        _recording(root / f"speed-{speed}", [8, 6], game_speed=speed, frames=frames,
+                   shade=50 * (speed - 1))  # fmt: skip
+
+
+def test_the_loader_takes_batches_from_its_workers_in_turn_past_those_run_out():
+    from hoi4_arena.dataset import loader_share
+
+    # Worker 1 runs out after its first: w0 w1 w2 w0 w2 w0 w0.
+    assert loader_share([4, 1, 2], 5) == [2, 1, 2]
+    assert loader_share([4, 1, 2], 7) == [4, 1, 2]
+    assert loader_share([4, 1, 2], 99) == [4, 1, 2]
+    assert loader_share([5], 3) == [3]
+    assert loader_share([3, 3], 0) == [0, 0]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("clips", [True, False])
+@pytest.mark.parametrize("carry", [False, True])
+def test_a_resumed_pass_is_the_uninterrupted_one_from_the_skip_on_and_decodes_none_before(
+    tmp_path, monkeypatch, clips, carry
+):
+    """A resume at step 2100 of bc6 spent 45 minutes decoding and cutting the batches it
+    then threw away (2026-09-26). Resumed, the loader hands out a stand-in for each of
+    those, and after them the very batches an uninterrupted pass does; the frames only
+    skipped windows read are never decoded, let alone viewed."""
+    import hoi4_arena.dataset as dataset
+    from hoi4_arena.dataset import GameSequences
+
+    _games(tmp_path)
+    sessions = VideoSessions(tmp_path, length=2, burn_in=1, device="cpu", clips=clips,
+                             streams=2, shuffle=2)  # fmt: skip
+    if carry:
+        trainset = GameSequences(sessions, 4, 2, device="cpu", clips=clips)
+        loader = sequence_loader(trainset)
+    else:
+        trainset = sessions
+        loader = window_loader(sessions, 3)
+    by_speed = {labels["speed"]: labels for labels in sessions.sessions}
+    viewed, opened = [], []
+    counted, open_ = dataset.views, dataset._Stream._open
+
+    def view(rgb, *args, **kwargs):
+        viewed.append(int(rgb[0, 0, 0]))
+        return counted(rgb, *args, **kwargs)
+
+    def spy(stream, frame):
+        opened.append((stream.labels["speed"], frame))
+        return open_(stream, frame)
+
+    monkeypatch.setattr(dataset, "views", view)
+    monkeypatch.setattr(dataset._Stream, "_open", spy)
+    trainset.epoch = 5
+    whole = list(loader)
+    assert len(whole) > 6
+    every = len(viewed)
+
+    def starts(batches):
+        """Each game's first window among `batches`."""
+        first = {}
+        for batch in batches:
+            for speed, start in zip(batch["speed"][:, 0].tolist(), batch["start"].tolist()):
+                first[speed] = min(first.get(speed, start), start)
+        return first
+
+    for skip in (1, len(whole) // 2, len(whole) - 1):
+        viewed.clear()
+        opened.clear()
+        trainset.epoch = 5
+        trainset.resume(skip, 1 if carry else 3)
+        resumed = list(loader)
+        assert len(resumed) == len(whole)
+        for batch in resumed[:skip]:
+            assert set(batch) == {"skipped"}
+        for a, b in zip(whole[skip:], resumed[skip:], strict=True):
+            _same(a, b)
+        # Each game is decoded from the first frame a window still to train reads (from
+        # its start if its first window trains, as ever), and a game with none never is.
+        first, earliest = starts(whole[skip:]), starts(whole)
+        for speed, start in first.items():
+            labels = by_speed[speed]
+            read = int(labels["frame_ids"][start])
+            if clips:
+                read = min(read, int(labels["clip_ids"][start].min()))
+            first[speed] = 0 if start == earliest[speed] else read
+        assert sorted(opened) == sorted(first.items())
+        for value in viewed:
+            speed = value // 50 + 1
+            assert value - 50 * (speed - 1) >= first[speed], "a skipped frame was viewed"
+        assert len(viewed) < every
+    # The next epoch is whole again.
+    viewed.clear()
+    trainset.epoch = 5
+    again = list(loader)
+    for a, b in zip(whole, again, strict=True):
+        _same(a, b)
+    assert len(viewed) == every
+
+
+@needs_ffmpeg
+def test_a_resumed_pass_through_worker_processes_is_the_uninterrupted_one(tmp_path):
+    """Two workers, one of which runs out first: the stand-ins still fall where the
+    trained batches were, because each worker works out where its own batches fall."""
+    from hoi4_arena.dataset import GameSequences
+
+    _games(tmp_path)
+    sessions = VideoSessions(tmp_path, length=2, burn_in=1, device="cpu", clips=False)
+    games = GameSequences(sessions, 4, 1, device="cpu", clips=False)
+    whole = list(sequence_loader(games, workers=2))
+    # Skipped well past where one worker ran out and turns stopped alternating.
+    skip = len(whole) - 1
+    workers = [int(b["slot"][0]) for b in whole[:skip]]
+    assert abs(workers.count(0) - workers.count(1)) >= 2
+    games.resume(skip)
+    resumed = list(sequence_loader(games, workers=2))
+    assert all(set(b) == {"skipped"} for b in resumed[:skip])
+    for a, b in zip(whole[skip:], resumed[skip:], strict=True):
+        _same(a, b)
+    whole = list(window_loader(sessions, 3, workers=2))
+    sessions.resume(3, 3)
+    resumed = list(window_loader(sessions, 3, workers=2))
+    for a, b in zip(whole[3:], resumed[3:], strict=True):
+        _same(a, b)
 
 
 class _Threads(torch.utils.data.IterableDataset):
