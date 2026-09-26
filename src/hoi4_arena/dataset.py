@@ -460,6 +460,20 @@ def session_labels(
         last = len(times) - 1
         pushed = (decisions >= times[min(begun, last)]) & (decisions <= times[min(ended, last)])
         weight = weight * np.where(pushed, np.float32(0), np.float32(1))
+    # A practice game (practice.Coach): only the coach's spans teach, what the scripted
+    # player did from where the policy had led the game; the policy's own decisions weigh
+    # nothing. Their windows stay, so the lead-up into each span is read.
+    if "coached" in manifest:
+        last = len(times) - 1
+        taught = np.zeros(len(decisions), bool)
+        for span in manifest["coached"]:
+            begun, ended = span.get("from_frame"), span.get("to_frame")
+            if begun is None or ended is None:
+                continue
+            taught |= (decisions >= times[min(begun, last)]) & (
+                decisions <= times[min(ended, last)]
+            )
+        weight = weight * taught.astype(np.float32)
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the

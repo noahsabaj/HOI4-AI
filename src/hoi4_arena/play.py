@@ -394,6 +394,8 @@ def play_policy_game(
     arena_name=None,
     after_surrender=5.0,
     snap_every=30.0,
+    coach=None,
+    log_from=None,
 ):
     """Record one game in which `actor` plays `country` against the game's AI.
 
@@ -401,6 +403,11 @@ def play_policy_game(
     it. Ends `after_surrender` seconds after the arena log names a winner, or at
     `cap_minutes` (a draw). Returns the outcome, the reason it ended early if it did, and
     the manifest.
+
+    With `coach` (practice.Coach), the scripted player watches the setup and takes a step
+    over when the policy falls behind; its inputs are recorded, tagged "by": "coach", and
+    the frames it held are the manifest's `coached`. `log_from` is where this game's lines
+    begin in the game log, for a game loaded from inside the last one (ai_games.log_end).
     """
     clock = time.perf_counter
     actor.reset_episode()
@@ -415,6 +422,10 @@ def play_policy_game(
     dispatcher = Dispatcher(desk, width, height, timed=timed)
     referee = Referee(setup_seconds, stall_seconds)
     arena = ArenaLog(desk)
+    if log_from is not None:
+        arena.offset = log_from
+    if coach is not None:
+        coach.attach(rec)
     watch = Watch(root, station, snap_every)
     stamped, timings = [], []
     outcome, reason, ending = "timeout", None, None
@@ -486,6 +497,17 @@ def play_policy_game(
             watch.count(applied)
             if dispatcher.speed_clicks and not referee.running:
                 referee.clicked_speed_up()
+            step = coach.look(desk, clock() - start, referee.running) if coach else None
+            if step is not None:
+                # The coach's own input, while no interval is in flight, as the harness's.
+                desk.release()
+                dispatcher.released()
+                actor.let_go()
+                log.info("[%s] the coach takes over: %s", station, step)
+                taken = coach.take_over(desk, step, clock() - start)
+                record(rec, frame, applied + taken, streamed)
+                deadline = clock()
+                continue
             wait = referee.due()
             if wait is not None:
                 # The harness's own input, while no interval is in flight; the action
@@ -591,6 +613,8 @@ def play_policy_game(
             presses=watch.presses,
             forced_releases=dispatcher.holds.forced,
         )
+        if coach is not None:
+            rec.manifest.update(coached=coach.coached, setup=coach.score())
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
 
