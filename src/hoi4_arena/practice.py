@@ -36,6 +36,23 @@ STEPS = ("army", "general", "front", "running")
 # start saves (army ~6 s, general ~12 s, front 18-28 s, running 31-40 s, 2026-09-25).
 DEADLINES = {"army": 20.0, "general": 35.0, "front": 60.0}
 MAIN_ARENA = "arena-12x8-v4"
+# The first army's card in the bottom bar, at 1080p (scripted.ARMY_CARD), the patch of it
+# read (x0, y0, x1, y1), and what tells an army and a general there. With no army the
+# spot is the dark gap between two empty "+" slots (mean 39-45); an army's card is lit
+# (88), and a general's portrait on it is ~63% skin tones against 0-4% without one
+# (2026-09-26, practice episodes). The unassigned alert's absence was no proof: a tooltip
+# over the top bar hid it, and an episode scored an army that never was.
+CARD = (929, 985, 965, 1025)
+CARD_LIT, PORTRAIT_SKIN = 65.0, 0.3
+
+
+def army_card(rgb):
+    """(an army's card is shown, a general's portrait is on it), from its patch."""
+    x0, y0, x1, y1 = CARD
+    patch = rgb[y0:y1, x0:x1].astype(np.int32)
+    r, g, b = patch[..., 0], patch[..., 1], patch[..., 2]
+    skin = float(((r > 120) & (r > g + 15) & (g > b)).mean())
+    return float(patch.mean()) > CARD_LIT, skin > PORTRAIT_SKIN
 
 
 class Coach:
@@ -96,11 +113,10 @@ class Coach:
             return None
         self.next_look = seconds + self.look_every
         rgb = screen(desk)
-        find = self.planner.find
-        if find(rgb, "unassigned") is None:
+        army, general = army_card(rgb)
+        if army:
             self.seen("army", seconds)
-        if find(rgb, "plans_bar") is not None and find(rgb, "no_commander") is None:
-            # The army's panel is open, and its commander slot is filled.
+        if general:
             self.seen("general", seconds)
         if plan_shown(rgb):
             self.seen("front", seconds)
