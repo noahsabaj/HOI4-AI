@@ -132,6 +132,12 @@ A learned policy imitates the scripted player's games and then plays them itself
 .venv\Scripts\hoi4-arena.exe play-policy artifacts/bc-scripted/epoch-0000.pt artifacts/live --peer artifacts/pairing/peer-fleet.json --games 2 --minutes 40 --point
 ```
 
+Strategy and execution can also be learned apart (`intents.py`). A high-level policy picks an intent every second or so (form an army, assign a general, draw a front or an offensive, execute, set a law, redraw, pause or run, a camera move, wait), and a hand turns it into clicks and keys. The vocabulary is the scripted player's own procedures, so `intents DATA` relabels its recorded games into skill segments and reports how much of their input the vocabulary explains and how many of the planner's orders a segment of the right skill ended in. Arguments such as `target_state` or `front_state` are optional: None leaves the choice to the hand. `hand.ScriptedHand` is the first hand, the scripted player's procedures one intent at a time, driven by the screen. Since this change the recorder also tags every input with the skill it served, so new recordings are labelled exactly.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe intents C:\hoi4-data\scripted-v6
+```
+
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
 
 ```powershell
