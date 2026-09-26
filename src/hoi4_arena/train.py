@@ -562,7 +562,8 @@ def _train_bc(
         "balance": balance,
     }
     output.mkdir(parents=True, exist_ok=True)
-    progress = Progress(output, config, every=save_every, resume=resume)
+    # The loader's workers are not the model's, but a resume needs the same (Progress).
+    progress = Progress(output, {**config, "workers": workers}, every=save_every, resume=resume)
     modules = {
         "policy": policy,
         "auxiliary": aux,
@@ -584,6 +585,15 @@ def _train_bc(
                 drop_last=not carry and auxiliary != "none",
             )
             store = {}  # A carried game's memory, by batch slot.
+            if carry and epoch == first_epoch and skip:
+                # The games under way when the run stopped go on from where they were.
+                if progress.carried is None:
+                    logger.warning(
+                        "the saved progress predates keeping the carried memory: the games "
+                        "under way go on from an empty one"
+                    )
+                else:
+                    store = {slot: value.to(device) for slot, value in progress.carried.items()}
             for step, batch in enumerate(loader):
                 if epoch == first_epoch and step < skip:
                     continue  # Trained before the run was interrupted.
@@ -645,7 +655,7 @@ def _train_bc(
                     row["orders"] = plan.item()
                 log.write(json.dumps(row) + "\n")
                 log.flush()
-                progress.tick(epoch, step + 1, modules, optimizer)
+                progress.tick(epoch, step + 1, modules, optimizer, store if carry else None)
             policy.eval()
             validation_losses, acting, predicted, truths = [], [], [], []
             order_right, order_known = 0, 0

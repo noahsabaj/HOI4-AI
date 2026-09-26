@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 def file_hash(path):
@@ -279,8 +282,14 @@ class Progress:
     exactly the ones trained before. The loader only counts its way past them, decoding
     none (dataset._Resumable), so resuming costs seconds, not the run.
 
+    A carried memory's state for each game under way is saved too, so a run that carries
+    it (train_bc's `carry`) goes on as if it had never stopped; a file saved before it was
+    kept resumes those games from an empty memory, with a warning.
+
     The config must match the saved one, so a resume cannot quietly continue a different
-    run. `every` 0 saves only after each epoch.
+    run; so must its `workers`, the loader's, since the batches' order depends on them (a
+    file saved before they were recorded is taken at its word, with a warning). `every`
+    0 saves only after each epoch.
     """
 
     def __init__(self, output, config, *, every=600.0, resume=False, clock=time.monotonic):
@@ -296,11 +305,34 @@ class Progress:
             raise FileNotFoundError(f"No run in progress to resume in {self.path.parent}")
 
     def start(self, modules, optimizer):
-        """Where to begin, (epoch, batches to skip), with the saved state loaded if resuming."""
+        """Where to begin, (epoch, batches to skip), with the saved state loaded if resuming.
+
+        What the run carried from batch to batch (`carried`, see `save`) is left in
+        `self.carried`: None if nothing was, or the file predates keeping it.
+        """
+        self.carried = None
         if not self.resume:
             return 0, 0
         saved = torch.load(self.path, map_location="cpu", weights_only=True)
-        if saved["config"] != self.config:
+        config = dict(saved["config"])
+        if "workers" in self.config:
+            # Each loader worker plays its own share of the recordings, so the order of the
+            # batches, and which ones were trained, depends on how many there are.
+            if "workers" not in config:
+                logger.warning(
+                    "%s predates recording the loader's workers: resuming with %s, which "
+                    "must be what the run used for its batches to come in the same order",
+                    self.path,
+                    self.config["workers"],
+                )
+                config["workers"] = self.config["workers"]
+            elif config["workers"] != self.config["workers"]:
+                raise ValueError(
+                    f"The run saved here loaded its data with --workers {config['workers']}, "
+                    "and the order of its batches depends on it: resume it with "
+                    f"--workers {config['workers']}"
+                )
+        if config != self.config:
             raise ValueError("The run saved here was made with other settings; it cannot resume")
         for name, module in modules.items():
             module.load_state_dict(saved["modules"][name])
@@ -308,11 +340,19 @@ class Progress:
         torch.set_rng_state(saved["rng"]["torch"])
         if torch.cuda.is_available() and saved["rng"]["cuda"] is not None:
             torch.cuda.set_rng_state_all(saved["rng"]["cuda"])
+        self.carried = saved.get("carried")
         return saved["epoch"], saved["step"]
 
-    def save(self, epoch, step, modules, optimizer):
-        """Write the state now: `step` batches of `epoch` are done."""
+    def save(self, epoch, step, modules, optimizer, carried=None):
+        """Write the state now: `step` batches of `epoch` are done.
+
+        `carried`, {batch slot: tensor}, is what the run carries into its next batch: a
+        carried memory's state for each game under way (train_bc's `carry`).
+        """
+        if carried is not None:
+            carried = {int(slot): value.detach().cpu() for slot, value in carried.items()}
         payload = {
+            "carried": carried,
             "config": self.config,
             "epoch": epoch,
             "step": step,
@@ -329,10 +369,10 @@ class Progress:
         replace_patiently(temp, self.path)
         self.last = self.clock()
 
-    def tick(self, epoch, step, modules, optimizer):
+    def tick(self, epoch, step, modules, optimizer, carried=None):
         """After each batch: save if `every` seconds have passed since the last save."""
         if self.every and self.clock() - self.last >= self.every:
-            self.save(epoch, step, modules, optimizer)
+            self.save(epoch, step, modules, optimizer, carried)
 
     def finish(self):
         self.path.unlink(missing_ok=True)
