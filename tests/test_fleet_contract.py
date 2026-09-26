@@ -1,7 +1,8 @@
-"""What the fleet project's `fleet` command relies on here, kept working: a `project`
-job run by Run-Job.ps1, with its state and log in jobs/. The worker's side (the `job`
-op on observer connections) is tested in the worker's crate, and the reservation files
-(queue/, granted/, done/) in test_ai_games.py."""
+"""What the fleet project's `fleet` command used here until 2026-09-26, kept working: a
+`project` job run by Run-Job.ps1, with its state and log in jobs/. The worker's side (the
+`job` op on observer connections) is tested in the worker's crate. fleet now reaches the
+second PC through a node of its own and relies here only on the reservation files
+(queue/, granted/, done/), tested in test_ai_games.py."""
 
 import json
 import shutil

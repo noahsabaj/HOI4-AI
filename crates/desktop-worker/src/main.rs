@@ -590,9 +590,9 @@ const JOB_SPEC_HEX: usize = 30_000;
 /// project's folder, compute\projects\<project>, which `fleet push` fills. The user asked
 /// for "a universal bus" so that every project on the coordinator can train here, and
 /// gave "full permission for the bridge access". Its arguments cross as JSON inside hex,
-/// so no shell ever reads them. The fleet project's `fleet` command starts, stops and
-/// lists these on observer connections: keep the op and its fields compatible, or tell
-/// the user before changing them.
+/// so no shell ever reads them. The fleet project's `fleet` command started, stopped and
+/// listed these on observer connections until 2026-09-26, when it moved to a node of its
+/// own on the second PC.
 fn job_arguments(cmd: &serde_json::Value) -> Result<Vec<String>, String> {
     let action = cmd["action"].as_str().unwrap_or("");
     if !matches!(action, "start" | "stop" | "status") {
@@ -3734,7 +3734,7 @@ mod tests {
             assert!(!observer_allows(op, &status), "{op} should be refused");
         }
         // Compute jobs touch no game, so an observer runs them beside a recording (the
-        // fleet project's jobs come this way).
+        // fleet project's jobs came this way until 2026-09-26).
         for action in ["start", "stop", "status"] {
             assert!(observer_allows(
                 "job",
