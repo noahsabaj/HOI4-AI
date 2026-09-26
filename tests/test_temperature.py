@@ -202,3 +202,37 @@ def test_practice_and_play_policy_take_the_temperatures(
     monkeypatch.setattr(sys, "argv", argv)
     cli.main()
     assert {k: seen[k] for k in expected} == expected
+
+
+@pytest.mark.parametrize(("where", "peer"), [(["--here"], None), (["--peer", "p.json"], "p.json")])
+def test_practice_runs_here_or_on_the_second_pc(monkeypatch, where, peer):
+    from hoi4_arena import cli
+
+    seen = {}
+    monkeypatch.setattr("hoi4_arena.practice.practice", lambda *a, **k: seen.update(k))
+    monkeypatch.setattr("hoi4_arena.models.configure_precision", lambda tf32: None)
+    monkeypatch.setattr("hoi4_arena.models.limit_gpu_memory", lambda fraction: None)
+    argv = ["hoi4-arena", "practice", "ckpt", "out", *where, "--minutes", "5"]
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.main()
+    assert seen["peer"] == peer and "here" not in seen
+
+
+def test_a_practice_station_is_this_pc_without_a_pairing(monkeypatch, tmp_path):
+    made = []
+
+    class Station:
+        def __init__(self, name, peer=None):
+            made.append((name, peer))
+            raise RuntimeError("stop here")
+
+    monkeypatch.setattr("hoi4_arena.ai_games.Station", Station)
+    monkeypatch.setattr("hoi4_arena.vision.ScreenRules", lambda path: None)
+    monkeypatch.setattr(
+        "PIL.Image.open", lambda path: __import__("PIL.Image").Image.new("RGB", (2, 2))
+    )
+    with pytest.raises(RuntimeError, match="stop here"):
+        practice.practice("ckpt", tmp_path, minutes=1)
+    with pytest.raises(RuntimeError, match="stop here"):
+        practice.practice("ckpt", tmp_path, peer="p.json", minutes=1)
+    assert made == [("here", None), ("peer", "p.json")]
