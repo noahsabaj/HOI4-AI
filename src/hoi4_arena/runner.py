@@ -157,6 +157,11 @@ class Actor:
         point=False,
         temperature=1.0,
         pointer_temperature=None,
+        lean=False,
+        fast=None,
+        compile_tower=False,
+        graph=None,
+        lean_tower=None,
     ):
         """`memory_window` N runs the memory afresh over the last N decisions' perception
         at every decision, from an empty state, instead of carrying it from the game's
@@ -165,7 +170,17 @@ class Actor:
         `point` places each move on its likeliest spot while still sampling what to do
         (models.ActionHead): for evaluation, not for self-play, whose likelihoods must be of
         samples. `temperature` and `pointer_temperature` sharpen what it does and where it
-        points (resolve_temperatures); likewise for evaluation only."""
+        points (resolve_temperatures); likewise for evaluation only.
+
+        A `lean` actor (play-policy, practice, drills) keeps no training sample, and decides
+        through one CUDA graph (`graph`, _capture) on a trimmed tower (`lean_tower`,
+        fast.lean_tower): the same numbers as eager, measured on the second PC's GPU beside
+        its game about 12% faster back to back and 7% paced at 5 Hz (scripts/bench_decide.py,
+        bench/decide-ledger.tsv). `fast` (True, or fast.apply_fast's options) is fast mode:
+        the tower in float16 with float16 accumulation, compiled by inductor, which changes
+        the numbers slightly (under 0.13 nats a head on the benchmark's decisions, every
+        sampled action the same) for about a third less time, and half on the Qwen3.5-4B
+        model's tower. `compile_tower` compiles the tower alone (see _compile_tower)."""
         self.temperature, self.pointer_temperature = resolve_temperatures(
             temperature, pointer_temperature, point
         )
@@ -177,6 +192,19 @@ class Actor:
         # amount of game time at each one.
         self.speed = recorded_speed(game_speed)["game_speed"]
         self.policy.eval().requires_grad_(False)
+        # fast.py: the tower's per-call waste removed (the same numbers), and fast mode
+        # (numeric shortcuts, opt-in).
+        from .fast import FAST, apply_fast
+        from .fast import lean_tower as trim
+
+        self.lean = bool(lean)
+        if fast is True:
+            fast = dict(FAST)
+        fast = dict(fast or {})
+        compile_tower = compile_tower or fast.pop("compile", False)
+        use_lean_tower = self.lean if lean_tower is None else lean_tower
+        self.lean_tower = bool(use_lean_tower) and trim(self.policy.encoder)
+        self.fast = apply_fast(self.policy, fast) if fast else {}
         # Evaluation runs take the argmax so paired_evaluation's bound is not inflated by
         # sampling noise the analysis does not model. Self-play collection must sample.
         self.deterministic = deterministic
@@ -188,13 +216,27 @@ class Actor:
         self.held = ()
         self.held_previous = bool(self.config.get("held_previous"))
         self.history = deque(maxlen=64)
-        self.compiled = compile_head and device == "cuda" and self._compile_head()
+        # A lean decision can run as one CUDA graph (_decide_graphed); the head inside it is
+        # compiled without inductor's own graphs, which cannot nest in another capture.
+        self.graph = bool(self.lean if graph is None else graph) and device == "cuda"
+        self.static = None
+        head_mode = None if self.graph else "reduce-overhead"
+        self.compiled = compile_head and device == "cuda" and self._compile_head(head_mode)
+        self.tower_compiled = bool(compile_tower) and device == "cuda"
+        self.tower_compiled = self.tower_compiled and self._compile_tower(compile_tower)
+        if self.fast or self.tower_compiled:
+            self.fast = {**self.fast, "compiled": self.tower_compiled}
+        # Pay the capture now rather than at the game's first decision.
+        if self._graphable():
+            self._ensure_graph()
 
     @property
     def sampling(self):
         """How this actor draws its actions, for a game's manifest: its two temperatures
         (resolve_temperatures) and whether it takes the argmax outright."""
+        fast = {"fast": True} if getattr(self, "fast", None) else {}
         return {
+            **fast,
             "temperature": getattr(self, "temperature", 1.0),
             "pointer_temperature": getattr(self, "pointer_temperature", 1.0),
             "deterministic": bool(getattr(self, "deterministic", False)),
@@ -228,7 +270,7 @@ class Actor:
         if getattr(self, "recent", None) is not None:
             self.recent.clear()
 
-    def _compile_head(self):
+    def _compile_head(self, mode="reduce-overhead"):
         """Capture the action head into a CUDA graph, and prove it before trusting it.
 
         The head is eight fixed-length slots of very small tensors, so nearly all of its
@@ -247,7 +289,7 @@ class Actor:
         here must cost latency rather than the match.
         """
         try:
-            self.policy.actor.compile(mode="reduce-overhead", dynamic=False)
+            self.policy.actor.compile(mode=mode, dynamic=False)
             self._warm_head()
         except Exception as error:  # noqa: BLE001 - an uncompiled actor is still correct.
             self._uncompile(f"{type(error).__name__}: {error}")
@@ -290,24 +332,188 @@ class Actor:
                     )
         torch.cuda.synchronize()
 
+    def _compile_tower(self, mode):
+        """Compile the vision tower with inductor (`mode` True for its default mode, or a
+        torch.compile mode's name), and pay the compilation now. Returns whether it took."""
+        from .dataset import DETAIL_SIZE
+
+        # A fast-mode tower (fast.FastTower) keeps its precision and kernel choice outside
+        # what is compiled.
+        encoder = getattr(self.policy.encoder, "inner", self.policy.encoder)
+        settings = mode if isinstance(mode, dict) else {"mode": None if mode is True else mode}
+        try:
+            import torch._inductor.config as inductor
+
+            for key, value in settings.get("config", {}).items():
+                setattr(inductor, key, value)
+            encoder.compile(mode=settings.get("mode"), dynamic=False)
+            quadrants = torch.zeros(1, 4, 3, *DETAIL_SIZE, device=self.device)
+            for _ in range(2):
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16),
+                ):
+                    self.policy.encoder(None, quadrants)
+            torch.cuda.synchronize()
+        except Exception as error:  # noqa: BLE001 - an eager tower is still correct.
+            log.warning("running the tower eagerly: %s: %s", type(error).__name__, error)
+            encoder._compiled_call_impl = None
+            return False
+        return True
+
     def _uncompile(self, reason):
         """Drop back to the eager head, keeping the match alive."""
         log.warning("running the action head eagerly: %s", reason)
         self.policy.actor = getattr(self.policy.actor, "_orig_mod", self.policy.actor)
         self.compiled = False
 
+    def _graphable(self):
+        """Whether this decision can replay the captured graph: a lean actor on the GPU whose
+        encoder reads no clip, carrying its memory, with a latent that is a constant."""
+        return (
+            getattr(self, "graph", False)
+            and getattr(self, "lean", False)
+            and not reads_clip(self.policy.encoder)
+            and getattr(self, "recent", None) is None
+            and (self.config["objective"] != "xm" or self.deterministic)
+        )
+
+    def _graph_key(self):
+        return (
+            self.deterministic,
+            getattr(self, "point", False),
+            getattr(self, "temperature", 1.0),
+            getattr(self, "pointer_temperature", 1.0),
+        )
+
+    def _capture(self):
+        """Capture one lean decision, from the uint8 views on the card to the action, as a
+        CUDA graph: the same kernels act runs eagerly, launched at once."""
+        from types import SimpleNamespace
+
+        from .dataset import DETAIL_SIZE, FOVEA_SIZE, MEAN, STD
+
+        device = self.device
+        s = SimpleNamespace(key=self._graph_key())
+        s.quads = torch.zeros(4, *DETAIL_SIZE, 3, dtype=torch.uint8, device=device)
+        s.fovea = torch.zeros(FOVEA_SIZE, FOVEA_SIZE, 3, dtype=torch.uint8, device=device)
+        s.previous = torch.zeros(1, SLOTS, 3, dtype=torch.long, device=device)
+        s.speed = torch.tensor([self.speed], device=device)
+        s.noise = act_noise(
+            self.config["objective"],
+            self.policy.actor.noise_dim,
+            self.deterministic,
+            device,
+            getattr(self.policy.actor, "latents", None),
+        )
+        # normalize's statistics, made once (new_tensor from a list is a copy that waits), and
+        # kept on `s`: the graph reads their memory at every replay, so it must outlive this.
+        s.mean = mean = torch.tensor(MEAN, dtype=torch.float32, device=device)
+        s.std = std = torch.tensor(STD, dtype=torch.float32, device=device)
+        s.host_quads = torch.empty(s.quads.shape, dtype=torch.uint8).pin_memory()
+        s.host_fovea = torch.empty(s.fovea.shape, dtype=torch.uint8).pin_memory()
+        s.host_previous = torch.empty(s.previous.shape, dtype=torch.long).pin_memory()
+        s.host_action = torch.empty(SLOTS, 3, dtype=torch.long).pin_memory()
+        s.done = torch.cuda.Event()
+
+        def body(hidden):
+            with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
+                quads = ((s.quads.float() / 255 - mean) / std).permute(0, 3, 1, 2)[None]
+                fovea = ((s.fovea.float() / 255 - mean) / std).permute(2, 0, 1)[None]
+                memory, _value, _, cells = self.policy(
+                    None, quads, fovea, s.previous, s.speed, hidden
+                )
+                action, logp, entropy = self.policy.actor(
+                    memory,
+                    cells,
+                    noise=s.noise,
+                    deterministic=self.deterministic,
+                    point=getattr(self, "point", False),
+                    temperature=getattr(self, "temperature", 1.0),
+                    pointer_temperature=getattr(self, "pointer_temperature", 1.0),
+                )
+            return memory, action, logp, entropy, cells
+
+        current = torch.cuda.current_stream()
+        with torch.inference_mode(), torch.random.fork_rng(devices=[device]):
+            # Warm up off the capture (allocations, cuBLAS workspaces, the head's guards),
+            # on a side stream, as capture requires; the match's generator is untouched.
+            side = torch.cuda.Stream()
+            side.wait_stream(current)
+            with torch.cuda.stream(side):
+                hidden = torch.zeros(1, self.policy.memory_dim, device=device)
+                for _ in range(3):
+                    hidden = body(hidden)[0]
+            current.wait_stream(side)
+            # The memory after a first decision is in bfloat16, and an empty one is equal
+            # to zeros in any dtype: the graph reads and writes one bfloat16 buffer.
+            # A normal tensor, not an inference one: act zeroes it outside inference mode.
+            with torch.inference_mode(False):
+                s.hidden = torch.zeros(hidden.shape, dtype=hidden.dtype, device=device)
+            s.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(s.graph, capture_error_mode="thread_local"):
+                memory, s.action, s.logp, s.entropy, s.cells = body(s.hidden)
+                s.hidden.copy_(memory)
+        torch.cuda.synchronize()
+        return s
+
+    def _ensure_graph(self):
+        """The captured decision for the current sampling, captured if need be. None, and
+        the actor decides eagerly from then on, if capture fails."""
+        s = self.static
+        if s is None or s.key != self._graph_key():
+            try:
+                s = self.static = self._capture()
+            except Exception as error:  # noqa: BLE001 - an eager decision is still correct.
+                log.warning("deciding eagerly: capture failed: %s: %s", type(error).__name__, error)
+                self.graph, self.static = False, None
+                return None
+        return s
+
+    def _decide_graphed(self, seen):
+        """act for a lean actor, replaying the captured decision (_capture)."""
+        s = self._ensure_graph()
+        if s is None:
+            return self.act(None, 0, precomputed=seen)
+        _global, quads, fovea = seen
+        for host, card, view in ((s.host_quads, s.quads, quads), (s.host_fovea, s.fovea, fovea)):
+            if torch.is_tensor(view):
+                card.copy_(view)
+            else:
+                host.numpy()[...] = view
+                card.copy_(host, non_blocking=True)
+        s.host_previous.numpy()[0] = self.previous
+        s.previous.copy_(s.host_previous, non_blocking=True)
+        if self.hidden is None:
+            s.hidden.zero_()
+        s.graph.replay()
+        s.host_action.copy_(s.action[0], non_blocking=True)
+        s.done.record()
+        s.done.synchronize()
+        chosen = s.host_action.numpy().copy()
+        self.hidden = s.hidden
+        self.last = (s.cells, s.logp, s.entropy)
+        self._remember(chosen)
+        return chosen, None
+
     def act(self, rgb, timestamp_ns, precomputed=None, cursor=None):
         device = self.device
         # A replay from the wrong thread would take the match down with an assertion
         # from inside inductor. Losing the graph costs about seven milliseconds a tick;
         # losing the match costs the match.
-        if self.compiled and threading.get_ident() != self.graph_thread:
+        if (
+            self.compiled
+            and not getattr(self, "graph", False)
+            and threading.get_ident() != self.graph_thread
+        ):
             self._uncompile("the cuda graph was captured on another thread")
         # The worker downscales on the capture side when it can, which keeps a 33 MB
         # frame off the wire and the resize out of this loop entirely. Fall back to
         # resizing here, on the GPU, when it handed back a full frame instead. The
         # fallback still needs the pointer, because the fovea is centred on it.
         seen = precomputed if precomputed is not None else views(rgb, device=device, cursor=cursor)
+        if self._graphable():
+            return self._decide_graphed(seen)
         # The worker hands back numpy; the local fallback hands back device tensors.
         global_view, quads, fovea = (torch.as_tensor(v, device=device) for v in seen)
         # Same lookback Sessions uses. Integer nanoseconds: dividing t_ns by 1e9 and
@@ -367,6 +573,9 @@ class Actor:
                 temperature=getattr(self, "temperature", 1.0),
                 pointer_temperature=getattr(self, "pointer_temperature", 1.0),
             )
+        # What the decision read and scored, kept by reference (no copy, no wait) for
+        # scripts/bench_decide.py's gate. Valid until the next decision.
+        self.last = (cells, logp, entropy)
         if lean:
             chosen = action[0].cpu().numpy()
             self._remember(chosen)

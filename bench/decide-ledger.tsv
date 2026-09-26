@@ -1,0 +1,39 @@
+when	label	tower	options	p50_ms	p95_ms	paced_p50_ms	paced_p95_ms	gpu_ms	launches	syncs	gate	exact	max_head_diff	peak_mib	note
+2026-09-26 13:28	a-baseline	qwen3-vit-88m	{}	38.98	50.15	105.56	116.5	37.747	926.0	10.1	ref			367	baseline; wrote the gate references
+2026-09-26 13:28	b-baseline	qwen3-vit-306m	{}	113.6	116.32	175.97	189.83	106.003	1346.0	10.1	ref			832	baseline; wrote the gate references
+2026-09-26 13:28	a-base1	qwen3-vit-88m	{}	53.56	57.93	60.86	115.37	38.841	926.0	10.1	pass	True	0.0	370	baseline repeat (noise), interleaved with the experiments
+2026-09-26 13:28	a-base2	qwen3-vit-88m	{}	46.08	57.47	95.39	132.33	38.877	926.0	10.1	pass	True	0.0	370	baseline repeat (noise), interleaved with the experiments
+2026-09-26 13:28	a-base3	qwen3-vit-88m	{}	37.15	48.17	104.61	116.07	37.797	926.0	10.1	pass	True	0.0	370	baseline repeat (noise), interleaved with the experiments
+2026-09-26 13:28	a-base4	qwen3-vit-88m	{}	42.36	58.33	58.04	104.36	42.799	926.0	10.1	pass	True	0.0	370	baseline repeat (noise), interleaved with the experiments
+2026-09-26 13:28	a-base5	qwen3-vit-88m	{}	44.41	47.89	111.58	126.68	38.091	926.0	10.1	pass	True	0.0	370	baseline repeat (noise), interleaved with the experiments
+2026-09-26 13:28	a-base6	qwen3-vit-88m	{}	43.62	46.05	81.37	109.73	59.981	926.0	10.1	pass	True	0.0	370	baseline repeat (noise), interleaved with the experiments
+2026-09-26 13:28	a-ctower1	qwen3-vit-88m	{"compile_tower":true}	36.97	39.81	57.16	112.76	47.998	636.0	10.1	FAIL	False	0.11132240295410156	369	E1 torch.compile tower, inductor default: FAIL heads 0.11 (actions same) -> fast mode
+2026-09-26 13:28	a-ctower2	qwen3-vit-88m	{"compile_tower":{"config":{"emulate_precision_casts":true}}}	41.08	53.47	88.81	108.48	32.311	636.0	10.1	FAIL	False	0.09055519104003906	356	E1b compile tower + emulate_precision_casts: FAIL heads 0.09 (actions same) -> fast mode
+2026-09-26 13:28	a-graph1	qwen3-vit-88m	{"graph":true}	37.83	43.99	59.72	61.68	39.368	917.0	0.1	pass	True	0.0	383	E2 whole lean decision as one CUDA graph: EXACT; keep
+2026-09-26 13:28	a-graph2	qwen3-vit-88m	{"graph":true}	40.99	46.87	56.15	56.86	39.691	917.0	0.1	pass	True	0.0	383	E2 whole lean decision as one CUDA graph: EXACT; keep
+2026-09-26 13:28	a-graph3	qwen3-vit-88m	{"graph":true}	40.92	43.36	56.5	103.72	36.73	917.0	0.1	pass	True	0.0	383	E2 whole lean decision as one CUDA graph: EXACT; keep
+2026-09-26 14:26	b-graph1	qwen3-vit-306m	{"graph":true}	97.88	109.98	110.12	110.93	110.282	1337.0	0.1	pass	True	0.0	845	E2 graph on the 4B tower, interleaved with baseline repeats: EXACT
+2026-09-26 14:26	b-base1	qwen3-vit-306m	{}	113.83	116.35	177.35	193.28	106.377	1346.0	10.1	pass	True	0.0	832	E2 graph on the 4B tower, interleaved with baseline repeats: EXACT
+2026-09-26 14:26	b-base2	qwen3-vit-306m	{}	115.38	117.8	187.05	195.37	109.385	1346.0	10.1	pass	True	0.0	832	E2 graph on the 4B tower, interleaved with baseline repeats: EXACT
+2026-09-26 14:26	b-graph2	qwen3-vit-306m	{"graph":true}	111.22	113.48	172.61	183.93	104.482	1337.0	0.1	pass	True	0.0	845	E2 graph on the 4B tower, interleaved with baseline repeats: EXACT
+2026-09-26 14:26	b-graph3	qwen3-vit-306m	{"graph":true}	96.77	108.04	106.79	186.44	110.704	1337.0	0.1	pass	True	0.0	845	E2 graph on the 4B tower, interleaved with baseline repeats: EXACT
+2026-09-26 14:26	b-base3	qwen3-vit-306m	{}	98.42	101.01	97.58	100.75	94.804	1346.0	10.1	pass	True	0.0	832	E2 graph on the 4B tower, interleaved with baseline repeats: EXACT
+2026-09-26 14:26	a-half1	qwen3-vit-88m	{"fast":{"half":true}}	31.08	49.7	85.06	102.36	29.267	916.0	10.1	FAIL	False	0.124847412109375	341	F1 fast: tower fp16 + fp16 accumulation: actions same, heads 0.12
+2026-09-26 14:26	a-cudnn1	qwen3-vit-88m	{"fast":{"attention":"cudnn"}}	40.38	49.19	101.16	113.22	39.013	938.0	10.1	FAIL	False	0.0925445556640625	370	F2 fast: cuDNN attention (12 heads): no gain, heads 0.09 -> drop
+2026-09-26 14:26	a-lean1	qwen3-vit-88m	{"lean_tower":true}	42.32	45.26	81.85	106.71	58.775	870.0	10.1	pass	True	0.0	350	E3 lean tower (no empty-prefix cats, cached pos/rope tables, last blocks' Linears precast): EXACT
+2026-09-26 14:26	a-glean1	qwen3-vit-88m	{"lean_tower":true,"graph":true}	38.59	46.78	59.39	106.51	38.727	861.0	0.1	pass	True	0.0	362	E2+E3 graph + lean tower: EXACT; keep
+2026-09-26 14:26	a-base7	qwen3-vit-88m	{}	43.64	47.17	60.97	64.69	60.859	926.0	10.1	pass	True	0.0	370	E2+E3 graph + lean tower: EXACT; keep
+2026-09-26 14:26	a-hgl1	qwen3-vit-88m	{"fast":{"half":true},"graph":true,"lean_tower":true}	29.22	40.05	49.68	99.95	32.185	867.0	0.1	FAIL	False	0.12485122680664062	359	fast: fp16 + graph + lean
+2026-09-26 14:26	a-cgl1	qwen3-vit-88m	{"compile_tower":true,"graph":true,"lean_tower":true}	33.41	34.16	55.3	107.77	32.592	611.0	0.1	FAIL	False	2.566880941390991	361	fast: compile + graph + lean: one slot flipped (agree 0.996) -> reject
+2026-09-26 14:26	a-hcgl1	qwen3-vit-88m	{"fast":{"half":true},"compile_tower":true,"graph":true,"lean_tower":true}	27.67	34.49	53.45	91.3	26.08	609.0	0.1	FAIL	False	0.111328125	358	fast: fp16 + compile + graph + lean: actions same; best fast (a)
+2026-09-26 14:26	b-glean1	qwen3-vit-306m	{"graph":true,"lean_tower":true}	106.35	110.34	108.75	175.49	99.464	1257.0	0.1	pass	True	0.0	804	E2+E3 on 4B: EXACT
+2026-09-26 14:26	b-hgl1	qwen3-vit-306m	{"fast":{"half":true},"graph":true,"lean_tower":true}	77.17	77.57	75.63	79.63	76.338	1263.0	0.1	FAIL	False	0.0701284408569336	804	fast on 4B: fp16 (+compile) + graph + lean; actions same
+2026-09-26 14:26	b-hcgl1	qwen3-vit-306m	{"fast":{"half":true},"compile_tower":true,"graph":true,"lean_tower":true}	81.03	147.97	142.57	156.08	114.479	753.0	0.1	FAIL	False	0.06138324737548828	805	fast on 4B: fp16 (+compile) + graph + lean; actions same
+2026-09-26 14:26	b-f8cgl1	qwen3-vit-306m	{"fast":{"float8":true},"compile_tower":true,"graph":true,"lean_tower":true}	82.6	145.71	68.7	99.43	73.888	923.0	0.1	FAIL	False	4.608770370483398	716	fast: fp8 per-tensor + compile on 4B: actions change (agree 0.957), no faster than fp16 -> reject
+2026-09-26 14:26	b-hacgl1	qwen3-vit-306m	{"fast":{"half":true,"attention":"cudnn"},"compile_tower":true,"graph":true,"lean_tower":true}	75.72	147.67	127.43	141.29	108.106	753.0	0.1	FAIL	False	0.06138324737548828	805	fast: + cuDNN attention on 4B: numbers identical to without (backend not taken) -> drop
+2026-09-26 15:05	a-final1	qwen3-vit-88m	{"lean":true}	40.78	100.6	40.64	56.23	56.37	861.0	0.1	pass	True	0.0	362	FINAL exact default for lean actors (lean=true: graph + lean tower, after the graph's kept-alive fix)
+2026-09-26 15:05	a-base8	qwen3-vit-88m	{}	54.49	66.81	46.86	60.66	57.052	926.0	10.1	pass	True	0.0	370	FINAL exact default for lean actors (lean=true: graph + lean tower, after the graph's kept-alive fix)
+2026-09-26 15:05	b-final1	qwen3-vit-306m	{"lean":true}	93.92	94.78	92.65	93.67	95.537	1257.0	0.1	pass	True	0.0	804	FINAL exact default for lean actors (lean=true: graph + lean tower, after the graph's kept-alive fix)
+2026-09-26 15:05	b-base4	qwen3-vit-306m	{}	189.83	202.7	140.56	195.92	112.341	1346.0	10.1	pass	True	0.0	832	FINAL exact default for lean actors (lean=true: graph + lean tower, after the graph's kept-alive fix)
+2026-09-26 15:05	a-fast1	qwen3-vit-88m	{"lean":true,"fast":true}	29.61	72.7	49.28	74.57	40.045	609.0	0.1	FAIL	False	0.111328125	358	FINAL fast mode (--fast: fp16 tower + fp16 accumulation + inductor compile, on the lean path): actions same
+2026-09-26 15:05	b-fast1	qwen3-vit-306m	{"lean":true,"fast":true}	76.81	148.91	75.92	86.57	73.199	753.0	0.1	FAIL	False	0.06138324737548828	805	FINAL fast mode (--fast: fp16 tower + fp16 accumulation + inductor compile, on the lean path): actions same

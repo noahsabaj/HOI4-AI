@@ -755,6 +755,7 @@ def evaluate_policy(
     seed=None,
     saves=None,
     held_previous=False,
+    fast=False,
 ):
     """Play up to `games` games (or until `minutes` run out) on the second PC and record them.
 
@@ -784,8 +785,10 @@ def evaluate_policy(
             point=point,
             temperature=temperature,
             pointer_temperature=pointer_temperature,
+            # Only the action is needed: no training sample, no clip, one CUDA graph.
+            lean=True,
+            fast=fast,
         )
-        actor.lean = True  # Only the action is needed: no training sample, no clip.
         # Shown what it holds even if trained without (a checkpoint trained with it is).
         actor.held_previous = actor.held_previous or held_previous
         for index in range(games):

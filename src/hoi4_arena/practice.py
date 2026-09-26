@@ -256,6 +256,7 @@ def practice(
     rules="artifacts/calibration-1080p/rules.json",
     model_path=None,
     seed=None,
+    fast=False,
 ):
     """Up to `episodes` practice episodes of `seconds` each (or until `minutes` run out) on
     the second PC, from the main arena's start saves, alternating countries. `temperature`,
@@ -281,9 +282,8 @@ def practice(
     try:
         actor = Actor(
             checkpoint, model_path, game_speed=5, temperature=temperature,
-            pointer_temperature=pointer_temperature, point=point,
+            pointer_temperature=pointer_temperature, point=point, lean=True, fast=fast,
         )  # fmt: skip
-        actor.lean = True
         actor.held_previous = actor.held_previous or held_previous
         for index in range(episodes):
             if time.monotonic() + seconds + 60 > end:
