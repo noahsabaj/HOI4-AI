@@ -97,9 +97,12 @@ def lean_tower(encoder):
 # What `--fast` turns on (runner.Actor): the tower in float16 with float16 accumulation,
 # compiled by inductor. Measured on the second PC beside its game (bench/decide-ledger.tsv):
 # today's tower 26 ms of GPU a decision from 38, the Qwen3.5-4B model's paced p50 72 ms
-# from 135, every sampled action on the benchmark's decisions the same, each head's
-# log-probability within 0.13. Float8 moved actions (4% of slots) and was no faster; cuDNN
-# attention was no faster.
+# from 135, each head's log-probability within 0.13. Float8 moved actions (4% of slots) and
+# was no faster; cuDNN attention was no faster. The attention is fast_attention's Triton
+# kernel (float16 accumulation) since 2026-09-26 (FastTower's attention="triton"): the
+# tower's attention in half the GPU time of PyTorch's memory-efficient kernel, a decision
+# 16-20% faster, and its sampled actions differ from the exact path's no more often than
+# without it (about 2% of decisions over 30 seeded games; STATUS.md).
 FAST = {"half": True, "compile": True, "attention": "triton"}
 
 
