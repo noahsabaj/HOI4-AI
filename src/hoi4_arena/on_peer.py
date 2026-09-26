@@ -141,19 +141,99 @@ def job(peer, action, job_id=None, kind=None, args=None):
         return desk.job(action, job_id, kind, args)
 
 
-def read_state(root, job_id):
+def read_state(root, job_id, suffix=".json"):
     """A job's state file from the share, or {} while it is not there or half-seen."""
     try:
-        return json.loads((root / "jobs" / f"{job_id}.json").read_text(encoding="utf-8-sig"))
+        state = json.loads((root / "jobs" / f"{job_id}{suffix}").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
+    return state if isinstance(state, dict) else {}
 
 
-def wait(root, job_id, *, deadline=None, poll=10.0, echo=None, clock=time.monotonic,
-         sleep=time.sleep):  # fmt: skip
+def listed_state(status, job_id):
+    """The state Run-Job's status (`status`, its text) gives the job, as its process shows
+    it: lost when the process is gone. None when the status does not list it as active.
+    Its `active:` line says; a Run-Job from before that line has only its table, whose
+    row for the job starts with the id and has the state among its words."""
+    table = None
+    for line in status.splitlines():
+        if line.startswith("active: "):
+            try:
+                active = json.loads(line[len("active: ") :])
+            except ValueError:
+                break
+            if isinstance(active, dict):  # One job, from a PowerShell that unwrapped it.
+                active = [active]
+            for entry in active:
+                if isinstance(entry, dict) and entry.get("id") == job_id:
+                    return entry.get("state")
+            return None
+        words = line.split()
+        if words and words[0] == job_id and table is None:
+            table = next((w for w in words[1:] if w in ("starting", "running", *FINAL)), None)
+    return table if table in ("starting", "running", "lost") else None
+
+
+def job_state_there(peer, job_id):
+    """The job's state as its process shows it there (listed_state), through the worker's
+    `job` op: the share alone cannot tell whether a process runs."""
+    return listed_state(job(peer, "status"), job_id)
+
+
+def wait(root, job_id, *, deadline=None, poll=10.0, echo=None, check=None, summary_path=None,
+         check_after=120.0, quiet=600.0, clock=time.monotonic, sleep=time.sleep):  # fmt: skip
     """Until the job ends: its last state. Each new line of its log goes to `echo`. At
-    `deadline` (a `clock` time) the state so far, which is not final."""
+    `deadline` (a `clock` time) the state so far, which is not final.
+
+    A job can end without its state file saying so. On 2026-09-26 the second PC's bridge
+    restarted as a job ended: its file stayed `running` beside the `.tmp` its last write
+    left, and this would have waited out the deadline, the session's minutes and half an
+    hour more. So an end left in the `.tmp` counts. And once the log has been quiet for
+    `check_after` seconds, `check(job_id)` (job_state_there) is asked, every
+    `check_after` seconds, whether the process still runs: lost if it is gone. While
+    `check` cannot say (the bridge is down, say), a job whose log and summary
+    (`summary_path`, which a session writes after each episode) have both been still for
+    `quiet` seconds is taken as lost too. The state returned says `why`."""
     log_path, offset = root / "jobs" / f"{job_id}.log", 0
+    seen, changed = {}, {}
+    last_check, verdict = None, None
+
+    def still_for(name, path):
+        """Seconds since `path` last changed as seen from here (its size or time)."""
+        try:
+            status = path.stat()
+            signature = (status.st_size, status.st_mtime_ns)
+        except OSError:
+            signature = None
+        now = clock()
+        if name not in seen or signature != seen[name]:
+            seen[name], changed[name] = signature, now
+        return now - changed[name], signature is not None
+
+    def ended_there():
+        """Why the job, recorded as not ended, has ended, or None."""
+        nonlocal last_check, verdict
+        quiet_log, _ = still_for("log", log_path)
+        if check is not None and quiet_log >= check_after:
+            now = clock()
+            if last_check is None or now - last_check >= check_after:
+                last_check = now
+                try:
+                    verdict = check(job_id)
+                except Exception as error:  # noqa: BLE001 - the bridge may be restarting.
+                    log.warning("[peer] cannot ask whether %s still runs: %s", job_id, error)
+                    verdict = None
+                if verdict == "lost":
+                    return "its process is gone there, and it never recorded an end"
+        if verdict in ("starting", "running") or summary_path is None:
+            return None
+        quiet_summary, written = still_for("summary", summary_path)
+        if written and min(quiet_log, quiet_summary) >= quiet:
+            return (
+                f"its log and summary have not changed for {quiet / 60:.0f} min and "
+                "whether its process runs cannot be asked"
+            )
+        return None
 
     def drain(whole=False):
         nonlocal offset
@@ -173,6 +253,17 @@ def wait(root, job_id, *, deadline=None, poll=10.0, echo=None, clock=time.monoto
     while True:
         state = read_state(root, job_id)
         drain()
+        if state.get("state") not in FINAL:
+            stranded = read_state(root, job_id, ".tmp")
+            if stranded.get("state") in FINAL:
+                log.warning("[peer] %s ended %s, left in %s.tmp by a write cut short",
+                            job_id, stranded["state"], job_id)  # fmt: skip
+                state = stranded
+            elif state.get("state") in ("starting", "running"):
+                why = ended_there()
+                if why:
+                    log.warning("[peer] %s taken as lost: %s", job_id, why)
+                    state = {**state, "state": "lost", "why": why}
         if state.get("state") in FINAL:
             # The share shows a growing file's size up to ~10 s late: read to log_bytes.
             end = clock() + 30
@@ -289,9 +380,12 @@ def run_on_peer(
             ensure_environment(peer, root)
         log.info("[peer] %s", job(peer, "start", job_id, "run", list(session)))
         deadline = time.monotonic() + (plan["minutes"] + grace_minutes) * 60
+        summary_there = root / "compute" / plan["output"] / SUMMARIES[plan["command"]]
         try:
             state = wait(root, job_id, deadline=deadline, poll=poll,
-                         echo=lambda line: log.info("[peer] %s", line))  # fmt: skip
+                         echo=lambda line: log.info("[peer] %s", line),
+                         check=lambda j: job_state_there(peer, j),
+                         summary_path=summary_there)  # fmt: skip
         except KeyboardInterrupt:
             log.warning("[peer] interrupted: stopping %s there", job_id)
             job(peer, "stop", job_id)
@@ -301,6 +395,8 @@ def run_on_peer(
             job(peer, "stop", job_id)
             state = wait(root, job_id, deadline=time.monotonic() + 60, poll=5.0)
         result.update(state=state.get("state"), exit=state.get("exit"))
+        if state.get("why"):
+            result["why"] = state["why"]
     finally:
         try:
             if bring_back(root, plan["output"], keep_there):

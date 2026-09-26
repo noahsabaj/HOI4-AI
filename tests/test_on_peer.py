@@ -3,6 +3,7 @@ as there, and the folder they bring back; and the scripts that carry them (Run-J
 session commands, Deploy-Peer.ps1 -ComputeOnly)."""
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -279,3 +280,184 @@ def test_the_session_commands_are_the_ones_run_job_runs():
 )
 def test_a_session_that_played_nothing_is_a_failure(result, nothing):
     assert on_peer.played_nothing(result) is nothing
+
+
+class _Clock:
+    """A clock that `sleep` moves on, and the second PC's side effects at given times."""
+
+    def __init__(self, events=()):
+        self.now, self.events = 0.0, sorted(events, key=lambda e: e[0])
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(seconds, 1.0)
+        while self.events and self.events[0][0] <= self.now:
+            self.events.pop(0)[1]()
+
+
+def _running(jobs, job_id="j", log=b"episode 1\n"):
+    jobs.mkdir(exist_ok=True)
+    (jobs / f"{job_id}.log").write_bytes(log)
+    (jobs / f"{job_id}.json").write_text(json.dumps({"id": job_id, "state": "running", "pid": 7}))
+
+
+def test_an_end_left_in_a_stranded_tmp_ends_the_wait(tmp_path):
+    # The bridge restarted as the job ended: its last write never became the state file.
+    _running(tmp_path / "jobs")
+    end = {"id": "j", "state": "done", "exit": 0, "log_bytes": 10}
+    (tmp_path / "jobs" / "j.tmp").write_text(json.dumps(end))
+    clock = _Clock()
+    got = on_peer.wait(tmp_path, "j", deadline=3600, poll=10, clock=clock, sleep=clock.sleep)
+    assert got["state"] == "done" and got["exit"] == 0
+    assert clock.now < 60
+
+
+def test_a_half_written_tmp_is_not_an_end(tmp_path):
+    _running(tmp_path / "jobs")
+    (tmp_path / "jobs" / "j.tmp").write_text('{"id": "j", "state": "do')
+    clock = _Clock()
+    got = on_peer.wait(tmp_path, "j", deadline=100, poll=10, clock=clock, sleep=clock.sleep)
+    assert got["state"] == "running"
+
+
+def test_a_running_job_whose_process_is_gone_ends_the_wait_as_lost(tmp_path):
+    _running(tmp_path / "jobs")
+    asked = []
+
+    def check(job_id):
+        asked.append(clock.now)
+        return "running" if len(asked) < 2 else "lost"
+
+    clock = _Clock()
+    got = on_peer.wait(tmp_path, "j", deadline=7200, poll=10, check=check, check_after=120,
+                       clock=clock, sleep=clock.sleep)  # fmt: skip
+    assert got["state"] == "lost" and "process is gone" in got["why"]
+    # Asked only once the log was quiet, then no more often than every check_after.
+    assert asked[0] >= 120 and asked[1] - asked[0] >= 120
+    assert clock.now < 400
+
+
+def test_a_growing_log_is_not_asked_about(tmp_path):
+    jobs = tmp_path / "jobs"
+    _running(jobs)
+    lines = [b"episode 1\n"]
+
+    def grow():
+        lines.append(b"step\n")
+        (jobs / "j.log").write_bytes(b"".join(lines))
+
+    clock = _Clock([(t, grow) for t in range(10, 1000, 30)])
+    asked = []
+    got = on_peer.wait(tmp_path, "j", deadline=900, poll=10, check=asked.append,
+                       check_after=120, clock=clock, sleep=clock.sleep)  # fmt: skip
+    assert got["state"] == "running" and asked == []
+
+
+def test_a_quiet_job_is_lost_only_when_its_process_cannot_be_asked(tmp_path):
+    jobs = tmp_path / "jobs"
+    summary = tmp_path / "compute" / "out" / "practice-peer.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text(json.dumps({"summary": {"episodes": 3}}))
+
+    def unreachable(job_id):
+        raise ConnectionError("the bridge is restarting")
+
+    _running(jobs)
+    clock = _Clock()
+    got = on_peer.wait(tmp_path, "j", deadline=7200, poll=10, check=unreachable,
+                       summary_path=summary, quiet=600, clock=clock, sleep=clock.sleep)  # fmt: skip
+    assert got["state"] == "lost" and "have not changed for 10 min" in got["why"]
+    assert 600 <= clock.now < 700
+    # A process there that still runs is waited for, however quiet.
+    clock = _Clock()
+    got = on_peer.wait(tmp_path, "j", deadline=3000, poll=10, check=lambda j: "running",
+                       summary_path=summary, quiet=600, clock=clock, sleep=clock.sleep)  # fmt: skip
+    assert got["state"] == "running"
+    # No summary yet: nothing played to go by, so waited for too.
+    summary.unlink()
+    clock = _Clock()
+    got = on_peer.wait(tmp_path, "j", deadline=3000, poll=10, check=unreachable,
+                       summary_path=summary, quiet=600, clock=clock, sleep=clock.sleep)  # fmt: skip
+    assert got["state"] == "running"
+
+
+STATUS_TABLE = """
+id                        kind project state   exit started                  ended
+--                        ---- ------- -----   ---- -------                  -----
+drills-20260926-101500    run          done       0 9/26/2026 10:15:00 AM    9/26/2026 10:45:00 AM
+drills-20260926-114500    run          lost         9/26/2026 11:45:00 AM
+practice-20260926-120000  run          running      9/26/2026 12:00:00 PM
+
+free disk: 400 GB
+environment: ready
+"""
+
+
+def test_the_status_says_which_jobs_still_run_there():
+    active = 'active: [{"id":"a","state":"lost","pid":7},{"id":"b","state":"running","pid":8}]'
+    assert on_peer.listed_state(STATUS_TABLE + active, "a") == "lost"
+    assert on_peer.listed_state(STATUS_TABLE + active, "b") == "running"
+    assert on_peer.listed_state(STATUS_TABLE + active, "drills-20260926-114500") is None
+    assert on_peer.listed_state('active: {"id":"a","state":"lost","pid":7}', "a") == "lost"
+    # A Run-Job from before the active line: its table.
+    assert on_peer.listed_state(STATUS_TABLE, "drills-20260926-114500") == "lost"
+    assert on_peer.listed_state(STATUS_TABLE, "practice-20260926-120000") == "running"
+    assert on_peer.listed_state(STATUS_TABLE, "drills-20260926-101500") is None
+    assert on_peer.listed_state(STATUS_TABLE, "absent") is None
+
+
+def test_a_session_whose_process_is_lost_there_is_not_waited_out(second, monkeypatch):
+    second.finish = False
+    monkeypatch.setattr(on_peer, "job_state_there", lambda peer, job_id: "lost")
+    clock = _Clock()
+    real_wait = on_peer.wait
+    monkeypatch.setattr(
+        on_peer, "wait",
+        lambda *a, **k: real_wait(*a, **{**k, "clock": clock, "sleep": clock.sleep}),
+    )  # fmt: skip
+    result = on_peer.run_on_peer(PRACTICE, "artifacts/pairing/peer.json", job_id="practice-t3",
+                                 poll=10)  # fmt: skip
+    assert result["state"] == "lost" and "process is gone" in result["why"]
+    # Ended there already: nothing to stop.
+    assert [c[0] for c in second.calls] == ["start"]
+    assert on_peer.played_nothing(result)
+    assert clock.now < 400
+
+
+def _stranded_jobs(folder):
+    jobs = folder / "jobs"
+    jobs.mkdir()
+    started = "2026-09-26T11:45:00.0000000+00:00"
+    running = {"kind": "run", "state": "running", "started": started}
+    # A running job whose process is gone, its end stranded in a .tmp an hour old.
+    (jobs / "gone.json").write_text(json.dumps({**running, "id": "gone", "pid": 999999}))
+    end = {**running, "id": "gone", "state": "done", "exit": 0, "log_bytes": 3, "ended": started}
+    (jobs / "gone.tmp").write_text(json.dumps(end))
+    hour_ago = time.time() - 3600
+    os.utime(jobs / "gone.tmp", (hour_ago, hour_ago))
+    # One whose process is gone with no end at all, and one whose end is being written now.
+    (jobs / "cut.json").write_text(json.dumps({**running, "id": "cut", "pid": 999998}))
+    (jobs / "fresh.json").write_text(json.dumps({**running, "id": "fresh", "pid": 999997}))
+    (jobs / "fresh.tmp").write_text(json.dumps({**end, "id": "fresh"}))
+    return jobs
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell 7")
+def test_run_job_status_finishes_a_stranded_end_and_reports_lost_jobs(tmp_path):
+    shutil.copy(ROOT / "scripts" / "Run-Job.ps1", tmp_path)
+    jobs = _stranded_jobs(tmp_path)
+    status = _pwsh(tmp_path / "Run-Job.ps1", "-Action", "status")
+    assert status.returncode == 0, status.stderr
+    # The stranded end became the state file; a .tmp still being written was left alone.
+    assert not (jobs / "gone.tmp").exists()
+    assert json.loads((jobs / "gone.json").read_text(encoding="utf-8-sig"))["state"] == "done"
+    assert (jobs / "fresh.tmp").exists()
+    assert on_peer.listed_state(status.stdout, "cut") == "lost"
+    assert on_peer.listed_state(status.stdout, "fresh") == "lost"
+    assert on_peer.listed_state(status.stdout, "gone") is None
+    # Stopping a job that has ended keeps its end.
+    stop = _pwsh(tmp_path / "Run-Job.ps1", "-Action", "stop", "-Id", "gone")
+    assert stop.returncode == 0 and "already done" in stop.stdout
+    assert json.loads((jobs / "gone.json").read_text(encoding="utf-8-sig"))["state"] == "done"

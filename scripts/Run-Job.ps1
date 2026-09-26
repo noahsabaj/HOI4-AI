@@ -27,8 +27,10 @@
 #   The job runs hidden and detached; its output goes to jobs\<id>.log and its state
 #   (starting, running, done, failed, stopped) to jobs\<id>.json, both readable through
 #   the share.
-# -Action stop -Id <id>   End a job and everything it started.
-# -Action status          Every job's state, the GPU, free disk, whether the environment exists.
+# -Action stop -Id <id>   End a job and everything it started (a job already ended is kept).
+# -Action status          Every job's state, the GPU, free disk, whether the environment exists,
+#                         and a line `active: <json>` of the jobs not ended, `lost` for one
+#                         whose process is gone. It finishes any state a killed write left.
 param(
     [Parameter(Mandatory)][ValidateSet('start', 'stop', 'status', 'inner')][string]$Action,
     [ValidatePattern('^[A-Za-z0-9_-]{1,40}$')][string]$Id,
@@ -51,9 +53,58 @@ $Commands = @('train-memory', 'train-bc', 'train-idm', 'train-critic', 'cache-fe
     'practice', 'drills', 'play-policy')
 $Scripts = @('memory_study.py', 'benchmark_policy.py', 'time_policy.py', 'codec_fidelity.py')
 
+function Complete-Stranded([string]$JobId) {
+    # Write-Job writes <id>.tmp and then renames it. A process killed between the two (the
+    # bridge restarting as a job ended, 2026-09-26) leaves the job's last state in the .tmp
+    # and an older one, `running`, in the .json. A .tmp a minute old that reads whole is
+    # that last state: finish its rename. A younger one may still be being written.
+    $temp = Join-Path $jobs "$JobId.tmp"
+    $item = Get-Item -LiteralPath $temp -ErrorAction SilentlyContinue
+    if (-not $item -or $item.LastWriteTime -gt (Get-Date).AddMinutes(-1)) { return }
+    try {
+        $state = Get-Content -LiteralPath $temp -Raw | ConvertFrom-Json -AsHashtable
+    } catch {
+        return
+    }
+    if ($state -isnot [Collections.IDictionary] -or $state.id -ne $JobId) { return }
+    Move-Item -LiteralPath $temp -Destination (Join-Path $jobs "$JobId.json") -Force -ErrorAction SilentlyContinue
+}
+
 function Read-Job([string]$JobId) {
+    Complete-Stranded $JobId
     $file = Join-Path $jobs "$JobId.json"
     if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable }
+}
+
+function Test-JobAlive($Job) {
+    # Whether the process a job recorded still runs. Its pid alone could be another
+    # process's by now: that one started after the job did, and the job's own within
+    # seconds of it.
+    if (-not $Job.pid) { return $false }
+    $process = Get-Process -Id $Job.pid -ErrorAction SilentlyContinue
+    if (-not $process) { return $false }
+    try {
+        $started = ([datetime]$Job.started).ToUniversalTime()
+        return $process.StartTime.ToUniversalTime() -le $started.AddMinutes(5)
+    } catch {
+        return $true  # No start time to compare (another user's process, say): as it seems.
+    }
+}
+
+function Get-JobState($Job) {
+    # The state a job is in, not only the one it recorded: a running job whose process is
+    # gone, or one still starting ten minutes on (its process never ran), was ended from
+    # outside and is lost.
+    if ($Job.state -eq 'running' -and -not (Test-JobAlive $Job)) { return 'lost' }
+    if ($Job.state -eq 'starting') {
+        try {
+            $age = (Get-Date).ToUniversalTime() - ([datetime]$Job.started).ToUniversalTime()
+            if ($age -gt [timespan]::FromMinutes(10)) { return 'lost' }
+        } catch {
+            # No start time: as recorded.
+        }
+    }
+    $Job.state
 }
 
 function Write-Job($Job) {
@@ -164,22 +215,33 @@ switch ($Action) {
     'stop' {
         $job = Read-Job $Id
         if (-not $job) { throw "no job $Id" }
+        if ($job.state -in 'done', 'failed', 'stopped') {
+            # Already ended (its end perhaps just recovered from a stranded .tmp): kept.
+            Write-Output "$Id already $($job.state)"
+            return
+        }
+        $alive = Test-JobAlive $job
         $job.state = 'stopped'
         $job.ended = (Get-Date).ToString('o')
         Write-Job $job
-        if ($job.pid) { taskkill /PID $job.pid /T /F *> $null }
+        if ($alive) { taskkill /PID $job.pid /T /F *> $null }
         Write-Output "stopped $Id"
     }
     'status' {
+        foreach ($temp in Get-ChildItem -LiteralPath $jobs -Filter '*.tmp') { Complete-Stranded $temp.BaseName }
+        $active = [Collections.Generic.List[object]]::new()
         $rows = Get-ChildItem -LiteralPath $jobs -Filter '*.json' | ForEach-Object {
             $job = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -AsHashtable
-            # A job whose process is gone but never recorded an end was killed from outside.
-            if ($job.state -eq 'running' -and -not (Get-Process -Id $job.pid -ErrorAction SilentlyContinue)) {
-                $job.state = 'lost'
+            if ($job.state -in 'starting', 'running') {
+                $job.state = Get-JobState $job
+                $active.Add([ordered]@{ id = $job.id; state = $job.state; pid = $job.pid })
             }
             [pscustomobject]@{ id = $job.id; kind = $job.kind; project = $job.project; state = $job.state; exit = $job.exit; started = $job.started; ended = $job.ended }
         }
         $rows | Sort-Object started | Format-Table -AutoSize | Out-String -Width 200
+        # The jobs that have not recorded an end, as their processes show them, for a
+        # program to read (hoi4-arena on-peer): lost is a job whose process is gone.
+        Write-Output ('active: ' + (ConvertTo-Json -InputObject @($active) -Compress -Depth 3))
         if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
             nvidia-smi --query-gpu=name,driver_version,memory.used,memory.total,utilization.gpu --format=csv
         }
