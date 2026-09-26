@@ -701,6 +701,29 @@ class _Stream:
         return done
 
 
+def balance_weights(sessions):
+    """Scale each recording's weights so that every (arena, side) group counts the same in
+    the loss, by its decisions' summed weight: 103 of v6's 218 games are on the main arena,
+    each other arena has ~17, and setup drills (practice.drills) add more of some."""
+    from collections import defaultdict
+
+    def group(labels):
+        manifest = labels["manifest"]
+        return Path(str(manifest.get("arena") or "")).name, manifest.get("started_as")
+
+    totals = defaultdict(float)
+    for labels in sessions:
+        totals[group(labels)] += float((labels["weight"] * labels["valid"]).sum())
+    groups = [t for t in totals.values() if t > 0]
+    if not groups:
+        return
+    mean = sum(groups) / len(groups)
+    for labels in sessions:
+        total = totals[group(labels)]
+        if total > 0:
+            labels["weight"] = labels["weight"] * np.float32(mean / total)
+
+
 class VideoSessions(IterableDataset):
     """Training windows read straight from the recordings' video.
 
@@ -760,6 +783,7 @@ class VideoSessions(IterableDataset):
         setup_weight=1.0,
         camera_since=None,
         held_previous=False,
+        balance=False,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -800,6 +824,8 @@ class VideoSessions(IterableDataset):
                     held_previous=held_previous,
                 )
             )
+        if balance:
+            balance_weights(self.sessions)
         self.tower_stamp = None
         if tower is not None:
             from .tower_cache import tower_paths

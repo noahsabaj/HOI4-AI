@@ -614,6 +614,12 @@ def main():
         "the screen (dataset.parking_moves)",
     )
     train.add_argument(
+        "--balance",
+        action="store_true",
+        help="Weigh every (arena, side) group of recordings the same in the loss "
+        "(dataset.balance_weights)",
+    )
+    train.add_argument(
         "--held-previous",
         action="store_true",
         help="Show the policy, in its previous action, every key and button it still holds "
