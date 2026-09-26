@@ -1,6 +1,6 @@
 #Requires -Version 7.5
 # Compute jobs on this PC's GPU for the coordinator. The desktop worker runs this for its
-# `job` operation (`hoi4-arena job`, and `peer run` from any project), approved by the
+# `job` operation (`hoi4-arena job`, and `fleet run` from any project), approved by the
 # user on 2026-09-23 so the second PC's GPU can train and act, with arguments it has
 # already checked. They are checked again here. HOI4's own kinds are fixed below, and
 # every argument of theirs is a flag, a value or a path inside this folder.
@@ -8,9 +8,15 @@
 # A `project` job is another project's own command. The user asked on 2026-09-24 for "a
 # universal bus", so that every project on the coordinator can train here, and gave
 # "full permission for the bridge access": its program and arguments are anything, and
-# it runs in that project's folder, compute\projects\<project>, which `peer push` fills
+# it runs in that project's folder, compute\projects\<project>, which `fleet push` fills
 # through the share. Only the coordinator can reach this script (the worker's pinned
 # certificate and token), and every job leaves its command, log and end in jobs\.
+#
+# The fleet project's `fleet` command (which replaced this project's `peer`, 2026-09-25)
+# relies on this: the `project` kind and its hex spec, jobs\<id>.json (its state, one of
+# starting, running, done, failed, stopped or lost; its project; and log_bytes, the log's
+# length once it has ended) and jobs\<id>.log. Keep them compatible, or tell the user
+# before changing them (tests/test_fleet_contract.py).
 #
 # -Action start -Id <id> -Spec <hex of {"kind", "args"[, "project"]}>
 #   setup    Build the Python environment in compute\ with uv (compute\tools\uv.exe).
@@ -63,7 +69,7 @@ function Get-ProjectFolder($JobSpec) {
     if ($JobSpec.project -cnotmatch '^[A-Za-z0-9_-]{1,40}$') { throw "project not allowed: $($JobSpec.project)" }
     $folder = Join-Path $projects $JobSpec.project
     if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
-        throw "no project $($JobSpec.project) here: push it first (peer push)"
+        throw "no project $($JobSpec.project) here: push it first (fleet push)"
     }
     $folder
 }

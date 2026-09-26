@@ -585,10 +585,12 @@ const JOB_SPEC_HEX: usize = 30_000;
 /// Run-Job; here every value is checked before pwsh starts, as for launch.
 ///
 /// Since 2026-09-24 a `project` job runs any program with any arguments in another
-/// project's folder, compute\projects\<project>, which `peer push` fills. The user asked
+/// project's folder, compute\projects\<project>, which `fleet push` fills. The user asked
 /// for "a universal bus" so that every project on the coordinator can train here, and
 /// gave "full permission for the bridge access". Its arguments cross as JSON inside hex,
-/// so no shell ever reads them.
+/// so no shell ever reads them. The fleet project's `fleet` command starts, stops and
+/// lists these on observer connections: keep the op and its fields compatible, or tell
+/// the user before changing them.
 fn job_arguments(cmd: &serde_json::Value) -> Result<Vec<String>, String> {
     let action = cmd["action"].as_str().unwrap_or("");
     if !matches!(action, "start" | "stop" | "status") {
@@ -3710,7 +3712,8 @@ mod tests {
         ] {
             assert!(!observer_allows(op, &status), "{op} should be refused");
         }
-        // Compute jobs touch no game, so an observer runs them beside a recording.
+        // Compute jobs touch no game, so an observer runs them beside a recording (the
+        // fleet project's jobs come this way).
         for action in ["start", "stop", "status"] {
             assert!(observer_allows(
                 "job",
