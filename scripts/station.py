@@ -17,6 +17,13 @@ Between sessions it answers fleet:
 - FLEET_RESTART_WANTED (new code pushed): the loop exits, and fleet starts it again.
 - artifacts/station/DRAIN: the loop ends after the session in progress.
 
+While a session runs, artifacts/station/current.json names it, for other projects sharing
+this PC (they read it to keep their GPU work away from a live policy):
+    {"command": "practice", "output": "...", "policy": true, "since": <unix time>,
+     "until_estimate": <unix time or null>}
+`policy` is whether a learned checkpoint decides on this PC's GPU (practice and
+play-policy; drills and record-ai are scripted). The file is gone between sessions.
+
 The plan (artifacts/station/plan.json, pushed from the training PC by collect_station.py
 deploy; read before each session, so it changes without a restart):
     {"checkpoint": "artifacts/learned/bc6/epoch-0000.pt", "name": "bc6-e0000",
@@ -45,6 +52,7 @@ from pathlib import Path
 STATION = Path("artifacts/station")
 PLAN = STATION / "plan.json"
 FINISHED = STATION / "finished.jsonl"
+CURRENT = STATION / "current.json"
 DRAIN = STATION / "DRAIN"
 # The worker, as fleet's service `hoi4-worker` on this PC's own loopback (the pairing
 # bundle-peer writes, shipped by collect_station.py deploy).
@@ -56,6 +64,8 @@ ARENAS = ["arena-12x8-v4", "arena-bay-v6", "arena-12x8-v4", "arena-river-v6", "a
 # What each session writes, as a glob in its folder: its summary, or record-ai's results.
 SUMMARIES = {"practice": "practice-peer.json", "drills": "drills-peer.json",
              "play-policy": "results-peer.json", "record-ai": "results-peer-*.json"}  # fmt: skip
+# The sessions in which a learned checkpoint decides on this PC's GPU.
+POLICY = {"practice", "play-policy"}
 
 
 def log(text):
@@ -119,11 +129,31 @@ def played(command, output):
     return False
 
 
+def announce(command, output, args):
+    """Write CURRENT for the session starting now; its end is estimated from --minutes."""
+    since = time.time()
+    minutes = None
+    if "--minutes" in args[:-1]:
+        try:
+            minutes = float(args[args.index("--minutes") + 1])
+        except ValueError:
+            pass
+    status = {"command": command, "output": output, "policy": command in POLICY,
+              "since": since, "until_estimate": since + minutes * 60 if minutes else None}  # fmt: skip
+    temporary = CURRENT.with_suffix(".tmp")
+    temporary.write_text(json.dumps(status))
+    temporary.replace(CURRENT)
+
+
 def session(command, output, args, run=hoi4):
     """One session here; its folder is listed for collection whatever happened."""
     log(f"{command} {output} {' '.join(args)}")
-    code = run(command, output, "--peer", PEER, *args)
     STATION.mkdir(parents=True, exist_ok=True)
+    announce(command, output, args)
+    try:
+        code = run(command, output, "--peer", PEER, *args)
+    finally:
+        CURRENT.unlink(missing_ok=True)
     ok = code == 0 and played(command, output)
     with FINISHED.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"output": output, "command": command, "exit": code,

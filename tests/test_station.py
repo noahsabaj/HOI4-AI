@@ -104,3 +104,31 @@ def test_the_plan_s_recording_run_plays_here_once_per_name(station):
     assert len(ran) == 1
     listed = [json.loads(line) for line in station.FINISHED.read_text().splitlines()]
     assert listed[0]["output"] == "artifacts/record-sv6", "collected like any session"
+
+
+@pytest.mark.parametrize("command, policy", [("practice", True), ("play-policy", True),
+                                             ("drills", False), ("record-ai", False)])  # fmt: skip
+def test_the_session_in_progress_is_announced_for_other_projects(station, command, policy):
+    seen = []
+
+    def run(*args):
+        seen.append(json.loads(station.CURRENT.read_text()))
+        return 0
+
+    before = time.time()
+    station.session(command, "artifacts/x", ["--minutes", "30"], run=run)
+    (status,) = seen
+    assert status["command"] == command and status["output"] == "artifacts/x"
+    assert status["policy"] is policy
+    assert before <= status["since"] <= time.time()
+    assert status["until_estimate"] == pytest.approx(status["since"] + 1800)
+    assert not station.CURRENT.exists(), "gone between sessions"
+
+
+def test_the_announcement_goes_even_if_the_session_fails(station):
+    def run(*args):
+        raise RuntimeError("worker gone")
+
+    with pytest.raises(RuntimeError):
+        station.session("practice", "artifacts/x", [], run=run)
+    assert not station.CURRENT.exists()
