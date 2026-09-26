@@ -8,22 +8,19 @@ from hoi4_arena import practice
 from hoi4_arena.dataset import session_labels
 
 LAND = np.zeros((1080, 1920, 3), np.uint8)
+# What the coach's screenshot shows, as a test sets it.
+SCREEN = {"rgb": LAND}
 
 
 class _Planner:
-    """The scripted player's screen checks and steps, as the test sets them."""
+    """The scripted player's steps, as the test sets them."""
 
     def __init__(self):
-        self.shown = {"unassigned"}
         self.steps = []
         self.fail = set()
 
-    def find(self, rgb, name, top=0.0):
-        return (0.5, 0.5) if name in self.shown else None
-
     def form_army(self, desk):
         self._do("army", desk)
-        self.shown.discard("unassigned")
 
     def assign_general(self, desk):
         self._do("general", desk)
@@ -48,10 +45,25 @@ class _Desk:
         return {"t_ns": 7}
 
 
+def _card(general):
+    """A screen with the first army's card lit, and a portrait on it if `general`."""
+    rgb = LAND.copy()
+    x0, y0, x1, y1 = practice.CARD
+    rgb[y0:y1, x0:x1] = (200, 150, 110) if general else (90, 90, 90)
+    return rgb
+
+
+def test_the_army_card_says_whether_there_is_an_army_and_a_general():
+    assert practice.army_card(LAND) == (False, False), "the dark gap between two + slots"
+    assert practice.army_card(_card(False)) == (True, False)
+    assert practice.army_card(_card(True)) == (True, True)
+
+
 @pytest.fixture
 def coach(monkeypatch):
-    """A coach whose screen shows land (no drift) and no plan, over a fake planner."""
-    monkeypatch.setattr("hoi4_arena.ai_games.screen", lambda desk: LAND)
+    """A coach whose screen shows land (no drift), no army and no plan, over a fake planner."""
+    SCREEN["rgb"] = LAND
+    monkeypatch.setattr("hoi4_arena.ai_games.screen", lambda desk: SCREEN["rgb"])
     monkeypatch.setattr("hoi4_arena.scripted.plan_shown", lambda rgb: False)
     monkeypatch.setattr("hoi4_arena.vision.country_pixels", lambda crop: (np.ones(1), None))
     made = practice.Coach("BLU", None, planner=_Planner(), plan={"attack": "broad"})
@@ -73,7 +85,7 @@ def test_the_coach_takes_over_a_late_step_in_order_and_records_it(coach):
 
 
 def test_what_the_policy_did_itself_is_its_own_and_never_taken_over(coach):
-    coach.planner.shown = {"plans_bar"}  # the army formed and selected, with a commander
+    SCREEN["rgb"] = _card(True)  # an army, with a general
     assert coach.look(_Desk(), 4.0, running=False) is None
     assert coach.done["army"]["by"] == coach.done["general"]["by"] == "policy"
     assert coach.look(_Desk(), 70.0, running=True) == "front"
@@ -85,7 +97,6 @@ def test_a_camera_off_the_arena_is_brought_back(coach, monkeypatch):
     monkeypatch.setattr("hoi4_arena.vision.country_pixels", lambda crop: (None, None))
     recentred = []
     monkeypatch.setattr("hoi4_arena.ai_games.recentre", lambda desk: recentred.append(1))
-    coach.planner.shown = set()
     assert coach.look(_Desk(), 3.0, running=False) is None, "lost for 0 s"
     assert coach.look(_Desk(), 9.0, running=False) == "camera", "lost for 6 s"
     coach.take_over(_Desk(), "camera", 9.0)
