@@ -434,3 +434,33 @@ def test_a_loader_s_workers_compute_with_more_than_one_thread(make):
     else:
         loader = sequence_loader(_Threads(), workers=1)
     assert [int(n) for n in loader] == [WORKER_THREADS]
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs CUDA"))])  # fmt: skip
+def test_quadrants_cut_in_a_batch_are_the_views_of_each_frame(device):
+    from hoi4_arena.dataset import quadrant_views, views
+
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 256, (5, 1080, 1920, 3), dtype=np.uint8)
+    batched = quadrant_views(torch.from_numpy(frames).to(device), chunk=2).cpu()
+    for frame, quads in zip(frames, batched, strict=True):
+        one = views(frame, None, device=device, cursor=[960, 540]).quadrants.cpu()
+        assert torch.equal(one, quads)
+
+
+@needs_ffmpeg
+def test_a_gpu_views_batch_is_the_same_batch_once_on_the_device(tmp_path):
+    from hoi4_arena.dataset import batch_to_device
+
+    click = {"kind": "button", "button": 0, "down": True}
+    _recording(tmp_path / "game", [3, 4], source="scripted", events=[(500_000_000, click)])
+    common = {"sources": ("scripted",), "length": 3, "burn_in": 1, "device": "cpu",
+              "clips": False, "lead_in": 0, "shuffle": 0}  # fmt: skip
+    plain = next(iter(VideoSessions(tmp_path, **common)))
+    raw = next(iter(VideoSessions(tmp_path, gpu_views=True, **common)))
+    assert "frames" in raw and "quadrants" not in raw
+    collate = torch.utils.data.default_collate
+    a = batch_to_device(collate([plain]), "cpu")
+    b = batch_to_device(collate([raw]), "cpu")
+    assert torch.equal(a["quadrants"], b["quadrants"]) and torch.equal(a["fovea"], b["fovea"])

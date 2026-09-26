@@ -598,6 +598,12 @@ def main():
         "the screen (dataset.parking_moves)",
     )
     train.add_argument(
+        "--gpu-views",
+        action="store_true",
+        help="Loader workers only decode: each frame's quadrants are cut on the GPU "
+        "(dataset.quadrant_views), the same pixels, without the CPU's ~20 ms a frame",
+    )
+    train.add_argument(
         "--held-previous",
         action="store_true",
         help="Show the policy, in its previous action, every key and button it still holds "

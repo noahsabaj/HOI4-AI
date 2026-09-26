@@ -157,6 +157,30 @@ def views(rgb, size=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE, device="cpu
     return Views(whole, quads.permute(0, 2, 3, 1), centre)
 
 
+def quadrant_views(frames, detail=DETAIL_SIZE, chunk=16):
+    """The four quadrants of uint8 frames (N, H, W, 3), on the frames' device, exactly as
+    views() makes them one frame at a time: (N, 4, h, w, 3).
+
+    For `gpu_views` training (VideoSessions): a loader worker cutting the quadrants of 64
+    1080p frames a step on the CPU kept the GPU waiting ~40% of every step even with four
+    threads (2026-09-25); on the GPU it is milliseconds. `area` pools each sample over its
+    own bins, so batching frames changes no pixel (tested against views()). `chunk` frames
+    go at a time: their float copy is 25 MB each.
+    """
+    out = []
+    for first in range(0, len(frames), chunk):
+        source = frames[first : first + chunk].permute(0, 3, 1, 2)
+        h, w = source.shape[-2:]
+        boxes = [source[..., t : t + bh, left : left + bw] for t, left, bh, bw in quadrants(h, w)]
+        if len({box.shape for box in boxes}) == 1:
+            quads = _area(torch.cat(boxes), detail)
+        else:
+            quads = torch.cat([_area(box, detail) for box in boxes])
+        n = source.shape[0]
+        out.append(quads.reshape(4, n, *quads.shape[1:]).transpose(0, 1).permute(0, 1, 3, 4, 2))
+    return torch.cat(out)
+
+
 def normalize(array):
     """uint8 channels-last pixels to the encoder's normalized float input."""
     x = array.float() if torch.is_tensor(array) else torch.as_tensor(np.array(array, copy=True))
@@ -179,6 +203,11 @@ def batch_to_device(batch, device, clips=True):
         if key == "clips" and not clips:
             continue
         out[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    if "frames" in out:
+        # Whole frames from a gpu_views loader: their quadrants are cut here, on `device`.
+        frames = out.pop("frames")
+        lead = frames.shape[:2]
+        out["quadrants"] = quadrant_views(frames.flatten(0, 1)).unflatten(0, lead)
     if "clips" in out:
         # (B, n, T, H, W, 3) -> (B, n, 3, T, H, W): the encoder takes channels first.
         out["clips"] = normalize(out["clips"]).permute(0, 1, 5, 2, 3, 4)
@@ -587,9 +616,11 @@ class _Stream:
     details of is decoded and dropped without computing any view of it.
     """
 
-    def __init__(self, labels, length, burn_in, device, starts=None, clips=True):
+    def __init__(self, labels, length, burn_in, device, starts=None, clips=True, raw=False):
         self.labels, self.length, self.burn_in, self.device = labels, length, burn_in, device
-        self.clips = clips
+        # With `raw`, a decision keeps its whole frame (and its fovea) instead of its
+        # quadrants: batch_to_device cuts them on the GPU (VideoSessions' gpu_views).
+        self.clips, self.raw = clips, raw
         manifest = labels["manifest"]
         self.w, self.h = manifest["width"], manifest["height"]
         self.starts = (
@@ -629,10 +660,11 @@ class _Stream:
         steps = range(start, start + n)
         quads = torch.stack([self.details[d][0] for d in steps])
         fovea = torch.stack([self.details[d][1] for d in steps])
+        pixels = "frames" if self.raw and not self.clips else "quadrants"
         actions = torch.from_numpy(labels["actions"][start : start + n].copy())
         previous = torch.from_numpy(label_previous(labels)[start : start + n].copy())
         window = {
-            "quadrants": quads,
+            pixels: quads,
             "fovea": fovea,
             "actions": actions,
             "previous": previous,
@@ -679,7 +711,14 @@ class _Stream:
         # No window can complete before the first pending one's clip begins.
         if i < int(labels["clip_ids"][first].min()) and not needed:
             return []
-        if needed or self.clips:
+        if needed and self.raw and not self.clips:
+            frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
+            x, y = parse_cursor(labels["cursors"][i])
+            whole = torch.from_numpy(frame.copy())
+            fovea = torch.from_numpy(np.ascontiguousarray(cursor_crop(frame, x, y, FOVEA_SIZE)))
+            for d in needed:
+                self.details[d] = (whole, fovea)
+        elif needed or self.clips:
             frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
             size = VIEW_SIZE if self.clips else None
             seen = views(frame, size, device=self.device, cursor=labels["cursors"][i])
@@ -762,6 +801,7 @@ class VideoSessions(IterableDataset):
         setup_weight=1.0,
         camera_since=None,
         held_previous=False,
+        gpu_views=False,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -769,6 +809,7 @@ class VideoSessions(IterableDataset):
                 "without frames; it is for an encoder that reads no clip"
             )
         self.length, self.burn_in, self.clips = length, burn_in, clips
+        self.gpu_views = gpu_views
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sessions = []
@@ -846,8 +887,13 @@ class VideoSessions(IterableDataset):
                 while order and len(active) < streams:
                     active.append(
                         _Stream(
-                            order.pop(), self.length, self.burn_in, self.device, clips=self.clips
-                        )
+                            order.pop(),
+                            self.length,
+                            self.burn_in,
+                            self.device,
+                            clips=self.clips,
+                            raw=self.gpu_views,
+                        )  # fmt: skip
                     )
                 for stream in list(active):
                     done = stream.advance()
@@ -886,6 +932,7 @@ class GameSequences(IterableDataset):
         self.sessions = sessions.sessions
         self.length, self.slots, self.seed = length, slots, seed
         self.device, self.clips = device, clips
+        self.gpu_views = getattr(sessions, "gpu_views", False)
         self.windows = sum(
             max(0, int(labels["readable"].sum())) // length for labels in self.sessions
         )
@@ -900,7 +947,9 @@ class GameSequences(IterableDataset):
         starts = list(range(0, count - self.length + 1, self.length))
         if not starts:
             return None
-        return _Stream(labels, self.length, 0, self.device, starts=starts, clips=self.clips)
+        return _Stream(
+            labels, self.length, 0, self.device, starts=starts, clips=self.clips, raw=self.gpu_views
+        )
 
     def __iter__(self):
         rng = random.Random(f"{self.seed}:{self.epoch}")
