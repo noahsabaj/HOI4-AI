@@ -82,7 +82,7 @@ def test_the_coach_takes_over_a_late_step_in_order_and_records_it(coach):
     assert coach.look(desk, 21.0, running=False) == "army"
     taken = coach.take_over(desk, "army", 21.0)
     assert [e["by"] for e in taken] == ["coach"] and taken[0]["t_ns"] == 7
-    assert coach.done["army"] == {"at": 21.0, "by": "coach"}
+    assert coach.done["army"] == {"at": 21.0, "by": "coach", "confirmed": None}
     # The general is due at 35 s; the front waits for it.
     assert coach.look(desk, 30.0, running=False) is None
     assert coach.look(desk, 61.0, running=False) == "general"
@@ -190,3 +190,34 @@ def test_a_scramble_goes_straight_to_the_desktop_and_says_what_it_did(monkeypatc
         kinds = practice.scramble(object(), random.Random(seed))
         assert 1 <= len(kinds) <= 3 and len(done) == len(kinds)
         assert set(kinds) <= set(practice.SCRAMBLES)
+
+
+def test_a_takeover_counts_once_the_screen_shows_the_step_done():
+    coach = practice.Coach("BLU", None, planner=_Planner(), plan={"attack": "broad"})
+    coach.seen("front", 60.0, by="coach")
+    assert coach.done["front"] == {"at": 60.0, "by": "coach", "confirmed": None}
+    assert not practice.coach_managed(coach.done["front"])
+    coach.seen("front", 64.0)
+    assert coach.done["front"] == {"at": 60.0, "by": "coach", "confirmed": 64.0}
+    assert practice.coach_managed(coach.done["front"])
+    assert practice.coach_managed({"at": 60.0, "by": "coach"}), "a record from before"
+    assert not practice.coach_managed({"at": 60.0, "by": "nobody"})
+
+
+@pytest.mark.parametrize(
+    "front, teaches",
+    [
+        ({"at": 60.0, "by": "coach", "confirmed": 64.0}, True),
+        ({"at": 60.0, "by": "coach"}, True),
+        ({"at": 60.0, "by": "coach", "confirmed": None}, False),
+        ({"at": 60.0, "by": "nobody"}, False),
+    ],
+)
+def test_a_takeover_that_left_its_step_undone_teaches_nothing(tmp_path, front, teaches):
+    _scripted(tmp_path / "game", coached=[{"from_frame": 10, "to_frame": 20, "step": "front"}])
+    path = tmp_path / "game" / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest.update(source="policy", setup={"steps": {"front": front}, "own": 0})
+    path.write_text(json.dumps(manifest))
+    labels = session_labels(tmp_path / "game", sources=("policy",), lead_in=0)
+    assert (labels["weight"] > 0).any() == teaches

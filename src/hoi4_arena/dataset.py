@@ -492,12 +492,18 @@ def session_labels(
     # A practice game (practice.Coach): only the coach's spans teach, what the scripted
     # player did from where the policy had led the game; the policy's own decisions weigh
     # nothing. Their windows stay, so the lead-up into each span is read.
+    # A span whose step the coach failed teaches nothing: it shows how not to do the step.
     if "coached" in manifest:
+        from .practice import coach_managed
+
         last = len(times) - 1
         taught = np.zeros(len(decisions), bool)
+        steps = (manifest.get("setup") or {}).get("steps") or {}
         for span in manifest["coached"]:
             begun, ended = span.get("from_frame"), span.get("to_frame")
             if begun is None or ended is None:
+                continue
+            if span.get("step") in steps and not coach_managed(steps[span["step"]] or {}):
                 continue
             taught |= (decisions >= times[min(begun, last)]) & (
                 decisions <= times[min(ended, last)]
