@@ -367,7 +367,9 @@ def session_labels(
     gap = np.flatnonzero(np.diff(times) > MAX_GAP_NS)
     cursors = [parse_cursor(row.get("cursor")) for row in rows]
     key = "events" if manifest["source"] == "human" else "scripted_events"
-    events = [e for row in rows for e in row.get(key, [])]
+    # Not the releases the harness made for a policy that held a key too long (play.Holds):
+    # those were not the player's.
+    events = [e for row in rows for e in row.get(key, []) if e.get("by") != "harness"]
     tail = source / "trailing-events.json"
     if tail.exists() and key == "events":
         events += json.loads(tail.read_text())["events"]

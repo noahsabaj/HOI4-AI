@@ -31,6 +31,22 @@
 		play();
 	}
 
+	// Paused and played again: back to live, not on from where it stopped. The newest
+	// moment the stream can play is the end of its seekable range.
+	let pausedAt = 0;
+	function paused() {
+		if (src) pausedAt = Date.now();
+	}
+	function resumed() {
+		if (!pausedAt) return;
+		pausedAt = 0;
+		const ranges = video.seekable;
+		if (ranges.length) {
+			const edge = hls?.liveSyncPosition ?? ranges.end(ranges.length - 1) - 1;
+			if (edge > video.currentTime + 1) video.currentTime = edge;
+		}
+	}
+
 	function detach() {
 		hls?.destroy();
 		hls = null;
@@ -95,6 +111,8 @@
 		playsinline
 		controls
 		onvolumechange={() => (sound = !video.muted)}
+		onpause={paused}
+		onplay={resumed}
 		onerror={() => src && setTimeout(() => src && attach(src), 3000)}
 	></video>
 	{#if src}
