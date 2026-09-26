@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -615,14 +616,29 @@ def cover_starts(labels, length):
     return starts
 
 
+def _skipped():
+    """What a loader yields in place of a batch a resumed run already trained: nothing
+    decoded, and train_bc passes over it (VideoSessions.resume)."""
+    return {"skipped": torch.ones((), dtype=torch.bool)}
+
+
 class _Stream:
     """One recording decoded front to back, yielding its windows as they fill.
 
     Without `clips` no global view is made or kept, and a frame no decision reads the
     details of is decoded and dropped without computing any view of it.
+
+    Windows that start before `skip_before` are only counted: each comes out when it
+    would have, as `{"start", "skipped"}` with no pixels, and the frames that only they
+    read are never decoded. The decoder opens at the first frame a later window reads
+    (none if no window is later), so a resumed run passes over what it already trained
+    without the cost of it, and every later window is the same as in a stream that
+    decoded all along: each reads only frames from that one on.
     """
 
-    def __init__(self, labels, length, burn_in, device, starts=None, clips=True, raw=False):
+    def __init__(
+        self, labels, length, burn_in, device, starts=None, clips=True, raw=False, skip_before=0
+    ):
         self.labels, self.length, self.burn_in, self.device = labels, length, burn_in, device
         # With `raw`, a decision keeps its whole frame (and its fovea) instead of its
         # quadrants: batch_to_device cuts them on the GPU (VideoSessions' gpu_views).
@@ -634,14 +650,24 @@ class _Stream:
             if starts is not None
             else sequence_starts(labels["valid"], length, burn_in)
         )
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
+        self.skip_before = skip_before
+        self.ffmpeg = shutil.which("ffmpeg")
+        if not self.ffmpeg:
             raise RuntimeError("FFmpeg is required to read recordings")
-        self.decoder = subprocess.Popen(
-            [ffmpeg, "-v", "error", "-i", str(labels["root"] / "screen.mkv")]
-            + ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-            stdout=subprocess.PIPE,
-        )
+        # The first frame decoded: the earliest any window from `skip_before` on reads.
+        live = [s for s in self.starts if s >= skip_before]
+        if not self.starts or live[:1] == self.starts[:1]:
+            self.wake = 0
+        elif live:
+            first = live[0]
+            self.wake = int(labels["frame_ids"][first])
+            if clips:
+                self.wake = min(self.wake, int(labels["clip_ids"][first].min()))
+        else:
+            self.wake = None
+        self.decoder = None
+        if self.wake == 0:
+            self._open(0)
         # Global views are kept only while a pending window's clip can still reach them.
         self.globals = {}
         self.details = {}
@@ -656,7 +682,20 @@ class _Stream:
                 for key in ("summary", "grid", "scale")
             ) + ((np.load(found["rows"]) if "rows" in found else None),)
 
+    def _open(self, frame):
+        """Start decoding at `frame`, counted as the frames come out of the decoder."""
+        command = [self.ffmpeg, "-v", "error", "-i", str(self.labels["root"] / "screen.mkv")]
+        if frame:
+            # The frames before it are decoded but never converted or piped. Selected by
+            # their number, not a time, so no timestamp can land it a frame off; and
+            # restarted at time zero, so the frames come out as they would from the start.
+            command += ["-vf", f"select=gte(n\\,{frame}),setpts=PTS-STARTPTS"]
+        command += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        self.decoder = subprocess.Popen(command, stdout=subprocess.PIPE)
+
     def close(self):
+        if self.decoder is None:
+            return
         if self.decoder.poll() is None:
             self.decoder.kill()
         self.decoder.wait()
@@ -707,7 +746,8 @@ class _Stream:
         return window
 
     def advance(self):
-        """Decode one frame. Returns the windows it completed, or None when none are left.
+        """Decode one frame (or count it, before `wake`). Returns the windows it completed,
+        or None when none are left.
 
         Decoding stops at the last window rather than at the end of the video: the frames
         after it train nothing.
@@ -716,17 +756,41 @@ class _Stream:
         if not self.starts:
             self.close()
             return None
+        i = self.index
+        self.index += 1
+        if self.wake is not None and i >= self.wake:
+            if self.decoder is None:
+                self._open(i)
+            self._view(i)
+        done = []
+        n = self.length + self.burn_in
+        while self.starts and labels["last_frame"][self.starts[0] + n - 1] <= i:
+            start = self.starts.pop(0)
+            if start >= self.skip_before:
+                done.append(self._window(start))
+            else:
+                done.append({"start": start, "skipped": True})
+            if not self.starts:
+                break
+            # Nothing before the next window's first clip is needed again. Clip indices
+            # only grow with the decision, so its first decision's clip is the earliest.
+            keep_from = int(labels["clip_ids"][self.starts[0]].min())
+            self.globals = {k: v for k, v in self.globals.items() if k >= keep_from}
+            self.details = {k: v for k, v in self.details.items() if k >= self.starts[0]}
+        return done
+
+    def _view(self, i):
+        """Read frame `i` from the decoder and keep the views pending windows read of it."""
+        labels = self.labels
         size = self.w * self.h * 3
         buffer = self.decoder.stdout.read(size)
         if len(buffer) != size:
             raise ValueError("Video truncated relative to timestamps")
-        i = self.index
-        self.index += 1
         first = self.starts[0]
         needed = [int(d) for d in np.flatnonzero(labels["frame_ids"] == i) if d >= first]
         # No window can complete before the first pending one's clip begins.
         if i < int(labels["clip_ids"][first].min()) and not needed:
-            return []
+            return
         if needed and self.raw and not self.clips:
             frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
             x, y = parse_cursor(labels["cursors"][i])
@@ -744,18 +808,6 @@ class _Stream:
                 quads, fovea = seen.quadrants.cpu(), seen.fovea.cpu()
                 for d in needed:
                     self.details[d] = (quads, fovea)
-        done = []
-        n = self.length + self.burn_in
-        while self.starts and labels["last_frame"][self.starts[0] + n - 1] <= i:
-            done.append(self._window(self.starts.pop(0)))
-            if not self.starts:
-                break
-            # Nothing before the next window's first clip is needed again. Clip indices
-            # only grow with the decision, so its first decision's clip is the earliest.
-            keep_from = int(labels["clip_ids"][self.starts[0]].min())
-            self.globals = {k: v for k, v in self.globals.items() if k >= keep_from}
-            self.details = {k: v for k, v in self.details.items() if k >= self.starts[0]}
-        return done
 
 
 def balance_weights(sessions):
@@ -781,7 +833,88 @@ def balance_weights(sessions):
             labels["weight"] = labels["weight"] * np.float32(mean / total)
 
 
-class VideoSessions(IterableDataset):
+def _live_from(labels, live):
+    """The first window of a recording a resumed pass cuts from its pixels (_Stream's
+    `skip_before`): all with no plan, none if the plan has none of it."""
+    if live is None:
+        return 0
+    return live.get(str(labels["root"]), math.inf)
+
+
+def loader_share(counts, batches):
+    """How many of each worker's batches are among the first `batches` a DataLoader hands
+    out, `counts` being how many each worker makes.
+
+    A DataLoader takes an iterable dataset's batches from its workers in turn, one from
+    each, and passes over a worker that has run out (in order, as torch's
+    _MultiProcessingDataLoaderIter dispatches them); with no worker process there is one.
+    """
+    taken = [0] * len(counts)
+    while batches > 0 and any(t < c for t, c in zip(taken, counts, strict=True)):
+        for worker, count in enumerate(counts):
+            if batches > 0 and taken[worker] < count:
+                taken[worker] += 1
+                batches -= 1
+    return taken
+
+
+class _Resumable:
+    """Iterates `_play`, and after `resume` passes over the batches already trained.
+
+    A resumed run used to have its loader make every batch it had trained before the
+    interruption, decode its video and cut its views, and then drop it: 2.8 s a batch
+    of bc6's on the CPU, and bc6's resume at step 2100 was still at it after 45 minutes
+    (2026-09-26). With 118 batches an epoch of four of its games, reaching batch 40 took
+    118 s that way and takes 12 s now, most of it the worker starting (7 s for batch 0),
+    whatever the batch: 9 s to reach batch 110. Now the loader still hands out one
+    batch for each, in the same order, but a stand-in (`_skipped`), and its streams only
+    count their way past those windows (_Stream's `skip_before`). The shuffles depend on
+    nothing but the seed, the epoch and how many windows each recording completes at
+    each frame, so a dry pass, which reads no video, finds which windows each batch
+    holds; from that, where each worker's own batches fall among the loader's
+    (loader_share), and from which window on each recording must be cut from its pixels.
+    Every batch after the skipped ones is then the same as in a run never interrupted,
+    as long as the number of loader workers is the same.
+    """
+
+    skip = None
+
+    def resume(self, batches, batch_size=1, drop_last=False):
+        """Pass over the first `batches` batches of the next epoch, as a loader of
+        `batch_size` windows a batch makes them (1 for GameSequences, whose windows come
+        batched), with `drop_last` as the loader's."""
+        self.skip = (batches, batch_size, drop_last) if batches else None
+
+    def __iter__(self):
+        epoch = self.epoch
+        self.epoch += 1
+        skip, self.skip = self.skip, None
+        info = get_worker_info()
+        worker, share = (0, 1)
+        if info is not None and info.num_workers > 1:
+            worker, share = info.id, info.num_workers
+        if skip is None:
+            for _, item in self._play(epoch, worker, share):
+                yield item
+            return
+        batches, size, drop_last = skip
+        plans = [[keys for keys, _ in self._play(epoch, w, share, live={})] for w in range(share)]
+        counts = [len(p) // size if drop_last else -(-len(p) // size) for p in plans]
+        passed = loader_share(counts, batches)[worker] * size
+        live = {}
+        for keys in plans[worker][passed:]:
+            for root, start in keys:
+                live[root] = min(live.get(root, start), start)
+        for i, (_, item) in enumerate(self._play(epoch, worker, share, live=live)):
+            if i < passed:
+                yield _skipped()
+            elif item is None or "skipped" in item:
+                raise RuntimeError("a resumed pass left a window uncut that it must train")
+            else:
+                yield item
+
+
+class VideoSessions(_Resumable, IterableDataset):
     """Training windows read straight from the recordings' video.
 
     Nothing is prepared ahead: each recording is decoded front to back and cut into
@@ -910,31 +1043,31 @@ class VideoSessions(IterableDataset):
     def __len__(self):
         return self.windows
 
-    def __iter__(self):
-        rng = random.Random(f"{self.seed}:{self.epoch}")
-        self.epoch += 1
+    def _play(self, epoch, worker, share, live=None):
+        """This worker's windows of `epoch`, each as ((recording, start),), window)."""
+        rng = random.Random(f"{self.seed}:{epoch}")
         order = list(self.sessions)
         rng.shuffle(order)
         streams, shuffle = self.streams, self.shuffle
-        worker = get_worker_info()
-        if worker is not None and worker.num_workers > 1:
+        if share > 1:
             # Every worker shuffles the same order and takes every n-th recording of it.
-            share = worker.num_workers
-            order = order[worker.id :: share]
-            rng = random.Random(f"{self.seed}:{self.epoch - 1}:{worker.id}")
+            order = order[worker::share]
+            rng = random.Random(f"{self.seed}:{epoch}:{worker}")
             streams, shuffle = -(-streams // share), -(-shuffle // share)
         active, buffer = [], []
         try:
             while order or active:
                 while order and len(active) < streams:
+                    labels = order.pop()
                     active.append(
                         _Stream(
-                            order.pop(),
+                            labels,
                             self.length,
                             self.burn_in,
                             self.device,
                             clips=self.clips,
                             raw=self.gpu_views,
+                            skip_before=_live_from(labels, live),
                         )  # fmt: skip
                     )
                 for stream in list(active):
@@ -943,7 +1076,8 @@ class VideoSessions(IterableDataset):
                         stream.close()
                         active.remove(stream)
                         continue
-                    buffer.extend(done)
+                    root = str(stream.labels["root"])
+                    buffer.extend((((root, int(w["start"])),), w) for w in done)
                     while len(buffer) > shuffle:
                         yield buffer.pop(rng.randrange(len(buffer)))
             rng.shuffle(buffer)
@@ -953,7 +1087,7 @@ class VideoSessions(IterableDataset):
                 stream.close()
 
 
-class GameSequences(IterableDataset):
+class GameSequences(_Resumable, IterableDataset):
     """Each game's decisions in order, in windows of `length`, `slots` games side by side.
 
     For a memory carried through whole games, trained by truncated backpropagation
@@ -984,57 +1118,69 @@ class GameSequences(IterableDataset):
         """Batches in an epoch, about: windows over slots."""
         return -(-self.windows // self.slots)
 
-    def _open(self, labels):
+    def _open(self, labels, live=None):
         count = int(labels["readable"].sum())
         starts = list(range(0, count - self.length + 1, self.length))
         if not starts:
             return None
         return _Stream(
-            labels, self.length, 0, self.device, starts=starts, clips=self.clips, raw=self.gpu_views
+            labels,
+            self.length,
+            0,
+            self.device,
+            starts=starts,
+            clips=self.clips,
+            raw=self.gpu_views,
+            skip_before=_live_from(labels, live),
         )
 
-    def __iter__(self):
-        rng = random.Random(f"{self.seed}:{self.epoch}")
-        self.epoch += 1
+    def _play(self, epoch, worker, share, live=None):
+        """This worker's batches of `epoch`, each as (its windows' (recording, start),
+        batch); the batch is None if a window in it was only counted."""
+        rng = random.Random(f"{self.seed}:{epoch}")
         order = list(self.sessions)
         rng.shuffle(order)
-        worker = get_worker_info()
         base = 0
-        if worker is not None and worker.num_workers > 1:
-            order = order[worker.id :: worker.num_workers]
-            base = worker.id * self.slots
+        if share > 1:
+            order = order[worker::share]
+            base = worker * self.slots
         streams = [None] * self.slots
         fresh = [True] * self.slots
         # Windows a stream finished together (after a capture gap), in order.
         pending = [[] for _ in range(self.slots)]
         try:
             while True:
-                windows, ids, starts = [], [], []
+                windows, keys, ids, starts = [], [], [], []
                 for b in range(self.slots):
                     while not pending[b]:
                         if streams[b] is None:
                             if not order:
                                 break
-                            streams[b], fresh[b] = self._open(order.pop()), True
+                            streams[b], fresh[b] = self._open(order.pop(), live), True
                             continue
                         done = streams[b].advance()
                         if done is None:
                             streams[b] = None
                             continue
-                        pending[b].extend(done)
+                        root = str(streams[b].labels["root"])
+                        pending[b].extend(((root, int(w["start"])), w) for w in done)
                     if not pending[b]:
                         continue
-                    window = pending[b].pop(0)
+                    key, window = pending[b].pop(0)
+                    keys.append(key)
                     windows.append(window)
                     ids.append(base + b)
                     starts.append(fresh[b])
                     fresh[b] = False
                 if not windows:
                     return
+                if any("skipped" in w for w in windows):
+                    yield tuple(keys), None
+                    continue
                 batch = torch.utils.data.default_collate(windows)
                 batch["slot"] = torch.tensor(ids)
                 batch["fresh"] = torch.tensor(starts)
-                yield batch
+                yield tuple(keys), batch
         finally:
             for stream in streams:
                 if stream is not None:

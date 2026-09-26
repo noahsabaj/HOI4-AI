@@ -140,10 +140,14 @@ def train_idm(
         for epoch in range(first_epoch, epochs):
             model.train()
             dataset.epoch = epoch  # Workers iterate copies of the dataset.
+            # The batches trained before an interruption come as stand-ins, nothing decoded.
+            dataset.resume(skip if epoch == first_epoch else 0, batch_size)
             loader = window_loader(dataset, batch_size, workers=workers, device=device)
             for step, batch in enumerate(loader):
                 if epoch == first_epoch and step < skip:
                     continue  # Trained before the run was interrupted.
+                if "skipped" in batch:
+                    raise RuntimeError("the loader passed over a batch this run has not trained")
                 batch = batch_to_device(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):

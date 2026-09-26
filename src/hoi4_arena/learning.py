@@ -276,8 +276,8 @@ class Progress:
     after every epoch, and removed when the run finishes. Resuming loads it and skips the
     batches already trained. The data comes back in the same order, because the windows
     are shuffled by seed and epoch alone (VideoSessions), so the skipped batches are
-    exactly the ones trained before. They are still decoded to be skipped, which is the
-    cost of resuming: a few minutes, not the run.
+    exactly the ones trained before. The loader only counts its way past them, decoding
+    none (dataset._Resumable), so resuming costs seconds, not the run.
 
     The config must match the saved one, so a resume cannot quietly continue a different
     run. `every` 0 saves only after each epoch.

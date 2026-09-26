@@ -577,10 +577,18 @@ def _train_bc(
             aux.train()
             # Workers iterate copies of the dataset, so its epoch is set here, not counted.
             trainset.epoch = epoch
+            # The batches trained before an interruption come as stand-ins, nothing decoded.
+            trainset.resume(
+                skip if epoch == first_epoch else 0,
+                1 if carry else batch_size,
+                drop_last=not carry and auxiliary != "none",
+            )
             store = {}  # A carried game's memory, by batch slot.
             for step, batch in enumerate(loader):
                 if epoch == first_epoch and step < skip:
                     continue  # Trained before the run was interrupted.
+                if "skipped" in batch:
+                    raise RuntimeError("the loader passed over a batch this run has not trained")
                 wait_while_paused(output)
                 slots = batch.pop("slot").tolist() if carry else None
                 fresh = batch.pop("fresh").tolist() if carry else None
