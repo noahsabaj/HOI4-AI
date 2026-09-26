@@ -82,6 +82,7 @@
 	video {
 		display: block;
 		width: 100%;
+		aspect-ratio: 16 / 9;
 		max-height: 72vh;
 		background: #000;
 	}

@@ -3,7 +3,7 @@
 Each PC with a game gets its own HLS stream in its own folder (`out/<station>/`):
 live.m3u8, its segments, and latest.jpg, a snapshot each second.
 
-- The second PC ("peer"): its worker's `view` captures the game window at 30 frames a
+- The second PC ("peer"): its worker's `view` captures the game window at 60 frames a
   second on that PC's GPU and sends H.264 over a read-only connection (PeerView). It shows
   the menus and loading between games too.
 - This PC ("here"): ffmpeg captures the HOI4 window here the same way (LocalView), only
@@ -98,16 +98,20 @@ def hls_command(ffmpeg, video, out, start=0.0, number=0, stall=STALL):
     ]  # fmt: skip
 
 
-def view_command(ffmpeg, out, number=0):
+def view_command(ffmpeg, out, number=0, raw=None):
     """ffmpeg cutting a live view (MPEG-TS on its stdin, keyframes every 2 s) into the
     playlist as it comes, without encoding it again, after a discontinuity, with
-    latest.jpg once a second.
+    latest.jpg once a second; and with `raw`, into that folder's pieces too, for the
+    games' archives (archive.piece_output).
 
     One thread each decodes, filters and encodes the snapshot. Left to choose, ffmpeg
     sized every pool to this PC's 28 threads (84 threads in all) and held ~900 MB a game
     for work one thread does at 13% of a core; capped, the peak was 83 MB (2026-09-24).
     """
+    from .archive import piece_output
+
     out = Path(out)
+    pieces = ["-map", "0:v", *piece_output(raw)] if raw else []
     return [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-threads", "1", "-f", "mpegts", "-i", "pipe:0",
@@ -117,10 +121,11 @@ def view_command(ffmpeg, out, number=0):
         "-hls_segment_filename", str(out / "seg%06d.ts"), str(out / "live.m3u8"),
         "-map", "0:v", "-filter_threads", "1", "-threads", "1",
         "-vf", "fps=1", "-q:v", "4", "-update", "1", str(out / "latest.jpg"),
+        *pieces,
     ]  # fmt: skip
 
 
-def capture_command(ffmpeg, hz=30):
+def capture_command(ffmpeg, hz=60):
     """ffmpeg capturing this PC's HOI4 window (by its program's name) as the second PC's
     worker captures its own (encoder.rs view_arguments): on the GPU, H.264 from NVENC with
     a keyframe every 2 s, as MPEG-TS on stdout for view_command."""
@@ -213,8 +218,9 @@ class PeerView:
     the menus and the loading between games too, where following the recording is 5
     frames a second and stops. `refused` once a worker without views says no."""
 
-    def __init__(self, peer, ffmpeg, out, hz=30):
+    def __init__(self, peer, ffmpeg, out, hz=60, raw=None):
         self.peer, self.ffmpeg, self.out, self.hz = peer, ffmpeg, Path(out), hz
+        self.raw = raw
         self.desk = self.proc = None
         self.ended = threading.Event()
         self.refused = False
@@ -225,7 +231,7 @@ class PeerView:
 
         self.stop()
         self.ended.clear()
-        command = view_command(self.ffmpeg, self.out, next_segment(self.out))
+        command = view_command(self.ffmpeg, self.out, next_segment(self.out), self.raw)
         self.proc = subprocess.Popen(command, stdin=subprocess.PIPE)
         try:
             self.desk = RemoteDesktop(self.peer, attach=True, observer=True)
@@ -278,8 +284,8 @@ class LocalView:
     (view_command): two ffmpegs joined by a pipe. Started only while record-ai plays a
     game on this PC."""
 
-    def __init__(self, ffmpeg, out, hz=30):
-        self.ffmpeg, self.out, self.hz = ffmpeg, Path(out), hz
+    def __init__(self, ffmpeg, out, hz=60, raw=None):
+        self.ffmpeg, self.out, self.hz, self.raw = ffmpeg, Path(out), hz, raw
         self.capture = self.cutter = None
         self.since = None
 
@@ -289,7 +295,8 @@ class LocalView:
             capture_command(self.ffmpeg, self.hz), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE
         )
         self.cutter = subprocess.Popen(
-            view_command(self.ffmpeg, self.out, next_segment(self.out)), stdin=self.capture.stdout
+            view_command(self.ffmpeg, self.out, next_segment(self.out), self.raw),
+            stdin=self.capture.stdout,
         )
         self.capture.stdout.close()  # The cutter holds it now.
         self.since = time.time()

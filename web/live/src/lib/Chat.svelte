@@ -44,6 +44,7 @@
 	onDestroy(() => clearInterval(timer));
 </script>
 
+<div class="chat">
 <ol bind:this={list}>
 	{#each messages as m (m.id)}
 		<li class={m.kind}>
@@ -58,20 +59,25 @@
 	<input bind:value={text} maxlength="300" placeholder="Say something" autocomplete="off" />
 	<button>Send</button>
 </form>
+</div>
 
 <style>
+	/* The list takes what the panel has, and scrolls; the box stays under it. */
+	.chat {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+	}
 	ol {
+		flex: 1;
+		min-height: 0;
 		list-style: none;
 		margin: 0;
 		padding: 0;
-		max-height: 46vh;
 		overflow-y: auto;
+		overscroll-behavior: contain;
 		font-size: 14px;
-	}
-	@media (min-width: 900px) {
-		ol {
-			max-height: calc(100vh - 170px);
-		}
 	}
 	li {
 		padding: 3px 0;
@@ -94,6 +100,7 @@
 		color: var(--flag);
 	}
 	form {
+		flex: none;
 		display: flex;
 		gap: 6px;
 		margin-top: 8px;

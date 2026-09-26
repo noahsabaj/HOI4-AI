@@ -7,11 +7,14 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 from . import state as games
+from .archive import Archive
 from .feed import Feed, Flags, Narrator
 from .media import Follower, LocalView, PeerView, update_pending
 from .replay import SAFE, Replays
@@ -25,16 +28,21 @@ LABELS = {"peer": "Second PC", "here": "This PC"}
 RECORDER_EVERY = 10
 # Seconds a watcher waits between messages.
 CHAT_GAP = 1.0
+# Thumbnails of played games: their width, where in the game (a share of it), and how
+# many are made at once.
+THUMB_WIDTH, THUMB_AT, THUMBS_AT_ONCE = 480, 0.6, 2
 
 
 class LiveApp:
-    def __init__(self, runs, out, ffmpeg, *, peer=None, hz=30, labels=None, feed="artifacts/live"):
+    def __init__(self, runs, out, ffmpeg, *, peer=None, hz=60, labels=None, feed="artifacts/live"):
         self.runs, self.out, self.ffmpeg = list(runs), Path(out), ffmpeg
         self.peer, self.hz = peer, hz
         self.labels = {**LABELS, **(labels or {})}
-        self.views = {"here": LocalView(ffmpeg, self.out / "here", hz)}
+        self.archive = Archive(Path(feed) / "raw", Path(feed) / "archive", ffmpeg)
+        raw = self.archive.pieces_for
+        self.views = {"here": LocalView(ffmpeg, self.out / "here", hz, raw("here"))}
         if peer:
-            self.views["peer"] = PeerView(peer, ffmpeg, self.out / "peer", hz)
+            self.views["peer"] = PeerView(peer, ffmpeg, self.out / "peer", hz, raw("peer"))
         self.followers = {"peer": Follower(ffmpeg, self.out / "peer")}
         for station in ("peer", "here"):
             (self.out / station).mkdir(parents=True, exist_ok=True)
@@ -43,6 +51,8 @@ class LiveApp:
         self.flags = Flags(Path(feed) / "flags.jsonl")
         self.narrator = Narrator(self.feed, self.labels)
         self.replays = Replays(self.out / "replays", ffmpeg)
+        (self.out / "thumbs").mkdir(exist_ok=True)
+        self.thumbing = threading.Semaphore(THUMBS_AT_ONCE)
         self.retry_at = 0.0
         self.recorders, self.recorders_at = [], 0.0
         self.last_post = 0.0
@@ -67,6 +77,9 @@ class LiveApp:
             cards[station] = games.game_card(game, manifest, entry, now)
         finished = {g["game"]: g for g in self.played}
         self.narrator.step(cards, finished.get)
+        self.archive.step(
+            self.played, [c["started_unix"] for c in cards.values() if c.get("started_unix")]
+        )
         self.feed.absorb()
         self.status = self.describe(cards, now)
 
@@ -144,7 +157,14 @@ class LiveApp:
             limit = min(500, int(query.get("limit") or 100))
             run = query.get("run")
             chosen = [g for g in self.played if not run or g["run"] == run]
-            return [_public(g) for g in chosen[:limit]]
+            return [
+                {
+                    **_public(g),
+                    "label": self.labels.get(g["station"], g["station"]),
+                    "archived": self.archive.path(g["game"]) is not None,
+                }
+                for g in chosen[:limit]
+            ]
         if name == "chat":
             try:
                 after = int(query.get("after") or 0)
@@ -160,11 +180,42 @@ class LiveApp:
             found = next((g for g in self.played if g["game"] == game), None)
             if found is None:
                 return {"state": "error", "error": "no such game"}
-            answer = self.replays.request(found["path"])
+            if self.archive.path(game) is not None:
+                # As it looked live, at 30 frames a second.
+                answer = {"state": "ready", "url": f"archive/{game}.mp4", "fps": 30}
+            else:
+                answer = self.replays.request(found["path"])
+                answer["fps"] = 5
             if answer.get("state") == "ready":
                 answer["orders"] = replay_orders(Path(found["path"]))
             return answer
         return None
+
+    def thumb(self, name):
+        """A played game's thumbnail, a frame from its recording 60% of the way in, made
+        the first time it is asked for; None without one."""
+        if not SAFE.match(name):
+            return None
+        path = self.out / "thumbs" / f"{name}.jpg"
+        if path.exists():
+            return path
+        found = next((g for g in self.played if g["game"] == name), None)
+        video = Path(found["path"]) / "screen.mkv" if found else None
+        if video is None or not video.exists():
+            return None
+        with self.thumbing:
+            if not path.exists():
+                partial = path.with_suffix(".part.jpg")
+                at = THUMB_AT * (found.get("seconds") or 60)
+                subprocess.run(
+                    [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                     "-threads", "2", "-ss", f"{at:.1f}", "-i", str(video), "-frames:v", "1",
+                     "-vf", f"scale={THUMB_WIDTH}:-2", "-q:v", "5", str(partial)],
+                    capture_output=True,
+                )  # fmt: skip
+                if partial.exists():
+                    partial.replace(path)
+        return path if path.exists() else None
 
     def post(self, name, body):
         if name == "chat":
@@ -216,7 +267,7 @@ def _public(game):
 
 def watch(
     runs=("artifacts/*", "artifacts/learned/*"), out=None, port=PORT, poll=2.0, ffmpeg=None,
-    rounds=None, peer=None, hz=30, labels=None, feed="artifacts/live",
+    rounds=None, peer=None, hz=60, labels=None, feed="artifacts/live",
 ):  # fmt: skip
     """Show the games live, until stopped (or for `rounds` rounds): each PC's stream in
     `out` (by default the system's temp folder's hoi4-live), served on `port` with the
