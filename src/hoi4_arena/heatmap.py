@@ -183,6 +183,7 @@ def trained_labels(config, recording, manifest):
         lead_in=config.get("lead_in"),
         drop_keys=keys + camera_keys_dropped(manifest, config.get("camera_since")),
         drop_parking=bool(config.get("drop_parking")),
+        held_previous=bool(config.get("held_previous")),
     )
     if config.get("tower_cache"):
         # A policy trained on the frozen tower's cache reads it here too, when the

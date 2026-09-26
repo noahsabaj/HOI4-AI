@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .actions import GRID, SLOTS
+from .actions import GRID, RELEASES, SLOTS, VOCAB, still_held, with_held
 from .dataset import CLIP_FRAMES, clip_frame_ids, normalize, recorded_speed, views
 from .desktop import Desktop
 from .environment import ArenaEnv, ArenaPair
@@ -154,13 +154,37 @@ class Actor:
         self.device = device
         self.hidden = None
         self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
+        # The presses still down (actions.still_held), and whether the previous action
+        # shows them (actions.with_held), as a checkpoint trained with held_previous reads it.
+        self.held = ()
+        self.held_previous = bool(self.config.get("held_previous"))
         self.history = deque(maxlen=64)
         self.compiled = compile_head and device == "cuda" and self._compile_head()
+
+    def _remember(self, action):
+        """The action just chosen, as the next decision will read it."""
+        # getattr: an actor made without __init__ (tests, memory_window's) holds nothing.
+        self.held = still_held(getattr(self, "held", ()), action)
+        shown = getattr(self, "held_previous", False)
+        self.previous = with_held(action, self.held) if shown else action
+
+    def let_go(self, event=None):
+        """An input released for the policy (play.Holds), or with no `event`, all of them
+        (the harness let go of the input): no longer shown as held."""
+        if event is None:
+            self.held = ()
+            return
+        try:
+            press = RELEASES.get(VOCAB.index(event))
+        except ValueError:
+            return
+        self.held = tuple(k for k in self.held if k != press)
 
     def reset_episode(self):
         """Drop the GRU state and the clip. A second match on this actor must not see the first."""
         self.hidden = None
         self.previous = np.zeros((SLOTS, 3), dtype=np.int64)
+        self.held = ()
         self.history.clear()
         if getattr(self, "recent", None) is not None:
             self.recent.clear()
@@ -303,8 +327,9 @@ class Actor:
                 temperature=getattr(self, "temperature", 1.0),
             )
         if lean:
-            self.previous = action[0].cpu().numpy()
-            return self.previous, None
+            chosen = action[0].cpu().numpy()
+            self._remember(chosen)
+            return chosen, None
         # One host transfer for the whole sample. Four separate .cpu()/.item() calls
         # each waited for the GPU, on the same thread that has to start the next capture.
         host = {
@@ -334,7 +359,7 @@ class Actor:
             "old_value": float(host["old_value"]),
             "noise": host["noise"].numpy(),
         }
-        self.previous = action_np
+        self._remember(action_np)
         return action_np, sample
 
 

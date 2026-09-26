@@ -66,6 +66,65 @@ def encode_event(event):
         raise ValueError(f"Demonstration contains unsupported match input: {event}") from None
 
 
+# Presses of a key or button, by kind index, and for each release the press it ends.
+PRESSES = frozenset(
+    i for i, e in enumerate(VOCAB) if e and e["kind"] in ("key", "button") and e["down"]
+)
+RELEASES = {
+    i: VOCAB.index({**e, "down": True})
+    for i, e in enumerate(VOCAB)
+    if e and e["kind"] in ("key", "button") and not e["down"]
+}
+
+
+def still_held(held, action):
+    """The presses (kind indices, oldest first) still down after `action`, from `held`,
+    those down before it."""
+    down = list(held)
+    for kind in (int(k) for k in np.asarray(action)[:, 0]):
+        if kind in PRESSES and kind not in down:
+            down.append(kind)
+        elif kind in RELEASES and RELEASES[kind] in down:
+            down.remove(RELEASES[kind])
+    return tuple(down)
+
+
+def with_held(action, held):
+    """`action` as the next decision reads it (the previous action), with a press of each
+    input still down (`held`, after it) in its last empty slots, unless the action shows
+    that press itself.
+
+    The policy sees only its previous action, so after one decision a key it holds is
+    gone from what it sees: bc5 pressed Right and held it for three minutes (2026-09-26).
+    The scripted player it copies releases a key the decision after pressing it, which
+    is what "a press in the previous action" teaches; shown every decision while the key
+    is down, the press keeps asking for its release.
+    """
+    out = np.array(action, dtype=np.int64, copy=True)
+    shown = {int(k) for k in out[:, 0]}
+    empty = [i for i in range(len(out)) if out[i, 0] == 0]
+    for kind in held:
+        if kind in shown or not empty:
+            continue
+        out[empty.pop()] = (kind, 0, 0)
+    return out
+
+
+def previous_actions(actions, held=False):
+    """Each decision's previous action: the decision before's (nothing for the first), and
+    with `held`, what is still held filled in (with_held)."""
+    actions = np.asarray(actions)
+    previous = np.zeros_like(actions)
+    if len(actions) > 1:
+        previous[1:] = actions[:-1]
+    if held:
+        down = ()
+        for t in range(1, len(actions)):
+            down = still_held(down, actions[t - 1])
+            previous[t] = with_held(actions[t - 1], down)
+    return previous
+
+
 def encode_interval(events, start_ns, period=PERIOD):
     result = np.zeros((SLOTS, 3), dtype=np.int64)
     last_slot = -1
