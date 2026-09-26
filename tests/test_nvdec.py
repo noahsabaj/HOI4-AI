@@ -52,6 +52,9 @@ def test_the_planes_converted_on_the_device_are_ffmpeg_s_rgb(tmp_path, device):
     assert planes.shape == (6, 3, 96, 128) and rgb.shape == (6, 96, 128, 3)
     converted = nvdec.to_rgb(torch.from_numpy(planes).to(device), chunk=4).cpu().numpy()
     assert np.array_equal(converted, rgb)
+    # A resumed run's reader starts at a frame: the same frames from there on.
+    later = _read(nvdec.open_frames(path, 128, 96, yuv=True, gpu=False, start=4))
+    assert np.array_equal(later, planes[4:])
 
 
 @needs_ffmpeg
@@ -98,6 +101,9 @@ def test_hevc_decoded_on_the_gpu_is_what_ffmpeg_decodes(tmp_path):
     assert isinstance(reader, nvdec.NvdecFrames)
     planes = _read(reader)
     assert np.array_equal(planes, _read(nvdec.FfmpegFrames(path, 256, 144, "yuv444p")))
+    later = nvdec.open_frames(path, 256, 144, yuv=True, start=5)
+    assert isinstance(later, nvdec.NvdecFrames)
+    assert np.array_equal(_read(later), planes[5:])
     # And RGB through ffmpeg's own CUDA decoder is the CPU's RGB.
     gpu = nvdec.open_frames(path, 256, 144)
     assert "-hwaccel" in gpu.process.args
