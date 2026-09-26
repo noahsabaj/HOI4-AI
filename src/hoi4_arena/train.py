@@ -375,6 +375,7 @@ def _train_bc(
     setup_weight=1.0,
     camera_since=None,
     held_previous=False,
+    gpu_views=False,
     balance=False,
 ):
     """Behaviour cloning on recordings, read straight from their video.
@@ -450,6 +451,7 @@ def _train_bc(
         "setup_weight": setup_weight,
         "camera_since": camera_since,
         "held_previous": held_previous,
+        "gpu_views": gpu_views,
         "balance": balance,
     }
     if tower_cache is not None and train_last != 0:
