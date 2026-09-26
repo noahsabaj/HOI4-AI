@@ -511,6 +511,32 @@ beside the bc6 trainer, in that morning's practice from here: 68.7 ms p50, 87.6 
 practice, drills and play-policy run on the second PC itself, as sessions of its station
 (a fleet service, `scripts/station.py`).
 
+**A faster decision, 2026-09-26.** `scripts/bench_decide.py` times `Actor.act` (lean) on
+32 fixed recorded decisions, back to back and paced at 5 Hz, and gates each change. The
+gate requires the same sampled actions from a fixed seed, and each head's log-probability
+within 0.01 of the unmodified code's. The ledgers are `bench/decide-ledger.tsv` and
+`bench/interleave-ledger.tsv`. On the second PC beside its game, the same code measured
+37-54 ms back to back from run to run: its GPU clock swings from 0.8 to 2.7 GHz with the
+game's load. Changes are therefore compared with `scripts/bench_interleave.py`, which runs
+the variants in one process, deciding in turn. Two results, each over 300 decisions a
+variant and two runs (p50 / p95 ms, paced):
+
+| | Today's tower (bc5) | The Qwen3.5-4B model's tower |
+|---|---|---|
+| Before | 57-61 / 117-120 | 117-169 / 198-249 |
+| Lean actors now (exact) | 52-54 / 106-109 | 110-159 / 189-201 |
+| `--fast` | 35-37 / 70-74 | 71-118 / 118-149 |
+
+- **Exact changes, on for play-policy and practice.** The whole lean decision is one CUDA
+  graph, with no host syncs (there were 10). The tower's per-call copies and tables are
+  trimmed (`fast.lean_tower`). Back to back that is 10-13% faster, and every number is
+  bit-identical.
+- **`--fast`.** The tower runs in float16 with float16 accumulation and is compiled by
+  inductor. It is 35-40% faster on both towers. It moves each head's log-probability by up
+  to 0.13 (float32 moves it by up to 24), and every sampled action stays the same.
+- **Tried and dropped.** cuDNN attention was no faster. Float8 changed 4% of the actions
+  and was no faster than float16. Compiling alone flipped one action.
+
 **`train-memory`, 2026-09-24.** One seed of the memory study's six arms (seed 1, 8
 epochs each, cache on the NVMe) took 64.1 min before and 21.2 min after. Every run was
 identical to the bit: each update's loss, the report and every tensor of the saved head.

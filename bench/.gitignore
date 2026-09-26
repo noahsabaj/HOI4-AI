@@ -1,0 +1,5 @@
+# Made from a private recording and the checkpoints; see scripts/bench_decide.py.
+*.npz
+*.pt
+results/
+diag*

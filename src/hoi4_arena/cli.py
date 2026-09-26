@@ -33,6 +33,12 @@ def add_sampling(parser):
         action="store_true",
         help="Place each move on its likeliest spot: --pointer-temperature 0",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast mode: the vision tower in float16, compiled (runner.Actor). About a third "
+        "less time a decision, half on the 4B tower; the numbers move slightly",
+    )
 
 
 # Commands that never touch a model, so they run without importing torch.
