@@ -14,7 +14,9 @@ encoder's input, as the policy would give it, and two things are asked of each p
         qwen3_vit_88m_enc.qwen3_5_0_8b vit_base_patch16_lingbot.robbyant@672 qwen3_vit_88m_enc.qwen3_5_0_8b@1152x640
 
 Models are timm names with pretrained weights, optionally @SIZE or @WIDTHxHEIGHT (default
-896 square). Measured on 2026-09-23 (STATUS.md, "Choosing the screen encoder").
+896 square). NAME=FILE takes the weights from FILE instead, such as the shard of a
+vision-language model's checkpoint that holds its tower (timm's Qwen towers read
+`model.visual.*` there): qwen3_vit_88m_enc=path/to/model.safetensors@1152x640. Measured on 2026-09-23 (STATUS.md, "Choosing the screen encoder").
 """
 
 import json
@@ -102,8 +104,11 @@ def fit(features, targets, classes):
 
 
 def probe(name, size, train, test):
-    extra = {"img_size": size} if "tipsv2" in name else {}
-    model = timm.create_model(name, pretrained=True, **extra).cuda().eval()
+    arch, _, weights = name.partition("=")
+    extra = {"img_size": size} if "tipsv2" in arch else {}
+    if weights:
+        extra["pretrained_cfg_overlay"] = {"file": weights}
+    model = timm.create_model(arch, pretrained=True, **extra).cuda().eval()
     mean = torch.tensor(model.pretrained_cfg.get("mean", (0.5,) * 3), device="cuda")[:, None, None]
     std = torch.tensor(model.pretrained_cfg.get("std", (0.5,) * 3), device="cuda")[:, None, None]
     rng = random.Random(0)

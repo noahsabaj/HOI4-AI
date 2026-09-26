@@ -398,6 +398,33 @@ test frames (a rerun of the Qwen row gave 85.6%). Larger towers (C-RADIOv4, the 
 Qwen3.5-2B tower, Qwen4-Exp, which is also gated) cost 120–160 ms at 896 px. UltraViT,
 TuringViT and LiAuto-MindViT have no public weights yet.
 
+### Bigger towers, a second look (2026-09-26)
+
+A new search (three agents on papers, model releases and GUI and game agents, and Grok on
+X) found no encoder released since June that clearly beats the Qwen tower within a live
+tick; GUI agents still reuse stock Qwen towers. What was left to try was size and
+fine-tuning, probed the same way on two games of run 43 (camera kicks, so many frames
+are far from the front: every score here is lower than above; compare within the table).
+Times are with the GPU shared with a tower-cache job, about 3x an idle card's; the 88M
+tower takes 36.9 ms idle at 1152x640.
+
+| Tower | Input | Time (shared) | Reads text | Finds pointer |
+|---|---|---|---|---|
+| Qwen3.5-0.8B (88M, today's) | 1152x640 | 119 ms | 44.3% | 58.3% |
+| same | 1280x720 | 174 ms | 56.0% | 41.7% |
+| OvisOCR2's (88M; Qwen3.5-0.8B tuned for documents) | 1152x640 | 160 ms | 30.5% | 66.7% |
+| **Qwen3.5-4B's** (306M, timm `qwen3_vit_306m_enc.qwen3_5_4b`) | 1152x640 | 363 ms | **59.4%** | **91.7%** |
+| Qwen3.5-2B's (306M) | 1152x640 | 359 ms | 56.0% | 89.6% |
+| Holo3.1-4B's (306M; Qwen3.5-4B tuned for GUI agents) | 1152x640 | 356 ms | 44.8% | 83.3% |
+
+The 4B model's tower reads 15 points more text and finds the pointer a third more often
+than today's at the same input; fine-tuning for documents or GUIs made towers worse, not
+better. At about 3x the time (an estimated ~105 ms idle) it fits a 200 ms tick, but its
+cache would not fit the drives: today's tower's cache for 218 games is ~520 GB, and the
+4B tower's patches are a third wider. Adopting it means caching its grid after the 2x2
+merge, a quarter of the size, and a fresh cache. `probe_encoders.py` now takes
+`NAME=FILE` to probe a tower from a vision-language model's checkpoint.
+
 ## LeVJEPA, a second look (2026-09-23)
 
 LeVJEPA had been set aside on speed alone: it never took the text or pointer probe, it
