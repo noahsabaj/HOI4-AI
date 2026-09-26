@@ -102,6 +102,13 @@ class Coach:
     def seen(self, step, seconds, by="policy"):
         if step not in self.done:
             self.done[step] = {"at": round(seconds, 1), "by": by}
+            if by == "coach":
+                # The scripted player ran without an error, which is not the step done:
+                # 29 of 87 front takeovers by bc5's time had left no front. The screen
+                # confirms it at a later look, and only a confirmed span teaches.
+                self.done[step]["confirmed"] = None
+        elif by == "policy" and self.done[step].get("confirmed", True) is None:
+            self.done[step]["confirmed"] = round(seconds, 1)
 
     def look(self, desk, seconds, running):
         """The step the coach should take over now, or None. A full screenshot at most
@@ -179,6 +186,12 @@ class Coach:
         return {"steps": steps, "own": own, "coached": len(self.coached)}
 
 
+def coach_managed(done):
+    """Whether a step's record (Coach.done) says the coach did it and the screen showed it
+    done after. Records from before the check (no "confirmed") count the coach's word."""
+    return done.get("by") == "coach" and done.get("confirmed", True) is not None
+
+
 def summary(results):
     """How often the policy did each step itself, over the episodes that played, and how
     often the coach managed a step it took over (`coach_<step>`)."""
@@ -188,10 +201,11 @@ def summary(results):
         own = sum(1 for r in played if (r["setup"]["steps"].get(step) or {}).get("by") == "policy")
         out[step] = f"{own}/{len(played)}"
     for step in ("army", "general", "front"):
-        by = [(r["setup"]["steps"].get(step) or {}).get("by") for r in played]
-        tried = sum(1 for b in by if b in ("coach", "nobody"))
+        done = [r["setup"]["steps"].get(step) or {} for r in played]
+        tried = sum(1 for d in done if d.get("by") in ("coach", "nobody"))
+        managed = sum(1 for d in done if coach_managed(d))
         if tried:
-            out[f"coach_{step}"] = f"{by.count('coach')}/{tried}"
+            out[f"coach_{step}"] = f"{managed}/{tried}"
     out["own_steps_mean"] = (
         round(float(np.mean([r["setup"]["own"] for r in played])), 2) if played else None
     )
