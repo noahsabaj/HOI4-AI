@@ -31,6 +31,13 @@ def test_rung_saves_are_named_after_their_last_step_and_none_contains_another():
         curriculum.rung_save("arenav4blu", "S4")
 
 
+def test_start_saves_are_named_as_drills_and_the_load_dialog_expect():
+    assert curriculum.default_start("arena-12x8-v4", "RED") == "arenav4red"
+    assert curriculum.default_start("arena-plains-v6", "BLU") == "arenaplainsv6blu"
+    saves = practice.drill_saves("no-such-registry.json")
+    assert saves[("arena-12x8-v4", "BLU")] == curriculum.default_start("arena-12x8-v4", "BLU")
+
+
 def test_the_ladder_lists_every_rung_with_the_start_saves_as_s0(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     ladder = curriculum.ladder("here")
