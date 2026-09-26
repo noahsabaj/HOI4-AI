@@ -1576,7 +1576,10 @@ def take_reservation(root, settle=2.0):
     """A request to have the second PC for a live evaluation, claimed, or None.
 
     Whoever evaluates a learned player writes `<root>/queue/<name>.json` holding
-    {"minutes": N}. It comes before every game of the recorder's own (lend).
+    {"minutes": N}. It comes before every game of the recorder's own (lend). The fleet
+    project's `fleet` reserves the PC the same way for a job needing more of the GPU than
+    a run leaves, so queue/, granted/ and done/ are its interface too: keep them
+    compatible, or tell the user before changing them.
     """
     queue = Path(root) / "queue"
     if not queue.is_dir():
