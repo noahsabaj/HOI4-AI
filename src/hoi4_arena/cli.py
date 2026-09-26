@@ -1379,6 +1379,11 @@ def _dispatch(command, args):
             session, args["peer"], reservation=args["reservation"], job_id=args["job_id"],
             deploy_first=args["deploy"], keep_there=args["keep_there"],
         )  # fmt: skip
+        from .on_peer import played_nothing
+
+        if played_nothing(result):
+            print(json.dumps(result, indent=2, default=str))
+            raise SystemExit(f"on-peer: {result.get('job')} played nothing")
     elif command == "template":
         from .vision import add_template
 

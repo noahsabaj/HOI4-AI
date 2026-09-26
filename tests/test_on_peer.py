@@ -246,3 +246,36 @@ def test_the_session_commands_are_the_ones_run_job_runs():
     text = (ROOT / "scripts" / "Run-Job.ps1").read_text()
     for command in on_peer.SUMMARIES:
         assert f"'{command}'" in text
+
+
+@pytest.mark.parametrize(
+    "result, nothing",
+    [
+        (
+            {
+                "command": "drills",
+                "state": "done",
+                "exit": 0,
+                "summary": {"drills": 60, "complete": 0},
+            },
+            True,
+        ),
+        (
+            {
+                "command": "drills",
+                "state": "done",
+                "exit": 0,
+                "summary": {"drills": 4, "complete": 3},
+            },
+            False,
+        ),
+        ({"command": "practice", "state": "done", "exit": 0, "summary": {"episodes": 0}}, True),
+        ({"command": "practice", "state": "done", "exit": 0, "summary": {"episodes": 14}}, False),
+        ({"command": "play-policy", "state": "done", "exit": 0, "summary": {}}, True),
+        ({"command": "play-policy", "state": "done", "exit": 0, "summary": {"games": 2}}, False),
+        ({"command": "practice", "state": "done", "exit": 0, "summary": None}, True),
+        ({"command": "drills", "state": "failed", "exit": 1, "summary": {"complete": 3}}, True),
+    ],
+)
+def test_a_session_that_played_nothing_is_a_failure(result, nothing):
+    assert on_peer.played_nothing(result) is nothing
