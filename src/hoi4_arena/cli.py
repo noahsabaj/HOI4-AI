@@ -41,9 +41,6 @@ NO_TORCH = {
     "record-ai",
     "control",
     "telemetry",
-    "job",
-    # It only sends a session to the second PC: this PC's GPU stays with training.
-    "on-peer",
     "probe-peer",
     "capture",
     "win-rate",
@@ -56,7 +53,7 @@ NO_TORCH = {
 
 
 def build_parser():
-    """Every command's arguments (on-peer reads a session's own with it too)."""
+    """Every command's arguments."""
     parser = argparse.ArgumentParser(description="Screen-only HOI4 research prototype")
     parser.add_argument(
         "--log-level",
@@ -198,12 +195,6 @@ def build_parser():
         "arena switch is a launch of HOI4).",
     )
     ai.add_argument(
-        "--eval-dir",
-        help="Lend the second PC between games to live evaluations that reserve it: "
-        '<dir>/queue/<name>.json ({"minutes": N}) is answered by <dir>/granted/<name>.json '
-        "with HOI4 closed, and play resumes at <dir>/done/<name>.json or after N+15 minutes.",
-    )
-    ai.add_argument(
         "--camera-kicks",
         nargs=2,
         type=float,
@@ -270,7 +261,6 @@ def build_parser():
         "--no-coach", dest="coach", action="store_false",
         help="Only watch and score; never take a step over",
     )  # fmt: skip
-    drill.add_argument("--reservation", help="Reserve the second PC first, as play-policy")
     drill.add_argument("--held-previous", action="store_true", help="As play-policy's")
     add_sampling(drill)
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
@@ -293,7 +283,6 @@ def build_parser():
     )
     drill.add_argument("--block", type=int, default=4, help="Drills in a row on an arena")
     drill.add_argument("--after", type=float, default=8.0, help="Seconds run after the setup")
-    drill.add_argument("--reservation", help="Reserve the second PC first, as play-policy")
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill.add_argument("--seed", type=int)
     live = sub.add_parser(
@@ -308,11 +297,6 @@ def build_parser():
     live.add_argument("--minutes", type=float, required=True, help="Time budget for all games")
     live.add_argument("--mod", default="arena-12x8-v4", help="The arena, as deployed there")
     live.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
-    live.add_argument(
-        "--reservation",
-        help="Reserve the second PC from the scripted player's agent under this name first "
-        "(artifacts/eval/queue), and hand it back after (artifacts/eval/done).",
-    )
     live.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
     live.add_argument("--cap-minutes", type=float, default=15.0)
     live.add_argument(
@@ -833,16 +817,17 @@ def build_parser():
     distill.add_argument("output")
     distill.add_argument("--model", default="models/levjepa-large")
     distill.add_argument("--epochs", type=int, default=1)
-    pairing = sub.add_parser("bundle-peer")
-    pairing.add_argument("output")
-    pairing.add_argument("--host", required=True)
-    pairing.add_argument("--coordinator", required=True)
+    pairing = sub.add_parser(
+        "bundle-peer",
+        help="A new pairing for the second PC's worker service: its certificate and token "
+        "(second-pc/) and peer-fleet.json, which its clients use on 127.0.0.1 (remote.bundle)",
+    )
+    pairing.add_argument("output", help="A new folder, such as artifacts/pairing")
     pairing.add_argument(
         "--port",
         type=int,
         required=True,
-        help="Worker port. Required rather than defaulted, because a published "
-        "default is a detail of somebody's actual network.",
+        help="The worker service's port on the second PC's loopback, and the tunnel's here.",
     )
     probe = sub.add_parser("probe-peer")
     probe.add_argument("config")
@@ -854,7 +839,7 @@ def build_parser():
         help="Launch, close or inspect HOI4 through the worker, here or on the second PC",
     )
     control.add_argument("action", choices=["launch", "quit", "report", "saves", "restart-discord"])
-    control.add_argument("--peer", help="The second PC's peer.json; this PC if omitted")
+    control.add_argument("--peer", help="The second PC's pairing file; this PC if omitted")
     control.add_argument("--mod", help="Arena mod folder name to launch, as deployed")
     control.add_argument(
         "--window", default="1920x1080", help="Client size of the windowed game to launch"
@@ -870,52 +855,10 @@ def build_parser():
         "per process (the game, the worker, the encoder), the game's window and capture "
         "timing. With --peer it uses a read-only connection, so it works during a recording.",
     )
-    tele.add_argument("--peer", help="The second PC's peer.json; this PC if omitted")
+    tele.add_argument("--peer", help="The second PC's pairing file; this PC if omitted")
     tele.add_argument("--watch", type=float, help="Repeat every this many seconds")
     tele.add_argument("--count", type=int, help="With --watch, stop after this many")
     tele.add_argument("--json", dest="as_json", action="store_true", help="Print the raw reply")
-    job = sub.add_parser(
-        "job",
-        help="Run compute on the second PC's GPU: set up its Python environment, run a "
-        "training command there, stop one, or list them (scripts/Run-Job.ps1)",
-    )
-    job.add_argument("action", choices=["start", "stop", "status"])
-    job.add_argument("--peer", required=True, help="The second PC's peer.json")
-    job.add_argument("--id", dest="job_id", help="A name for the job: letters, digits, _ and -")
-    job.add_argument("--kind", choices=["setup", "run", "script"], default="run")
-    job.add_argument(
-        "args",
-        nargs="*",
-        help="For run, the hoi4-arena command and its arguments; for script, the script "
-        "and its arguments. Paths are inside the second PC's compute folder. Put -- first.",
-    )
-    away = sub.add_parser(
-        "on-peer",
-        help="Run a practice, drills or play-policy session on the second PC itself, as a "
-        "job: its own Python plays its own game with the policy on its own GPU, and the "
-        "session's folder comes back here when it ends (on_peer.py)",
-    )
-    away.add_argument("--peer", required=True, help="The second PC's pairing file")
-    away.add_argument(
-        "--reservation",
-        help="Reserve the second PC under this name here first (artifacts/eval, as "
-        "play-policy's), and hand it back when the session ends",
-    )
-    away.add_argument("--id", dest="job_id", help="The job's name (default: command and time)")
-    away.add_argument(
-        "--no-deploy", dest="deploy", action="store_false",
-        help="Send no code or data first: what is there already",
-    )  # fmt: skip
-    away.add_argument(
-        "--keep-there", action="store_true",
-        help="Leave the session's folder on the second PC too (by default it is moved here)",
-    )  # fmt: skip
-    away.add_argument(
-        "session",
-        nargs=argparse.REMAINDER,
-        help="The session's command as it would run here, with its --peer (the same "
-        "pairing file, whose copy there reaches its own bridge). Put -- first.",
-    )
     template = sub.add_parser("template")
     template.add_argument("screenshot")
     template.add_argument("rules")
@@ -1370,25 +1313,6 @@ def _dispatch(command, args):
         from .telemetry import watch
 
         watch(args["peer"], args["watch"], args["as_json"], args["count"])
-    elif command == "job":
-        from .remote import RemoteDesktop
-
-        # An observer: the full connection may be held by a game, there or here.
-        with RemoteDesktop(args["peer"], attach=False, observer=True) as desktop:
-            print(desktop.job(args["action"], args["job_id"], args["kind"], args["args"]))
-    elif command == "on-peer":
-        from .on_peer import run_on_peer
-
-        session = args["session"][1:] if args["session"][:1] == ["--"] else args["session"]
-        result = run_on_peer(
-            session, args["peer"], reservation=args["reservation"], job_id=args["job_id"],
-            deploy_first=args["deploy"], keep_there=args["keep_there"],
-        )  # fmt: skip
-        from .on_peer import played_nothing
-
-        if played_nothing(result):
-            print(json.dumps(result, indent=2, default=str))
-            raise SystemExit(f"on-peer: {result.get('job')} played nothing")
     elif command == "template":
         from .vision import add_template
 

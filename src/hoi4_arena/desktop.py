@@ -442,23 +442,6 @@ class Desktop:
         """The save games on the worker's PC, newest first, to choose a mid-game start from."""
         return self._control("saves", timeout)
 
-    def job(
-        self,
-        action: str,
-        job_id: str | None = None,
-        kind: str | None = None,
-        args: list[str] | None = None,
-        timeout: float = 60,
-    ) -> str:
-        """Start, stop or list compute jobs on the worker's PC (scripts/Run-Job.ps1).
-
-        A job runs detached and hidden there: the Python environment's setup, one of a
-        fixed set of hoi4-arena commands, or a study script. Its output and state are in
-        the jobs folder beside the worker, which the share makes readable from here.
-        """
-        # "job", not "id": every request's id routes its reply back to the caller.
-        return self._control("job", timeout, action=action, job=job_id, kind=kind, args=args)
-
     def quit(self, timeout: float = 120) -> str:
         """Close HOI4, politely first, and return once it is gone."""
         return self._control("quit", timeout)

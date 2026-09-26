@@ -16,7 +16,7 @@ from pathlib import Path
 from . import state as games
 from .archive import Archive
 from .feed import Feed, Flags, Narrator
-from .media import Follower, LocalView, PeerView, update_pending
+from .media import Follower, LocalView, PeerView
 from .replay import SAFE, Replays
 from .server import serve
 
@@ -89,19 +89,15 @@ class LiveApp:
         recorder plays a game here, and the recording followed where no view is had."""
         view = self.views.get("peer")
         if view is not None and not view.refused:
-            if view.running() and update_pending(self.peer):
-                view.stop()
-                log.info("a new worker waits on the second PC: the view steps aside")
-            elif not view.running() and time.monotonic() >= self.retry_at:
-                if update_pending(self.peer):
+            # The worker service's restart closes a view that has watched a while (its
+            # bridge's Holding), and the view connects again here.
+            if not view.running() and time.monotonic() >= self.retry_at:
+                try:
+                    view.start()
+                    log.info("viewing the second PC at %d frames a second", self.hz)
+                except Exception as error:  # noqa: BLE001 - tried again.
                     self.retry_at = time.monotonic() + 5
-                else:
-                    try:
-                        view.start()
-                        log.info("viewing the second PC at %d frames a second", self.hz)
-                    except Exception as error:  # noqa: BLE001 - tried again.
-                        self.retry_at = time.monotonic() + 5
-                        log.info("no view of the second PC: %s", error)
+                    log.info("no view of the second PC: %s", error)
         else:
             self.followers["peer"].step(live.get("peer"))
         here = self.views["here"]

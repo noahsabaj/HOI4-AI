@@ -18,8 +18,9 @@ decoded frame (TM_CCOEFF_NORMED and TM_SQDIFF_NORMED, the two the recorder and t
 player use) and whether its best match moves; the screen rules' mean absolute error
 (--rules); and encode and decode speed. Results go to OUT/results.json.
 
-It runs on either PC: on the second one as a compute job (hoi4-arena job ... --kind
-script -- codec_fidelity.py ...), where it measures that PC's video encoder.
+It runs on either PC: on the second one as a fleet job (fleet run --on <second-pc-node>
+-- uv run --frozen python scripts/codec_fidelity.py ...), where it measures that PC's
+video encoder.
 """
 
 from __future__ import annotations

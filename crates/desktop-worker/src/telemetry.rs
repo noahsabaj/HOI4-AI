@@ -53,7 +53,7 @@ const PERIOD: Duration = Duration::from_secs(1);
 /// How long the sampler keeps going after the last request.
 const IDLE: Duration = Duration::from_secs(60);
 /// Processes always reported, whatever they cost: the game, the worker, the encoder, the
-/// bridge, compute jobs and the compositor. A crash reporter (any name with "crash" in
+/// bridge, the sessions and jobs (python) and the compositor. A crash reporter (any name with "crash" in
 /// it) is too.
 const WATCHED: [&str; 6] = [
     "hoi4.exe",

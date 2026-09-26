@@ -236,21 +236,6 @@ def test_the_referee_starts_the_game_after_the_policy_s_plus_or_the_setup_limit(
     assert lazy.due() == "start", "a policy that never clicks + still gets its game"
 
 
-def test_the_reservation_waits_for_the_grant_and_hands_the_pc_back(tmp_path, monkeypatch):
-    sleeps = []
-
-    def sleep(seconds):
-        sleeps.append(seconds)
-        (tmp_path / "granted" / "trial.json").write_text("{}")
-
-    monkeypatch.setattr(play.time, "sleep", sleep)
-    play.reserve("trial", 30, root=tmp_path)
-    assert json.loads((tmp_path / "queue" / "trial.json").read_text())["minutes"] == 30
-    assert sleeps == [10]
-    play.hand_back("trial", {"games": 2}, root=tmp_path)
-    assert json.loads((tmp_path / "done" / "trial.json").read_text())["games"] == 2
-
-
 class _Screen(torch.nn.Module):
     dim = 8
     reads_clip = False
@@ -907,14 +892,6 @@ def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
         same = head(memory, cells, actions)[1], head(memory, cells, actions, temperature=0.2)[1]
     assert cold > warm, "the likeliest input gains"
     assert torch.equal(*same), "a demonstration's likelihood does not depend on it"
-
-
-def test_a_reservation_made_ahead_is_not_made_twice(tmp_path, monkeypatch):
-    (tmp_path / "granted").mkdir(parents=True)
-    (tmp_path / "granted" / "early.json").write_text("{}")
-    monkeypatch.setattr(play.time, "sleep", lambda s: None)
-    play.reserve("early", 30, root=tmp_path)
-    assert not (tmp_path / "queue" / "early.json").exists(), "granted already: no new request"
 
 
 def test_what_the_memory_takes_in_does_not_grow_with_the_tower_s_loudness():

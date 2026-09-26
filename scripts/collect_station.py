@@ -2,29 +2,33 @@
 what it needs goes there, and what it recorded comes back.
 
     python scripts/collect_station.py deploy [--checkpoint CKPT --name bc6-e0000 --evaluate]
+                                             [--record NAME --record-minutes M -- ARGS]
                                              [--worker]
     python scripts/collect_station.py collect [--every 120]
     python scripts/collect_station.py tunnel
 
 - deploy: a staging folder (a git worktree at origin/main, because a fleet push copies a
   whole folder and this checkout holds hundreds of GB) gets the code and the data the
-  sessions read: the screen templates and rules, the start saves, the pairing file, and
-  with --checkpoint that checkpoint, its manifest and its tower, plus the plan naming it.
-  It is pushed to the station's project, and the service is asked to restart at its next
-  idle moment if its code changed.
+  sessions read: the screen templates and rules, the start saves, the pairing file
+  (peer-fleet.json, the worker at 127.0.0.1), the arena mods the station plays (their
+  .mod descriptors are written into the game's mod folder at each launch, pointing
+  there), and with --checkpoint that checkpoint, its manifest and its tower, plus the
+  plan naming it. --record adds a recording run of full games to the plan (station.py's
+  `record`: record-ai with ARGS, such as --player scripted --mod
+  artifacts/mods/arena-12x8-v4, for its minutes), once per name. It is all pushed to the
+  station's project, and the service is asked to restart at its next idle moment if its
+  code changed.
   With --worker it also ships the desktop worker, which runs in the same project as the
   fleet service `hoi4-worker` (scripts/Start-Worker.ps1 -Service): this checkout's release
-  build, the pairing's second-PC half, the arenas the station plays (their .mod
-  descriptors are written into the game's mod folder at each launch, pointing here), and
-  peer-fleet.json, the pairing on 127.0.0.1 that the station then uses (station.peer). The
-  worker service is asked to restart at its next idle moment if any of it changed.
+  build and the pairing's second-PC half. The worker service is asked to restart at its
+  next idle moment if any of it changed.
 - collect: every --every seconds, the station's list of finished sessions is pulled, each
   new session folder is pulled into this checkout at the same path (where the dataset
   builders and the scoreboard look), and deleted on the second PC, whose disk is shared.
 - tunnel: the worker service's port here on 127.0.0.1 (`fleet tunnel`), opened again
   whenever it ends, for the live view and anything else here with --peer
   artifacts/pairing/peer-fleet.json. A tunnel's connections end when the node restarts,
-  and clients using that pairing connect again (reconnect_seconds).
+  and clients using that pairing connect again (its reconnect_seconds).
 """
 
 from __future__ import annotations
@@ -44,7 +48,8 @@ ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT.parent / f"{ROOT.name}-fleet"
 NODE, PROJECT, SERVICE = "kat-pc", "hoi4-ai", "hoi4-station"
 DATA_FOLDERS = ["artifacts/screens-1080p", "artifacts/calibration-1080p"]
-DATA_FILES = ["artifacts/pairing/peer.json", "artifacts/arenas/saves-peer.json"]
+FLEET_PEER = "artifacts/pairing/peer-fleet.json"
+DATA_FILES = [FLEET_PEER, "artifacts/arenas/saves-peer.json"]
 # The desktop worker as a fleet service (deploy --worker, tunnel).
 WORKER_SERVICE, WORKER_PORT = "hoi4-worker", 47941
 WORKER_BUILD = "target/release/hoi4-desktop-worker.exe"
@@ -53,14 +58,9 @@ WORKER_PAIRING = [
     "artifacts/pairing/second-pc/server.json",
     "artifacts/pairing/second-pc/worker.pfx",
 ]
-FLEET_PEER = "artifacts/pairing/peer-fleet.json"
 # What the service reads when it starts: a change to any of them wants a restart. The
 # control scripts are read at each operation, and the arenas at each launch.
 WORKER_STARTS_FROM = [WORKER_EXE, "scripts/Start-Worker.ps1", *WORKER_PAIRING]
-# How long a client with the fleet pairing keeps trying to connect: a service restart
-# (fleet starts it again within ~5 s, and it compiles its bridge in a few more) or a node
-# restart (its tunnel's connections end) is waited out, not a session's failure.
-RECONNECT_SECONDS = 60
 COLLECTED = ROOT / "artifacts" / "station" / "collected.txt"
 EVALUATE = [
     {"name": "t05", "command": "practice", "args": ["--episodes", "16", "--minutes", "30",
@@ -116,22 +116,19 @@ def tower_of(checkpoint):
     return f"models/{PureWindowsPath(manifest['config']['model_path']).name}"
 
 
-def fleet_pairing(port=WORKER_PORT):
-    """artifacts/pairing/peer-fleet.json: peer.json's token and certificate pin at
-    127.0.0.1:`port`. On the second PC that is the worker service itself; here, fleet's
-    tunnel to it, opened on the same port (tunnel). Its clients keep trying to connect for
-    RECONNECT_SECONDS (remote.open_tls). Written only when it changes."""
-    spec = json.loads((ROOT / DATA_FILES[0]).read_text())
-    spec.update(host="127.0.0.1", port=port, reconnect_seconds=RECONNECT_SECONDS)
-    text = json.dumps(spec, indent=2)
-    path = ROOT / FLEET_PEER
-    if not path.exists() or path.read_text() != text:
-        path.write_text(text)
-    return path
+def recorded_arenas(args):
+    """The arena folder names a record-ai command line plays (its --mod values)."""
+    names, taking = set(), False
+    for arg in args:
+        if arg.startswith("--"):
+            taking = arg == "--mod"
+        elif taking:
+            names.add(PureWindowsPath(arg).name)
+    return names
 
 
 def station_arenas():
-    """The arenas the station plays: its own list, and its plan's."""
+    """The arenas the station plays: its own list, and its plan's (drills and recording)."""
     spec = importlib.util.spec_from_file_location("station", ROOT / "scripts" / "station.py")
     station = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(station)
@@ -139,7 +136,8 @@ def station_arenas():
         plan = json.loads((STAGE / station.PLAN).read_text())
     except (OSError, ValueError):
         plan = {}
-    return sorted({*station.ARENAS, *(plan.get("arenas") or [])})
+    recording = recorded_arenas((plan.get("record") or {}).get("args", []))
+    return sorted({*station.ARENAS, *(plan.get("arenas") or []), *recording})
 
 
 def worker_stamp():
@@ -162,13 +160,27 @@ def stage_worker():
     link(WORKER_EXE, build, copy=True)
     for relative in WORKER_PAIRING:
         link(relative)
-    fleet_pairing()
-    link(FLEET_PEER)
-    for arena in station_arenas():
-        mirror(f"artifacts/mods/{arena}")
 
 
-def deploy(checkpoint=None, name=None, evaluate=False, practice=(), worker=False):
+def stage_plan(checkpoint=None, name=None, evaluate=False, practice=(), record=None):
+    """The station's plan in the staging folder: the one there, with --checkpoint's part
+    replaced and --record's added."""
+    path = STAGE / "artifacts" / "station" / "plan.json"
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, ValueError):
+        plan = {}
+    if checkpoint:
+        plan.update(checkpoint=checkpoint, name=name or Path(checkpoint).parent.name,
+                    practice=list(practice), evaluate=EVALUATE if evaluate else [])  # fmt: skip
+    if record:
+        plan["record"] = record
+    if checkpoint or record:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan, indent=2))
+
+
+def deploy(checkpoint=None, name=None, evaluate=False, practice=(), worker=False, record=None):
     if not STAGE.exists():
         subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(STAGE),
                         "origin/main"], check=True)  # fmt: skip
@@ -188,10 +200,9 @@ def deploy(checkpoint=None, name=None, evaluate=False, practice=(), worker=False
         link(checkpoint)
         link(Path(checkpoint).with_suffix(".json").as_posix())
         mirror(tower_of(checkpoint))
-        plan = {"checkpoint": checkpoint, "name": name or Path(checkpoint).parent.name,
-                "practice": list(practice), "evaluate": EVALUATE if evaluate else []}  # fmt: skip
-        (STAGE / "artifacts" / "station").mkdir(parents=True, exist_ok=True)
-        (STAGE / "artifacts" / "station" / "plan.json").write_text(json.dumps(plan, indent=2))
+    stage_plan(checkpoint, name, evaluate, practice, record)
+    for arena in station_arenas():
+        mirror(f"artifacts/mods/{arena}")
     if worker:
         stage_worker()
     fleet("push", "--on", NODE, "--name", PROJECT)
@@ -199,7 +210,7 @@ def deploy(checkpoint=None, name=None, evaluate=False, practice=(), worker=False
         log(f"code {before[:7]} -> {after[:7]}: the station restarts at its next idle moment")
         fleet("service", "restart", SERVICE, "--on", NODE, check=False)
     if worker and worker_stamp() != worker_before:
-        # Before the service exists (the cutover's first deploy) this only fails.
+        # Before the service exists (its first deploy) this only fails.
         log("the worker changed: its service restarts at its next idle moment")
         fleet("service", "restart", WORKER_SERVICE, "--on", NODE, check=False)
     log("deployed")
@@ -276,8 +287,19 @@ def main():
     push.add_argument(
         "--worker",
         action="store_true",
-        help=f"Also the desktop worker, for the fleet service {WORKER_SERVICE} (and "
-        f"{FLEET_PEER}, which the station then uses)",
+        help=f"Also the desktop worker, for the fleet service {WORKER_SERVICE}",
+    )
+    push.add_argument(
+        "--record",
+        metavar="NAME",
+        help="Add a recording run of full games to the plan, played once under this name "
+        "into artifacts/record-NAME (record-ai --peer-only with the arguments after --)",
+    )
+    push.add_argument("--record-minutes", type=float, default=240.0)
+    push.add_argument(
+        "record_args",
+        nargs=argparse.REMAINDER,
+        help="With --record, record-ai's arguments, after --",
     )
     pull = sub.add_parser("collect")
     pull.add_argument("--every", type=float, default=120.0)
@@ -285,12 +307,19 @@ def main():
     sub.add_parser("tunnel")
     args = parser.parse_args()
     if args.action == "deploy":
+        extra = args.record_args[1:] if args.record_args[:1] == ["--"] else args.record_args
+        record = None
+        if args.record:
+            record = {"name": args.record, "minutes": args.record_minutes, "args": extra}
+        elif extra:
+            parser.error("record-ai's arguments go with --record")
         deploy(
             args.checkpoint,
             args.name,
             args.evaluate,
             ["--held-previous"] if args.held_previous else [],
             worker=args.worker,
+            record=record,
         )
         return 0
     if args.action == "tunnel":

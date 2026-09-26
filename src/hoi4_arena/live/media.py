@@ -160,26 +160,6 @@ def clear_stream(out):
             pass  # Held for a moment; the next stream overwrites it.
 
 
-def update_pending(peer, share=None):
-    """Whether a new worker waits on the second PC's share (Deploy-Peer stages it as
-    .new beside the running one). Its bridge swaps it in only while no connection is
-    open there, so a view that never closed would keep every update out.
-
-    Never for a pairing on this PC's loopback (fleet's worker service, reached through
-    `fleet tunnel`): there is no share, and the service's restart closes a view that has
-    watched a while by itself, which then connects again."""
-    from ..remote import is_loopback
-
-    try:
-        spec = json.loads(Path(peer).read_text())
-        if share is None and is_loopback(spec):
-            return False
-        share = share or f"//{spec['host']}/HOI4Worker"
-        return (Path(share) / "hoi4-desktop-worker.exe.new").exists()
-    except (OSError, ValueError, KeyError):
-        return False
-
-
 class Follower:
     """The recording being written, followed at its 5 frames a second (hls_command): one
     ffmpeg per game, from near the live edge, restarted 10 s after a failure."""

@@ -1,4 +1,6 @@
-"""Pinned TLS connection to the same raw desktop protocol on another Windows PC."""
+"""Pinned TLS connection to the same raw desktop protocol on another Windows PC: the second
+PC's worker, the fleet service `hoi4-worker` on that PC's loopback, reached there directly
+and from here through `fleet tunnel` on the same port."""
 
 from __future__ import annotations
 
@@ -13,9 +15,14 @@ import threading
 import time
 from pathlib import Path
 
-from .desktop import Desktop, DesktopError, read_reply, worker_executable
+from .desktop import Desktop, DesktopError, read_reply
 
 log = logging.getLogger(__name__)
+
+# How long a client of the pairing keeps trying to connect: a service restart (fleet starts
+# it again within ~5 s, and it compiles its bridge in a few more) or a node restart (its
+# tunnel's connections end) is waited out, not a session's failure.
+RECONNECT_SECONDS = 60
 
 
 def open_tls(spec, context, wait=0.0, *, pause=2.0):
@@ -40,15 +47,6 @@ def open_tls(spec, context, wait=0.0, *, pause=2.0):
             time.sleep(pause)
 
 
-def is_loopback(spec):
-    """Whether a pairing names this PC's loopback: fleet's worker service, reached on its
-    own PC or through `fleet tunnel`, not the old bridge on the second PC's LAN address."""
-    try:
-        return ipaddress.ip_address(spec.get("host", "")).is_loopback
-    except ValueError:
-        return spec.get("host") == "localhost"
-
-
 class RemoteDesktop(Desktop):
     encoding = "lz4"
 
@@ -63,8 +61,8 @@ class RemoteDesktop(Desktop):
         A bridge from before observers refuses it by closing the connection.
 
         `wait`: seconds to keep trying while the worker cannot be reached (open_tls). By
-        default the pairing's `reconnect_seconds`: a fleet pairing (collect_station.py)
-        waits out a tunnel or service restart, the old LAN pairing fails at once.
+        default the pairing's `reconnect_seconds` (RECONNECT_SECONDS in one bundle-peer
+        writes), which waits out a tunnel or service restart; without it, none.
         """
         from collections import deque
 
@@ -182,12 +180,15 @@ class RemoteDesktop(Desktop):
             self._shutdown()
 
 
-def bundle(output, host, coordinator, port):
-    """Creates a portable worker plus private pairing credentials; never auto-opens a port."""
+def bundle(output, port):
+    """A new pairing in `output` (a new folder, such as artifacts/pairing): for the second
+    PC's worker service, second-pc/server.json (its port, token and certificate password)
+    and second-pc/worker.pfx, which scripts/collect_station.py deploy --worker ships; for
+    its clients, peer-fleet.json, the worker at 127.0.0.1:`port` with the token and the
+    certificate's pin. It is the same file on both PCs: there the service listens on that
+    port of its loopback, and here `fleet tunnel` opens the same port. Opens no port."""
     import datetime
-    import ipaddress
     import secrets
-    import shutil
 
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -195,8 +196,6 @@ def bundle(output, host, coordinator, port):
     from cryptography.hazmat.primitives.serialization import pkcs12
     from cryptography.x509.oid import NameOID
 
-    host_ip = ipaddress.ip_address(host)
-    ipaddress.ip_address(coordinator)
     root = Path(output).resolve()
     root.mkdir(parents=True, exist_ok=False)
     peer = root / "second-pc"
@@ -213,7 +212,7 @@ def bundle(output, host, coordinator, port):
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(days=825))
         .add_extension(
-            x509.SubjectAlternativeName([x509.IPAddress(host_ip)]),
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,
         )
         .sign(key, hashes.SHA256())
@@ -225,38 +224,19 @@ def bundle(output, host, coordinator, port):
         )
     )
     (peer / "server.json").write_text(
-        json.dumps(
-            {
-                "bind": host,
-                "coordinator": coordinator,
-                "port": port,
-                "token": token,
-                "pfx_password": password,
-            },
-            indent=2,
-        )
+        json.dumps({"port": port, "token": token, "pfx_password": password}, indent=2)
     )
-    (root / "peer.json").write_text(
+    client = root / "peer-fleet.json"
+    client.write_text(
         json.dumps(
             {
-                "host": host,
+                "host": "127.0.0.1",
                 "port": port,
                 "token": token,
                 "certificate_sha256": cert.fingerprint(hashes.SHA256()).hex(),
+                "reconnect_seconds": RECONNECT_SECONDS,
             },
             indent=2,
         )
     )
-    shutil.copy2(worker_executable(), peer / "hoi4-desktop-worker.exe")
-    script = Path(__file__).resolve().parents[2] / "scripts" / "Start-Worker.ps1"
-    shutil.copy2(script if script.exists() else "scripts/Start-Worker.ps1", peer)
-    (peer / "START-HERE.txt").write_text(
-        "Open HOI4, then run Start-Worker.ps1 in PowerShell 7.5 or later (pwsh), not\n"
-        "Windows PowerShell 5.1. Leave this window open.\n"
-        "F12 stops injected inputs. Close PowerShell to disconnect.\n"
-        "Only the paired coordinator can connect. Keep this folder private.\n"
-        f"If Windows Firewall blocks this connection, allow TCP {port} only from the\n"
-        "coordinator address in server.json on your private network.\n"
-    )
-    shutil.make_archive(str(root / "second-pc"), "zip", peer)
-    return {"bundle": str(root / "second-pc.zip"), "client_config": str(root / "peer.json")}
+    return {"worker": str(peer), "client_config": str(client)}

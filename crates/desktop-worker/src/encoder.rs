@@ -159,16 +159,12 @@ pub fn arguments(name: &str, quality: Option<u32>, hz: u32) -> Result<(Vec<Strin
     Ok((args.into_iter().map(String::from).collect(), q))
 }
 
-/// ffmpeg for the encoder: beside the worker, in the compute tools the second PC's
-/// deploy puts there, or on PATH.
+/// ffmpeg for the encoder: beside the worker, or on PATH (on the second PC, the one fleet
+/// gives its jobs and services).
 pub fn find_ffmpeg(exe_dir: &Path, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    [
-        exe_dir.join("ffmpeg.exe"),
-        exe_dir.join("compute").join("tools").join("ffmpeg.exe"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
-    .or_else(|| crate::find_on_path("ffmpeg.exe", path))
+    Some(exe_dir.join("ffmpeg.exe"))
+        .filter(|p| p.is_file())
+        .or_else(|| crate::find_on_path("ffmpeg.exe", path))
 }
 
 /// Why a frame was not queued.

@@ -446,30 +446,6 @@ def test_an_ended_game_is_archived_from_its_pieces_and_replayed_from_there(tmp_p
     assert not list(raw.glob("*.ts"))
 
 
-def test_the_view_steps_aside_while_a_new_worker_waits(tmp_path):
-    peer = tmp_path / "peer.json"
-    peer.write_text(json.dumps({"host": "second-pc"}))
-    share = tmp_path / "share"
-    share.mkdir()
-    assert not live.update_pending(peer, share)
-    (share / "hoi4-desktop-worker.exe.new").write_bytes(b"MZ")
-    assert live.update_pending(peer, share)
-    assert not live.update_pending(tmp_path / "missing.json")
-
-
-def test_a_view_through_fleet_s_tunnel_never_looks_for_the_share(tmp_path, monkeypatch):
-    """A pairing on this PC's loopback is fleet's worker service: no share to look in (a
-    look at //127.0.0.1 would ask this PC's own file sharing every round)."""
-    from pathlib import Path
-
-    peer = tmp_path / "peer-fleet.json"
-    peer.write_text(json.dumps({"host": "127.0.0.1", "port": 47941}))
-    looked = []
-    monkeypatch.setattr(Path, "exists", lambda self: looked.append(self) or True)
-    assert not live.update_pending(peer)
-    assert not looked
-
-
 class FakeProcess:
     def __init__(self):
         self.stdin, self.returncode = io.BytesIO(), None
