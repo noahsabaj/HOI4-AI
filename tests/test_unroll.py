@@ -364,8 +364,8 @@ def test_an_interrupted_run_resumes_to_where_an_uninterrupted_one_ends(tmp_path,
 
     tick = Progress.tick
 
-    def interrupt(self, epoch, step, modules, optimizer):
-        tick(self, epoch, step, modules, optimizer)
+    def interrupt(self, epoch, step, modules, optimizer, carried=None):
+        tick(self, epoch, step, modules, optimizer, carried)
         if step == 2:
             raise KeyboardInterrupt
 
@@ -394,3 +394,89 @@ def test_an_interrupted_run_resumes_to_where_an_uninterrupted_one_ends(tmp_path,
         train.train_bc(
             tmp_path / "data", "model", tmp_path / "again", resume=True, **{**common, "seed": 7}
         )
+    # So is one whose loader has another number of workers: its batches come in another order.
+    with pytest.raises(ValueError, match="--workers 0"):
+        train.train_bc(
+            tmp_path / "data", "model", tmp_path / "again", resume=True, **{**common, "workers": 2}
+        )
+
+
+def test_a_carried_memory_resumes_where_it_was_and_the_run_goes_on_bit_for_bit(
+    tmp_path, monkeypatch, caplog
+):
+    """Two games side by side, stopped halfway through both: resumed, each game's memory
+    is what it was, and every later batch's memory, loss and the weights are the
+    uninterrupted run's. An older progress file, which kept no memory, still resumes,
+    from an empty one, and says so."""
+    import json
+    import logging
+    import shutil
+
+    from test_dataset import _recording
+
+    import hoi4_arena.train as train
+    from hoi4_arena.learning import Progress
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("needs ffmpeg")
+    data = tmp_path / "data"
+    data.mkdir()
+    for name, split, shade in (("a", "train", 0), ("b", "train", 100), ("c", "validation", 50)):
+        _recording(data / name, [8, 6], shade=shade)
+        manifest = data / name / "manifest.json"
+        manifest.write_text(json.dumps({**json.loads(manifest.read_text()), "split": split}))
+    monkeypatch.setattr(train, "build_encoder", lambda path, variant: _Screen())
+    common = {"sequence": 2, "batch_size": 2, "workers": 0, "save_every": 1e-9, "carry": True}
+    tick = Progress.tick
+    memories = {}  # run: {step: each slot's memory after it}
+
+    def watch(run, stop=None):
+        def watched(self, epoch, step, modules, optimizer, carried=None):
+            memories.setdefault(run, {})[step] = {s: m.clone() for s, m in carried.items()}
+            tick(self, epoch, step, modules, optimizer, carried)
+            if step == stop:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(Progress, "tick", watched)
+
+    def steps(run):
+        rows = [json.loads(line) for line in (tmp_path / run / "metrics.jsonl").open()]
+        return {row["step"]: (row["bc"], row["loss"]) for row in rows if "step" in row}
+
+    watch("whole")
+    train.train_bc(data, "model", tmp_path / "whole", **common)
+    whole = memories["whole"]
+    assert len(whole) == 5 and len(whole[2]) == 2  # Both games under way at step 2.
+    for run in ("cut", "old"):
+        watch(run, stop=2)
+        with pytest.raises(KeyboardInterrupt):
+            train.train_bc(data, "model", tmp_path / run, **common)
+    saved = torch.load(tmp_path / "cut" / "progress.pt", weights_only=True)
+    assert saved["config"]["workers"] == 0
+    for slot, memory in whole[2].items():
+        assert torch.equal(saved["carried"][slot], memory) and memory.abs().sum() > 0
+
+    watch("cut")
+    train.train_bc(data, "model", tmp_path / "cut", resume=True, **common)
+    assert memories["cut"].keys() == {1, 2, 3, 4, 5}
+    for step in (3, 4, 5):
+        assert memories["cut"][step].keys() == whole[step].keys()
+        for slot, memory in whole[step].items():
+            assert torch.equal(memories["cut"][step][slot], memory), (step, slot)
+    assert steps("cut") == steps("whole")
+    trained = torch.load(tmp_path / "whole" / "epoch-0000.pt", weights_only=True)["policy"]
+    resumed = torch.load(tmp_path / "cut" / "epoch-0000.pt", weights_only=True)["policy"]
+    for name, value in trained.items():
+        assert torch.equal(value, resumed[name]), name
+
+    # A progress file from before: no memory kept, no workers recorded.
+    path = tmp_path / "old" / "progress.pt"
+    old = torch.load(path, weights_only=True)
+    del old["carried"], old["config"]["workers"]
+    torch.save(old, path)
+    watch("old")
+    with caplog.at_level(logging.WARNING):
+        train.train_bc(data, "model", tmp_path / "old", resume=True, **common)
+    assert "empty one" in caplog.text and "predates recording the loader's workers" in caplog.text
+    after = {step: row for step, row in steps("old").items() if step > 2}
+    assert after != {step: row for step, row in steps("whole").items() if step > 2}

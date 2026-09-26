@@ -133,7 +133,8 @@ def train_idm(
     }
     output.mkdir(parents=True, exist_ok=True)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
-    progress = Progress(output, config, every=save_every, resume=resume)
+    # The loader's workers are not the model's, but a resume needs the same (Progress).
+    progress = Progress(output, {**config, "workers": workers}, every=save_every, resume=resume)
     modules = {"model": model}
     first_epoch, skip = progress.start(modules, optimizer)
     with (output / "metrics.jsonl").open("a") as log:
