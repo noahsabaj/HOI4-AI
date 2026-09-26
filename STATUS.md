@@ -854,6 +854,29 @@ each change below is a flag measured against what it replaces.
   an 8 GB card in real time, and most are closed. What they teach is kept for later:
   emitting short chunks of actions, and thinking only now and then, which a paused
   game allows.
+- **Noted for later: Explorative Modeling (2607.27372, 2026-07).** Each training step
+  draws K candidates and trains only the one nearest the data, so a regression loss
+  stops averaging several valid answers into one blurred wrong one. It gains with scale
+  (the same image quality with 6.2x less data or 4.1x fewer FLOPs), overfits less on a
+  small dataset, and makes one-pass generators: a behaviour-cloning policy matches
+  Diffusion Policy with 1 network pass instead of 100, and a world model matches
+  Diffuser with 16-256x fewer. Our action head does not need it: it samples discrete
+  tokens (a cell, then a spot in it) with an exact likelihood, which already holds
+  several answers. It fits a model of the next screen's features for the reinforcement
+  learning phase: that is a regression, blur is its usual failure, and one pass a
+  decision would fit a 200 ms tick. The paper suggests pairing it with JEPA-style
+  feature world models.
+- **Noted for later: PoEM (2609.30226, 2026-09).** Given several copies of one model
+  each trained by RL on its own reward, the policy for a weighted mix of those rewards
+  is close to the base policy plus the weighted sum of each copy's log-probability
+  shift, with weights fitted by linear regression on a small scored sample and no new
+  training. It recovered 0.78-1.08 of a real RL run's gain on mixed rewards, about the
+  spread between two RL seeds; less on rewards outside the mix (0.55-0.69 when its
+  coverage check passes). Tested on text and image models only. It fits here once
+  there are several RL experts sharing one imitation policy as their base, e.g. one
+  per setup step (army, general, front) and later one for territory: our action head's
+  exact per-choice log-probabilities are what its decoder composes, and each RL run is
+  the expensive part at ~30 practice episodes an hour.
 
 ## A scripted player and the true state (2026-09-23)
 
