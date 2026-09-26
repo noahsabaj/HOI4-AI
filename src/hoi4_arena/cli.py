@@ -211,6 +211,29 @@ def main():
         help="Where recordings go once the output's drive would keep less than --keep-free",
     )
     tower.add_argument("--keep-free", type=float, default=30.0, help="GB to leave free")
+    drill = sub.add_parser(
+        "practice",
+        help="A trained policy practises the setup on the second PC: short episodes from the "
+        "start save, each scored on the army, its general, its front and the game running, "
+        "with the scripted player taking late steps over (practice.py).",
+    )
+    drill.add_argument("checkpoint")
+    drill.add_argument("output", help="A folder for the episodes and practice-peer.json")
+    drill.add_argument("--peer", required=True, help="The second PC's pairing file")
+    drill.add_argument("--episodes", type=int, default=20)
+    drill.add_argument("--minutes", type=float, required=True, help="Time budget for all")
+    drill.add_argument("--seconds", type=float, default=90.0, help="Each episode's length")
+    drill.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    drill.add_argument(
+        "--no-coach", dest="coach", action="store_false",
+        help="Only watch and score; never take a step over",
+    )  # fmt: skip
+    drill.add_argument("--reservation", help="Reserve the second PC first, as play-policy")
+    drill.add_argument("--held-previous", action="store_true", help="As play-policy's")
+    drill.add_argument("--temperature", type=float, default=1.0)
+    drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    drill.add_argument("--model", dest="model_path")
+    drill.add_argument("--seed", type=int)
     live = sub.add_parser(
         "play-policy",
         help="A trained policy plays arena games against the game's AI on the second PC, "
@@ -1042,6 +1065,11 @@ def _dispatch(command, args):
             spill=args["spill"],
             keep_free_gb=args["keep_free"],
         )
+    elif command == "practice":
+        from .practice import practice
+
+        args["countries"] = tuple(args["countries"])
+        result = practice(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "play-policy":
         from .play import evaluate_policy
 
