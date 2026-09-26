@@ -265,7 +265,12 @@ def build_parser():
     )
     drill.add_argument("checkpoint")
     drill.add_argument("output", help="A folder for the episodes and practice-peer.json")
-    drill.add_argument("--peer", required=True, help="The second PC's pairing file")
+    where = drill.add_mutually_exclusive_group(required=True)
+    where.add_argument("--peer", help="The second PC's pairing file")
+    where.add_argument(
+        "--here", action="store_true",
+        help="Practise on this PC's game instead (practice-here.json); hold its lock",
+    )  # fmt: skip
     drill.add_argument("--episodes", type=int, default=20)
     drill.add_argument("--minutes", type=float, required=True, help="Time budget for all")
     drill.add_argument("--seconds", type=float, default=90.0, help="Each episode's length")
@@ -1193,6 +1198,7 @@ def _dispatch(command, args):
     elif command == "practice":
         from .practice import practice
 
+        args.pop("here")
         args["countries"] = tuple(args["countries"])
         result = practice(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "make-ladder":

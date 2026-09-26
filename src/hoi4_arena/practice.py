@@ -300,7 +300,7 @@ def practice(
     checkpoint,
     output,
     *,
-    peer,
+    peer=None,
     episodes=20,
     minutes=60.0,
     seconds=90.0,
@@ -316,10 +316,11 @@ def practice(
     fast=False,
 ):
     """Up to `episodes` practice episodes of `seconds` each (or until `minutes` run out) on
-    the second PC, from the main arena's start saves, alternating countries. `temperature`,
+    the second PC (`peer`, its pairing), or on this PC without one, from the main arena's
+    start saves, alternating countries. `temperature`,
     `pointer_temperature` and `point` are how the policy samples, as play-policy's
     (runner.resolve_temperatures); each episode and the summary name the two temperatures.
-    Returns the episodes and the summary (practice-peer.json in `output`)."""
+    Returns the episodes and the summary (practice-<station>.json in `output`)."""
     from PIL import Image
 
     from .ai_games import EVENT_OK, Station, focus, log_end, start_game
@@ -333,7 +334,7 @@ def practice(
     ok = [np.asarray(Image.open(path).convert("RGB")) for path in (
         "artifacts/screens-1080p/ok-button.png", EVENT_OK)]  # fmt: skip
     rng = random.Random(seed)
-    station = Station("peer", peer)
+    station = Station("peer", peer) if peer else Station("here")
     end = time.monotonic() + minutes * 60
     results, running = [], False
     try:
@@ -347,8 +348,8 @@ def practice(
                 break
             country = countries[index % len(countries)]
             save = f"arenav4{country.lower()}"
-            name = time.strftime("practice-peer-%Y%m%d-%H%M%S")
-            entry = {"game": name, "station": "peer", "started_as": country, "arena": MAIN_ARENA,
+            name = time.strftime(f"practice-{station.name}-%Y%m%d-%H%M%S")
+            entry = {"game": name, "station": station.name, "started_as": country, "arena": MAIN_ARENA,
                      "start_save": save, "checkpoint": actor.digest, "coach": coach,
                      **sampling_of(actor)}  # fmt: skip
             failure_shot = out_root / f"{name}-start-failed.png"
@@ -374,7 +375,7 @@ def practice(
                     outcome, reason, manifest = play_policy_game(
                         desk, actor, out_root / name, rules=screen_rules, country=country,
                         cap_minutes=seconds / 60, setup_seconds=seconds, arena_name=MAIN_ARENA,
-                        coach=watcher, log_from=log_from,
+                        coach=watcher, log_from=log_from, station=station.name,
                     )  # fmt: skip
             except Exception as error:  # noqa: BLE001 - reported, then the next episode.
                 entry["error"] = f"{type(error).__name__}: {error}"
@@ -392,7 +393,7 @@ def practice(
                 running = reason is None
                 log.info("[peer] %s: %s", name, json.dumps(entry["setup"]))
             results.append(entry)
-            (out_root / "practice-peer.json").write_text(
+            (out_root / f"practice-{station.name}.json").write_text(
                 json.dumps({"summary": summary(results), "episodes": results}, indent=2)
             )
     finally:
