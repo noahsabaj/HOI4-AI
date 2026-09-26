@@ -360,6 +360,10 @@ def build_parser():
     rungs.add_argument("--arenas", nargs="+", default=["arena-12x8-v4"])
     rungs.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
     rungs.add_argument("--rungs", nargs="+", choices=["S1", "S2", "S3"], default=["S1", "S2", "S3"])
+    rungs.add_argument(
+        "--fresh-starts", action="store_true",
+        help="Make every start save anew through the menus rather than use one found there",
+    )  # fmt: skip
     rungs.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     rungs.add_argument("--seed", type=int)
     rungs = sub.add_parser(

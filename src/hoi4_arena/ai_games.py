@@ -577,6 +577,15 @@ def load_in_game(desk, save, templates, rules, failure_shot):
     click(desk, *name)
     time.sleep(0.6)
     click(desk, *LOAD_BUTTON)
+    # The dialog closes once the load begins. A save the game will not load (one copied
+    # from the other PC showed a red "!" in the list, 2026-09-26) leaves it open over the
+    # last game, still paused, which wait_paused would take for the new one.
+    for _ in range(20):
+        time.sleep(0.5)
+        if shown(screen(desk), "load-dialog-load") is None:
+            break
+    else:
+        raise RuntimeError(f"the load dialog stayed open: {save} did not load")
     wait_paused(desk, rules, failure_shot, 90)
 
 
