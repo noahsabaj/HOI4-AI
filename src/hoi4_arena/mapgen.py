@@ -784,17 +784,26 @@ def generate(
     region_names = {1: "Arena", 2: "Ocean"}
     sea_terrain = {2: "water_shallow_sea"}
     if naval:
-        # A naval arena's own regions: each land province (lakes with the land, as stock)
-        # joins the nearest land region's point, each sea province the nearest sea one's,
-        # and each region's half turn is its twin region.
+        # A naval arena's own regions: each island (lakes with the land, as stock) joins
+        # the land region whose point is nearest its middle, each sea province the nearest
+        # sea one's, and each region's half turn is its twin region. An island goes whole:
+        # a state split between two regions crashed the game at load, dividing by zero,
+        # when the channel coast of each main island fell nearer the isles' region point.
         regions, region_names, sea_terrain = [], {}, {}
         seeds = arenas.region_seeds(design.regions, to_pixel, (height, width))
         terrains = {r.name: r.terrain for r in design.regions}
         terrains.update({r.twin_name: r.terrain for r in design.regions if r.twin_name})
+        middles = {}
+        for province, piece in island.items():
+            middles.setdefault(piece, []).append(anchor[province - 1])
+        middles = {piece: np.mean(spots, axis=0) for piece, spots in middles.items()}
+        placed_at = np.array(
+            [middles[island[i + 1]] if i + 1 in island else anchor[i] for i in range(len(kind))]
+        )
         for wanted, mask in (("land", kind != SEA), ("sea", kind == SEA)):
             own = [k for k, (region_kind, _, _) in enumerate(seeds) if region_kind == wanted]
             listed = np.flatnonzero(mask)
-            chosen = arenas.nearest_region(anchor[listed], [seeds[k][2] for k in own], width)
+            chosen = arenas.nearest_region(placed_at[listed], [seeds[k][2] for k in own], width)
             for k, index in enumerate(own):
                 region = index + 1
                 regions.append((region, np.isin(np.arange(len(kind)), listed[chosen == k])))
@@ -1921,6 +1930,12 @@ def audit(root):
             problems.append(f"{tag} owns no victory point, so it can never capitulate")
     owned = [p for listed in states.values() for p in listed]
     check("history/states", owned)
+    # A state in two strategic regions crashed the game at load (a division by zero,
+    # 2026-09-26, the first archipelago): every stock state lies in one region.
+    region_of = {p: region for region, listed in regions.items() for p in listed}
+    for state, listed in sorted(states.items()):
+        if len({region_of.get(p) for p in listed}) > 1:
+            problems.append(f"state {state} lies in more than one strategic region")
     stateless = sorted(p for p in valid if kind[p] == "land" and p not in owned)
     if stateless:
         problems.append(f"{len(stateless)} land provinces have no state, first {stateless[0]}")

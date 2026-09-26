@@ -382,6 +382,15 @@ time out or lose to the AI:
 6. Data: scripted naval games first, so the learned player has demonstrations of all of
    the above.
 
+**A state split between two strategic regions crashes the game at load** (division by
+zero, just after the state categories load, with nothing in the error log). The first
+archipelago drew land regions province by province, and the channel coast of each main
+island fell nearer the isles' region point, splitting the home-port state. Loads on the
+training PC bisected it: one land and one sea region loaded, the designed sea regions with
+one land region loaded, the designed land regions crashed. Land regions are now drawn
+island by island, and the audit checks that every state lies in one region (every stock
+state does).
+
 **The arena test queue is not served any more.** `artifacts/arenas/queue` was played by
 `record-ai --arena-queue` run here with `--peer`. Since the second PC runs only through
 fleet (#131, #134), nothing runs that: the station (`scripts/station.py`) runs drills on

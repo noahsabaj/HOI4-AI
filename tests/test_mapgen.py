@@ -707,6 +707,9 @@ def test_the_archipelago_sea_regions_are_whole_and_turn_with_the_map(archipelago
     for province, region in region_of.items():
         turned = region_of[twin(province)]
         assert {twin(p) for p in regions[region][0]} == regions[turned][0]
+    # Every state in one region: a state split between two crashed the game at load.
+    for state in range(1, 17):
+        assert len({region_of[p] for p in _state_provinces(root, state)}) == 1, state
     # One piece of water each, the far ocean joined round the map's wrap.
     neighbours = _neighbours(root, wrap=True)
     for region in seas:
