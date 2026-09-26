@@ -137,14 +137,10 @@ def rung_start(manifest, times, rung):
 
 
 def setup_complete(game):
-    """Whether a game completed the setup: an army with a general, a front, and its plan
-    executed, by whoever (the rung, the policy, the coach). Route 2's
-    practice.setup_complete is the shared measure; this stands in where it is missing."""
-    from . import practice
-
-    shared = getattr(practice, "setup_complete", None)
-    if shared is not None and "execute" not in ((game.get("setup") or {}).get("steps") or {}):
-        return bool(shared(game))
+    """Whether a game from a rung completed the setup: an army with a general, a front, and
+    its plan executed (the arrow seen lit), counting the steps its rung save held. The
+    shared measure, practice.setup_complete, asks the policy to have done every step
+    itself, which a game from S1-S3 cannot; summary reports both."""
     steps = (game.get("setup") or {}).get("steps") or {}
     need = ("army", "general", "front", "execute")
     return all((steps.get(step) or {}).get("by") in DOERS for step in need)
@@ -372,6 +368,8 @@ def wilson(wins, games, z=1.96):
 def summary(results):
     """Per rung: games that ended (a win, a loss or the cap), wins with a 95% interval,
     setups complete, and how often each step showed done (and by the policy itself)."""
+    from .practice import setup_rate
+
     out = {}
     for rung in RUNGS:
         played = [
@@ -387,6 +385,8 @@ def summary(results):
             "win_rate": round(wins / len(played), 3),
             "wilson95": [round(low, 3), round(high, 3)],
             "setup_complete": sum(1 for r in played if setup_complete(r)),
+            # The shared measure (route 2's): the whole setup by the policy itself.
+            "setup_rate_own": setup_rate(played),
             "timeouts": sum(1 for r in played if r["winner"] == "timeout"),
             "seconds_mean": round(float(np.mean([r.get("seconds", 0) for r in played])), 1),
         }
