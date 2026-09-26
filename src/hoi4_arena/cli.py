@@ -271,6 +271,11 @@ def build_parser():
         "--here", action="store_true",
         help="Practise on this PC's game instead (practice-here.json); hold its lock",
     )  # fmt: skip
+    drill.add_argument(
+        "--arenas", nargs="+", default=["arena-12x8-v4"],
+        help="Arenas to practise on, each with start saves (artifacts/arenas/saves-peer.json)",
+    )  # fmt: skip
+    drill.add_argument("--block", type=int, default=4, help="Episodes in a row on an arena")
     drill.add_argument("--episodes", type=int, default=20)
     drill.add_argument("--minutes", type=float, required=True, help="Time budget for all")
     drill.add_argument("--seconds", type=float, default=90.0, help="Each episode's length")
@@ -1200,6 +1205,7 @@ def _dispatch(command, args):
 
         args.pop("here")
         args["countries"] = tuple(args["countries"])
+        args["arenas"] = tuple(args["arenas"])
         result = practice(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "make-ladder":
         from .curriculum import make_ladder
