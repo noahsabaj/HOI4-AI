@@ -465,6 +465,7 @@ def play_policy_game(
                 dispatcher.join()
                 desk.release()
                 dispatcher.released()
+                actor.let_go()
                 focus(desk, tries=2)
                 dispatcher.refused = 0
                 continue
@@ -479,6 +480,9 @@ def play_policy_game(
             # Every input of the interval that just ended, now that it has: recorded with
             # this frame, which was taken while they were being applied.
             applied = dispatcher.take()
+            for item in applied:
+                if item.get("by") == "harness":
+                    actor.let_go(item["event"])
             watch.count(applied)
             if dispatcher.speed_clicks and not referee.running:
                 referee.clicked_speed_up()
@@ -490,6 +494,7 @@ def play_policy_game(
                 pointer = (pointer[0] / width, pointer[1] / height)
                 desk.release()
                 dispatcher.released()
+                actor.let_go()
                 if wait == "start":
                     run_game(desk, pointer)
                     referee.started()
@@ -745,6 +750,7 @@ def evaluate_policy(
     model_path=None,
     seed=None,
     saves=None,
+    held_previous=False,
 ):
     """Play up to `games` games (or until `minutes` run out) on the second PC and record them.
 
@@ -777,6 +783,8 @@ def evaluate_policy(
             temperature=temperature,
         )
         actor.lean = True  # Only the action is needed: no training sample, no clip.
+        # Shown what it holds even if trained without (a checkpoint trained with it is).
+        actor.held_previous = actor.held_previous or held_previous
         for index in range(games):
             # A game takes about 3 minutes to launch and up to cap_minutes to play.
             if time.monotonic() + (cap_minutes + 4) * 60 > end:

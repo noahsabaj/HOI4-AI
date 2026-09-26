@@ -247,6 +247,12 @@ def main():
         help="Place each move on its likeliest spot while still sampling what to do",
     )
     live.add_argument(
+        "--held-previous",
+        action="store_true",
+        help="Show the policy what it still holds even if its training did not "
+        "(a checkpoint trained with --held-previous always does)",
+    )
+    live.add_argument(
         "--temperature",
         type=float,
         default=1.0,
@@ -563,6 +569,12 @@ def main():
         action="store_true",
         help="Leave out the moves that only park the pointer so the scripted player can read "
         "the screen (dataset.parking_moves)",
+    )
+    train.add_argument(
+        "--held-previous",
+        action="store_true",
+        help="Show the policy, in its previous action, every key and button it still holds "
+        "(actions.with_held), so it knows to let them go",
     )
     train.add_argument(
         "--setup-weight",

@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from .actions import PERIOD, SLOTS, VOCAB, encode_interval
+from .actions import PERIOD, SLOTS, VOCAB, encode_interval, previous_actions
 
 # The view sizes, the game speeds, the pointer and the speed record are in layout.py, which
 # needs no torch, so the recorders and the worker's client can use them without it. They
@@ -286,6 +286,14 @@ def player_outcome(manifest):
     return "win" if winner == player else "loss"
 
 
+def label_previous(labels):
+    """A recording's previous actions (session_labels' "previous"), made here from its
+    actions, as they always were, for labels made without them."""
+    if "previous" not in labels:
+        labels["previous"] = previous_actions(labels["actions"])
+    return labels["previous"]
+
+
 def session_labels(
     source,
     *,
@@ -305,6 +313,7 @@ def session_labels(
     drop_parking=False,
     setup_weight=1.0,
     setup_seconds=30.0,
+    held_previous=False,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -493,6 +502,9 @@ def session_labels(
         "readable": readable,
         "outcome": outcome.astype(np.float32),
         "actions": actions,
+        # What each decision reads as the previous action; with `held_previous`, a press
+        # of every key or button still down fills its empty slots (actions.with_held).
+        "previous": previous_actions(actions, held=held_previous),
         "valid": valid,
         "weight": weight,
         "excluded": excluded,
@@ -603,10 +615,7 @@ class _Stream:
         quads = torch.stack([self.details[d][0] for d in steps])
         fovea = torch.stack([self.details[d][1] for d in steps])
         actions = torch.from_numpy(labels["actions"][start : start + n].copy())
-        previous = torch.zeros_like(actions)
-        previous[1:] = actions[:-1]
-        if start:
-            previous[0] = torch.from_numpy(labels["actions"][start - 1].copy())
+        previous = torch.from_numpy(label_previous(labels)[start : start + n].copy())
         window = {
             "quadrants": quads,
             "fovea": fovea,
@@ -736,6 +745,7 @@ class VideoSessions(IterableDataset):
         drop_parking=False,
         setup_weight=1.0,
         camera_since=None,
+        held_previous=False,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -773,6 +783,7 @@ class VideoSessions(IterableDataset):
                     press_weight=press_weight,
                     drop_parking=drop_parking,
                     setup_weight=setup_weight,
+                    held_previous=held_previous,
                 )
             )
         self.tower_stamp = None

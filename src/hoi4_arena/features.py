@@ -40,7 +40,7 @@ from torch import nn
 from torch.utils.data import default_collate
 
 from .actions import SLOTS
-from .dataset import _Stream, batch_to_device, cover_starts, session_labels
+from .dataset import _Stream, batch_to_device, cover_starts, label_previous, session_labels
 from .memory import build_memory, detach, reset, state_size
 from .models import CELL_DIM, CELLS, SPEEDS, ActionHead, fuse, reads_clip
 
@@ -206,10 +206,7 @@ class CachedGame:
             return torch.from_numpy(out)
 
         actions = self.labels["actions"]
-        previous = np.zeros_like(actions[start:stop])
-        previous[1:] = actions[start : stop - 1]
-        if start:
-            previous[0] = actions[start - 1]
+        previous = label_previous(self.labels)[start:stop]
         valid = np.zeros(length, bool)
         valid[:n] = self.labels["valid"][start:stop]
         prev = np.zeros((length, SLOTS, 3), np.int64)
@@ -695,8 +692,7 @@ class _Loader:
                 host[key][row, :n] = source[start:stop]
                 host[key][row, n:] = 0
             previous = host["previous"][row]
-            previous[0] = labels["actions"][start - 1] if start else 0
-            previous[1:n] = labels["actions"][start : stop - 1]
+            previous[:n] = label_previous(labels)[start:stop]
             previous[n:] = 0
             for k in range(0, n, PIECE):
                 reads.append((game, start + k, host["cells"][row, k : min(n, k + PIECE)]))

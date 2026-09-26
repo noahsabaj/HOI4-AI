@@ -9,7 +9,7 @@ import torch
 from test_dataset import _recording, needs_ffmpeg
 
 from hoi4_arena import play
-from hoi4_arena.actions import GRID, SLOTS, VOCAB
+from hoi4_arena.actions import GRID, SLOTS, VOCAB, previous_actions, still_held, with_held
 from hoi4_arena.dataset import VideoSessions, player_outcome, session_labels
 from hoi4_arena.models import Policy
 from hoi4_arena.privileged import DIM, NAMES, decision_states, state_rows
@@ -368,6 +368,9 @@ class _Actor:
 
     def reset_episode(self):
         self.steps = 0
+
+    def let_go(self, event=None):
+        pass
 
     def act(self, rgb, t_ns, precomputed=None, cursor=None):
         self.steps += 1
@@ -754,6 +757,62 @@ def test_a_timed_dispatch_releases_a_stuck_key_first_and_marks_it_the_harness_s(
     assert marks == ["harness", None]
     assert dispatcher.holds.forced == {"key39": 1}
     dispatcher.close()
+
+
+def _actions(*tokens_per_decision):
+    out = np.zeros((len(tokens_per_decision), SLOTS, 3), np.int64)
+    for t, tokens in enumerate(tokens_per_decision):
+        for slot, kind in tokens:
+            out[t, slot] = (VOCAB.index(kind), 0, 0)
+    return out
+
+
+def test_the_previous_action_shows_a_key_still_held_until_it_is_released():
+    down, up = VOCAB.index(RIGHT_DOWN), VOCAB.index(RIGHT_UP)
+    # Right pressed at decision 0 and released at 3; the left button tapped at 1.
+    actions = _actions(
+        [(2, RIGHT_DOWN)], [(0, CLICK), (1, {**CLICK, "down": False})], [], [(0, RIGHT_UP)], []
+    )
+    plain = previous_actions(actions)
+    assert (plain[0] == 0).all() and (plain[1:] == actions[:-1]).all(), "as it always was"
+    held = previous_actions(actions, held=True)
+    assert (held[1] == actions[0]).all(), "the press itself shows it"
+    # Decisions 2 and 3: nothing of Right in the action before, so its press fills the
+    # last empty slot; the tap's own slots stay as they were.
+    assert held[2][SLOTS - 1, 0] == down and (held[2][: SLOTS - 1] == actions[1][: SLOTS - 1]).all()
+    assert held[3][SLOTS - 1, 0] == down and (held[3][: SLOTS - 1] == 0).all()
+    assert (held[4] == actions[3]).all() and held[4][0, 0] == up, "released: shown no more"
+
+
+def test_what_is_held_follows_presses_and_releases_in_order():
+    press = VOCAB.index(RIGHT_DOWN)
+    (tap,) = _actions([(0, RIGHT_DOWN), (1, RIGHT_UP)])
+    assert still_held((), tap) == ()
+    (again,) = _actions([(0, RIGHT_UP), (1, RIGHT_DOWN)])
+    assert still_held((press,), again) == (press,)
+    (full,) = _actions([(s, {"kind": "key", "vk": 0x41 + s, "down": True}) for s in range(SLOTS)])
+    assert (with_held(full, (press,)) == full).all(), "no empty slot: nothing added"
+
+
+def test_the_live_actor_shows_what_it_holds_and_forgets_what_the_harness_released():
+    from hoi4_arena.runner import Actor
+
+    actor = Actor.__new__(Actor)
+    actor.held, actor.held_previous = (), True
+    press, (pressed, idle) = VOCAB.index(RIGHT_DOWN), _actions([(2, RIGHT_DOWN)], [])
+    actor._remember(pressed)
+    actor._remember(idle)
+    assert actor.previous[SLOTS - 1, 0] == press and actor.held == (press,)
+    actor.let_go(RIGHT_UP)  # play.Holds let it go
+    actor._remember(idle)
+    assert (actor.previous == 0).all() and actor.held == ()
+    actor._remember(pressed)
+    actor.let_go()  # the harness released every input
+    assert actor.held == ()
+    actor.held_previous = False
+    actor._remember(pressed)
+    actor._remember(idle)
+    assert (actor.previous == idle).all(), "a checkpoint trained without it sees none"
 
 
 def test_a_low_temperature_sharpens_what_to_do_and_leaves_scoring_alone():
