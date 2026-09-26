@@ -47,6 +47,8 @@ PERIOD_NS = int(round(PERIOD * 1e9))
 MAX_GAP_NS = 1_000_000_000
 # Where `hoi4-arena label` writes the inverse dynamics model's labels in a recording.
 IDM_LABELS = "labels-idm.npz"
+# The scripted player's labels for a practice game's decisions (dagger.relabel).
+DAGGER_LABELS = "labels-dagger.npz"
 # Where `hoi4-arena advantage` writes a player's recording's weights (offline.py).
 ADVANTAGE_LABELS = "labels-advantage.npz"
 MEAN = (0.485, 0.456, 0.406)
@@ -339,6 +341,28 @@ def player_outcome(manifest):
     return "win" if winner == player else "loss"
 
 
+def coached_spans(manifest, times, decisions):
+    """Per decision, whether a practice game's coach held it (practice.Coach) and whether
+    that span teaches: a span whose step the coach failed teaches nothing, since it shows
+    how not to do the step. Both all False in a game without a coach."""
+    from .practice import coach_managed
+
+    held = np.zeros(len(decisions), bool)
+    taught = np.zeros(len(decisions), bool)
+    last = len(times) - 1
+    steps = (manifest.get("setup") or {}).get("steps") or {}
+    for span in manifest.get("coached") or []:
+        begun, ended = span.get("from_frame"), span.get("to_frame")
+        if begun is None or ended is None:
+            continue
+        inside = (decisions >= times[min(begun, last)]) & (decisions <= times[min(ended, last)])
+        held |= inside
+        if span.get("step") in steps and not coach_managed(steps[span["step"]] or {}):
+            continue
+        taught |= inside
+    return held, taught
+
+
 def label_previous(labels):
     """A recording's previous actions (session_labels' "previous"), made here from its
     actions, as they always were, for labels made without them."""
@@ -368,6 +392,7 @@ def session_labels(
     setup_seconds=30.0,
     held_previous=False,
     rung=None,
+    dagger=0.0,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -413,6 +438,12 @@ def session_labels(
     before it weigh nothing, as if the game had started from that rung's save. Their
     windows stay, so the memory still reads the lead-up. A game recorded from a rung
     save starts there already.
+
+    `dagger` > 0 trains a practice game on the scripted player's labels for the states
+    the policy led it into (dagger.relabel, DAGGER_LABELS beside it): every decision the
+    expert labelled weighs `dagger` and learns the expert's action, a coach's takeover
+    teaches its own inputs as before, and the rest weighs nothing. What each decision reads
+    as its previous action stays what the policy did: that is what it saw when it acted.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -474,6 +505,19 @@ def session_labels(
         except ValueError as error:
             valid[i] = False
             excluded.append({"decision": i, "reason": str(error)})
+    # What was done, before any expert's labels replace it: each decision's previous action.
+    executed = actions.copy()
+    expert = None
+    if dagger > 0 and (source / DAGGER_LABELS).exists():
+        with np.load(source / DAGGER_LABELS) as stored:
+            grid, labelled = stored["decisions"], stored["valid"]
+            at = np.clip(np.searchsorted(grid, decisions), 0, len(grid) - 1)
+            expert = labelled[at] & (grid[at] == decisions)
+            # A coach's takeover is the scripted player's own inputs: its label as it is.
+            expert &= ~coached_spans(manifest, times, decisions)[0]
+            actions[expert] = stored["actions"][at[expert]]
+            # A decision the policy's own inputs could not encode is labelled all the same.
+            valid |= expert
     if look_before_click:
         # A policy that looks before it clicks (models.ActionHead `look`) cannot press
         # after a move in the same decision, so such a decision cannot be its label.
@@ -529,21 +573,13 @@ def session_labels(
     # nothing. Their windows stay, so the lead-up into each span is read.
     # A span whose step the coach failed teaches nothing: it shows how not to do the step.
     if "coached" in manifest:
-        from .practice import coach_managed
-
-        last = len(times) - 1
-        taught = np.zeros(len(decisions), bool)
-        steps = (manifest.get("setup") or {}).get("steps") or {}
-        for span in manifest["coached"]:
-            begun, ended = span.get("from_frame"), span.get("to_frame")
-            if begun is None or ended is None:
-                continue
-            if span.get("step") in steps and not coach_managed(steps[span["step"]] or {}):
-                continue
-            taught |= (decisions >= times[min(begun, last)]) & (
-                decisions <= times[min(ended, last)]
-            )
-        weight = weight * taught.astype(np.float32)
+        taught = coached_spans(manifest, times, decisions)[1].astype(np.float32)
+        if expert is not None:
+            # Beside the coach's spans, the decisions the expert labelled.
+            taught = np.maximum(taught, np.where(expert, np.float32(dagger), np.float32(0)))
+        weight = weight * taught
+    elif expert is not None:
+        weight = weight * np.where(expert, np.float32(dagger), np.float32(0))
     # A recorded AI game names its winner. Every decision then has a return to predict:
     # the win (+1) or loss (-1) from Blue's side, the side the observer's view keeps,
     # discounted by the wall time left until the recording ends. It pre-trains the
@@ -588,7 +624,7 @@ def session_labels(
         "actions": actions,
         # What each decision reads as the previous action; with `held_previous`, a press
         # of every key or button still down fills its empty slots (actions.with_held).
-        "previous": previous_actions(actions, held=held_previous),
+        "previous": previous_actions(executed, held=held_previous),
         "valid": valid,
         "weight": weight,
         "excluded": excluded,
@@ -980,6 +1016,9 @@ class VideoSessions(_Resumable, IterableDataset):
     shorter than a clip needs `clips` off. `tower`, a tower cache (tower_cache.py), adds
     each decision's frozen-tower reading to its window. `camera_since` (unix seconds)
     also drops the arrow keys from recordings made before it (camera_keys_dropped).
+    `more` are further folders of recordings read beside `root` (each with its own
+    splits.json), such as the practice games DAgger gathers, and `dagger` passes to
+    session_labels: the weight of the expert's labels in them.
     """
 
     def __init__(
@@ -1016,6 +1055,8 @@ class VideoSessions(_Resumable, IterableDataset):
         balance=False,
         yuv=None,
         rung=None,
+        dagger=0.0,
+        more=(),
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -1027,8 +1068,11 @@ class VideoSessions(_Resumable, IterableDataset):
         self.streams, self.shuffle, self.seed = streams, shuffle, seed
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sessions = []
-        overrides = recording_splits(root)
-        for path in sorted(Path(root).glob("*/manifest.json")):
+        found = []
+        for folder in (root, *more):
+            overrides = recording_splits(folder)
+            found += [(p, overrides) for p in sorted(Path(folder).glob("*/manifest.json"))]
+        for path, overrides in found:
             meta = json.loads(path.read_text())
             labelled = "idm" in sources and (path.parent / IDM_LABELS).exists()
             chosen = overrides.get(path.parent.name, meta.get("split"))
@@ -1056,6 +1100,7 @@ class VideoSessions(_Resumable, IterableDataset):
                     setup_weight=setup_weight,
                     held_previous=held_previous,
                     rung=rung,
+                    dagger=dagger,
                 )
             )
         if balance:

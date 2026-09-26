@@ -289,6 +289,36 @@ def build_parser():
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill.add_argument("--model", dest="model_path")
     drill.add_argument("--seed", type=int)
+    dagger = sub.add_parser(
+        "dagger-label",
+        help="DAgger: the scripted player's label for every decision of practice games, "
+        "from their frames and the inputs before each (dagger.py), for train-bc --dagger",
+    )
+    dagger.add_argument("recordings", nargs="+", help="Recording folders, or folders of them")
+    dagger.add_argument("--force", action="store_true", help="Label again what has labels")
+    dagger.add_argument("--jobs", type=int, default=1, help="Recordings labelled at once")
+    dagger.add_argument(
+        "--into",
+        help="A DAgger data folder to link every labelled game into (train-bc --dagger-data)",
+    )
+    dagger.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    dagger = sub.add_parser(
+        "dagger-score",
+        help="A policy's likelihood of the DAgger expert's labels on practice games (the "
+        "held-out ones of an aggregate): how well it acts as the expert would where a "
+        "learner led the game",
+    )
+    dagger.add_argument("checkpoint")
+    dagger.add_argument("recordings", nargs="+", help="Recording folders, or folders of them")
+    dagger.add_argument("--model", dest="model_path")
+    dagger = sub.add_parser(
+        "dagger-check",
+        help="How often the DAgger expert presses what the scripted player pressed, on the "
+        "scripted player's own recordings (drills or games), over their setup",
+    )
+    dagger.add_argument("recordings", nargs="+", help="Recording folders, or folders of them")
+    dagger.add_argument("--jobs", type=int, default=1, help="Recordings checked at once")
+    dagger.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill = sub.add_parser(
         "drills",
         help="The scripted player's setup alone, over and over, on the second PC: recorded "
@@ -724,6 +754,19 @@ def build_parser():
         action="store_true",
         help="Weigh every (arena, side) group of recordings the same in the loss "
         "(dataset.balance_weights)",
+    )
+    train.add_argument(
+        "--dagger",
+        type=float,
+        default=0.0,
+        help="Train practice games on the scripted player's labels for their decisions "
+        "(hoi4-arena dagger-label), each labelled decision at this weight (DAgger; 0: off)",
+    )
+    train.add_argument(
+        "--dagger-data",
+        nargs="+",
+        default=[],
+        help="Folders of practice games read beside DATA, as DAgger aggregates them",
     )
     train.add_argument(
         "--held-previous",
@@ -1198,6 +1241,22 @@ def _dispatch(command, args):
             fast=args["fast"],
             dry_run=args["dry_run"],
         )
+    elif command == "dagger-label":
+        from .dagger import aggregate, label_all
+
+        result = label_all(
+            args["recordings"], force=args["force"], jobs=args["jobs"], rules=args["rules"]
+        )
+        if args["into"]:
+            result["aggregate"] = aggregate(args["into"], args["recordings"])
+    elif command == "dagger-score":
+        from .dagger import expert_nll
+
+        result = expert_nll(args["checkpoint"], args["recordings"], model_path=args["model_path"])
+    elif command == "dagger-check":
+        from .dagger import check_all
+
+        result = check_all(args["recordings"], jobs=args["jobs"], rules=args["rules"])
     elif command == "drills":
         from .practice import drills
 
