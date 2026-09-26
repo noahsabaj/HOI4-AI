@@ -35,6 +35,10 @@ deploy; read before each session, so it changes without a restart):
      "record": {"name": "scripted-v6", "minutes": 240,
                 "args": ["--player", "scripted", "--mod", "artifacts/mods/arena-12x8-v4"]},
      "drill_minutes": 30, "practice_minutes": 30, "arenas": [...]}
+`ladder`, {"name": ..., "args": [...]}, makes the curriculum's rung saves here once per
+name (make-ladder, into artifacts/ladder-<name>) before anything else; an `evaluate` entry
+whose command is "rung-games" then plays full games from them (curriculum.py), into
+artifacts/learned/rung-<name>-<entry>.
 `record` is a run of full games for data (record-ai --peer-only, into
 artifacts/record-<name>), played once per name before the next round's drills. It holds
 the PC for its minutes: a restart waits for it, and <its folder>/DRAIN ends it after the
@@ -66,9 +70,12 @@ ARENAS = ["arena-12x8-v4", "arena-bay-v6", "arena-12x8-v4", "arena-river-v6", "a
           "arena-ford-v6"]  # fmt: skip
 # What each session writes, as a glob in its folder: its summary, or record-ai's results.
 SUMMARIES = {"practice": "practice-peer.json", "drills": "drills-peer.json",
-             "play-policy": "results-peer.json", "record-ai": "results-peer-*.json"}  # fmt: skip
+             "play-policy": "results-peer.json", "record-ai": "results-peer-*.json",
+             "rung-games": "rung-games.json", "make-ladder": "ladder.json"}  # fmt: skip
 # The sessions in which a learned checkpoint decides on this PC's GPU.
-POLICY = {"practice", "play-policy"}
+POLICY = {"practice", "play-policy", "rung-games"}
+# What each evaluation's folder is called after (artifacts/learned/<kind>-<name>-<entry>).
+KINDS = {"play-policy": "live", "rung-games": "rung"}
 
 
 def log(text):
@@ -119,6 +126,14 @@ def played(command, output):
         try:
             written = json.loads(path.read_text())
         except (OSError, ValueError):
+            continue
+        if command == "make-ladder":
+            if any(entry.get("rungs") for entry in written):
+                return True
+            continue
+        if command == "rung-games":
+            if any(game.get("winner") for game in written.get("games", [])):
+                return True
             continue
         if isinstance(written, list):
             if command == "record-ai":
@@ -204,6 +219,17 @@ def record(entry, run=hoi4):
     return True
 
 
+def ladder(entry, run=hoi4):
+    """The plan's rung saves (curriculum.make_ladder), made here once per name, before
+    any session that plays from them. Returns whether it ran."""
+    done = STATION / f"laddered-{entry['name']}"
+    if done.exists():
+        return False
+    session("make-ladder", f"artifacts/ladder-{entry['name']}", entry.get("args", []), run=run)
+    done.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    return True
+
+
 def main():
     STATION.mkdir(parents=True, exist_ok=True)
     log(f"started (pid {os.getpid()})")
@@ -211,6 +237,11 @@ def main():
     while not should_stop():
         lend_if_wanted()
         now = plan()
+        if now.get("ladder") and ladder(now["ladder"]):
+            if should_stop():
+                break
+            lend_if_wanted()
+            now = plan()
         if now.get("record") and record(now["record"]):
             if should_stop():
                 break
@@ -242,7 +273,7 @@ def main():
             if should_stop():
                 break
             lend_if_wanted()
-            kind = "live" if entry["command"] == "play-policy" else "practice"
+            kind = KINDS.get(entry["command"], "practice")
             output = f"artifacts/learned/{kind}-{name}-{entry['name']}"
             session(entry["command"], output, entry.get("args", []), run=with_checkpoint)
             done.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))

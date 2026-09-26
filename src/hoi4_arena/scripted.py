@@ -350,6 +350,8 @@ class Planner:
         self.debug_dir, self.kept = None, 0
         # Whether water cut the border in two at the start (draw_front).
         self.split_border = False
+        # The setup's steps the game started with done (a rung save): setup skips them.
+        self.done = frozenset()
 
     def order(self, kind, **details):
         self.orders.append({"frame": self.frame(), "order": kind, **details})
@@ -846,11 +848,19 @@ class Planner:
         return max(guard, self.left_behind + POCKET_GROWTH) if self.left_behind else guard
 
     def setup(self, desk):
-        """While paused: the army, its general, its front, its offensive; then run."""
-        self.form_army(desk)
-        self.assign_general(desk)
-        self.draw_front(desk)
-        if self.plan["attack"] in OFFENSIVES:
+        """While paused: the army, its general, its front, its offensive; then run. The
+        steps in `done` (a game from a rung save, curriculum.DONE) are skipped; the map is
+        still looked at once, for the land held at the start (incursion)."""
+        done = self.done
+        if "army" not in done:
+            self.form_army(desk)
+        if "general" not in done:
+            self.assign_general(desk)
+        if "front" not in done:
+            self.draw_front(desk)
+        else:
+            self.overview(desk)
+        if self.plan["attack"] in OFFENSIVES and "offensive" not in done:
             self.draw_offensive(desk)
         run_at(desk, self.rules, self.speed)
         self.running = True
