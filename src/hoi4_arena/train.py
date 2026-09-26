@@ -8,7 +8,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .dataset import GameSequences, VideoSessions, batch_to_device, window_loader
+from .dataset import (
+    GameSequences,
+    VideoSessions,
+    batch_to_device,
+    sequence_loader,
+    window_loader,
+)
 from .learning import Progress, save_checkpoint
 from .models import (
     CHUNK,
@@ -429,13 +435,7 @@ def _train_bc(
         trainset = GameSequences(
             dataset, sequence, batch_size, seed=seed, device=common["device"], clips=common["clips"]
         )
-        loader = torch.utils.data.DataLoader(
-            trainset,
-            batch_size=None,
-            num_workers=workers,
-            pin_memory=bool(workers) and device == "cuda",
-            persistent_workers=bool(workers),
-        )
+        loader = sequence_loader(trainset, workers=workers, device=device)
     else:
         # The regularizer needs two sequences. Plain behavior cloning can use a leftover one.
         loader = window_loader(

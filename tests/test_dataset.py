@@ -14,14 +14,17 @@ from hoi4_arena.dataset import (
     PERIOD_NS,
     QUADRANTS,
     VIEW_SIZE,
+    WORKER_THREADS,
     VideoSessions,
     batch_to_device,
     clip_frame_ids,
     cursor_crop,
     quadrants,
     recorded_speed,
+    sequence_loader,
     session_labels,
     views,
+    window_loader,
 )
 
 
@@ -413,3 +416,21 @@ def test_each_worker_reads_its_own_recordings_and_every_window_once(tmp_path, mo
     # Real worker processes, which on Windows start fresh and are sent the dataset.
     loader = dataset.window_loader(sessions, 1, workers=2)
     assert Counter(_key(w) for w in loader) == every
+
+
+class _Threads(torch.utils.data.IterableDataset):
+    """Yields the threads its loader worker computes with."""
+
+    def __iter__(self):
+        yield torch.tensor(torch.get_num_threads())
+
+
+@pytest.mark.parametrize("make", ["window", "sequence"])
+def test_a_loader_s_workers_compute_with_more_than_one_thread(make):
+    # bc5's carried-memory loader ran its worker on DataLoader's one thread, and the GPU
+    # waited on it (2026-09-25).
+    if make == "window":
+        loader = window_loader(_Threads(), None, workers=1)
+    else:
+        loader = sequence_loader(_Threads(), workers=1)
+    assert [int(n) for n in loader] == [WORKER_THREADS]

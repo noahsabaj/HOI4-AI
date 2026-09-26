@@ -935,12 +935,31 @@ def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=Fal
         drop_last=drop_last,
         num_workers=workers,
         pin_memory=bool(workers) and torch.device(device).type == "cuda",
-        worker_init_fn=_worker_threads if workers else None,
+        worker_init_fn=worker_threads if workers else None,
         persistent_workers=bool(workers),
     )
 
 
-def _worker_threads(_worker_id, threads=2):
-    """More than the one thread a DataLoader worker is given: with one, the views of a
-    frame took 46 ms (2026-09-24)."""
-    torch.set_num_threads(threads)
+def sequence_loader(sequences, *, workers=0, device="cpu"):
+    """GameSequences' batches (already batched: a carried memory's), prepared by `workers`
+    background processes as window_loader's are."""
+    return DataLoader(
+        sequences,
+        batch_size=None,
+        num_workers=workers,
+        pin_memory=bool(workers) and torch.device(device).type == "cuda",
+        worker_init_fn=worker_threads if workers else None,
+        persistent_workers=bool(workers),
+    )
+
+
+# Threads a loader worker computes its views with. A DataLoader worker gets one, and the
+# views of a 1080p frame then took 50 ms; with 2, 31 ms; with 4, 18 ms, and more gained
+# little (2026-09-25). A carried memory's loader was built without this until then: bc5's
+# only worker ran on one thread, and the GPU waited on it for two thirds of every step.
+WORKER_THREADS = 4
+
+
+def worker_threads(_worker_id, threads=None):
+    """Give a loader worker WORKER_THREADS threads (DataLoader's worker_init_fn)."""
+    torch.set_num_threads(threads or WORKER_THREADS)
