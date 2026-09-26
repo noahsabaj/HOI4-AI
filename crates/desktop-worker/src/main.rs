@@ -5,6 +5,8 @@ use std::{
 };
 
 #[cfg(windows)]
+mod audio;
+#[cfg(windows)]
 mod duplication;
 #[cfg(windows)]
 mod encoder;
@@ -2416,8 +2418,9 @@ mod platform {
 
     /// A live view of the attached game, for someone watching from a phone: ffmpeg
     /// captures the window by itself on the GPU (encoder::view_arguments), apart from any
-    /// recording's clock and capture, at `hz` frames a second (30 by default). Its video
-    /// comes as the stream `key`'s data, then `end` with why.
+    /// recording's clock and capture, at `hz` frames a second (30 by default), with the
+    /// game's own sound (audio::Capture) when `audio` is true. Its video comes as the
+    /// stream `key`'s data, then `end` with why.
     fn start_view(
         cmd: &serde_json::Value,
         hwnd: HWND,
@@ -2440,12 +2443,24 @@ mod platform {
         }
         let ffmpeg = crate::encoder::find_ffmpeg(exe_dir, std::env::var_os("PATH").as_deref())
             .ok_or("ffmpeg_not_found")?;
-        let args = crate::encoder::view_arguments(hwnd as usize, hz);
+        // The game's own sound when asked for (`audio`), and only the game's: a view goes
+        // on without it, saying why, when Windows will not capture it.
+        let (sound, silent) = if cmd["audio"].as_bool().unwrap_or(false) {
+            match crate::audio::Capture::start(unsafe { window_pid(hwnd) }) {
+                Ok(capture) => (Some(capture), None),
+                Err(why) => (None, Some(why)),
+            }
+        } else {
+            (None, None)
+        };
+        let args = crate::encoder::view_arguments(hwnd as usize, hz, sound.is_some());
         let offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (tag, ended) = (key.clone(), key.clone());
+        let audio = sound.is_some();
         let view = crate::encoder::View::start(
             &ffmpeg,
             &args,
+            sound,
             move |chunk| {
                 let at = offset.fetch_add(chunk.len() as u64, Ordering::SeqCst);
                 push(serde_json::json!({"stream": tag, "data": at}), chunk);
@@ -2457,7 +2472,13 @@ mod platform {
                 )
             },
         )?;
-        let reply = serde_json::json!({"view": key, "hz": hz, "encoder_pid": view.pid});
+        let mut reply = serde_json::json!({"view": key, "hz": hz, "encoder_pid": view.pid});
+        if cmd["audio"].as_bool().unwrap_or(false) {
+            reply["audio"] = serde_json::json!(audio);
+            if let Some(why) = silent {
+                reply["audio_error"] = serde_json::json!(why);
+            }
+        }
         Ok((view, reply))
     }
 

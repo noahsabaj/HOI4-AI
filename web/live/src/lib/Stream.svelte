@@ -1,7 +1,8 @@
 <script lang="ts">
 	// A PC's live stream (HLS). Attached while `src` is set and gone the moment it is not,
 	// so a finished game's last seconds never pass for live ones; started again at the live
-	// edge when the picture freezes for 20 s while it should play.
+	// edge when the picture freezes for 20 s while it should play. It starts muted, as
+	// browsers play nothing else by themselves, and keeps the game's sound once turned on.
 	import { onDestroy } from 'svelte';
 	import type Hls from 'hls.js';
 	import { nativeHls } from './format';
@@ -12,6 +13,23 @@
 	let hls: Hls | null = null;
 	let lastTime = -1;
 	let still = 0;
+	let sound = $state(false);
+
+	// Played with sound where the browser allows it, else muted rather than stopped.
+	function play() {
+		video.muted = !sound;
+		video.play().catch(() => {
+			if (video.muted) return;
+			sound = false;
+			video.muted = true;
+			video.play().catch(() => {});
+		});
+	}
+
+	function toggle() {
+		sound = !sound;
+		play();
+	}
 
 	function detach() {
 		hls?.destroy();
@@ -39,7 +57,7 @@
 			hls.loadSource(url);
 			hls.attachMedia(video);
 		}
-		video.play().catch(() => {});
+		play();
 	}
 
 	$effect(() => {
@@ -68,17 +86,41 @@
 
 <svelte:document onvisibilitychange={visible} />
 
-<!-- svelte-ignore a11y_media_has_caption -->
-<video
-	bind:this={video}
-	autoplay
-	muted
-	playsinline
-	controls
-	onerror={() => src && setTimeout(() => src && attach(src), 3000)}
-></video>
+<div class="player">
+	<!-- svelte-ignore a11y_media_has_caption -->
+	<video
+		bind:this={video}
+		autoplay
+		muted
+		playsinline
+		controls
+		onvolumechange={() => (sound = !video.muted)}
+		onerror={() => src && setTimeout(() => src && attach(src), 3000)}
+	></video>
+	{#if src}
+		<button class="sound" onclick={toggle} aria-pressed={sound}>
+			{sound ? 'Sound on' : 'Sound off'}
+		</button>
+	{/if}
+</div>
 
 <style>
+	.player {
+		position: relative;
+	}
+	.sound {
+		position: absolute;
+		top: 8px;
+		right: 8px;
+		padding: 4px 10px;
+		border: 0;
+		border-radius: 999px;
+		background: rgb(0 0 0 / 0.6);
+		color: #fff;
+		font: inherit;
+		font-size: 0.85rem;
+		cursor: pointer;
+	}
 	video {
 		display: block;
 		width: 100%;

@@ -33,9 +33,9 @@ STAMP = "%Y%m%d-%H%M%S"
 
 
 def piece_output(folder):
-    """The ffmpeg output (after `-map 0:v`) writing a stream into raw pieces in `folder`."""
+    """The ffmpeg output (after its maps) writing a stream into raw pieces in `folder`."""
     return [
-        "-c:v", "copy", "-f", "segment", "-segment_time", str(PIECE),
+        "-c:v", "copy", "-c:a", "copy", "-f", "segment", "-segment_time", str(PIECE),
         "-segment_format", "mpegts", "-reset_timestamps", "1", "-strftime", "1",
         str(Path(folder) / f"{STAMP}.ts"),
     ]  # fmt: skip
@@ -44,7 +44,7 @@ def piece_output(folder):
 def archive_command(ffmpeg, pieces, start, seconds, out, encoder="hevc_nvenc"):
     """ffmpeg joining `pieces` (a concat list file), cutting `seconds` from `start` seconds
     into them, as 720p at 30 frames a second, a keyframe every 5 s, the index at the front,
-    and its progress on stdout."""
+    and its progress on stdout; with the game's sound where the pieces have it."""
     quality = ["-preset", "p5", "-cq", "36", "-tag:v", "hvc1"]
     if encoder != "hevc_nvenc":
         quality = ["-crf", "30", "-tag:v", "hvc1"] if encoder == "libx265" else ["-crf", "28"]
@@ -52,8 +52,9 @@ def archive_command(ffmpeg, pieces, start, seconds, out, encoder="hevc_nvenc"):
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "4",
         "-f", "concat", "-safe", "0", "-i", str(pieces),
         "-ss", f"{max(0.0, start):.2f}", "-t", f"{seconds:.2f}",
+        "-map", "0:v", "-map", "0:a?",
         "-vf", "fps=30,scale=-2:720,format=yuv420p", "-c:v", encoder, *quality, "-g", "150",
-        "-an", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats",
+        "-af", "aresample=async=1", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats",
         "-f", "mp4", str(out),
     ]  # fmt: skip
 
