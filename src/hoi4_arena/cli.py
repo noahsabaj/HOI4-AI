@@ -42,6 +42,8 @@ NO_TORCH = {
     "control",
     "telemetry",
     "job",
+    # It only sends a session to the second PC: this PC's GPU stays with training.
+    "on-peer",
     "probe-peer",
     "capture",
     "win-rate",
@@ -53,7 +55,8 @@ NO_TORCH = {
 }
 
 
-def main():
+def build_parser():
+    """Every command's arguments (on-peer reads a session's own with it too)."""
     parser = argparse.ArgumentParser(description="Screen-only HOI4 research prototype")
     parser.add_argument(
         "--log-level",
@@ -871,6 +874,33 @@ def main():
         help="For run, the hoi4-arena command and its arguments; for script, the script "
         "and its arguments. Paths are inside the second PC's compute folder. Put -- first.",
     )
+    away = sub.add_parser(
+        "on-peer",
+        help="Run a practice, drills or play-policy session on the second PC itself, as a "
+        "job: its own Python plays its own game with the policy on its own GPU, and the "
+        "session's folder comes back here when it ends (on_peer.py)",
+    )
+    away.add_argument("--peer", required=True, help="The second PC's pairing file")
+    away.add_argument(
+        "--reservation",
+        help="Reserve the second PC under this name here first (artifacts/eval, as "
+        "play-policy's), and hand it back when the session ends",
+    )
+    away.add_argument("--id", dest="job_id", help="The job's name (default: command and time)")
+    away.add_argument(
+        "--no-deploy", dest="deploy", action="store_false",
+        help="Send no code or data first: what is there already",
+    )  # fmt: skip
+    away.add_argument(
+        "--keep-there", action="store_true",
+        help="Leave the session's folder on the second PC too (by default it is moved here)",
+    )  # fmt: skip
+    away.add_argument(
+        "session",
+        nargs=argparse.REMAINDER,
+        help="The session's command as it would run here, with its --peer (the same "
+        "pairing file, whose copy there reaches its own bridge). Put -- first.",
+    )
     template = sub.add_parser("template")
     template.add_argument("screenshot")
     template.add_argument("rules")
@@ -1020,7 +1050,11 @@ def main():
     critic.add_argument(
         "--trunk", action="store_true", help="Also train the shared trunk, not only the head."
     )
-    args = vars(parser.parse_args())
+    return parser
+
+
+def main():
+    args = vars(build_parser().parse_args())
     command = args.pop("command")
     logging.basicConfig(
         level=getattr(logging, args.pop("log_level").upper()),
@@ -1323,8 +1357,17 @@ def _dispatch(command, args):
     elif command == "job":
         from .remote import RemoteDesktop
 
-        with RemoteDesktop(args["peer"], attach=False) as desktop:
+        # An observer: the full connection may be held by a game, there or here.
+        with RemoteDesktop(args["peer"], attach=False, observer=True) as desktop:
             print(desktop.job(args["action"], args["job_id"], args["kind"], args["args"]))
+    elif command == "on-peer":
+        from .on_peer import run_on_peer
+
+        session = args["session"][1:] if args["session"][:1] == ["--"] else args["session"]
+        result = run_on_peer(
+            session, args["peer"], reservation=args["reservation"], job_id=args["job_id"],
+            deploy_first=args["deploy"], keep_there=args["keep_there"],
+        )  # fmt: skip
     elif command == "template":
         from .vision import add_template
 

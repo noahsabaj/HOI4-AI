@@ -153,10 +153,15 @@ public static class Hoi4Bridge {
         try { stream.Write(line, 0, line.Length); stream.Flush(); } catch (Exception) {}
         Console.WriteLine("Refused a connection: " + why);
     }
-    private static void Serve(TcpClient client, X509Certificate2 cert, string peer, string token, string exe) {
+    // Connections come from the coordinator, or from this PC itself: a session that runs
+    // here as a compute job (hoi4-arena on-peer) plays this PC's game through the bridge
+    // like any other, so it holds the one full connection, a recording from the coordinator
+    // is told worker_busy meanwhile, and its worker is counted before an update swaps in.
+    private static void Serve(TcpClient client, X509Certificate2 cert, string peer, string bind, string token, string exe) {
         using (client)
         using (var tls = new SslStream(client.GetStream(), false)) {
-            if (!((IPEndPoint)client.Client.RemoteEndPoint).Address.Equals(IPAddress.Parse(peer))) return;
+            var from = ((IPEndPoint)client.Client.RemoteEndPoint).Address;
+            if (!from.Equals(IPAddress.Parse(peer)) && !from.Equals(IPAddress.Parse(bind))) return;
             // A frame's row or a reply goes out at once, not after the last video bytes are
             // acknowledged (Nagle's wait, which the other side's delayed acknowledgement can
             // stretch to 200 ms). And a peer that vanished without closing (its PC off, its
@@ -254,7 +259,7 @@ public static class Hoi4Bridge {
                     var client = listener.AcceptTcpClient();
                     Interlocked.Increment(ref connections);
                     Task.Run(() => {
-                        try { Serve(client, cert, peer, token, exe); }
+                        try { Serve(client, cert, peer, bind, token, exe); }
                         finally { Interlocked.Decrement(ref connections); }
                     });
                     continue;

@@ -501,6 +501,15 @@ it had been installed by hand on this PC only, and elsewhere the head silently r
 eagerly. The newest Triton, 3.8, was no faster and not bit-exact with the eager head, so
 3.6 stays until PyTorch moves.
 
+**Where the policy decides, 2026-09-26.** A trained checkpoint's own decision
+(`time_policy.py --checkpoint`, bc5 epoch 0, `Actor.act` as practice runs it) on the
+second PC's GPU while its HOI4 played and recorded drills and practice there: 40.8-44.5 ms
+p50 and 44.7-46.9 ms p95 over three runs of 300-600 decisions, 367 MiB of GPU at peak,
+about 4 GB of commit charge for the process. The same checkpoint deciding live on this PC,
+beside the bc6 trainer, in that morning's practice from here: 68.7 ms p50, 87.6 ms p95
+(3031 decisions), and each tick's capture across the network another 127 ms p50. So
+`hoi4-arena on-peer` runs practice, drills and play-policy on the second PC itself.
+
 **`train-memory`, 2026-09-24.** One seed of the memory study's six arms (seed 1, 8
 epochs each, cache on the NVMe) took 64.1 min before and 21.2 min after. Every run was
 identical to the bit: each update's loss, the report and every tensor of the saved head.

@@ -44,7 +44,11 @@ $projects = Join-Path $compute 'projects'
 $jobs = Join-Path $PSScriptRoot 'jobs'
 $python = Join-Path $compute '.venv\Scripts\python.exe'
 New-Item -ItemType Directory -Force -Path $jobs | Out-Null
-$Commands = @('train-memory', 'train-bc', 'train-idm', 'train-critic', 'cache-features', 'label', 'check-session')
+# The sessions that play HOI4 here (practice, drills, play-policy) run as jobs too, so the
+# policy they play with runs on this PC's GPU (hoi4-arena on-peer). They drive this PC's
+# game through the bridge, like any connection from the coordinator.
+$Commands = @('train-memory', 'train-bc', 'train-idm', 'train-critic', 'cache-features', 'label', 'check-session',
+    'practice', 'drills', 'play-policy')
 $Scripts = @('memory_study.py', 'benchmark_policy.py', 'time_policy.py', 'codec_fidelity.py')
 
 function Read-Job([string]$JobId) {

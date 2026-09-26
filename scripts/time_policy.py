@@ -16,6 +16,13 @@ does not depend on what the screen shows), with the weights the live actor uses
     python scripts/time_policy.py --output artifacts/time-policy.json
 
 Run it with the GPU otherwise idle: a training run beside it doubles every number.
+
+With `--checkpoint`, it times a trained checkpoint's own decision instead, as play-policy
+and practice make it (runner.Actor.act, lean, its head compiled), on random views of the
+sizes the worker hands over, with what its process holds (a second PC running HOI4
+launches only while its commit charge leaves room for a game):
+
+    python scripts/time_policy.py --checkpoint artifacts/learned/bc5/epoch-0000.pt
 """
 
 import argparse
@@ -54,13 +61,58 @@ def timed(fn, steps, warm=10):
     return percentiles(times)
 
 
+def time_actor(checkpoint, model_path, steps):
+    """A checkpoint's decisions as a live game makes them, one every 200 ms of game clock."""
+    import numpy as np
+    import psutil
+
+    from hoi4_arena.layout import VIEW_SIZE
+    from hoi4_arena.runner import Actor
+
+    actor = Actor(checkpoint, model_path, game_speed=5)
+    actor.lean = True
+    rng = np.random.default_rng(0)
+    views = (
+        rng.integers(0, 256, (*VIEW_SIZE, 3), dtype=np.uint8),
+        rng.integers(0, 256, (4, *DETAIL_SIZE, 3), dtype=np.uint8),
+        rng.integers(0, 256, (FOVEA_SIZE, FOVEA_SIZE, 3), dtype=np.uint8),
+    )
+    clock = [0]
+
+    def decide():
+        clock[0] += 200_000_000
+        actor.act(None, clock[0], precomputed=views)
+
+    decision = timed(decide, steps, warm=20)
+    memory = psutil.Process().memory_info()
+    return {
+        "gpu": torch.cuda.get_device_name(),
+        "checkpoint": str(checkpoint),
+        "compiled_head": bool(actor.compiled),
+        "steps": steps,
+        "decision": decision,
+        "peak_mib": round(torch.cuda.max_memory_allocated() / 2**20),
+        # Windows' private bytes are the process's commit charge; rss its working set.
+        "process_private_mib": round(getattr(memory, "private", 0) / 2**20),
+        "process_rss_mib": round(memory.rss / 2**20),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="models/qwen3-vit-88m")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--output", default="artifacts/time-policy.json")
+    parser.add_argument("--checkpoint", help="Time this checkpoint's decision (see above)")
     args = parser.parse_args()
     torch.manual_seed(0)
+    if args.checkpoint:
+        model = None if args.model == parser.get_default("model") else args.model
+        report = time_actor(args.checkpoint, model, args.steps)
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2))
+        return
     device = "cuda"
     policy = halve_frozen(Policy(ScreenEncoder(args.model))).to(device).eval()
     report = {"gpu": torch.cuda.get_device_name(), "steps": args.steps}
