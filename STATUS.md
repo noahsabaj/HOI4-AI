@@ -1131,8 +1131,14 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   tower frozen (`--train-last 0`). Then what the tower reads from a frame never changes,
   so `cache-tower` runs it once over every frame and `--tower-cache` reads the result:
   the summary, and the patch grid already resized to the 32x32 cells (the policy's 1x1
-  convolution and the resize commute), 1.5 MB a frame. The tower was about a third of a
-  training step. A test holds the cached path to the running tower's outputs.
+  convolution and the resize commute). The tower was about a third of a training step. A
+  test holds the cached path to the running tower's outputs. Since 2026-09-26 the grid is
+  int8 with a scale per frame and channel by default (`--bf16` for the old 1.5 MB a
+  frame), and only the frames a decision reads are kept (~94% of a 5 Hz recording's): one
+  real game's cache fell from 1.57 MB to 0.74 MB a recorded frame. A build works out its
+  whole size first and refuses one its drive cannot hold (`--dry-run` only reports it);
+  it goes onto a second drive only when `--spill` names one. The Qwen3.5-4B model's tower
+  (1024 wide) needs 340 GiB for scripted-v6's 218 games this way, against ~724 in bfloat16.
 - **Memory carried through a game** (`--carry`): each batch slot plays one game window
   after window in order, and its memory goes on from one window to the next (truncated
   backpropagation through time). It was chosen from the memory study's verdict, which is

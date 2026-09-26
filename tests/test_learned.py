@@ -548,7 +548,7 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
     import hoi4_arena.train as train
     from hoi4_arena.dataset import batch_to_device
     from hoi4_arena.models import ScreenEncoder
-    from hoi4_arena.tower_cache import cache_tower
+    from hoi4_arena.tower_cache import cache_tower, tower_paths
 
     def small(path=None, variant="screen", **_):
         return ScreenEncoder(pretrained=False, size=(32, 64))
@@ -567,19 +567,11 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
         {"policy": policy.state_dict(), "config": {"model_path": "x", "variant": "screen"}},
         checkpoint,
     )
-    report = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
-    assert report["recordings"] == 2 and report["frames"] == 80
-    again = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu")
+    report = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu", int8=False)
+    # 40 frames at 10 Hz: a decision every 0.2 s reads only every other one.
+    assert report["recordings"] == 2 and report["frames"] == 80 and report["kept"] == 40
+    again = cache_tower(data, checkpoint, tmp_path / "cache", device="cpu", int8=False)
     assert again["skipped"] == 2 and again["recordings"] == 0, "a finished recording stays"
-    # A drive that would keep too little free sends the recordings to the spill folder.
-    from hoi4_arena.tower_cache import tower_paths
-
-    full = cache_tower(
-        data, checkpoint, tmp_path / "full", device="cpu", spill=tmp_path / "spill",
-        keep_free_gb=1e9,
-    )  # fmt: skip
-    assert full["spilled"] == 2
-    assert tower_paths(tmp_path / "full", "game")["grid"].parent.parent == tmp_path / "spill"
 
     common = {"sources": ("scripted",), "length": 3, "burn_in": 1, "device": "cpu",
               "clips": False, "lead_in": 0, "shuffle": 0}  # fmt: skip
@@ -597,18 +589,47 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
         )  # fmt: skip
     for a, b in zip(run, read, strict=True):
         assert torch.allclose(a.float(), b.float(), atol=0.1, rtol=0.05)
-    # Kept as int8 (half the space), it reads back within half a step of the scale, plus
-    # bfloat16's rounding of both (a 2**-8 part of the value each).
-    cache_tower(data, checkpoint, tmp_path / "small", device="cpu", int8=True)
-    assert tower_paths(tmp_path / "small", "game")["scale"].exists()
+    # By default kept as int8 (half the space), it reads back within half a step of the
+    # scale, plus bfloat16's rounding of both (a 2**-8 part of the value each).
+    small = cache_tower(data, checkpoint, tmp_path / "small", device="cpu")
+    assert small["frame_bytes"] < report["frame_bytes"] * 0.51
+    found = tower_paths(tmp_path / "small", "game")
+    assert found["scale"].exists() and np.load(found["grid"]).dtype == np.int8
     small_grid = next(iter(VideoSessions(data, tower=tmp_path / "small", **common)))["tower_grid"]
     step = cached["tower_grid"].float().abs().amax((-2, -1), keepdim=True) / 127
     bound = step * 0.5 + cached["tower_grid"].float().abs() * 2**-7
     assert ((small_grid.float() - cached["tower_grid"].float()).abs() <= bound).all()
+    # A cache from before only the decisions' frames were kept holds every frame and no
+    # rows file; it reads the same.
+    import hoi4_arena.tower_cache as tower_cache
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tower_cache, "kept_frames", lambda times: np.arange(len(times)))
+        cache_tower(data, checkpoint, tmp_path / "old", device="cpu")
+    for name in ("game", "held-out"):
+        (tmp_path / "old" / name / tower_cache.ROWS_FILE).unlink()
+    assert np.load(tower_paths(tmp_path / "old", "game")["grid"]).shape[0] == 40
+    old = next(iter(VideoSessions(data, tower=tmp_path / "old", **common)))
+    assert torch.equal(old["tower_grid"], small_grid)
+    # A build the drive cannot hold is refused before it writes anything.
+    with pytest.raises(RuntimeError, match="no room"):
+        cache_tower(data, checkpoint, tmp_path / "full", device="cpu", keep_free_gb=1e9)
+    assert not (tmp_path / "full" / "game").exists()
+    # With a second drive named, what the first cannot hold goes there, and is found.
+    need = tower_cache.recording_bytes(40, 20, 768)
+    monkeypatch.setattr(tower_cache, "_drive", lambda p: "spill" in str(p))
+    monkeypatch.setattr(
+        tower_cache, "_free", lambda p: 10 * 2**30 if "spill" in str(p) else 2**30 + need * 1.5
+    )
+    full = cache_tower(
+        data, checkpoint, tmp_path / "full", device="cpu", spill=tmp_path / "spill", keep_free_gb=1
+    )  # fmt: skip
+    assert full["spilled"] == 1 and full["recordings"] == 2
+    assert tower_paths(tmp_path / "full", "held-out")["grid"].parent.parent == tmp_path / "spill"
 
     common = {"sources": ("scripted",), "sequence": 2, "burn_in": 1, "workers": 0, "lead_in": 0}
     train.train_bc(data, "model", tmp_path / "out", train_last=0, init=checkpoint,
-                   tower_cache=tmp_path / "cache", **common)  # fmt: skip
+                   tower_cache=tmp_path / "small", **common)  # fmt: skip
     rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
     assert rows[-1]["validation_nll"] > 0
     with pytest.raises(ValueError, match="another tower"):
@@ -617,6 +638,48 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="frozen tower"):
         train.train_bc(data, "model", tmp_path / "unfrozen", init=checkpoint,
                        tower_cache=tmp_path / "cache", **common)  # fmt: skip
+
+
+def test_the_tower_cache_keeps_every_frame_a_decision_reads_whatever_the_lead_in(tmp_path):
+    from hoi4_arena.tower_cache import kept_frames
+
+    _scripted(tmp_path / "game")
+    lines = (tmp_path / "game" / "frames.jsonl").read_text().splitlines()
+    # About 10 Hz with jitter, and a stall halfway.
+    rng = np.random.default_rng(0)
+    times = np.cumsum(rng.integers(60_000_000, 140_000_000, len(lines)))
+    times[len(lines) // 2 :] += 1_200_000_000
+    rows = [{**json.loads(line), "t_ns": int(t)} for line, t in zip(lines, times, strict=True)]
+    (tmp_path / "game" / "frames.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    kept = set(kept_frames(times).tolist())
+    assert len(kept) < len(lines)
+    for lead_in in (0, 1, 3, None):
+        labels = session_labels(tmp_path / "game", sources=("scripted",), lead_in=lead_in)
+        assert set(labels["frame_ids"].tolist()) <= kept
+
+
+def test_a_tower_cache_build_is_placed_before_it_starts(tmp_path, monkeypatch):
+    """The output's drive takes what it can, a named second drive the rest, and a build
+    that fits neither is refused with the numbers. A folder on the output's own drive is
+    no second drive."""
+    import hoi4_arena.tower_cache as tower_cache
+
+    gb = 2**30
+    drives = {"fast": 10 * gb, "slow": 100 * gb}
+    monkeypatch.setattr(tower_cache, "_drive", lambda p: "slow" if "slow" in str(p) else "fast")
+    monkeypatch.setattr(tower_cache, "_free", lambda p: drives[tower_cache._drive(p)])
+    todo = [(f"r{i}", 3 * gb) for i in range(3)]
+    chosen, placed = tower_cache.plan_drives(todo, tmp_path / "fast", tmp_path / "slow", 2)
+    assert [chosen[f"r{i}"].parent.name for i in range(3)] == ["fast", "fast", "slow"]
+    assert placed[tmp_path / "fast"][:2] == [2, 6 * gb]
+    with pytest.raises(RuntimeError, match=r"needs 9.0 GB .* 1 recordings \(3.0 GB\) have no"):
+        tower_cache.plan_drives(todo, tmp_path / "fast", None, 2)
+    with pytest.raises(RuntimeError, match="no room"):
+        tower_cache.plan_drives(todo, tmp_path / "fast", tmp_path / "fast-too", 2)
+    # A half-written recording's files are overwritten in place: their space counts.
+    monkeypatch.setattr(tower_cache, "_partial", lambda f: 2 * gb if f.name == "r2" else 0)
+    chosen, _ = tower_cache.plan_drives(todo, tmp_path / "fast", None, 2)
+    assert chosen["r2"] == tmp_path / "fast" / "r2"
 
 
 @needs_ffmpeg
