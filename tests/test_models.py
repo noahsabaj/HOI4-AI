@@ -331,3 +331,33 @@ def test_the_gpu_memory_cap_is_a_fraction_and_optional():
             torch.empty(int(total * 0.6 * 2**20), dtype=torch.uint8, device="cuda")
     finally:
         limit_gpu_memory(1.0)
+
+
+class _Wider(_Encoder):
+    dim = 12
+
+
+def test_a_policy_carries_over_to_another_tower_all_but_what_is_sized_to_it():
+    from hoi4_arena.train import load_carried
+
+    torch.manual_seed(0)
+    old = Policy(_Encoder(), memory_dim=16)
+    same = Policy(_Encoder(), memory_dim=16)
+    assert load_carried(same, old.state_dict()) == []
+    assert all(torch.equal(a, b) for a, b in zip(same.parameters(), old.parameters()))
+    new = Policy(_Wider(), memory_dim=16)
+    fresh = load_carried(new, old.state_dict())
+    assert {name.split(".")[0] for name in fresh} == {"global_cells", "fusion"}
+    assert torch.equal(new.memory.weight_hh, old.memory.weight_hh)
+    assert torch.equal(new.actor.init.weight, old.actor.init.weight)
+
+
+def test_a_tower_folder_names_its_timm_model(tmp_path):
+    import json
+
+    from hoi4_arena.models import ScreenEncoder, tower_arch
+
+    assert tower_arch(tmp_path) == ScreenEncoder.ARCH, "no config: the 0.8B model's tower"
+    config = {"architecture": "qwen3_vit_306m_enc", "pretrained_cfg": {"tag": "qwen3_5_4b"}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert tower_arch(tmp_path) == "qwen3_vit_306m_enc.qwen3_5_4b"
