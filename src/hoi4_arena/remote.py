@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import socket
 import ssl
 import threading
+import time
 from pathlib import Path
 
 from .desktop import Desktop, DesktopError, read_reply, worker_executable
@@ -16,16 +18,53 @@ from .desktop import Desktop, DesktopError, read_reply, worker_executable
 log = logging.getLogger(__name__)
 
 
+def open_tls(spec, context, wait=0.0, *, pause=2.0):
+    """The TLS connection to the worker `spec` (a pairing) names, tried again every
+    `pause` seconds for up to `wait` seconds while it cannot be made: while fleet's tunnel
+    is down (a node restart ends its connections) or up with no bridge behind it (the
+    service restarting), the connection is refused, or closed during the handshake. With
+    `wait` 0 the first failure is raised, as it always was."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            raw = socket.create_connection((spec["host"], spec["port"]), timeout=10)
+            try:
+                return context.wrap_socket(raw, server_hostname=spec["host"])
+            except BaseException:
+                raw.close()
+                raise
+        except OSError as error:  # Refused, reset, closed mid-handshake (ssl's are OSErrors).
+            if time.monotonic() + pause > deadline:
+                raise
+            log.info("no worker at %s:%s yet (%s)", spec["host"], spec["port"], error)
+            time.sleep(pause)
+
+
+def is_loopback(spec):
+    """Whether a pairing names this PC's loopback: fleet's worker service, reached on its
+    own PC or through `fleet tunnel`, not the old bridge on the second PC's LAN address."""
+    try:
+        return ipaddress.ip_address(spec.get("host", "")).is_loopback
+    except ValueError:
+        return spec.get("host") == "localhost"
+
+
 class RemoteDesktop(Desktop):
     encoding = "lz4"
 
-    def __init__(self, config, *, attach: bool = True, observer: bool = False):
+    def __init__(
+        self, config, *, attach: bool = True, observer: bool = False, wait: float | None = None
+    ):
         """Connect to the second PC's worker. `attach=False` as for Desktop: the control
         operations need no game running there.
 
         `observer=True` asks for a read-only connection beside the one that holds the game:
         telemetry, `report`, captures, the game log, and no input, launches or recording.
         A bridge from before observers refuses it by closing the connection.
+
+        `wait`: seconds to keep trying while the worker cannot be reached (open_tls). By
+        default the pairing's `reconnect_seconds`: a fleet pairing (collect_station.py)
+        waits out a tunnel or service restart, the old LAN pairing fails at once.
         """
         from collections import deque
 
@@ -38,8 +77,8 @@ class RemoteDesktop(Desktop):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE  # Exact certificate pin is verified below.
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        raw = socket.create_connection((spec["host"], spec["port"]), timeout=10)
-        self.socket = context.wrap_socket(raw, server_hostname=spec["host"])
+        wait = float(spec.get("reconnect_seconds", 0)) if wait is None else wait
+        self.socket = open_tls(spec, context, wait)
         pin = hashlib.sha256(self.socket.getpeercert(binary_form=True)).hexdigest()
         if not hmac.compare_digest(pin, spec["certificate_sha256"]):
             self.socket.close()

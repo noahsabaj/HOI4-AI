@@ -5,7 +5,7 @@
 
 Round after round: setup drills, then, once the plan names a learned checkpoint, that
 checkpoint's one-off evaluation sessions and its coached practice. Each session is a
-`hoi4-arena` command run here against this PC's own worker, and each finished session's
+`hoi4-arena` command run here against this PC's own worker (peer()), and each finished session's
 folder is listed in artifacts/station/finished.jsonl for scripts/collect_station.py on the
 training PC, which pulls it back and deletes it here.
 
@@ -39,6 +39,10 @@ PLAN = STATION / "plan.json"
 FINISHED = STATION / "finished.jsonl"
 DRAIN = STATION / "DRAIN"
 PEER = "artifacts/pairing/peer.json"
+# The worker as fleet's service `hoi4-worker` on this PC's own loopback, once
+# `collect_station.py deploy --worker` has shipped it (the cutover); until then the old
+# at-logon bridge, at this PC's LAN address.
+FLEET_PEER = "artifacts/pairing/peer-fleet.json"
 ARENAS = ["arena-12x8-v4", "arena-bay-v6", "arena-12x8-v4", "arena-river-v6", "arena-12x8-v4",
           "arena-plains-v6", "arena-12x8-v4", "arena-passes-v6", "arena-12x8-v4",
           "arena-marsh-v6", "arena-12x8-v4", "arena-salient-v6", "arena-12x8-v4",
@@ -57,6 +61,11 @@ def flag(name):
     return Path(path) if path and Path(path).exists() else None
 
 
+def peer():
+    """The pairing this session's commands use, looked at before each one."""
+    return FLEET_PEER if Path(FLEET_PEER).exists() else PEER
+
+
 def hoi4(*args):
     return subprocess.run([sys.executable, "-m", "hoi4_arena", *args]).returncode
 
@@ -68,7 +77,7 @@ def lend_if_wanted(poll=10.0, quit_game=None):
     if wanted is None:
         return False
     log("fleet wants the GPU: closing HOI4 and lending it")
-    (quit_game or (lambda: hoi4("control", "quit", "--peer", PEER)))()
+    (quit_game or (lambda: hoi4("control", "quit", "--peer", peer())))()
     lent = Path(os.environ["FLEET_YIELD_LENT"])
     lent.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
     while wanted.exists():
@@ -102,7 +111,7 @@ def played(command, output):
 def session(command, output, args, run=hoi4):
     """One session here; its folder is listed for collection whatever happened."""
     log(f"{command} {output} {' '.join(args)}")
-    code = run(command, output, "--peer", PEER, *args)
+    code = run(command, output, "--peer", peer(), *args)
     STATION.mkdir(parents=True, exist_ok=True)
     ok = code == 0 and played(command, output)
     with FINISHED.open("a", encoding="utf-8") as handle:

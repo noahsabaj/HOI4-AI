@@ -163,9 +163,18 @@ def clear_stream(out):
 def update_pending(peer, share=None):
     """Whether a new worker waits on the second PC's share (Deploy-Peer stages it as
     .new beside the running one). Its bridge swaps it in only while no connection is
-    open there, so a view that never closed would keep every update out."""
+    open there, so a view that never closed would keep every update out.
+
+    Never for a pairing on this PC's loopback (fleet's worker service, reached through
+    `fleet tunnel`): there is no share, and the service's restart closes a view that has
+    watched a while by itself, which then connects again."""
+    from ..remote import is_loopback
+
     try:
-        share = share or f"//{json.loads(Path(peer).read_text())['host']}/HOI4Worker"
+        spec = json.loads(Path(peer).read_text())
+        if share is None and is_loopback(spec):
+            return False
+        share = share or f"//{spec['host']}/HOI4Worker"
         return (Path(share) / "hoi4-desktop-worker.exe.new").exists()
     except (OSError, ValueError, KeyError):
         return False
@@ -235,7 +244,9 @@ class PeerView:
         command = view_command(self.ffmpeg, self.out, next_segment(self.out), self.raw)
         self.proc = subprocess.Popen(command, stdin=subprocess.PIPE)
         try:
-            self.desk = RemoteDesktop(self.peer, attach=True, observer=True)
+            # Not waiting for a worker that is not there (a fleet pairing would): the
+            # round goes on, and the view is asked for again in 5 s.
+            self.desk = RemoteDesktop(self.peer, attach=True, observer=True, wait=0)
             self.desk.streams["view"] = self.deliver
             # With its sound: a worker from before sound ignores `audio` and sends none.
             reply = self.desk.request("view", action="start", key="view", hz=self.hz, audio=True)

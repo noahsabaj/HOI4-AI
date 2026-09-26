@@ -457,6 +457,19 @@ def test_the_view_steps_aside_while_a_new_worker_waits(tmp_path):
     assert not live.update_pending(tmp_path / "missing.json")
 
 
+def test_a_view_through_fleet_s_tunnel_never_looks_for_the_share(tmp_path, monkeypatch):
+    """A pairing on this PC's loopback is fleet's worker service: no share to look in (a
+    look at //127.0.0.1 would ask this PC's own file sharing every round)."""
+    from pathlib import Path
+
+    peer = tmp_path / "peer-fleet.json"
+    peer.write_text(json.dumps({"host": "127.0.0.1", "port": 47941}))
+    looked = []
+    monkeypatch.setattr(Path, "exists", lambda self: looked.append(self) or True)
+    assert not live.update_pending(peer)
+    assert not looked
+
+
 class FakeProcess:
     def __init__(self):
         self.stdin, self.returncode = io.BytesIO(), None
@@ -477,8 +490,9 @@ def fake_worker(monkeypatch, requests, refuse=False):
     from hoi4_arena.desktop import DesktopError
 
     class Desk:
-        def __init__(self, peer, attach=True, observer=False):
+        def __init__(self, peer, attach=True, observer=False, wait=None):
             assert attach and observer  # Read-only, beside the recording's connection.
+            assert wait == 0, "the round goes on: no waiting for a worker that is not there"
             self.streams = {}
 
         def request(self, op, timeout=10, **fields):
