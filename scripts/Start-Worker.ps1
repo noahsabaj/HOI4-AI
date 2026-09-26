@@ -3,51 +3,99 @@
 #
 # .\Start-Worker.ps1            Run the worker bridge here, restarting it after updates.
 # .\Start-Worker.ps1 -Install   Also start it hidden at every logon, and (re)start it now.
-#                               Undo with -Stop, then delete "HOI4 Worker" from shell:startup.
-# .\Start-Worker.ps1 -Stop      Stop a running worker, hidden or not.
+#                               Undo with -Uninstall.
+# .\Start-Worker.ps1 -Stop      Stop a running at-logon bridge, hidden or not, and its workers.
+# .\Start-Worker.ps1 -Uninstall -Stop, and remove its "HOI4 Worker" shortcut from shell:startup.
+#                               -DryRun with either lists what it would stop and remove.
 # The worker has no window to close by accident. Its output goes to worker.log beside this
 # script, which the first PC can read through the share.
-param([switch]$Install, [switch]$Stop, [switch]$Bridge)
+#
+# .\Start-Worker.ps1 -Service   The bridge as a fleet service, run from the project's folder:
+#     fleet service add hoi4-worker --on <second-pc-node> --name hoi4-ai -- \
+#         pwsh -NoProfile -File scripts/Start-Worker.ps1 -Service
+#   It listens on 127.0.0.1 only: sessions on that PC connect there, and other PCs through
+#   `fleet tunnel <node> 47941`, inside fleet's TLS. It runs in the foreground and logs to
+#   stdout (fleet logs); fleet starts it with the node and again when it exits. It exits
+#   when the file named by FLEET_RESTART_WANTED exists (fleet service restart) and nothing
+#   holds it back (RunService), and takes the worker that shipped with the project on its
+#   next start. The pairing's certificate and token still guard every connection.
+#   -Pairing (server.json, worker.pfx), -Worker and -Mods are relative to the project's
+#   folder; -Port replaces the pairing's; -QuietSeconds is how long a restart waits after
+#   the last game connection, and how old an observer must be not to hold one back.
+param(
+    [switch]$Install, [switch]$Stop, [switch]$Uninstall, [switch]$DryRun, [switch]$Bridge,
+    [switch]$Service,
+    [string]$Pairing = 'artifacts\pairing\second-pc',
+    [string]$Worker = 'artifacts\worker\hoi4-desktop-worker.exe',
+    [string]$Mods = 'artifacts\mods',
+    [int]$Port = 0,
+    [int]$QuietSeconds = 30
+)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $pwsh = (Get-Process -Id $PID).Path
 $log = Join-Path $PSScriptRoot 'worker.log'
+$shortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'HOI4 Worker.lnk'
 
-function Stop-Worker {
+function Get-AtLogonBridge {
+    # The at-logon bridge, wherever its script is: the pwsh supervisor and bridge running a
+    # script of this name (never a fleet service's, nor another -Stop or -Install), and the
+    # workers those bridges started. Workers of anything else, such as a fleet service's
+    # bridge or a recorder on this PC, are not its.
     $script = Split-Path $PSCommandPath -Leaf
-    Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*$script*" -and $_.CommandLine -notlike '* -Install*' -and $_.CommandLine -notlike '* -Stop*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Get-Process hoi4-desktop-worker -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $all = @(Get-CimInstance Win32_Process)
+    $bridges = @($all | Where-Object {
+            $_.Name -eq 'pwsh.exe' -and $_.ProcessId -ne $PID -and $_.CommandLine -like "*$script*" -and
+            $_.CommandLine -notmatch ' -(Service|Install|Stop|Uninstall)\b'
+        })
+    $ids = @($bridges | ForEach-Object ProcessId)
+    $workers = @($all | Where-Object { $_.Name -eq 'hoi4-desktop-worker.exe' -and $ids -contains $_.ParentProcessId })
+    [pscustomobject]@{ Bridges = $bridges; Workers = $workers }
 }
 
-if ($Stop) {
+function Stop-Worker {
+    $found = Get-AtLogonBridge
+    foreach ($process in @($found.Bridges) + @($found.Workers)) {
+        $line = "$($process.Name) $($process.ProcessId): $($process.CommandLine)"
+        if ($DryRun) { Write-Output "would stop $line"; continue }
+        # The supervisor first, so it cannot start the bridge again.
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Output "stopped $line"
+    }
+    if (-not @($found.Bridges).Count) { Write-Output 'No at-logon bridge is running.' }
+}
+
+if ($Stop -or $Uninstall) {
     Stop-Worker
-    Write-Output 'Stopped the HOI4 worker.'
+    if ($Uninstall) {
+        if (-not (Test-Path -LiteralPath $shortcut)) { Write-Output "No $shortcut." }
+        elseif ($DryRun) { Write-Output "would remove $shortcut" }
+        else { Remove-Item -LiteralPath $shortcut; Write-Output "removed $shortcut" }
+    }
+    if (-not $DryRun) { Write-Output 'Stopped the HOI4 worker.' }
     return
 }
 
 if ($Install) {
-    $link = Join-Path ([Environment]::GetFolderPath('Startup')) 'HOI4 Worker.lnk'
     # A path that survives PowerShell updates: the Store build's own path names its version.
     $stable = @(
         (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
         (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe')
     ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
-    $shortcut.TargetPath = if ($stable) { $stable } else { $pwsh }
-    $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -File `"$PSCommandPath`""
-    $shortcut.WorkingDirectory = $PSScriptRoot
-    $shortcut.WindowStyle = 7  # Minimized, for the moment before -WindowStyle hides it.
-    $shortcut.Save()
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    $link.TargetPath = if ($stable) { $stable } else { $pwsh }
+    $link.Arguments = "-NoProfile -WindowStyle Hidden -File `"$PSCommandPath`""
+    $link.WorkingDirectory = $PSScriptRoot
+    $link.WindowStyle = 7  # Minimized, for the moment before -WindowStyle hides it.
+    $link.Save()
     # Replace a running copy, such as one started by an older, windowed shortcut.
     Stop-Worker
-    Start-Process -FilePath $link
-    Write-Output "Installed $link and started the worker hidden. Its log is $log."
+    Start-Process -FilePath $shortcut
+    Write-Output "Installed $shortcut and started the worker hidden. Its log is $log."
     return
 }
 
-if (-not $Bridge) {
+if (-not $Bridge -and -not $Service) {
     # One supervisor per session: a second one would only fail to bind the port forever.
     $mutex = [Threading.Mutex]::new($false, 'Local\HOI4Worker')
     if (-not $mutex.WaitOne(0)) {
@@ -74,10 +122,9 @@ if (-not $Bridge) {
     }
 }
 
-$spec = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server.json') -Raw | ConvertFrom-Json
 # The bridge accepts only raw worker requests. It exposes no shell or filesystem API.
 # Launching, closing and inspecting HOI4 are worker operations too; the worker runs
-# Game-Control.ps1 from this folder for them, with arguments it has checked.
+# Game-Control.ps1 for them, with arguments it has checked.
 Add-Type -TypeDefinition @'
 using System;
 using System.IO;
@@ -88,6 +135,7 @@ using System.Net.Security;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -117,7 +165,17 @@ public static class Hoi4Bridge {
     private static int connections = 0;
     private static int observers = 0;
     private static int workers = 0;
+    // For a service's restart (RunService): the connections open now, by number, with when
+    // each opened and whether it is an observer; when the last one that was not an
+    // observer ended; and the workers running, stopped when the bridge exits.
+    private static readonly ConcurrentDictionary<long, Tuple<long, bool>> open = new ConcurrentDictionary<long, Tuple<long, bool>>();
+    private static long opened = 0;
+    private static long lastGameEnd = 0;
+    private static readonly ConcurrentDictionary<Process, byte> running = new ConcurrentDictionary<Process, byte>();
 
+    public static void Say(string text) {
+        Console.WriteLine(DateTime.Now.ToString("s") + " " + text);
+    }
     private static async Task Pump(Stream source, Stream destination) {
         var buffer = new byte[65536];
         int count;
@@ -151,117 +209,139 @@ public static class Hoi4Bridge {
     private static void Refuse(Stream stream, string why) {
         var line = Encoding.UTF8.GetBytes("{\"error\":\"" + why + "\",\"bytes\":0}\n");
         try { stream.Write(line, 0, line.Length); stream.Flush(); } catch (Exception) {}
-        Console.WriteLine("Refused a connection: " + why);
+        Say("Refused a connection: " + why);
     }
     // Connections come from the coordinator, or from this PC itself: a session that runs
-    // here as a compute job (hoi4-arena on-peer) plays this PC's game through the bridge
-    // like any other, so it holds the one full connection, a recording from the coordinator
-    // is told worker_busy meanwhile, and its worker is counted before an update swaps in.
-    private static void Serve(TcpClient client, X509Certificate2 cert, string peer, string bind, string token, string exe) {
-        using (client)
-        using (var tls = new SslStream(client.GetStream(), false)) {
-            var from = ((IPEndPoint)client.Client.RemoteEndPoint).Address;
-            if (!from.Equals(IPAddress.Parse(peer)) && !from.Equals(IPAddress.Parse(bind))) return;
-            // A frame's row or a reply goes out at once, not after the last video bytes are
-            // acknowledged (Nagle's wait, which the other side's delayed acknowledgement can
-            // stretch to 200 ms). And a peer that vanished without closing (its PC off, its
-            // cable out) is noticed within about 20 s even while nothing is sent, so it
-            // cannot hold the game here until this bridge restarts.
-            client.NoDelay = true;
-            try {
-                client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 10);
-                client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 2);
-                client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
-            } catch (Exception error) { Console.WriteLine("Keepalive not set: " + error.Message); }
-            Process worker = null;
-            Task errors = null;
-            bool holding = false, watching = false, started = false;
-            try {
-                tls.ReadTimeout = 10000; tls.WriteTimeout = 10000;
-                tls.AuthenticateAsServer(cert, false, SslProtocols.Tls12, false);
-                var line = ReadLine(tls);
-                bool observer;
-                if (line == token) observer = false;
-                else if (line == token + " observer") observer = true;
-                else return;
-                if (observer) {
-                    watching = true;
-                    if (Interlocked.Increment(ref observers) > MaxObservers) {
-                        Refuse(tls, "too_many_observers");
-                        return;
+    // here plays this PC's game through the bridge like any other, so it holds the one full
+    // connection, a recording from the coordinator is told worker_busy meanwhile, and its
+    // worker is counted before an update swaps in. `allowed` says which addresses may
+    // connect; `args` go on each worker's command line after --observer.
+    private static void Serve(long id, TcpClient client, X509Certificate2 cert, Func<IPAddress, bool> allowed, string token, string exe, string[] args) {
+        bool observer = false;
+        try {
+            using (client)
+            using (var tls = new SslStream(client.GetStream(), false)) {
+                var from = ((IPEndPoint)client.Client.RemoteEndPoint).Address;
+                if (!allowed(from)) return;
+                // A frame's row or a reply goes out at once, not after the last video bytes are
+                // acknowledged (Nagle's wait, which the other side's delayed acknowledgement can
+                // stretch to 200 ms). And a peer that vanished without closing (its PC off, its
+                // cable out) is noticed within about 20 s even while nothing is sent, so it
+                // cannot hold the game here until this bridge restarts.
+                client.NoDelay = true;
+                try {
+                    client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 10);
+                    client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 2);
+                    client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+                } catch (Exception error) { Say("Keepalive not set: " + error.Message); }
+                Process worker = null;
+                Task errors = null;
+                bool holding = false, watching = false, started = false;
+                try {
+                    tls.ReadTimeout = 10000; tls.WriteTimeout = 10000;
+                    tls.AuthenticateAsServer(cert, false, SslProtocols.Tls12, false);
+                    var line = ReadLine(tls);
+                    if (line == token) observer = false;
+                    else if (line == token + " observer") observer = true;
+                    else return;
+                    if (observer) {
+                        watching = true;
+                        Tuple<long, bool> since;
+                        if (open.TryGetValue(id, out since)) open[id] = Tuple.Create(since.Item1, true);
+                        if (Interlocked.Increment(ref observers) > MaxObservers) {
+                            Refuse(tls, "too_many_observers");
+                            return;
+                        }
+                    } else {
+                        if (!primary.Wait(PrimaryWaitMs)) {
+                            Refuse(tls, "worker_busy: another connection holds the game here (a recording or a match); an observer connection can still watch and measure");
+                            return;
+                        }
+                        holding = true;
                     }
-                } else {
-                    if (!primary.Wait(PrimaryWaitMs)) {
-                        Refuse(tls, "worker_busy: another connection holds the game here (a recording or a match); an observer connection can still watch and measure");
-                        return;
+                    lock (gate) {
+                        // Deploy-Peer stages a new worker beside the running one. It is swapped
+                        // in only while no worker runs, never under a connection. (A service
+                        // takes its worker at start instead: none is staged beside its copy.)
+                        if (workers == 0 && File.Exists(exe + ".new")) {
+                            try { File.Move(exe + ".new", exe, true); Say("Updated worker."); }
+                            catch (Exception error) { Say("Worker update deferred: " + error.Message); }
+                        }
+                        worker = new Process();
+                        worker.StartInfo = new ProcessStartInfo(exe) {
+                            UseShellExecute=false, CreateNoWindow=true,
+                            RedirectStandardInput=true, RedirectStandardOutput=true,
+                            RedirectStandardError=true
+                        };
+                        if (observer) worker.StartInfo.ArgumentList.Add("--observer");
+                        foreach (var arg in args) worker.StartInfo.ArgumentList.Add(arg);
+                        worker.Start();
+                        running[worker] = 0;
+                        workers++;
+                        started = true;
                     }
-                    holding = true;
-                }
-                lock (gate) {
-                    // Deploy-Peer stages a new worker beside the running one. It is swapped
-                    // in only while no worker runs, never under a connection.
-                    if (workers == 0 && File.Exists(exe + ".new")) {
-                        try { File.Move(exe + ".new", exe, true); Console.WriteLine("Updated worker."); }
-                        catch (Exception error) { Console.WriteLine("Worker update deferred: " + error.Message); }
+                    var log = Path.Combine(Path.GetDirectoryName(exe), observer ? "observer-stderr.log" : "worker-stderr.log");
+                    var process = worker;
+                    errors = Task.Run(() => {
+                        string text;
+                        while ((text = process.StandardError.ReadLine()) != null) {
+                            Console.Error.WriteLine(text);
+                            AppendLog(log, text);
+                        }
+                    });
+                    var input = Pump(tls, worker.StandardInput.BaseStream);
+                    var output = Pump(worker.StandardOutput.BaseStream, tls);
+                    Task.WaitAny(input, output);
+                } catch (Exception error) { Say(error.GetType().Name + ": " + error.Message); }
+                finally {
+                    if (worker != null) {
+                        try { worker.StandardInput.Close(); } catch (Exception) {}
+                        try { if (!worker.WaitForExit(2000)) worker.Kill(); } catch (Exception) {}
                     }
-                    worker = new Process();
-                    worker.StartInfo = new ProcessStartInfo(exe) {
-                        UseShellExecute=false, CreateNoWindow=true,
-                        RedirectStandardInput=true, RedirectStandardOutput=true,
-                        RedirectStandardError=true
-                    };
-                    if (observer) worker.StartInfo.ArgumentList.Add("--observer");
-                    worker.Start();
-                    workers++;
-                    started = true;
-                }
-                var log = Path.Combine(Path.GetDirectoryName(exe), observer ? "observer-stderr.log" : "worker-stderr.log");
-                var process = worker;
-                errors = Task.Run(() => {
-                    string text;
-                    while ((text = process.StandardError.ReadLine()) != null) {
-                        Console.Error.WriteLine(text);
-                        AppendLog(log, text);
+                    // The worker has exited, so stderr reaches EOF. Let the reader write a
+                    // crash's last lines.
+                    if (errors != null) {
+                        try { errors.Wait(2000); } catch (Exception) {}
                     }
-                });
-                var input = Pump(tls, worker.StandardInput.BaseStream);
-                var output = Pump(worker.StandardOutput.BaseStream, tls);
-                Task.WaitAny(input, output);
-            } catch (Exception error) { Console.WriteLine(error.GetType().Name + ": " + error.Message); }
-            finally {
-                if (worker != null) {
-                    try { worker.StandardInput.Close(); } catch (Exception) {}
-                    try { if (!worker.WaitForExit(2000)) worker.Kill(); } catch (Exception) {}
+                    if (worker != null) { byte gone; running.TryRemove(worker, out gone); worker.Dispose(); }
+                    if (started) lock (gate) { workers--; }
+                    if (holding) primary.Release();
+                    if (watching) Interlocked.Decrement(ref observers);
                 }
-                // The worker has exited, so stderr reaches EOF. Let the reader write a
-                // crash's last lines.
-                if (errors != null) {
-                    try { errors.Wait(2000); } catch (Exception) {}
-                }
-                if (worker != null) worker.Dispose();
-                if (started) lock (gate) { workers--; }
-                if (holding) primary.Release();
-                if (watching) Interlocked.Decrement(ref observers);
             }
+        } finally {
+            Tuple<long, bool> gone;
+            open.TryRemove(id, out gone);
+            if (!observer) Interlocked.Exchange(ref lastGameEnd, Environment.TickCount64);
         }
     }
-    // True when the watched files changed and the caller should restart from them.
+    private static void Accept(TcpListener listener, X509Certificate2 cert, Func<IPAddress, bool> allowed, string token, string exe, string[] args) {
+        var client = listener.AcceptTcpClient();
+        Interlocked.Increment(ref connections);
+        // Counted as open before its task runs, so a restart cannot slip in between.
+        long id = Interlocked.Increment(ref opened);
+        open[id] = Tuple.Create(Environment.TickCount64, false);
+        Task.Run(() => {
+            try { Serve(id, client, cert, allowed, token, exe, args); }
+            finally { Interlocked.Decrement(ref connections); }
+        });
+    }
+    // The at-logon bridge. True when the watched files changed and the caller should
+    // restart from them.
     public static bool Run(string bind, int port, string peer, string pfx, string password, string token, string exe, string[] watch) {
         var stamp = Stamp(watch);
         var cert = X509CertificateLoader.LoadPkcs12FromFile(pfx, password, X509KeyStorageFlags.UserKeySet);
-        var listener = new TcpListener(IPAddress.Parse(bind), port);
+        var coordinator = IPAddress.Parse(peer);
+        var self = IPAddress.Parse(bind);
+        Func<IPAddress, bool> allowed = from => from.Equals(coordinator) || from.Equals(self);
+        var listener = new TcpListener(self, port);
         listener.Start(16);
-        Console.WriteLine("HOI4 worker ready at " + bind + ":" + port + ". F12 stops game input. Observers welcome.");
+        Say("HOI4 worker ready at " + bind + ":" + port + ". F12 stops game input. Observers welcome.");
         try {
             for (int tick = 0; ; tick++) {
                 if (listener.Pending()) {
-                    var client = listener.AcceptTcpClient();
-                    Interlocked.Increment(ref connections);
-                    Task.Run(() => {
-                        try { Serve(client, cert, peer, bind, token, exe); }
-                        finally { Interlocked.Decrement(ref connections); }
-                    });
+                    Accept(listener, cert, allowed, token, exe, new string[0]);
                     continue;
                 }
                 // Updates are picked up only with no connection open, never during a match.
@@ -274,8 +354,94 @@ public static class Hoi4Bridge {
             }
         } finally { listener.Stop(); cert.Dispose(); }
     }
+    // Why a wanted restart must wait, or null. A connection that holds the game (or has not
+    // yet said what it is) holds it back, and so does one that ended less than `quiet` ms
+    // ago: a session opens the next within seconds. So does an observer younger than that:
+    // a report or a memory check ends on its own. An older observer is a watcher, the live
+    // view, which would never step aside: it is closed and connects again.
+    public static string Holding(long quiet, long now) {
+        foreach (var connection in open.Values) {
+            if (!connection.Item2) return "a connection holds the game";
+            if (now - connection.Item1 < quiet) return "an observer connected " + (now - connection.Item1) / 1000 + " s ago";
+        }
+        long ended = Interlocked.Read(ref lastGameEnd);
+        if (ended != 0 && now - ended < quiet) return "a game connection ended " + (now - ended) / 1000 + " s ago";
+        return null;
+    }
+    // The fleet service's bridge: on this PC's loopback only, for sessions here and fleet's
+    // tunnel. Returns once `restart` (FLEET_RESTART_WANTED's file) exists and nothing holds
+    // the restart back (Holding), with every worker it started stopped.
+    public static void RunService(int port, string pfx, string password, string token, string exe, string[] args, string restart, int quietSeconds) {
+        var cert = X509CertificateLoader.LoadPkcs12FromFile(pfx, password, X509KeyStorageFlags.UserKeySet);
+        Func<IPAddress, bool> allowed = from => IPAddress.IsLoopback(from);
+        var listener = new TcpListener(IPAddress.Loopback, port);
+        listener.Start(16);
+        long quiet = quietSeconds * 1000L;
+        Say("HOI4 worker ready at 127.0.0.1:" + port + " (a fleet service). F12 stops game input. Observers welcome.");
+        long said = long.MinValue / 2;
+        try {
+            for (int tick = 0; ; tick++) {
+                if (listener.Pending()) {
+                    Accept(listener, cert, allowed, token, exe, args);
+                    continue;
+                }
+                if (tick % 8 == 7 && !string.IsNullOrEmpty(restart) && File.Exists(restart)) {
+                    long now = Environment.TickCount64;
+                    var why = Holding(quiet, now);
+                    if (why == null) {
+                        Say("A restart is wanted and nothing holds it back: exiting.");
+                        return;
+                    }
+                    // Why, when it first waits and every minute after.
+                    if (now - said >= 60000) { Say("A restart is wanted; waiting: " + why + "."); said = now; }
+                }
+                Thread.Sleep(125);
+            }
+        } finally {
+            listener.Stop();
+            foreach (var worker in running.Keys) {
+                try { worker.Kill(true); } catch (Exception) {}
+            }
+            cert.Dispose();
+        }
+    }
 }
 '@
+
+if ($Service) {
+    # Relative paths are the project's: fleet starts a service in its project's folder.
+    $pairingDir = (Resolve-Path -LiteralPath $Pairing).Path
+    $spec = Get-Content -LiteralPath (Join-Path $pairingDir 'server.json') -Raw | ConvertFrom-Json
+    $listen = if ($Port) { $Port } else { [int]$spec.port }
+    # The worker that shipped with the project runs from a copy named by its contents: a
+    # running program cannot be replaced, so a push of a new one would fail on it. A new
+    # one is taken at the next start; older copies go once nothing runs them.
+    $shipped = (Resolve-Path -LiteralPath $Worker).Path
+    $hash = (Get-FileHash -LiteralPath $shipped -Algorithm SHA256).Hash.Substring(0, 12).ToLowerInvariant()
+    $home_ = Split-Path $shipped -Parent
+    $folder = Join-Path $home_ "run-$hash"
+    $exe = Join-Path $folder (Split-Path $shipped -Leaf)
+    if (-not (Test-Path -LiteralPath $exe)) {
+        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+        Copy-Item -LiteralPath $shipped -Destination "$exe.tmp" -Force
+        Move-Item -LiteralPath "$exe.tmp" -Destination $exe -Force
+    }
+    foreach ($old in Get-ChildItem -LiteralPath $home_ -Directory -Filter 'run-*') {
+        if ($old.FullName -ne $folder) {
+            try { Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction Stop } catch { }
+        }
+    }
+    # The worker runs Game-Control.ps1 with the pwsh it finds on PATH: this one.
+    $env:PATH = (Split-Path $pwsh -Parent) + [IO.Path]::PathSeparator + $env:PATH
+    New-Item -ItemType Directory -Force -Path $Mods | Out-Null
+    $arguments = @('--scripts', $PSScriptRoot, '--mods', (Resolve-Path -LiteralPath $Mods).Path)
+    [Hoi4Bridge]::Say("Bridge started (PID $PID): worker $hash, scripts $PSScriptRoot, mods $($arguments[3]).")
+    [Hoi4Bridge]::RunService($listen, (Join-Path $pairingDir 'worker.pfx'), $spec.pfx_password, $spec.token,
+        $exe, $arguments, $env:FLEET_RESTART_WANTED, $QuietSeconds)
+    exit 0
+}
+
+$spec = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'server.json') -Raw | ConvertFrom-Json
 $pairing = Join-Path $PSScriptRoot 'server.json'
 $pfx = Join-Path $PSScriptRoot 'worker.pfx'
 $restart = [Hoi4Bridge]::Run($spec.bind, $spec.port, $spec.coordinator, $pfx, $spec.pfx_password, $spec.token,
