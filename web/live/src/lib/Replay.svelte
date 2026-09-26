@@ -1,6 +1,7 @@
 <script lang="ts">
-	// A game played, watched again: its replay is made from the recording when asked for
-	// (a few seconds), played at 1x to 8x, with its orders to jump to and a flag button.
+	// A game played, watched again: as it looked live (30 frames a second) when it was kept,
+	// else made from its recording when asked for (5 a second, a few seconds to make);
+	// played at 1x to 8x, with its orders to jump to and a flag button.
 	import { onDestroy } from 'svelte';
 	import { flag, get } from './api';
 	import { ORDERS, SIDE, VERDICT, arena, clock, day } from './format';
@@ -23,7 +24,10 @@
 		if (!answer) {
 			note = 'No replay: offline';
 		} else if (answer.state === 'ready') {
-			note = 'Recorded at 5 frames a second.';
+			note =
+				answer.fps === 30
+					? 'As it looked live, at 30 frames a second.'
+					: 'From the recording, at 5 frames a second.';
 			url = answer.url;
 			orders = answer.orders ?? [];
 		} else if (answer.state === 'working' || answer.state === 'busy') {

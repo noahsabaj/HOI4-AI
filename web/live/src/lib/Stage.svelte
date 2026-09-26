@@ -67,6 +67,7 @@
 	img {
 		display: block;
 		width: 100%;
+		aspect-ratio: 16 / 9;
 		max-height: 72vh;
 		object-fit: contain;
 		opacity: 0.35;

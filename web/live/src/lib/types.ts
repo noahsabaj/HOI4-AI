@@ -62,6 +62,10 @@ export interface Played {
 	started_unix: number | null;
 	ended_unix: number | null;
 	milestones: Record<string, number> | null;
+	/** The PC's name. */
+	label?: string;
+	/** Kept as it looked live, at 30 frames a second. */
+	archived?: boolean;
 }
 
 export interface Station {
@@ -109,7 +113,7 @@ export interface Stats {
 }
 
 export type ReplayAnswer =
-	| { state: 'ready'; url: string; orders?: Order[] }
+	| { state: 'ready'; url: string; fps?: number; orders?: Order[] }
 	| { state: 'working'; progress: number }
 	| { state: 'busy' }
 	| { state: 'error'; error: string };

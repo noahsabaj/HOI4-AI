@@ -324,7 +324,7 @@ def main():
         help="The second PC's pairing file: show its own view of the game window (smooth, "
         "menus included) instead of following the recording at 5 frames a second.",
     )
-    live.add_argument("--hz", type=int, default=30, help="The view's frames a second.")
+    live.add_argument("--hz", type=int, default=60, help="The view's frames a second.")
     live.add_argument(
         "--label",
         nargs="+",

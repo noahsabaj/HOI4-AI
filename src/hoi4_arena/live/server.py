@@ -10,6 +10,8 @@ GET  /api/chat?after=ID         the feed since a message
 GET  /api/stats                 the record by map and plan, and training in progress
 GET  /api/replay?run=R&game=G   a replay: made on request, then its URL
 GET  /replays/<game>.mp4        a replay's file, in byte ranges as iPhones ask for it
+GET  /archive/<game>.mp4        a game's live view kept (archive.py), in byte ranges
+GET  /thumbs/<game>.jpg         a played game's thumbnail, made when first asked for
 POST /api/chat {who, text}      a watcher's message
 POST /api/flag {..., note}      a moment marked for a closer look
 
@@ -92,6 +94,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             and parts[1].endswith(".mp4")
         ):
             self.send_range(app.replays.folder / parts[1], head)
+        elif (
+            len(parts) == 2
+            and parts[0] == "archive"
+            and SAFE.match(parts[1])
+            and parts[1].endswith(".mp4")
+        ):
+            self.send_range(app.archive.folder / parts[1], head)
+        elif (
+            len(parts) == 2
+            and parts[0] == "thumbs"
+            and SAFE.match(parts[1])
+            and parts[1].endswith(".jpg")
+        ):
+            path = app.thumb(parts[1][: -len(".jpg")])
+            if path is None:
+                self.send_error(404)
+            else:
+                self.send_file(path, head, cache=True)
         else:
             self.send_error(404)
 

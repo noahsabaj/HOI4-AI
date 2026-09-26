@@ -353,6 +353,73 @@ def test_the_view_command_runs_on_a_stream_like_the_second_pc_s(tmp_path):
     assert (out / "latest.jpg").read_bytes()[:2] == b"\xff\xd8"
 
 
+def test_the_view_also_writes_raw_pieces_for_the_archive_when_asked(tmp_path):
+    command = live.view_command("ffmpeg", tmp_path / "out", raw=tmp_path / "raw")
+    at = command.index("segment")
+    assert command[at - 5 : at - 1] == ["-map", "0:v", "-c:v", "copy"]
+    assert command[-1].endswith("%Y%m%d-%H%M%S.ts")
+    assert "segment" not in live.view_command("ffmpeg", tmp_path / "out")
+
+
+def test_a_game_s_pieces_are_used_once_they_cover_it_whole(tmp_path):
+    def piece(began, written):
+        path = tmp_path / f"{began}.ts"
+        path.write_bytes(b"x")
+        os.utime(path, (written, written))
+        return (began, path)
+
+    now = 10_000.0
+    found = [piece(t, t + 30) for t in (1000, 1030, 1060, 1090)]
+    # A game from 1010 to 1080: the piece begun at 1090 shows the view went on past it.
+    assert [p[0] for p in live.covering(found, 1010, 1080, now)] == [1000, 1030, 1060]
+    # Past the last piece's end, and it is still being written: not yet.
+    assert live.covering(found[:3], 1010, 1080, 1085) is None
+    # The view began after the game did: no archive (its start would be missing).
+    assert live.covering(found[1:], 1010, 1080, now) is None
+    # A hole where the view stopped mid-game.
+    assert live.covering([found[0], found[2], found[3]], 1010, 1080, now) is None
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_an_ended_game_is_archived_from_its_pieces_and_replayed_from_there(tmp_path):
+    ffmpeg = shutil.which("ffmpeg")
+    raw = tmp_path / "raw" / "peer"
+    raw.mkdir(parents=True)
+    start = time.time() - 600
+    for k in range(3):
+        began = time.strftime("%Y%m%d-%H%M%S", time.localtime(start + 4 * k))
+        subprocess.run(
+            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=60",
+             "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts",
+             str(raw / f"{began}.ts")],
+            check=True,
+        )  # fmt: skip
+        os.utime(raw / f"{began}.ts", (start + 4 * k + 4, start + 4 * k + 4))
+    game = tmp_path / "run" / "scripted-peer-20260925-120000"
+    game.mkdir(parents=True)
+    manifest = {"recorder": {"started_unix": start + 1}, "frames": 40, "nominal_fps": 5}
+    (game / "manifest.json").write_text(json.dumps(manifest))
+    played = [{"game": game.name, "station": "peer", "path": str(game), "ended_unix": start + 9}]
+    archive = live.Archive(tmp_path / "raw", tmp_path / "archive", ffmpeg, encoder="libx264")
+    archive.step(played)
+    deadline = time.time() + 60
+    while archive.job and time.time() < deadline:
+        time.sleep(0.1)
+    made = archive.path(game.name)
+    assert made is not None, archive.failed
+    probe = subprocess.run(
+        [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=r_frame_rate", "-of", "json", str(made)],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    facts = json.loads(probe.stdout)
+    assert abs(float(facts["format"]["duration"]) - 8) < 0.5, "the game's 8 s, cut from 12"
+    assert facts["streams"][0]["r_frame_rate"] == "30/1"
+    # Its pieces go once no game needs them (all of them are older than RAW_KEEP here).
+    archive.step(played, now=time.time() + live.archive.RAW_KEEP + 700)
+    assert not list(raw.glob("*.ts"))
+
+
 def test_the_view_steps_aside_while_a_new_worker_waits(tmp_path):
     peer = tmp_path / "peer.json"
     peer.write_text(json.dumps({"host": "second-pc"}))

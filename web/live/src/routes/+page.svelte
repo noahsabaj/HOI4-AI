@@ -1,29 +1,34 @@
 <script lang="ts">
-	// HOI4 Live: one stream per PC, what each game is doing, a feed like a stream's chat,
-	// replays of the games played, and the record. Everything comes from /api/*.
+	// HOI4 Live, laid out like a streaming site: the game on the player, what it is doing,
+	// the games live now (which PC each is on), the games played to watch again, and the
+	// chat beside it all. Everything comes from /api/*.
 	import { onDestroy } from 'svelte';
 	import Chat from '$lib/Chat.svelte';
 	import GameCard from '$lib/GameCard.svelte';
-	import Games from '$lib/Games.svelte';
+	import LiveNow from '$lib/LiveNow.svelte';
+	import Recent from '$lib/Recent.svelte';
 	import Replay from '$lib/Replay.svelte';
 	import Stage from '$lib/Stage.svelte';
 	import StatsPanel from '$lib/StatsPanel.svelte';
 	import { get } from '$lib/api';
-	import { arena } from '$lib/format';
 	import type { Played, Status } from '$lib/types';
 
-	let status: Status | null = $state(null);
+	let status = $state<Status | null>(null);
 	let chosen: string | null = $state(null);
-	let tab: 'chat' | 'games' | 'stats' = $state('chat');
+	let tab: 'chat' | 'stats' = $state('chat');
 	let replaying: Played | null = $state(null);
 
-	// The PC shown: the one chosen, else the first playing, streaming, or any.
+	const live = $derived(status?.stations.filter((s) => s.game) ?? []);
+
+	// The PC on the player: the one picked while it plays, else the first playing,
+	// streaming, or any.
 	const station = $derived.by(() => {
 		if (!status) return null;
 		const picked = status.stations.find((s) => s.id === chosen);
 		return (
+			(picked?.game ? picked : null) ??
+			live[0] ??
 			picked ??
-			status.stations.find((s) => s.game) ??
 			status.stations.find((s) => s.streaming) ??
 			status.stations[0] ??
 			null
@@ -32,7 +37,7 @@
 
 	const badge = $derived.by(() => {
 		if (!status) return { text: 'CONNECTING', kind: '' };
-		if (station?.game) return { text: 'LIVE', kind: 'live' };
+		if (live.length) return { text: live.length > 1 ? `${live.length} LIVE` : 'LIVE', kind: 'live' };
 		if (status.idle_since) return { text: 'STOPPED', kind: 'stopped' };
 		return { text: 'BETWEEN GAMES', kind: '' };
 	});
@@ -49,24 +54,12 @@
 <svelte:head><title>HOI4 Live</title></svelte:head>
 <svelte:document onvisibilitychange={() => !document.hidden && poll()} />
 
-<header>
-	<h1>HOI4 Live</h1>
-	<span class="badge {badge.kind}">{badge.text}</span>
-</header>
-
-{#if status && status.stations.length > 1}
-	<nav class="pills">
-		{#each status.stations as s (s.id)}
-			<button class:on={s.id === station?.id} onclick={() => (chosen = s.id)}>
-				<span class="dot" class:live={s.game} class:menus={!s.game && s.streaming}></span>{s.label}{#if s.game}
-					· {arena(s.game.arena)}{/if}
-			</button>
-		{/each}
-	</nav>
-{/if}
-
-<div class="layout">
+<div class="app">
 	<section class="watch">
+		<header>
+			<h1>HOI4 Live</h1>
+			<span class="badge {badge.kind}">{badge.text}</span>
+		</header>
 		{#if status}
 			{#key station?.id}
 				<Stage {station} {status} />
@@ -74,18 +67,28 @@
 			<GameCard {station} />
 		{/if}
 	</section>
-	<section class="side">
+
+	<aside class="side">
 		<nav class="pills">
 			<button class:on={tab === 'chat'} onclick={() => (tab = 'chat')}>Chat</button>
-			<button class:on={tab === 'games'} onclick={() => (tab = 'games')}>Games</button>
 			<button class:on={tab === 'stats'} onclick={() => (tab = 'stats')}>Stats</button>
 		</nav>
 		<div class="panel" hidden={tab !== 'chat'}><Chat /></div>
-		{#if tab === 'games'}
-			<div class="panel"><Games onopen={(game) => (replaying = game)} /></div>
-		{:else if tab === 'stats'}
-			<div class="panel"><StatsPanel /></div>
+		{#if tab === 'stats'}
+			<div class="panel scroll"><StatsPanel /></div>
 		{/if}
+	</aside>
+
+	<section class="more">
+		{#if live.length}
+			<h2>Live now <span class="count">{live.length}</span></h2>
+			<LiveNow stations={live} watching={station?.game ? station.id : null} onpick={(id) => {
+				chosen = id;
+				window.scrollTo({ top: 0, behavior: 'smooth' });
+			}} />
+		{/if}
+		<h2>Recent games</h2>
+		<Recent onopen={(game) => (replaying = game)} />
 	</section>
 </div>
 
@@ -139,45 +142,70 @@
 			opacity: 0.25;
 		}
 	}
-	.dot {
-		display: inline-block;
-		width: 7px;
-		height: 7px;
-		border-radius: 50%;
-		margin-right: 6px;
-		background: #555;
-		vertical-align: 1px;
+	.app {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		grid-template-areas: 'watch' 'side' 'more';
 	}
-	.dot.live {
-		background: var(--live);
+	.watch {
+		grid-area: watch;
+		min-width: 0;
 	}
-	.dot.menus {
-		background: var(--draw);
+	.more {
+		grid-area: more;
+		min-width: 0;
+		padding-bottom: 32px;
 	}
-	.layout {
+	/* The chat keeps its box in view: the list scrolls, never the box away. */
+	.side {
+		grid-area: side;
 		display: flex;
 		flex-direction: column;
+		height: 62dvh;
+		min-height: 0;
+		border-top: 1px solid var(--line);
+		border-bottom: 1px solid var(--line);
+		padding-top: 8px;
 	}
 	@media (min-width: 900px) {
-		.layout {
-			flex-direction: row;
-			align-items: flex-start;
-		}
-		.watch {
-			flex: 1 1 auto;
-			min-width: 0;
+		.app {
+			grid-template-columns: minmax(0, 1fr) 380px;
+			grid-template-rows: auto 1fr;
+			grid-template-areas: 'watch side' 'more side';
 		}
 		.side {
-			width: 380px;
-			flex: 0 0 380px;
+			align-self: start;
 			position: sticky;
-			top: 0;
+			top: env(safe-area-inset-top);
+			height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+			border: 0;
+			border-left: 1px solid var(--line);
 		}
 	}
-	.side {
-		padding-bottom: 16px;
-	}
 	.panel {
-		padding: 0 16px;
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		padding: 0 16px 12px;
+	}
+	.panel.scroll {
+		overflow-y: auto;
+		display: block;
+	}
+	h2 {
+		font-size: 17px;
+		font-weight: 650;
+		margin: 22px 16px 10px;
+	}
+	.count {
+		font-size: 12px;
+		font-weight: 700;
+		background: var(--live);
+		color: #fff;
+		border-radius: 999px;
+		padding: 1px 8px;
+		vertical-align: 2px;
+		margin-left: 4px;
 	}
 </style>
