@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import math
 import random
-import shutil
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +27,7 @@ from .layout import (  # noqa: F401
     recorded_speed,
 )
 from .learning import GAMMA
+from .nvdec import YUV444_CODECS, open_frames, to_rgb
 
 # How many past global views one decision looks at. Eight frames is what fits the
 # 200 ms tick: on the 4060 Ti the encoder forward fell from 131.5 ms at sixteen frames
@@ -100,6 +99,20 @@ def cursor_crop(rgb, x, y, size):
         dst_y0 : dst_y0 + (src_y1 - src_y0),
         dst_x0 : dst_x0 + (src_x1 - src_x0),
     ] = image[src_y0:src_y1, src_x0:src_x1]
+    return out
+
+
+def cursor_crops(frames, cursors, size):
+    """cursor_crop of each of the frames (N, H, W, C) around its pointer (N, 2) as (x, y),
+    on the frames' device: (N, size, size, C)."""
+    out = frames.new_zeros((frames.shape[0], size, size, frames.shape[3]))
+    height, width = frames.shape[1:3]
+    for k, (x, y) in enumerate(cursors.tolist()):
+        ox, oy = int(x) - size // 2, int(y) - size // 2
+        x0, y0 = max(0, ox), max(0, oy)
+        x1, y1 = min(width, ox + size), min(height, oy + size)
+        if x0 < x1 and y0 < y1:
+            out[k, y0 - oy : y1 - oy, x0 - ox : x1 - ox] = frames[k, y0:y1, x0:x1]
     return out
 
 
@@ -204,6 +217,16 @@ def batch_to_device(batch, device, clips=True):
         if key == "clips" and not clips:
             continue
         out[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    if "planes" in out:
+        # 4:4:4 planes from a gpu_views loader (nvdec.py): the frames ffmpeg's rgb24 would
+        # have given, and the fovea around each pointer, made here on `device`.
+        # The pointers are read where they came from, so the crops need no wait on the card.
+        planes, cursor = out.pop("planes"), batch["cursor"]
+        out.pop("cursor")
+        lead = planes.shape[:2]
+        frames = to_rgb(planes.flatten(0, 1))
+        out["fovea"] = cursor_crops(frames, cursor.flatten(0, 1), FOVEA_SIZE).unflatten(0, lead)
+        out["frames"] = frames.unflatten(0, lead)
     if "frames" in out:
         # Whole frames from a gpu_views loader: their quadrants are cut here, on `device`.
         frames = out.pop("frames")
@@ -637,12 +660,24 @@ class _Stream:
     """
 
     def __init__(
-        self, labels, length, burn_in, device, starts=None, clips=True, raw=False, skip_before=0
+        self,
+        labels,
+        length,
+        burn_in,
+        device,
+        starts=None,
+        clips=True,
+        raw=False,
+        skip_before=0,
+        yuv=False,
     ):
         self.labels, self.length, self.burn_in, self.device = labels, length, burn_in, device
         # With `raw`, a decision keeps its whole frame (and its fovea) instead of its
         # quadrants: batch_to_device cuts them on the GPU (VideoSessions' gpu_views).
+        # With `yuv` as well, the frame stays the decoder's 4:4:4 planes and the fovea just
+        # its pointer: batch_to_device converts and crops them there (nvdec.py).
         self.clips, self.raw = clips, raw
+        self.yuv = yuv and raw and not clips
         manifest = labels["manifest"]
         self.w, self.h = manifest["width"], manifest["height"]
         self.starts = (
@@ -651,9 +686,6 @@ class _Stream:
             else sequence_starts(labels["valid"], length, burn_in)
         )
         self.skip_before = skip_before
-        self.ffmpeg = shutil.which("ffmpeg")
-        if not self.ffmpeg:
-            raise RuntimeError("FFmpeg is required to read recordings")
         # The first frame decoded: the earliest any window from `skip_before` on reads.
         live = [s for s in self.starts if s >= skip_before]
         if not self.starts or live[:1] == self.starts[:1]:
@@ -683,22 +715,15 @@ class _Stream:
             ) + ((np.load(found["rows"]) if "rows" in found else None),)
 
     def _open(self, frame):
-        """Start decoding at `frame`, counted as the frames come out of the decoder."""
-        command = [self.ffmpeg, "-v", "error", "-i", str(self.labels["root"] / "screen.mkv")]
-        if frame:
-            # The frames before it are decoded but never converted or piped. Selected by
-            # their number, not a time, so no timestamp can land it a frame off; and
-            # restarted at time zero, so the frames come out as they would from the start.
-            command += ["-vf", f"select=gte(n\\,{frame}),setpts=PTS-STARTPTS"]
-        command += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-        self.decoder = subprocess.Popen(command, stdout=subprocess.PIPE)
+        """Start decoding at `frame`, counted as the frames come out of the decoder: HEVC on
+        the GPU's decoder where there is one, else ffmpeg on the CPU, the same pixels
+        either way (nvdec.open_frames)."""
+        path = self.labels["root"] / "screen.mkv"
+        self.decoder = open_frames(path, self.w, self.h, yuv=self.yuv, start=frame)
 
     def close(self):
-        if self.decoder is None:
-            return
-        if self.decoder.poll() is None:
-            self.decoder.kill()
-        self.decoder.wait()
+        if self.decoder is not None:
+            self.decoder.close()
 
     def _window(self, start):
         labels = self.labels
@@ -707,11 +732,12 @@ class _Stream:
         quads = torch.stack([self.details[d][0] for d in steps])
         fovea = torch.stack([self.details[d][1] for d in steps])
         pixels = "frames" if self.raw and not self.clips else "quadrants"
+        pixels = "planes" if self.yuv else pixels
         actions = torch.from_numpy(labels["actions"][start : start + n].copy())
         previous = torch.from_numpy(label_previous(labels)[start : start + n].copy())
         window = {
             pixels: quads,
-            "fovea": fovea,
+            "cursor" if self.yuv else "fovea": fovea,
             "actions": actions,
             "previous": previous,
             "valid": torch.from_numpy(labels["valid"][start : start + n].copy()),
@@ -782,24 +808,26 @@ class _Stream:
     def _view(self, i):
         """Read frame `i` from the decoder and keep the views pending windows read of it."""
         labels = self.labels
-        size = self.w * self.h * 3
-        buffer = self.decoder.stdout.read(size)
-        if len(buffer) != size:
+        frame = self.decoder.read()
+        if frame is None:
             raise ValueError("Video truncated relative to timestamps")
         first = self.starts[0]
         needed = [int(d) for d in np.flatnonzero(labels["frame_ids"] == i) if d >= first]
         # No window can complete before the first pending one's clip begins.
         if i < int(labels["clip_ids"][first].min()) and not needed:
             return
-        if needed and self.raw and not self.clips:
-            frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
+        if needed and self.yuv:
+            planes = torch.from_numpy(frame if frame.flags.writeable else frame.copy())
+            pointer = torch.tensor(parse_cursor(labels["cursors"][i]), dtype=torch.int32)
+            for d in needed:
+                self.details[d] = (planes, pointer)
+        elif needed and self.raw and not self.clips:
             x, y = parse_cursor(labels["cursors"][i])
             whole = torch.from_numpy(frame.copy())
             fovea = torch.from_numpy(np.ascontiguousarray(cursor_crop(frame, x, y, FOVEA_SIZE)))
             for d in needed:
                 self.details[d] = (whole, fovea)
         elif needed or self.clips:
-            frame = np.frombuffer(buffer, np.uint8).reshape(self.h, self.w, 3)
             size = VIEW_SIZE if self.clips else None
             seen = views(frame, size, device=self.device, cursor=labels["cursors"][i])
             if self.clips:
@@ -975,6 +1003,7 @@ class VideoSessions(_Resumable, IterableDataset):
         held_previous=False,
         gpu_views=False,
         balance=False,
+        yuv=None,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -1018,6 +1047,15 @@ class VideoSessions(_Resumable, IterableDataset):
             )
         if balance:
             balance_weights(self.sessions)
+        # With gpu_views and a GPU, frames travel as their 4:4:4 planes, HEVC decoded on the
+        # GPU and every frame converted there (nvdec.py): the same pixels for ~4 ms of CPU
+        # a frame instead of ~48. Every recording must hold such planes, since a batch
+        # cannot mix planes and RGB.
+        if yuv is None:
+            yuv = gpu_views and not clips and torch.cuda.is_available()
+        self.yuv = bool(yuv) and all(
+            s["manifest"].get("codec") in YUV444_CODECS for s in self.sessions
+        )
         self.tower_stamp = None
         if tower is not None:
             from .tower_cache import tower_paths
@@ -1068,6 +1106,7 @@ class VideoSessions(_Resumable, IterableDataset):
                             clips=self.clips,
                             raw=self.gpu_views,
                             skip_before=_live_from(labels, live),
+                            yuv=self.yuv,
                         )  # fmt: skip
                     )
                 for stream in list(active):
@@ -1109,6 +1148,7 @@ class GameSequences(_Resumable, IterableDataset):
         self.length, self.slots, self.seed = length, slots, seed
         self.device, self.clips = device, clips
         self.gpu_views = getattr(sessions, "gpu_views", False)
+        self.yuv = getattr(sessions, "yuv", False)
         self.windows = sum(
             max(0, int(labels["readable"].sum())) // length for labels in self.sessions
         )
@@ -1132,6 +1172,7 @@ class GameSequences(_Resumable, IterableDataset):
             clips=self.clips,
             raw=self.gpu_views,
             skip_before=_live_from(labels, live),
+            yuv=self.yuv,
         )
 
     def _play(self, epoch, worker, share, live=None):

@@ -40,7 +40,13 @@ from .ai_games import SPEED_UP, Station, act, focus, on_screen, start_game, tap
 from .arena_log import ArenaLog
 from .dataset import DETAIL_SIZE, FOVEA_SIZE, VIEW_SIZE
 from .desktop import DesktopError, EmergencyStop
-from .recording import STREAM_CODECS, Recorder, StreamRecorder, StreamUnavailable
+from .recording import (
+    STREAM_CODECS,
+    Recorder,
+    StreamRecorder,
+    StreamUnavailable,
+    stream_codecs,
+)
 from .telemetry import game_fits
 
 log = logging.getLogger(__name__)
@@ -396,7 +402,7 @@ def play_policy_game(
     cap_minutes=15.0,
     setup_seconds=90.0,
     stall_seconds=8.0,
-    codec="nvenc",
+    codec="nvenc-hevc",
     arena_name=None,
     after_surrender=5.0,
     snap_every=30.0,
@@ -631,13 +637,15 @@ def open_stream(desk, root, first, *, speed, hz, codec):
     """A recording clocked and encoded by the worker whose frames carry the policy's views
     (StreamRecorder), when the worker can; else the classic recording, here, in x264."""
     if codec in STREAM_CODECS and _protocol(desk) >= 2:
-        try:
-            return StreamRecorder(
-                root, desk, game_speed=speed, source="policy", hz=hz, codec=codec,
-                views=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE,
-            )  # fmt: skip
-        except StreamUnavailable as error:
-            log.warning("no recording stream (%s); recording here in x264", error)
+        for tried in stream_codecs(codec):
+            try:
+                return StreamRecorder(
+                    root, desk, game_speed=speed, source="policy", hz=hz, codec=tried,
+                    views=VIEW_SIZE, detail=DETAIL_SIZE, fovea=FOVEA_SIZE,
+                )  # fmt: skip
+            except StreamUnavailable as error:
+                log.warning("no %s recording stream (%s)", tried, error)
+        log.warning("no recording stream; recording here in x264")
     codec = "x264" if codec in STREAM_CODECS else codec
     return Recorder(root, first, game_speed=speed, source="policy", hz=hz, codec=codec)
 

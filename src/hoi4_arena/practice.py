@@ -388,7 +388,7 @@ def drill_episode(
     scrambled=False,
     after=8.0,
     log_from=None,
-    codec="nvenc",
+    codec="nvenc-hevc",
 ):
     """The scripted player's setup alone, recorded as a scripted game: army, general, front,
     offensive, the game running, then `after` seconds. With `scrambled`, from a start

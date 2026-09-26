@@ -119,10 +119,22 @@ def test_views_centres_the_fovea_on_the_pointer_and_refuses_to_invent_one():
         views(_POINTER, size=3)
 
 
-def _recording(root, cursor, *, game_speed=4, frames=40, source="human", events=None, shade=0):
+def _recording(
+    root,
+    cursor,
+    *,
+    game_speed=4,
+    frames=40,
+    source="human",
+    events=None,
+    shade=0,
+    codec=None,
+):
     """A recording as Recorder writes it: manifest, frames.jsonl, and ffv1 video.
 
     Frame i is a flat image of value `shade` + i, so any view of it can be traced back to it.
+    With `codec` "x264", the video is x264 4:4:4 as the recorders' was, and frame i is noise
+    over that value, so the colour conversion has many pixels to get right.
     """
     root.mkdir()
     manifest = {
@@ -135,6 +147,8 @@ def _recording(root, cursor, *, game_speed=4, frames=40, source="human", events=
     }
     if game_speed is not None:
         manifest["game_speed"] = game_speed
+    if codec is not None:
+        manifest["codec"] = codec
     (root / "manifest.json").write_text(json.dumps(manifest))
     rows = []
     for i in range(frames):
@@ -150,14 +164,21 @@ def _recording(root, cursor, *, game_speed=4, frames=40, source="human", events=
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         return
+    video = ["-c:v", "ffv1", "-level", "3"]
+    if codec == "x264":
+        video = ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv444p"]
     encoder = subprocess.Popen(
         [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "rawvideo"]
         + ["-pixel_format", "rgb24", "-video_size", "16x16", "-framerate", "10"]
-        + ["-i", "pipe:0", "-an", "-c:v", "ffv1", "-level", "3", str(root / "screen.mkv")],
+        + ["-i", "pipe:0", "-an", *video, str(root / "screen.mkv")],
         stdin=subprocess.PIPE,
     )
+    noise = np.random.default_rng(0)
     for i in range(frames):
-        encoder.stdin.write(np.full((16, 16, 3), shade + i, np.uint8).tobytes())
+        frame = np.full((16, 16, 3), shade + i, np.uint8)
+        if codec == "x264":
+            frame = noise.integers(0, 256, (16, 16, 3), dtype=np.uint8) // 2 + frame
+        encoder.stdin.write(frame.tobytes())
     encoder.stdin.close()
     assert encoder.wait(timeout=30) == 0
 
@@ -603,6 +624,39 @@ def test_a_gpu_views_batch_is_the_same_batch_once_on_the_device(tmp_path):
     a = batch_to_device(collate([plain]), "cpu")
     b = batch_to_device(collate([raw]), "cpu")
     assert torch.equal(a["quadrants"], b["quadrants"]) and torch.equal(a["fovea"], b["fovea"])
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("carry", [False, True])
+def test_a_batch_of_planes_is_the_same_batch_once_on_the_device(tmp_path, carry):
+    # nvdec.py: the decoder's 4:4:4 planes travel, and the device converts and crops them.
+    from hoi4_arena.dataset import GameSequences, batch_to_device
+
+    click = {"kind": "button", "button": 0, "down": True}
+    for name, cursor in (("edge", [3, 4]), ("inside", [9, 12])):
+        _recording(tmp_path / name, cursor, source="scripted", codec="x264",
+                   events=[(500_000_000, click)])  # fmt: skip
+    common = {"sources": ("scripted",), "length": 3, "burn_in": 0, "device": "cpu",
+              "clips": False, "lead_in": 0, "shuffle": 0, "seed": 1}  # fmt: skip
+    plain = VideoSessions(tmp_path, **common)
+    planes = VideoSessions(tmp_path, gpu_views=True, yuv=True, **common)
+    assert planes.yuv and not plain.yuv
+    if carry:
+        a = list(GameSequences(plain, 3, 2, clips=False))
+        b = list(GameSequences(planes, 3, 2, clips=False))
+    else:
+        collate = torch.utils.data.default_collate
+        a = [collate([w]) for w in plain]
+        b = [collate([w]) for w in planes]
+    assert len(a) == len(b) > 1
+    assert "planes" in b[0] and "cursor" in b[0] and "fovea" not in b[0]
+    for x, y in zip(a, b, strict=True):
+        x, y = batch_to_device(x, "cpu", clips=False), batch_to_device(y, "cpu", clips=False)
+        assert torch.equal(x["quadrants"], y["quadrants"]) and torch.equal(x["fovea"], y["fovea"])
+        assert torch.equal(x["actions"], y["actions"])
+    # A recording whose video is not 4:4:4 YUV (ffv1 RGB here) keeps its frames as RGB.
+    _recording(tmp_path / "rgb", [3, 4], source="scripted", events=[(500_000_000, click)])
+    assert not VideoSessions(tmp_path, gpu_views=True, yuv=True, **common).yuv
 
 
 def test_balance_weighs_every_arena_and_side_the_same():
