@@ -19,7 +19,7 @@ def station(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.chdir(tmp_path)
-    for name in ("FLEET_YIELD_WANTED", "FLEET_YIELD_LENT", "FLEET_RESTART_WANTED"):
+    for name in ("FLEET_YIELD_WANTED", "FLEET_YIELD_LENT", "FLEET_RESTART_WANTED", "FLEET_STATUS"):
         monkeypatch.setenv(name, str(tmp_path / name.lower()))
     return module
 
@@ -132,3 +132,22 @@ def test_the_announcement_goes_even_if_the_session_fails(station):
     with pytest.raises(RuntimeError):
         station.session("practice", "artifacts/x", [], run=run)
     assert not station.CURRENT.exists()
+
+
+def test_fleet_s_status_file_says_whether_a_policy_is_on_the_gpu(station, tmp_path):
+    fleet_status = tmp_path / "fleet_status"
+    seen = []
+
+    def run(*args):
+        seen.append(json.loads(fleet_status.read_text()))
+        return 0
+
+    station.session("play-policy", "artifacts/x", ["--minutes", "40"], run=run)
+    assert seen[0]["policy_on_gpu"] is True and seen[0]["command"] == "play-policy"
+    after = json.loads(fleet_status.read_text())
+    assert after["policy_on_gpu"] is False and after["command"] is None, "idle between sessions"
+
+
+def test_without_fleet_s_status_file_sessions_still_run(station, monkeypatch):
+    monkeypatch.delenv("FLEET_STATUS")
+    assert station.session("drills", "artifacts/x", [], run=lambda *a: 0) is False
