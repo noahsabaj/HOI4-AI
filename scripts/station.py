@@ -23,6 +23,9 @@ this PC (they read it to keep their GPU work away from a live policy):
      "until_estimate": <unix time or null>}
 `policy` is whether a learned checkpoint decides on this PC's GPU (practice and
 play-policy; drills and record-ai are scripted). The file is gone between sessions.
+The same status goes to fleet's FLEET_STATUS file, with "policy_on_gpu" for `policy`
+(`fleet service list --on <node> --json` shows it), and {"policy_on_gpu": false,
+"command": null} between sessions.
 
 The plan (artifacts/station/plan.json, pushed from the training PC by collect_station.py
 deploy; read before each session, so it changes without a restart):
@@ -143,6 +146,17 @@ def announce(command, output, args):
     temporary = CURRENT.with_suffix(".tmp")
     temporary.write_text(json.dumps(status))
     temporary.replace(CURRENT)
+    tell_fleet({**status, "policy_on_gpu": status["policy"]})
+
+
+def tell_fleet(status):
+    """Write fleet's FLEET_STATUS file, if fleet gave one; a failure never stops a session."""
+    path = os.environ.get("FLEET_STATUS")
+    if path:
+        try:
+            Path(path).write_text(json.dumps(status))
+        except OSError as error:
+            log(f"could not write FLEET_STATUS: {error}")
 
 
 def session(command, output, args, run=hoi4):
@@ -154,6 +168,7 @@ def session(command, output, args, run=hoi4):
         code = run(command, output, "--peer", PEER, *args)
     finally:
         CURRENT.unlink(missing_ok=True)
+        tell_fleet({"policy_on_gpu": False, "command": None, "since": time.time()})
     ok = code == 0 and played(command, output)
     with FINISHED.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"output": output, "command": command, "exit": code,
@@ -192,6 +207,7 @@ def record(entry, run=hoi4):
 def main():
     STATION.mkdir(parents=True, exist_ok=True)
     log(f"started (pid {os.getpid()})")
+    tell_fleet({"policy_on_gpu": False, "command": None, "since": time.time()})
     while not should_stop():
         lend_if_wanted()
         now = plan()
