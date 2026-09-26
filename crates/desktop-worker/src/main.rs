@@ -374,6 +374,17 @@ fn control_action(op: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether a control operation starts a program that must outlive this worker, so its pwsh
+/// is started outside the worker's job object (`platform::spawn_outside_job`): the game
+/// (launch) and the PC owner's chat app (restart_discord). A fleet service runs in a job
+/// object, and a forced stop (`fleet stop`, `fleet service restart --now`, `remove`) ends
+/// every process in it. The chat app is the owner's own and must never end with ours. The
+/// game belongs to the session that launched it, not to this worker, of which each
+/// connection starts its own: sessions quit it when they end and before each launch.
+fn control_outlives(op: &str) -> bool {
+    matches!(op, "launch" | "restart_discord")
+}
+
 /// What an observer connection may ask for: to look and to measure, never to give input,
 /// launch or quit the game, or record. `report` and `saves` only read; a `view` only
 /// watches, on a capture of its own (start_view).
@@ -1511,11 +1522,12 @@ mod platform {
             }
             ControlGuard
         };
+        let outlive = control_outlives(op);
         let cmd = cmd.clone();
         thread::Builder::new()
             .name(format!("control-{op}"))
             .spawn(move || {
-                let result = run_control(&pwsh, &script, &args);
+                let result = run_control(&pwsh, &script, &args, outlive);
                 // Free before replying, so a caller that sends the next control operation
                 // as soon as this reply arrives is not told the worker is still busy.
                 drop(guard);
@@ -1532,15 +1544,20 @@ mod platform {
     /// handles keeps the pipe open until it exits too; waiting for the end of the pipe
     /// would hold the reply for the whole game. The worker's own stdio is made
     /// uninheritable at startup for the same reason, in `run`.
+    ///
+    /// With `outlive` (control_outlives), pwsh starts outside the worker's job object, and
+    /// so does everything it starts: the game, the watcher that puts the display settings
+    /// back when the game exits, and the chat app.
     fn run_control(
         pwsh: &Path,
         script: &Path,
         args: &[String],
+        outlive: bool,
     ) -> Result<(serde_json::Value, Vec<u8>), String> {
         use std::io::Read;
-        use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         let (mut pipe, writer) = io::pipe().map_err(|e| e.to_string())?;
+        let mut stayed = None;
         let mut child = {
             let mut command = Command::new(pwsh);
             command
@@ -1549,16 +1566,28 @@ mod platform {
                 .args(args)
                 .stdin(Stdio::null())
                 .stdout(writer.try_clone().map_err(|e| e.to_string())?)
-                .stderr(writer)
-                // The worker on the second PC has no console, so pwsh would open a
-                // visible one on a screen nobody may be watching.
-                .creation_flags(CREATE_NO_WINDOW);
-            command
+                .stderr(writer);
+            // The worker on the second PC has no console, so pwsh would open a visible one
+            // on a screen nobody may be watching.
+            let started = if outlive {
+                spawn_outside_job(&mut command, CREATE_NO_WINDOW).map(|(child, why)| {
+                    stayed = why;
+                    child
+                })
+            } else {
+                std::os::windows::process::CommandExt::creation_flags(
+                    &mut command,
+                    CREATE_NO_WINDOW,
+                )
                 .spawn()
-                .map_err(|e| format!("control_start_failed: {e}"))?
+            };
+            started.map_err(|e| format!("control_start_failed: {e}"))?
             // `command` holds this end of the pipe. Dropping it here lets the read below
             // end once pwsh and everything that inherited the pipe have exited.
         };
+        if let Some(why) = &stayed {
+            eprintln!("{why}");
+        }
         let output = Arc::new(Mutex::new(Vec::new()));
         let (done, finished) = mpsc::channel();
         let sink = Arc::clone(&output);
@@ -1604,7 +1633,42 @@ mod platform {
                 -1
             }
         };
+        if let Some(why) = stayed {
+            text.push_str(&format!("\n{why}"));
+        }
         Ok((serde_json::json!({"output": text, "exit": exit}), vec![]))
+    }
+
+    /// Start `command` with `flags` outside the job object this worker runs in, so that a
+    /// forced stop of the worker's fleet service, which ends every process in its job, does
+    /// not end it or anything it starts (CREATE_BREAKAWAY_FROM_JOB). It starts as any child
+    /// would otherwise: in this session, on this desktop, with its windows.
+    ///
+    /// Outside any job the flag changes nothing. A job that does not allow leaving it
+    /// (fleet's does; some terminals' may not) refuses the start, and then the command is
+    /// started inside it after all, rather than not at all: the second value says so.
+    fn spawn_outside_job(
+        command: &mut std::process::Command,
+        flags: u32,
+    ) -> io::Result<(std::process::Child, Option<String>)> {
+        use std::os::windows::process::CommandExt;
+        match command
+            .creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+        {
+            Ok(child) => Ok((child, None)),
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                let child = command.creation_flags(flags).spawn()?;
+                Ok((
+                    child,
+                    Some(format!(
+                        "The worker's job object does not let a process leave it ({e}): what \
+                         this started ends if the worker's service is stopped."
+                    )),
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Bring the attached game window to the front, for setup only. A windowed game
@@ -2989,6 +3053,170 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Command, Stdio};
+        use windows_sys::Win32::System::JobObjects::*;
+
+        /// Where `a_launch_outlives_a_forced_stop_of_the_worker` puts its child.
+        const JOB_CHILD: &str = "HOI4_TEST_JOB_CHILD";
+        /// A program with windows to stand in for the game, instead of a windowless ping;
+        /// its window must then show on this desktop. Not Windows 11's notepad.exe, whose
+        /// window belongs to a Store app started outside the launcher.
+        const STAND_IN: &str = "HOI4_TEST_STAND_IN";
+
+        /// The worker under a fleet service's job object (one that allows leaving it, and
+        /// does not end its processes when closed), running a control operation through
+        /// Start-Process as Game-Control does, once as a launch (outlive) and once as a quit
+        /// would. Then the job is ended, as `fleet stop` ends it: what the launch started
+        /// must still run, in this session and on this desktop; the other must not.
+        #[test]
+        fn a_launch_outlives_a_forced_stop_of_the_worker() {
+            // Tests run inside a job that forbids leaving it cannot show this.
+            let (mut probe, stayed) = spawn_outside_job(
+                Command::new("cmd.exe").args(["/c", "exit"]),
+                CREATE_NO_WINDOW,
+            )
+            .unwrap();
+            probe.wait().unwrap();
+            if let Some(why) = stayed {
+                eprintln!("skipped: {why}");
+                return;
+            }
+            let dir = std::env::temp_dir().join(format!("hoi4-job-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            unsafe {
+                let job = CreateJobObjectW(null_mut(), null_mut());
+                assert!(!job.is_null());
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+                assert_ne!(
+                    SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        &limits as *const _ as *const _,
+                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    ),
+                    0
+                );
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["platform::tests::worker_in_a_job", "--exact", "--ignored"])
+                    .args(["--nocapture", "--test-threads=1"])
+                    .env(JOB_CHILD, &dir)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                assert_ne!(
+                    AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE),
+                    0
+                );
+                // Its lines ending "outlives <pid>" and "stays <pid>" (the first follows
+                // the test harness's "test ... " on the same line), with a handle to each
+                // process taken while it surely runs.
+                let (mut outlives, mut stays) = (None, None);
+                for line in io::BufReader::new(child.stdout.take().unwrap()).lines() {
+                    let line = line.unwrap();
+                    let words: Vec<&str> = line.split_whitespace().collect();
+                    let [.., which @ ("outlives" | "stays"), pid] = words[..] else {
+                        continue;
+                    };
+                    let Ok(pid) = pid.parse::<u32>() else {
+                        continue;
+                    };
+                    let handle = OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                        0,
+                        pid,
+                    );
+                    assert!(!handle.is_null(), "{line}");
+                    if which == "outlives" {
+                        outlives = Some((pid, handle));
+                    } else {
+                        stays = Some((pid, handle));
+                    }
+                    if outlives.is_some() && stays.is_some() {
+                        break;
+                    }
+                }
+                let (Some((pid, outlived)), Some((_, stayed))) = (outlives, stays) else {
+                    TerminateJobObject(job, 1);
+                    panic!("the worker in the job did not start both");
+                };
+                assert_ne!(TerminateJobObject(job, 1), 0);
+                child.wait().unwrap();
+                let ended = WaitForSingleObject(stayed, 10_000) == WAIT_OBJECT_0;
+                let survived = WaitForSingleObject(outlived, 1_000) == WAIT_TIMEOUT;
+                // It shows its windows here, on the desktop this test runs on, if it has any.
+                let mut windowed = std::env::var_os(STAND_IN).is_none();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while survived && !windowed && Instant::now() < deadline {
+                    unsafe extern "system" fn visible(hwnd: HWND, lp: LPARAM) -> BOOL {
+                        let found = &mut *(lp as *mut (u32, bool));
+                        if IsWindowVisible(hwnd) != 0 && window_pid(hwnd) == found.0 {
+                            found.1 = true;
+                        }
+                        1
+                    }
+                    let mut found = (pid, false);
+                    EnumWindows(Some(visible), &mut found as *mut _ as LPARAM);
+                    windowed = found.1;
+                    thread::sleep(Duration::from_millis(200));
+                }
+                TerminateProcess(outlived, 0);
+                TerminateProcess(stayed, 0);
+                CloseHandle(outlived);
+                CloseHandle(stayed);
+                CloseHandle(job);
+                let _ = std::fs::remove_dir_all(&dir);
+                assert!(survived, "what the launch started ended with the job");
+                assert!(windowed, "what the launch started showed no window here");
+                assert!(ended, "what the quit started outlived the job");
+            }
+        }
+
+        /// The worker's side of `a_launch_outlives_a_forced_stop_of_the_worker`, run only by
+        /// it, as its child inside a job object.
+        #[test]
+        #[ignore = "run by a_launch_outlives_a_forced_stop_of_the_worker"]
+        fn worker_in_a_job() {
+            let Some(dir) = std::env::var_os(JOB_CHILD).map(PathBuf::from) else {
+                return;
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut inside = 0;
+                unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut inside) };
+                if inside != 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "never put in a job");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let script = dir.join("start.ps1");
+            std::fs::write(
+                &script,
+                "$p = if ($env:HOI4_TEST_STAND_IN) { Start-Process $env:HOI4_TEST_STAND_IN -PassThru }\n\
+                 else { Start-Process ping.exe -ArgumentList '-n', '60', '127.0.0.1' -WindowStyle Hidden -PassThru }\n\
+                 \"pid $($p.Id)\"\n",
+            )
+            .unwrap();
+            // Windows PowerShell, not whichever pwsh is on PATH: the Store build of pwsh
+            // starts outside the job it was started from (2026-09-26, on the first PC), so
+            // everything would outlive the job and the test would show nothing.
+            let windir = std::env::var_os("SystemRoot").unwrap();
+            let shell =
+                Path::new(&windir).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+            for (which, outlive) in [("outlives", true), ("stays", false)] {
+                let (reply, _) = run_control(&shell, &script, &[], outlive).unwrap();
+                let output = reply["output"].as_str().unwrap();
+                let pid = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("pid "))
+                    .unwrap_or_else(|| panic!("{output}"));
+                println!("{which} {pid}");
+            }
+            // Ended with the job.
+            thread::sleep(Duration::from_secs(60));
+        }
 
         #[test]
         fn a_game_whose_window_is_gone_has_exited_and_is_never_in_front() {
@@ -3458,6 +3686,15 @@ mod tests {
             control_arguments("restart-discord", &noisy, mods).unwrap_err(),
             "unknown_operation"
         );
+    }
+    #[test]
+    fn only_the_game_and_the_chat_app_outlive_the_worker() {
+        for op in ["launch", "restart_discord"] {
+            assert!(control_outlives(op), "{op}");
+        }
+        for op in ["quit", "report", "saves", "restart-discord", "arm", ""] {
+            assert!(!control_outlives(op), "{op}");
+        }
     }
     #[test]
     fn a_launch_may_load_a_save_by_name_only() {

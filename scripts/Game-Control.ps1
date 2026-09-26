@@ -13,6 +13,11 @@
 # -Action report            Its processes, windows and log ends.
 # -Action saves             The save games there, newest first.
 # -Action restart-discord   Restart Discord, whose overlay can hang the game's startup.
+#
+# The worker starts this script for launch and restart-discord outside its fleet service's
+# job object (CREATE_BREAKAWAY_FROM_JOB), so the game, the display-settings watcher and
+# Discord outlive a forced stop of the service, which ends everything left in the job.
+# Start-Process cannot leave a job itself; what it starts from here is already outside.
 param(
     [Parameter(Mandatory)][ValidateSet('launch', 'quit', 'report', 'saves', 'restart-discord')][string]$Action,
     [string]$Mod,
