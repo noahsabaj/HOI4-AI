@@ -711,6 +711,13 @@ def build_parser():
         "converted to RGB there, again the same pixels (nvdec.py)",
     )
     train.add_argument(
+        "--fast-perception",
+        action="store_true",
+        help="Fast mode, opt-in: the detail and fovea readers keep their maps in bfloat16 "
+        "(models.Stage `low`), about 1.3x faster steps with --gpu-views; not the same bits "
+        "as without (bfloat16 rounding)",
+    )
+    train.add_argument(
         "--balance",
         action="store_true",
         help="Weigh every (arena, side) group of recordings the same in the loss "
