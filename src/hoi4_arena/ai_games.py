@@ -641,8 +641,17 @@ def pick_country(desk, country, tries=8):
         # was the largest red patch: move it up onto the top bar, off the map, first.
         act(desk, [{"kind": "move", "x": 0.3, "y": 0.015}])
         rgb = screen(desk)
-        if picked(rgb) == country:
+        selected = picked(rgb)
+        if selected == country:
             return True
+        if selected is None:
+            # No selected flag: this is not the picker (the game still loading, or the
+            # menus did not advance). Its "land" could be anything: on a Linux station,
+            # where the menu clicks had landed on the loading screen, the main menu's blue
+            # DLC banner passed for Blue land and a click on it opened Steam's store
+            # (2026-09-26). Look again rather than click.
+            time.sleep(2)
+            continue
         top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
         land = own_land(rgb[top:bottom], country)
         if land is None:
@@ -1641,6 +1650,11 @@ def local_mod(mod, mods_dir=None):
     if link.exists():
         if link.resolve() != source:
             raise RuntimeError(f"another arena is already called {source.name} in {mods_dir}")
+        return
+    if os.name != "nt":
+        # A Linux station (xworker) finds the arena by folder name in the same place.
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(source, target_is_directory=True)
         return
     made = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(source)], capture_output=True, text=True

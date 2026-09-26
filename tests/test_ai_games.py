@@ -127,6 +127,11 @@ def test_picking_a_country_clicks_its_land_until_its_flag_shows(monkeypatch):
     # No Blue land and Blue not selected: the pick never takes.
     frame[300:700, 700:1152] = SEA
     assert not pick_country(None, "BLU")
+    # Not the picker at all (no selected flag): nothing is clicked, however blue it is.
+    clicks.clear()
+    frame[:] = SEA
+    frame[600:700, 800:1100] = BLUE_LAND  # say, the main menu's store banner
+    assert not pick_country(None, "BLU") and not clicks
 
 
 def test_the_front_is_where_blue_land_meets_red():
