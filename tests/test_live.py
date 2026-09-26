@@ -333,30 +333,53 @@ def test_the_second_pc_s_view_is_cut_into_the_playlist_without_encoding_again(tm
     assert "-filter_threads 1 -threads 1 -vf fps=1" in joined
 
 
+def _streams(path):
+    probe = subprocess.run(
+        [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    return sorted(set(probe.stdout.split()))  # MPEG-TS lists them per program too
+
+
+def _sound(on):
+    """A tone's input and its AAC encoding (the worker's view with `audio`), or nothing."""
+    return (["-f", "lavfi", "-i", "sine=frequency=440"], ["-c:a", "aac"]) if on else ([], [])
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-def test_the_view_command_runs_on_a_stream_like_the_second_pc_s(tmp_path):
-    """ffmpeg takes every option, as a failed start would leave the page without a view."""
+@pytest.mark.parametrize("sound", [False, True])
+def test_the_view_command_runs_on_a_stream_like_the_second_pc_s(tmp_path, sound):
+    """ffmpeg takes every option, as a failed start would leave the page without a view,
+    and the game's sound, where the stream has it, reaches the playlist and the pieces."""
     ffmpeg = shutil.which("ffmpeg")
+    tone, aac = _sound(sound)
     stream = subprocess.run(
-        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=5", "-t", "5",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", "-bf", "0", "-f", "mpegts",
-         "pipe:1"],
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=5", *tone,
+         "-t", "5", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", "-bf", "0", *aac,
+         "-f", "mpegts", "pipe:1"],
         check=True, capture_output=True,
     ).stdout  # fmt: skip
-    out = tmp_path / "out"
+    out, raw = tmp_path / "out", tmp_path / "raw"
     out.mkdir()
+    raw.mkdir()
     done = subprocess.run(
-        live.view_command(ffmpeg, out, number=3), input=stream, capture_output=True, timeout=60
-    )
+        live.view_command(ffmpeg, out, number=3, raw=raw),
+        input=stream, capture_output=True, timeout=60,
+    )  # fmt: skip
     assert done.returncode == 0, done.stderr.decode(errors="replace")
     assert "seg000003.ts" in (out / "live.m3u8").read_text()
     assert (out / "latest.jpg").read_bytes()[:2] == b"\xff\xd8"
+    kinds = ["audio", "video"] if sound else ["video"]
+    assert _streams(out / "seg000003.ts") == kinds
+    assert _streams(next(raw.glob("*.ts"))) == kinds
 
 
 def test_the_view_also_writes_raw_pieces_for_the_archive_when_asked(tmp_path):
     command = live.view_command("ffmpeg", tmp_path / "out", raw=tmp_path / "raw")
     at = command.index("segment")
-    assert command[at - 5 : at - 1] == ["-map", "0:v", "-c:v", "copy"]
+    maps = ["-map", "0:v", "-map", "0:a?", "-c:v", "copy", "-c:a", "copy"]
+    assert command[at - 9 : at - 1] == maps
     assert command[-1].endswith("%Y%m%d-%H%M%S.ts")
     assert "segment" not in live.view_command("ffmpeg", tmp_path / "out")
 
@@ -381,16 +404,18 @@ def test_a_game_s_pieces_are_used_once_they_cover_it_whole(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
-def test_an_ended_game_is_archived_from_its_pieces_and_replayed_from_there(tmp_path):
+@pytest.mark.parametrize("sound", [False, True])
+def test_an_ended_game_is_archived_from_its_pieces_and_replayed_from_there(tmp_path, sound):
     ffmpeg = shutil.which("ffmpeg")
     raw = tmp_path / "raw" / "peer"
     raw.mkdir(parents=True)
     start = time.time() - 600
+    tone, aac = _sound(sound)
     for k in range(3):
         began = time.strftime("%Y%m%d-%H%M%S", time.localtime(start + 4 * k))
         subprocess.run(
-            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=60",
-             "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts",
+            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=60", *tone,
+             "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", *aac, "-f", "mpegts",
              str(raw / f"{began}.ts")],
             check=True,
         )  # fmt: skip
@@ -415,6 +440,7 @@ def test_an_ended_game_is_archived_from_its_pieces_and_replayed_from_there(tmp_p
     facts = json.loads(probe.stdout)
     assert abs(float(facts["format"]["duration"]) - 8) < 0.5, "the game's 8 s, cut from 12"
     assert facts["streams"][0]["r_frame_rate"] == "30/1"
+    assert _streams(made) == (["audio", "video"] if sound else ["video"])
     # Its pieces go once no game needs them (all of them are older than RAW_KEEP here).
     archive.step(played, now=time.time() + live.archive.RAW_KEEP + 700)
     assert not list(raw.glob("*.ts"))

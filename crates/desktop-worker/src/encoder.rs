@@ -395,18 +395,24 @@ impl Drop for Encoder {
 /// a second, encoded on the GPU as H.264 4:2:0, which any browser plays, and written as
 /// MPEG-TS for the viewer to cut into HLS without encoding it again. A keyframe every 2 s,
 /// where the viewer's segments begin.
-pub fn view_arguments(hwnd: usize, hz: u32) -> Vec<String> {
+pub fn view_arguments(hwnd: usize, hz: u32, sound: bool) -> Vec<String> {
     let source = format!("gfxcapture=hwnd={hwnd}:max_framerate={hz}:capture_cursor=1");
     let (rate, gop) = (hz.to_string(), (2 * hz).to_string());
-    [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostats",
-        "-f",
-        "lavfi",
-        "-i",
-        &source,
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostats"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(["-f", "lavfi", "-i", &source].iter().map(|s| s.to_string()));
+    // The game's sound, as PCM on stdin (audio::Capture), into AAC beside the picture.
+    if sound {
+        args.extend(crate::audio::input_arguments());
+        args.extend(
+            ["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "128k"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+    let rest = [
         "-fps_mode",
         "cfr",
         "-r",
@@ -434,10 +440,9 @@ pub fn view_arguments(hwnd: usize, hz: u32) -> Vec<String> {
         "-flush_packets",
         "1",
         "pipe:1",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect()
+    ];
+    args.extend(rest.iter().map(|arg| arg.to_string()));
+    args
 }
 
 /// A live view: ffmpeg capturing and encoding by itself, apart from the recording's clock
@@ -448,18 +453,26 @@ pub struct View {
     pub pid: u32,
     child: Child,
     _job: Option<Job>,
+    // After the child: dropped once ffmpeg is gone, its writes fail and it ends.
+    _sound: Option<crate::audio::Capture>,
 }
 
 impl View {
     pub fn start(
         ffmpeg: &Path,
         args: &[String],
+        mut sound: Option<crate::audio::Capture>,
         mut on_data: impl FnMut(&[u8]) + Send + 'static,
         on_end: impl FnOnce(String) + Send + 'static,
     ) -> Result<Self, String> {
+        let stdin = if sound.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
         let mut child = Command::new(ffmpeg)
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
@@ -467,6 +480,9 @@ impl View {
             .map_err(|e| format!("view_start_failed: {e}"))?;
         let job = kill_on_close(&child);
         let pid = child.id();
+        if let (Some(sound), Some(stdin)) = (sound.as_mut(), child.stdin.take()) {
+            sound.attach(stdin);
+        }
         let mut stdout = child.stdout.take().ok_or("view_stdout")?;
         let stderr = child.stderr.take().ok_or("view_stderr")?;
         let last = Arc::new(Mutex::new(String::new()));
@@ -502,6 +518,7 @@ impl View {
             pid,
             child,
             _job: job,
+            _sound: sound,
         })
     }
 }
@@ -519,13 +536,24 @@ mod tests {
 
     #[test]
     fn a_view_captures_the_window_on_the_gpu_as_mpeg_ts() {
-        let args = view_arguments(0x1234, 30);
+        let args = view_arguments(0x1234, 30, false);
         let joined = args.join(" ");
         assert!(joined.contains("gfxcapture=hwnd=4660:max_framerate=30:capture_cursor=1"));
         assert!(joined.contains("-c:v h264_nvenc") && joined.contains("-g 60"));
         assert!(joined.ends_with("-f mpegts -flush_packets 1 pipe:1"));
         // Nothing of the recording's 4:4:4 profile: phones play 4:2:0 alone.
         assert!(!joined.contains("444"));
+        assert!(!joined.contains("pipe:0") && !joined.contains("-c:a"));
+    }
+
+    #[test]
+    fn a_view_with_sound_reads_it_from_stdin_into_aac() {
+        let joined = view_arguments(0x1234, 60, true).join(" ");
+        assert!(joined.contains("-f s16le -ar 48000 -ac 2 -thread_queue_size 1024 -i pipe:0"));
+        assert!(joined.contains("-map 0:v -map 1:a -c:a aac -b:a 128k"));
+        // The picture's input comes first, so 0:v is the window.
+        assert!(joined.find("gfxcapture").unwrap() < joined.find("pipe:0").unwrap());
+        assert!(joined.ends_with("-f mpegts -flush_packets 1 pipe:1"));
     }
 
     #[test]

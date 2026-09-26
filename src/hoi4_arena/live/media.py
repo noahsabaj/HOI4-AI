@@ -102,7 +102,8 @@ def view_command(ffmpeg, out, number=0, raw=None):
     """ffmpeg cutting a live view (MPEG-TS on its stdin, keyframes every 2 s) into the
     playlist as it comes, without encoding it again, after a discontinuity, with
     latest.jpg once a second; and with `raw`, into that folder's pieces too, for the
-    games' archives (archive.piece_output).
+    games' archives (archive.piece_output). The game's sound goes along where the stream
+    has it (the second PC's worker, asked for `audio`).
 
     One thread each decodes, filters and encodes the snapshot. Left to choose, ffmpeg
     sized every pool to this PC's 28 threads (84 threads in all) and held ~900 MB a game
@@ -111,11 +112,11 @@ def view_command(ffmpeg, out, number=0, raw=None):
     from .archive import piece_output
 
     out = Path(out)
-    pieces = ["-map", "0:v", *piece_output(raw)] if raw else []
+    pieces = ["-map", "0:v", "-map", "0:a?", *piece_output(raw)] if raw else []
     return [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-threads", "1", "-f", "mpegts", "-i", "pipe:0",
-        "-map", "0:v", "-c:v", "copy",
+        "-map", "0:v", "-map", "0:a?", "-c:v", "copy", "-c:a", "copy",
         "-f", "hls", "-hls_time", str(SEGMENT), "-hls_list_size", str(SEGMENTS),
         "-hls_delete_threshold", "5", "-hls_flags", FLAGS, "-start_number", str(number),
         "-hls_segment_filename", str(out / "seg%06d.ts"), str(out / "live.m3u8"),
@@ -236,7 +237,10 @@ class PeerView:
         try:
             self.desk = RemoteDesktop(self.peer, attach=True, observer=True)
             self.desk.streams["view"] = self.deliver
-            self.desk.request("view", action="start", key="view", hz=self.hz)
+            # With its sound: a worker from before sound ignores `audio` and sends none.
+            reply = self.desk.request("view", action="start", key="view", hz=self.hz, audio=True)
+            if isinstance(reply, dict) and reply.get("audio_error"):
+                log.info("the second PC's view is without sound: %s", reply["audio_error"])
         except Exception as error:
             self.refused = "refused_for_observer" in str(error) or "unknown" in str(error)
             self.stop()
