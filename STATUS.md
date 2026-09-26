@@ -866,6 +866,17 @@ each change below is a flag measured against what it replaces.
   learning phase: that is a regression, blur is its usual failure, and one pass a
   decision would fit a 200 ms tick. The paper suggests pairing it with JEPA-style
   feature world models.
+- **Noted for later: PoEM (2609.30226, 2026-09).** Given several copies of one model
+  each trained by RL on its own reward, the policy for a weighted mix of those rewards
+  is close to the base policy plus the weighted sum of each copy's log-probability
+  shift, with weights fitted by linear regression on a small scored sample and no new
+  training. It recovered 0.78-1.08 of a real RL run's gain on mixed rewards, about the
+  spread between two RL seeds; less on rewards outside the mix (0.55-0.69 when its
+  coverage check passes). Tested on text and image models only. It fits here once
+  there are several RL experts sharing one imitation policy as their base, e.g. one
+  per setup step (army, general, front) and later one for territory: our action head's
+  exact per-choice log-probabilities are what its decoder composes, and each RL run is
+  the expensive part at ~30 practice episodes an hour.
 
 ## A scripted player and the true state (2026-09-23)
 
