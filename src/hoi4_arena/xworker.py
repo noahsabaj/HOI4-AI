@@ -166,7 +166,9 @@ def map_error_report(error_log: Path):
         text = error_log.read_text(encoding="utf8", errors="replace").splitlines()
     except FileNotFoundError:
         return []
-    found = [line for line in text if MAP_ERROR.search(line)]
+    # A node with no sound card logs every missing sound, and some are named after
+    # railway guns, which the pattern would take for the map's railways.
+    found = [line for line in text if MAP_ERROR.search(line) and "sound effect" not in line]
     return [f"== map errors in error.log: {len(found)}", *found[:10], "== end of map errors"]
 
 

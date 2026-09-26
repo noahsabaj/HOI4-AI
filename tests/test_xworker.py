@@ -136,7 +136,10 @@ def test_launch_arguments_and_the_mod_list(tmp_path):
 
 def test_map_errors_are_reported_as_game_control_reports_them(tmp_path):
     log = tmp_path / "error.log"
-    log.write_text("a map/definition.csv line\nfine\nMAP_ERROR two\n")
+    log.write_text(
+        "a map/definition.csv line\nfine\nMAP_ERROR two\n"
+        'Couldn\'t find sound effect: "GEN_railway_gun"\n'  # no sound card, not the map
+    )
     report = xworker.map_error_report(log)
     assert report[0] == "== map errors in error.log: 2" and report[-1] == "== end of map errors"
     from hoi4_arena.ai_games import parse_map_errors
