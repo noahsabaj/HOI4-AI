@@ -180,10 +180,15 @@ class Coach:
 
 
 def summary(results):
-    """How often the policy did each step itself, over the episodes that played, and how
-    often the coach managed a step it took over (`coach_<step>`)."""
+    """How often the policy did each step itself, over the episodes that played, how often
+    the coach managed a step it took over (`coach_<step>`), and the temperatures played at."""
     played = [r for r in results if r.get("setup")]
     out = {"episodes": len(played)}
+    # The temperatures the policy played at (one session, one actor, so one of each).
+    for key in ("temperature", "pointer_temperature"):
+        seen = sorted({r.get(key, 1.0) for r in results})
+        if seen:
+            out[key] = seen[0] if len(seen) == 1 else seen
     for step in STEPS:
         own = sum(1 for r in played if (r["setup"]["steps"].get(step) or {}).get("by") == "policy")
         out[step] = f"{own}/{len(played)}"
@@ -233,17 +238,21 @@ def practice(
     reservation=None,
     held_previous=False,
     temperature=1.0,
+    pointer_temperature=None,
+    point=False,
     rules="artifacts/calibration-1080p/rules.json",
     model_path=None,
     seed=None,
 ):
     """Up to `episodes` practice episodes of `seconds` each (or until `minutes` run out) on
-    the second PC, from the main arena's start saves, alternating countries. Returns the
-    episodes and the summary (practice-peer.json in `output`)."""
+    the second PC, from the main arena's start saves, alternating countries. `temperature`,
+    `pointer_temperature` and `point` are how the policy samples, as play-policy's
+    (runner.resolve_temperatures); each episode and the summary name the two temperatures.
+    Returns the episodes and the summary (practice-peer.json in `output`)."""
     from PIL import Image
 
     from .ai_games import EVENT_OK, Station, focus, log_end, start_game
-    from .play import hand_back, play_policy_game, reserve
+    from .play import hand_back, play_policy_game, reserve, sampling_of
     from .runner import Actor
     from .vision import ScreenRules
 
@@ -259,7 +268,10 @@ def practice(
     end = time.monotonic() + minutes * 60
     results, running = [], False
     try:
-        actor = Actor(checkpoint, model_path, game_speed=5, temperature=temperature)
+        actor = Actor(
+            checkpoint, model_path, game_speed=5, temperature=temperature,
+            pointer_temperature=pointer_temperature, point=point,
+        )  # fmt: skip
         actor.lean = True
         actor.held_previous = actor.held_previous or held_previous
         for index in range(episodes):
@@ -269,7 +281,8 @@ def practice(
             save = f"arenav4{country.lower()}"
             name = time.strftime("practice-peer-%Y%m%d-%H%M%S")
             entry = {"game": name, "station": "peer", "started_as": country, "arena": MAIN_ARENA,
-                     "start_save": save, "checkpoint": actor.digest, "coach": coach}  # fmt: skip
+                     "start_save": save, "checkpoint": actor.digest, "coach": coach,
+                     **sampling_of(actor)}  # fmt: skip
             failure_shot = out_root / f"{name}-start-failed.png"
             try:
                 log_from = None

@@ -333,6 +333,14 @@ def gumbel_argmax(logits):
     return (logits - torch.empty_like(logits).exponential_().log_()).argmax(-1)
 
 
+def draw(logits, temperature=1.0):
+    """A categorical draw from `logits` at `temperature`: 1 samples them as they are (the
+    very same draw as gumbel_argmax), below 1 sharpens them, 0 takes the likeliest."""
+    if temperature == 0:
+        return logits.argmax(-1)
+    return gumbel_argmax(logits if temperature == 1.0 else logits / temperature)
+
+
 def categorical(logits):
     """Normalized log-probabilities, the way torch.distributions.Categorical does it.
 
@@ -433,6 +441,7 @@ class ActionHead(nn.Module):
         sigma=0.0,
         point=False,
         temperature=1.0,
+        pointer_temperature=1.0,
     ):
         """Sample (or score, given `actions`) the eight slots.
 
@@ -453,6 +462,10 @@ class ActionHead(nn.Module):
         there. The likelihood returned is then of the place taken, not of a sample.
         `temperature` below 1, when sampling, sharpens what to do: the likeliest input of
         each slot gains, and rarely chosen ones, such as a camera's aimless moves, fade.
+        `pointer_temperature` does the same for where a move goes (its cell, then the
+        position inside it). Either at 0 takes the likeliest (`point` is a pointer
+        temperature of 0). Neither changes the likelihood returned, which is always of the
+        head's own distribution, nor any scoring of given `actions`.
 
         The entropy of a slot is the kind's, plus, weighted by the chance of a move, the
         cell's and the position's within one cell. That last term is exact only for the
@@ -462,6 +475,7 @@ class ActionHead(nn.Module):
         """
         b = memory.shape[0]
         rows = torch.arange(b, device=memory.device)
+        aim = 0.0 if point else pointer_temperature
         if noise is None:
             noise = torch.zeros(b, self.noise_dim, device=memory.device, dtype=memory.dtype)
         state = torch.tanh(self.init(torch.cat([memory, noise], -1)))
@@ -486,12 +500,12 @@ class ActionHead(nn.Module):
             elif deterministic:
                 kind, place = kinds.argmax(-1), places.argmax(-1)
             else:
-                kind = gumbel_argmax(kinds / temperature if temperature != 1.0 else kinds)
-                place = places.argmax(-1) if point else gumbel_argmax(places)
+                kind = draw(kinds, temperature)
+                place = draw(places, aim)
             chosen = cells[rows, place].to(state.dtype)
             fine = categorical(self.fine(torch.cat([state, chosen], -1)).float())
             if actions is None:
-                offset = fine.argmax(-1) if deterministic or point else gumbel_argmax(fine)
+                offset = fine.argmax(-1) if deterministic else draw(fine, aim)
             kind_p, place_p, fine_p = kinds.softmax(-1), places.softmax(-1), fine.softmax(-1)
             move = (kind == 1).float()
             moved = moved | (kind == 1)

@@ -118,6 +118,21 @@ def act_noise(objective, width, deterministic, device, latents=None):
     return torch.randn(1, width, device=device)
 
 
+def resolve_temperatures(temperature=1.0, pointer_temperature=None, point=False):
+    """(what to do, where to point): the temperatures an actor samples its action head at
+    (models.ActionHead). The pointer's follows `temperature` unless given its own, and
+    `point` is a pointer temperature of 0 (the likeliest spot). 0 takes the likeliest, 1
+    samples the policy as trained, anything between sharpens it."""
+    if pointer_temperature is None:
+        pointer_temperature = 0.0 if point else temperature
+    elif point and pointer_temperature != 0:
+        raise ValueError("point is a pointer temperature of 0; give one or the other")
+    for name, value in (("temperature", temperature), ("pointer_temperature", pointer_temperature)):
+        if not float(value) >= 0:
+            raise ValueError(f"{name} must be 0 or more, not {value}")
+    return float(temperature), float(pointer_temperature)
+
+
 class Actor:
     def __init__(
         self,
@@ -131,6 +146,7 @@ class Actor:
         memory_window=None,
         point=False,
         temperature=1.0,
+        pointer_temperature=None,
     ):
         """`memory_window` N runs the memory afresh over the last N decisions' perception
         at every decision, from an empty state, instead of carrying it from the game's
@@ -138,10 +154,13 @@ class Actor:
         decisions long (train-bc's burn-in plus sequence). None carries it, as always.
         `point` places each move on its likeliest spot while still sampling what to do
         (models.ActionHead): for evaluation, not for self-play, whose likelihoods must be of
-        samples."""
+        samples. `temperature` and `pointer_temperature` sharpen what it does and where it
+        points (resolve_temperatures); likewise for evaluation only."""
+        self.temperature, self.pointer_temperature = resolve_temperatures(
+            temperature, pointer_temperature, point
+        )
         self.policy, self.config, self.digest = load_policy(checkpoint, model_path, device)
         self.point = point
-        self.temperature = temperature
         self.memory_window = memory_window
         self.recent = deque(maxlen=memory_window) if memory_window else None
         # The policy is told the speed the match runs at: the same clip is a different
@@ -160,6 +179,16 @@ class Actor:
         self.held_previous = bool(self.config.get("held_previous"))
         self.history = deque(maxlen=64)
         self.compiled = compile_head and device == "cuda" and self._compile_head()
+
+    @property
+    def sampling(self):
+        """How this actor draws its actions, for a game's manifest: its two temperatures
+        (resolve_temperatures) and whether it takes the argmax outright."""
+        return {
+            "temperature": getattr(self, "temperature", 1.0),
+            "pointer_temperature": getattr(self, "pointer_temperature", 1.0),
+            "deterministic": bool(getattr(self, "deterministic", False)),
+        }
 
     def _remember(self, action):
         """The action just chosen, as the next decision will read it."""
@@ -247,6 +276,7 @@ class Actor:
                         deterministic=self.deterministic,
                         point=getattr(self, "point", False),
                         temperature=getattr(self, "temperature", 1.0),
+                        pointer_temperature=getattr(self, "pointer_temperature", 1.0),
                     )
         torch.cuda.synchronize()
 
@@ -325,6 +355,7 @@ class Actor:
                 deterministic=self.deterministic,
                 point=getattr(self, "point", False),
                 temperature=getattr(self, "temperature", 1.0),
+                pointer_temperature=getattr(self, "pointer_temperature", 1.0),
             )
         if lean:
             chosen = action[0].cpu().numpy()

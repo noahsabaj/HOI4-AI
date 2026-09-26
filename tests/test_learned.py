@@ -392,11 +392,15 @@ def test_a_policy_game_starts_when_the_policy_clicks_plus_and_ends_on_the_surren
 ):
     monkeypatch.setattr("hoi4_arena.ai_games.time.sleep", lambda s: None)
     game = _Game()
+    actor = _Actor()
+    actor.sampling = {"temperature": 0.5, "pointer_temperature": 0.0, "deterministic": False}
     outcome, reason, manifest = play.play_policy_game(
-        game, _Actor(), tmp_path / "game", rules=None, country="BLU", codec="ffv1",
+        game, actor, tmp_path / "game", rules=None, country="BLU", codec="ffv1",
         cap_minutes=1, setup_seconds=30, after_surrender=0.5, snap_every=0.5,
     )  # fmt: skip
     assert reason is None and outcome == "BLU"
+    saved = json.loads((tmp_path / "game" / "manifest.json").read_text())
+    assert (saved["temperature"], saved["pointer_temperature"]) == (0.5, 0.0), "what it played at"
     assert manifest["source"] == "policy" and manifest["harness"] == {"starts": 1, "restarts": 0}
     assert manifest["complete"] and manifest["frames"] > 5
     assert manifest["presses"].get("b0") == 1, "its one click, on +"

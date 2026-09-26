@@ -13,6 +13,28 @@ def local_time(text):
     return time.mktime(time.strptime(text, "%Y%m%d-%H%M%S"))
 
 
+def add_sampling(parser):
+    """How a policy playing live samples its actions (runner.resolve_temperatures)."""
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sample the policy at this temperature: 1 as trained, below 1 sharper (each "
+        "slot's likeliest input and spot gain), 0 always the likeliest. The pointer follows "
+        "it unless --pointer-temperature is given",
+    )
+    parser.add_argument(
+        "--pointer-temperature",
+        type=float,
+        help="Where a move goes (its cell and the spot inside) at this temperature instead",
+    )
+    parser.add_argument(
+        "--point",
+        action="store_true",
+        help="Place each move on its likeliest spot: --pointer-temperature 0",
+    )
+
+
 # Commands that never touch a model, so they run without importing torch.
 NO_TORCH = {
     "record",
@@ -234,7 +256,7 @@ def main():
     )  # fmt: skip
     drill.add_argument("--reservation", help="Reserve the second PC first, as play-policy")
     drill.add_argument("--held-previous", action="store_true", help="As play-policy's")
-    drill.add_argument("--temperature", type=float, default=1.0)
+    add_sampling(drill)
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill.add_argument("--model", dest="model_path")
     drill.add_argument("--seed", type=int)
@@ -288,22 +310,12 @@ def main():
         type=int,
         help="Run the memory afresh over the last N decisions at each one, as in training",
     )
-    live.add_argument(
-        "--point",
-        action="store_true",
-        help="Place each move on its likeliest spot while still sampling what to do",
-    )
+    add_sampling(live)
     live.add_argument(
         "--held-previous",
         action="store_true",
         help="Show the policy what it still holds even if its training did not "
         "(a checkpoint trained with --held-previous always does)",
-    )
-    live.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Below 1 sharpens what the policy does each slot (its likeliest input gains)",
     )
     live.add_argument(
         "--start-save",
