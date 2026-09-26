@@ -221,6 +221,18 @@ def build_parser():
         help="Arenas (folder names) whose exploring games are not tuned, such as one every "
         "plan loses on.",
     )
+    ai.add_argument(
+        "--strategist",
+        help="A folder: with --player scripted, the player pauses at decision points (the "
+        "start, every few game weeks, a state changing hands, a stalled attack), writes a "
+        "screenshot and the game's numbers there, waits for a decision file in the intent "
+        "vocabulary, and carries it out (strategist.py).",
+    )
+    ai.add_argument(
+        "--strategist-timeout",
+        type=float,
+        help="Seconds to wait for each decision before the game goes on as it was (1200).",
+    )
     tower = sub.add_parser(
         "cache-tower",
         help="Run a checkpoint's frozen vision tower once over every frame of the "
