@@ -8,7 +8,7 @@ import logging
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 import torch
@@ -76,6 +76,16 @@ def ppo_exclusion(meta):
     return None
 
 
+def tower_folder(named):
+    """Where the tower a checkpoint names is on this PC: where it says, or else models/ with
+    the same folder name. A checkpoint names the absolute folder of the PC that trained it,
+    and the second PC keeps its towers in its compute folder's models/ (on-peer)."""
+    if Path(named).exists():
+        return named
+    here = Path("models") / PureWindowsPath(named).name
+    return str(here) if here.is_dir() else named
+
+
 def load_policy(checkpoint, model_path=None, device="cuda"):
     path = Path(checkpoint)
     metadata = json.loads(path.with_suffix(".json").read_text())
@@ -83,7 +93,7 @@ def load_policy(checkpoint, model_path=None, device="cuda"):
         raise ValueError("Checkpoint does not match its immutable manifest")
     saved = torch.load(path, map_location="cpu", weights_only=True)
     config = saved["config"]
-    encoder = build_encoder(model_path or config["model_path"], config["variant"])
+    encoder = build_encoder(model_path or tower_folder(config["model_path"]), config["variant"])
     policy = Policy(
         encoder,
         latents=config.get("xm_latents", 0),
