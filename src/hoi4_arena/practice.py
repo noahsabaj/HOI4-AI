@@ -92,9 +92,12 @@ class Coach:
         self.next_look = 0.0
         self.lost_since = None
 
-    def attach(self, rec):
-        """The recording whose frames stamp the coach's orders and spans."""
+    def attach(self, rec, root=None):
+        """The recording whose frames stamp the coach's orders and spans; `root`, its folder,
+        keeps the planner's own view when a step fails (scripted.Planner.keep)."""
         self.frames = lambda: rec.manifest["frames"]
+        if root is not None and hasattr(self.planner, "debug_dir"):
+            self.planner.debug_dir = Path(root)
 
     def seen(self, step, seconds, by="policy"):
         if step not in self.done:
@@ -114,7 +117,9 @@ class Coach:
         self.next_look = seconds + self.look_every
         rgb = screen(desk)
         army, general = army_card(rgb)
-        if army:
+        # All its divisions, too: bc5 formed armies of one division of eight (a click on the
+        # unassigned alert without Shift), and the alert stayed up (2026-09-26).
+        if army and self.planner.find(rgb, "unassigned") is None:
             self.seen("army", seconds)
         if general:
             self.seen("general", seconds)
@@ -175,16 +180,44 @@ class Coach:
 
 
 def summary(results):
-    """How often the policy did each step itself, over the episodes that played."""
+    """How often the policy did each step itself, over the episodes that played, and how
+    often the coach managed a step it took over (`coach_<step>`)."""
     played = [r for r in results if r.get("setup")]
     out = {"episodes": len(played)}
     for step in STEPS:
         own = sum(1 for r in played if (r["setup"]["steps"].get(step) or {}).get("by") == "policy")
         out[step] = f"{own}/{len(played)}"
+    for step in ("army", "general", "front"):
+        by = [(r["setup"]["steps"].get(step) or {}).get("by") for r in played]
+        tried = sum(1 for b in by if b in ("coach", "nobody"))
+        if tried:
+            out[f"coach_{step}"] = f"{by.count('coach')}/{tried}"
     out["own_steps_mean"] = (
         round(float(np.mean([r["setup"]["own"] for r in played])), 2) if played else None
     )
     return out
+
+
+def load_or_launch(station, arena, save, running, ok, rules, failure_shot):
+    """`save` of `arena` up on the station, paused: loaded from inside the game running
+    there (`running`: the same arena, left cleanly) when the save's name is calibrated
+    (ai_games.can_load), else HOI4 launched afresh into it. True if it was loaded."""
+    from .ai_games import can_load, focus, load_in_game
+    from .play import room_for_a_game
+
+    if running and can_load(save):
+        try:
+            with station.connect() as desk:
+                focus(desk)
+                load_in_game(desk, save, ok, rules, failure_shot)
+            return True
+        except Exception as error:  # noqa: BLE001 - launched afresh instead.
+            log.info("[peer] loading in the game failed (%s): launching", error)
+    station.quit()
+    if not room_for_a_game(station):
+        raise RuntimeError("the second PC has no commit room for a game")
+    station.launch(arena, save=save)
+    return False
 
 
 def practice(
@@ -209,16 +242,8 @@ def practice(
     episodes and the summary (practice-peer.json in `output`)."""
     from PIL import Image
 
-    from .ai_games import (
-        EVENT_OK,
-        Station,
-        can_load,
-        focus,
-        load_in_game,
-        log_end,
-        start_game,
-    )
-    from .play import hand_back, play_policy_game, reserve, room_for_a_game
+    from .ai_games import EVENT_OK, Station, focus, log_end, start_game
+    from .play import hand_back, play_policy_game, reserve
     from .runner import Actor
     from .vision import ScreenRules
 
@@ -247,20 +272,10 @@ def practice(
                      "start_save": save, "checkpoint": actor.digest, "coach": coach}  # fmt: skip
             failure_shot = out_root / f"{name}-start-failed.png"
             try:
-                log_from, loaded = None, False
-                if running and can_load(save):
-                    try:
-                        with station.connect() as desk:
-                            focus(desk)
-                            load_in_game(desk, save, ok, screen_rules, failure_shot)
-                        loaded = True
-                    except Exception as error:  # noqa: BLE001 - launched afresh instead.
-                        log.info("[peer] loading in the game failed (%s): launching", error)
-                if not loaded:
-                    station.quit()
-                    if not room_for_a_game(station):
-                        raise RuntimeError("the second PC has no commit room for a game")
-                    station.launch(MAIN_ARENA, save=save)
+                log_from = None
+                loaded = load_or_launch(
+                    station, MAIN_ARENA, save, running, ok, screen_rules, failure_shot
+                )
                 entry["loaded_in_game"] = loaded
                 running = False
                 with station.connect() as desk:
@@ -307,3 +322,217 @@ def practice(
         if reservation:
             hand_back(reservation, {"episodes": len(results), "summary": summary(results)})
     return {"summary": summary(results), "episodes": results}
+
+
+# The scrambles a drill may start from (scramble): the camera knocked off an edge or right
+# in (ai_games.kick_camera), a state's panel open from a click on the map, the political
+# screen (Q, the learned player's most pressed key), the pointer somewhere else.
+SCRAMBLES = ("camera", "click", "panel", "pointer")
+
+
+def scramble(desk, rng):
+    """One to three SCRAMBLES, straight to the desktop (so none is a label). Returns their
+    kinds."""
+    from .ai_games import ZOOM_MAX, act, click, kick_camera, tap
+
+    kinds = rng.sample(SCRAMBLES, rng.randint(1, 3))
+    for kind in kinds:
+        if kind == "camera":
+            kick_camera(desk, rng, rng.randint(0, ZOOM_MAX))
+        elif kind == "click":
+            click(desk, rng.uniform(0.2, 0.8), rng.uniform(0.2, 0.8))
+        elif kind == "panel":
+            act(desk, tap(0x51))
+        else:
+            at = {"kind": "move", "x": rng.uniform(0.05, 0.95), "y": rng.uniform(0.05, 0.95)}
+            act(desk, [at])
+        time.sleep(0.5)
+    return kinds
+
+
+def drill_episode(
+    desk,
+    root,
+    *,
+    country,
+    rules,
+    rng,
+    arena,
+    scrambled=False,
+    after=8.0,
+    log_from=None,
+    codec="nvenc",
+):
+    """The scripted player's setup alone, recorded as a scripted game: army, general, front,
+    offensive, the game running, then `after` seconds. With `scrambled`, from a start
+    scramble() has messed up first, unrecorded: those frames weigh nothing in training
+    (the manifest's camera_kicks), and what the recording shows is the way back.
+
+    A setup is most of what the learned player gets wrong, and a whole game holds about
+    40 s of it; a drill is little else. A failed step leaves the drill incomplete, which
+    training skips. Returns the manifest.
+    """
+    from .ai_games import Logged, on_screen
+    from .arena_log import ArenaLog
+    from .recording import open_recorder
+    from .scripted import TEMPLATES, Planner, best_plan, load_templates
+
+    inputs = Logged(desk)
+    first = on_screen(desk.capture(full=True))
+    rec = open_recorder(desk, root, first, game_speed=5, source="scripted", hz=5, codec=codec)
+    if not getattr(rec, "streamed", False):
+        rec.close(complete=False, reason="a drill needs the worker's stream")
+        raise RuntimeError("a drill needs the worker's stream (protocol 2)")
+    arena_log = ArenaLog(desk)
+    if log_from is not None:
+        arena_log.offset = log_from
+    plan = best_plan(rng)
+    frames = lambda: rec.manifest["frames"]  # noqa: E731
+    planner = Planner(country, plan, load_templates(TEMPLATES), rules, 5, frames, rng=rng)
+    planner.debug_dir = Path(root)
+    kicked, reason, began = [], None, time.monotonic()
+    try:
+        if scrambled:
+            start = frames()
+            kinds = scramble(desk, rng)
+            kicked.append({"kind": "+".join(kinds), "from_frame": start, "to_frame": frames()})
+        planner.setup(inputs)
+        time.sleep(after)
+    except Exception as error:  # noqa: BLE001 - recorded in the manifest.
+        reason = f"{type(error).__name__}: {error}"
+        log.info("[peer] drill failed: %s", reason)
+    finally:
+        rec.append(scripted_events=inputs.take())
+        arena_log.poll()
+        last = frames()
+        Path(root, "arena-log.txt").write_text("\n".join(arena_log.lines) + "\n")
+        with Path(root, "arena-log.jsonl").open("w") as out:
+            out.writelines(
+                json.dumps({"frame": last, "line": line}) + "\n" for line in arena_log.lines
+            )
+        driver = "the scripted player's setup alone, a drill"
+        rec.manifest.update(
+            drill=True, started_as=country, arena=arena, winner=None, plan=plan,
+            orders=planner.orders, planner_errors=planner.failures, camera_kicks=kicked,
+            declarer=arena_log.declarer, players=[country], labels="scripted_events",
+            seconds=round(time.monotonic() - began), station="peer",
+            driver=driver + (", from a scramble" if scrambled else ""),
+        )  # fmt: skip
+        rec.close(complete=reason is None, reason=reason)
+    return rec.manifest
+
+
+def drill_saves(registry="artifacts/arenas/saves-peer.json"):
+    """{(arena, country): start save} for every arena with one (ai_games.known_saves)."""
+    from .ai_games import known_saves
+
+    saves = known_saves(registry)
+    for country in ("BLU", "RED"):
+        saves.setdefault((MAIN_ARENA, country), f"arenav4{country.lower()}")
+    return saves
+
+
+def drill_order(arenas, countries, episodes, block):
+    """Which arena and country each drill plays: `block` in a row on each arena in turn
+    (a load from inside the game is ~10 s, a launch ~3 minutes), countries alternating."""
+    return [
+        (arenas[(index // block) % len(arenas)], countries[index % len(countries)])
+        for index in range(episodes)
+    ]
+
+
+def drills(
+    output,
+    *,
+    peer,
+    episodes=40,
+    minutes=60.0,
+    arenas=(MAIN_ARENA,),
+    countries=("BLU", "RED"),
+    scrambled=0.7,
+    block=4,
+    after=8.0,
+    reservation=None,
+    rules="artifacts/calibration-1080p/rules.json",
+    seed=None,
+):
+    """Up to `episodes` drills (drill_episode) on the second PC in drill_order, a `scrambled`
+    share of them from a scrambled start. Returns the drills and a summary (drills-peer.json
+    in `output`): how many completed, and how many an hour."""
+    from PIL import Image
+
+    from .ai_games import EVENT_OK, Station, focus, log_end, start_game
+    from .play import hand_back, reserve
+    from .vision import ScreenRules
+
+    out_root = Path(output)
+    out_root.mkdir(parents=True, exist_ok=True)
+    screen_rules = ScreenRules(rules)
+    ok = [np.asarray(Image.open(path).convert("RGB")) for path in (
+        "artifacts/screens-1080p/ok-button.png", EVENT_OK)]  # fmt: skip
+    rng = random.Random(seed)
+    saves = drill_saves()
+    arenas = [a for a in arenas if all((a, c) in saves for c in countries)]
+    if not arenas:
+        raise ValueError("no arena has start saves for every country")
+    if reservation:
+        reserve(reservation, minutes)
+    station = Station("peer", peer)
+    began = time.monotonic()
+    end = began + minutes * 60
+    results, running = [], None
+
+    def tally():
+        done = sum(1 for r in results if r.get("complete"))
+        hours = max((time.monotonic() - began) / 3600, 1e-6)
+        return {"drills": len(results), "complete": done, "per_hour": round(done / hours, 1)}
+
+    try:
+        for arena, country in drill_order(arenas, countries, episodes, block):
+            if time.monotonic() + 120 > end:
+                break
+            save = saves[(arena, country)]
+            name = time.strftime("drill-peer-%Y%m%d-%H%M%S")
+            entry = {"game": name, "arena": arena, "started_as": country, "start_save": save,
+                     "scrambled": rng.random() < scrambled}  # fmt: skip
+            failure_shot = out_root / f"{name}-start-failed.png"
+            try:
+                loaded = load_or_launch(
+                    station, arena, save, running == arena, ok, screen_rules, failure_shot
+                )
+                entry["loaded_in_game"] = loaded
+                running = None
+                with station.connect() as desk:
+                    if not focus(desk):
+                        raise RuntimeError("could not bring the game window to the front")
+                    log_from = log_end(desk) if loaded else None
+                    start_game(
+                        desk, screen_rules, failure_shot, country, 5, observe=False,
+                        declarer=rng.choice(("BLU", "RED")), saved=True,
+                    )  # fmt: skip
+                    manifest = drill_episode(
+                        desk, out_root / name, country=country, rules=screen_rules, rng=rng,
+                        arena=arena, scrambled=entry["scrambled"], after=after, log_from=log_from,
+                    )  # fmt: skip
+            except Exception as error:  # noqa: BLE001 - reported, then the next drill.
+                entry["error"] = f"{type(error).__name__}: {error}"
+                log.warning("[peer] %s failed: %s", name, entry["error"])
+            else:
+                entry.update(
+                    complete=manifest["complete"], reason=manifest.get("reason"),
+                    frames=manifest["frames"], orders=len(manifest["orders"]),
+                )  # fmt: skip
+                running = arena
+                log.info("[peer] %s: %s", name, entry["reason"] or "complete")
+            results.append(entry)
+            (out_root / "drills-peer.json").write_text(
+                json.dumps({"summary": tally(), "drills": results}, indent=2)
+            )
+    finally:
+        try:
+            station.quit()
+        except Exception as error:  # noqa: BLE001 - the drills are saved.
+            log.warning("quit failed: %s", error)
+        if reservation:
+            hand_back(reservation, tally())
+    return {"summary": tally(), "drills": results}

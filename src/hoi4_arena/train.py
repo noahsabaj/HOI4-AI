@@ -376,6 +376,7 @@ def _train_bc(
     camera_since=None,
     held_previous=False,
     gpu_views=False,
+    balance=False,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -451,6 +452,7 @@ def _train_bc(
         "camera_since": camera_since,
         "held_previous": held_previous,
         "gpu_views": gpu_views,
+        "balance": balance,
     }
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
@@ -557,6 +559,7 @@ def _train_bc(
         "setup_weight": setup_weight,
         "camera_since": camera_since,
         "held_previous": held_previous,
+        "balance": balance,
     }
     output.mkdir(parents=True, exist_ok=True)
     progress = Progress(output, config, every=save_every, resume=resume)

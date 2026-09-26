@@ -464,3 +464,21 @@ def test_a_gpu_views_batch_is_the_same_batch_once_on_the_device(tmp_path):
     a = batch_to_device(collate([plain]), "cpu")
     b = batch_to_device(collate([raw]), "cpu")
     assert torch.equal(a["quadrants"], b["quadrants"]) and torch.equal(a["fovea"], b["fovea"])
+
+
+def test_balance_weighs_every_arena_and_side_the_same():
+    from hoi4_arena.dataset import balance_weights
+
+    def game(arena, side, n):
+        return {"manifest": {"arena": f"mods/{arena}", "started_as": side},
+                "weight": np.ones(n, np.float32), "valid": np.ones(n, bool)}  # fmt: skip
+
+    sessions = [game("main", "BLU", 100), game("main", "BLU", 100), game("bay", "BLU", 50),
+                game("bay", "RED", 30)]  # fmt: skip
+    balance_weights(sessions)
+    totals = {}
+    for s in sessions:
+        key = (s["manifest"]["arena"], s["manifest"]["started_as"])
+        totals[key] = totals.get(key, 0) + float((s["weight"] * s["valid"]).sum())
+    assert len(set(round(t, 3) for t in totals.values())) == 1
+    assert sum(totals.values()) == pytest.approx(280), "the whole loss keeps its size"
