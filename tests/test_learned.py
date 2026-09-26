@@ -597,6 +597,14 @@ def test_the_tower_cache_reads_what_the_frozen_tower_reads(tmp_path, monkeypatch
         )  # fmt: skip
     for a, b in zip(run, read, strict=True):
         assert torch.allclose(a.float(), b.float(), atol=0.1, rtol=0.05)
+    # Kept as int8 (half the space), it reads back within half a step of the scale, plus
+    # bfloat16's rounding of both (a 2**-8 part of the value each).
+    cache_tower(data, checkpoint, tmp_path / "small", device="cpu", int8=True)
+    assert tower_paths(tmp_path / "small", "game")["scale"].exists()
+    small_grid = next(iter(VideoSessions(data, tower=tmp_path / "small", **common)))["tower_grid"]
+    step = cached["tower_grid"].float().abs().amax((-2, -1), keepdim=True) / 127
+    bound = step * 0.5 + cached["tower_grid"].float().abs() * 2**-7
+    assert ((small_grid.float() - cached["tower_grid"].float()).abs() <= bound).all()
 
     common = {"sources": ("scripted",), "sequence": 2, "burn_in": 1, "workers": 0, "lead_in": 0}
     train.train_bc(data, "model", tmp_path / "out", train_last=0, init=checkpoint,

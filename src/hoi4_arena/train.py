@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -296,6 +297,29 @@ def wait_while_paused(output, poll=5.0, sleep=None):
     return True
 
 
+logger = logging.getLogger(__name__)
+
+
+def load_carried(policy, state):
+    """Load `state` (a checkpoint's policy) into `policy`, carrying over what fits: all of
+    it for the same tower. For another tower, the new tower keeps its own pretrained
+    weights, and the layers sized to the tower's width (the cells' 1x1 convolution and
+    the fusion) start afresh; the memory, the action head and the rest carry over.
+    Returns the names left at their initialization."""
+    own = policy.state_dict()
+    tower = [k for k in own if k.startswith("encoder.")]
+    same = all(k in state and state[k].shape == own[k].shape for k in tower) and not any(
+        k.startswith("encoder.") and k not in own for k in state
+    )
+    kept = {
+        k: v
+        for k, v in state.items()
+        if k in own and v.shape == own[k].shape and (same or not k.startswith("encoder."))
+    }
+    policy.load_state_dict(kept, strict=False)
+    return sorted(k for k in own if k not in kept and not k.startswith("encoder."))
+
+
 def train_bc(data, model_path, output, **options):
     """Behaviour cloning (_train_bc), one run at a time per output folder (RunLock)."""
     from .learning import RunLock
@@ -456,7 +480,9 @@ def _train_bc(
     policy = Policy(encoder, latents=xm_latents, look=look_before_click)
     if init is not None:
         saved = torch.load(init, map_location="cpu", weights_only=True)
-        policy.load_state_dict(saved["policy"])
+        fresh = load_carried(policy, saved["policy"])
+        if fresh:
+            logger.info("started afresh, sized for another tower: %s", ", ".join(fresh))
         for name in reinit:
             # Layers trained in another regime start afresh (their default initialization).
             for layer in getattr(policy, name).modules():

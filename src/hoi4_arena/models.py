@@ -188,7 +188,9 @@ class ScreenEncoder(nn.Module):
             if not weights.is_file():
                 raise FileNotFoundError(f"No screen encoder weights at {weights}")
             self.model = timm.create_model(
-                self.ARCH, pretrained=True, pretrained_cfg_overlay={"file": str(weights)}
+                tower_arch(weights.parent),
+                pretrained=True,
+                pretrained_cfg_overlay={"file": str(weights)},
             )
         else:
             self.model = timm.create_model(self.ARCH, pretrained=False)
@@ -249,6 +251,20 @@ class ScreenEncoder(nn.Module):
         for block in self.model.blocks[depth:]:
             x = block(x, rope=rope)
         return self._read(x.reshape(x.shape[0], *hw, -1))
+
+
+def tower_arch(folder, default=ScreenEncoder.ARCH):
+    """The timm model a tower's folder holds: its config.json's architecture and tag, as
+    timm's own download of it has (the Qwen3.5-4B model's tower, 2026-09-26, reads the
+    screen better than the 0.8B's: STATUS.md), or the 0.8B's for a folder without one."""
+    config = Path(folder) / "config.json"
+    if not config.is_file():
+        return default
+    import json
+
+    meta = json.loads(config.read_text())
+    tag = (meta.get("pretrained_cfg") or {}).get("tag")
+    return f"{meta['architecture']}.{tag}" if tag else meta["architecture"]
 
 
 def build_encoder(model_path, variant="large", **kwargs):
