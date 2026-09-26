@@ -139,7 +139,8 @@ def test_the_summary_counts_the_policy_s_own_steps():
     ]
     summary = practice.summary(episodes)
     assert summary == {"episodes": 2, "army": "1/2", "general": "0/2", "front": "0/2",
-                       "running": "1/2", "coach_army": "1/1", "own_steps_mean": 1.0}  # fmt: skip
+                       "running": "1/2", "coach_army": "1/1", "own_steps_mean": 1.0,
+                       "temperature": 1.0, "pointer_temperature": 1.0}  # fmt: skip
 
 
 def test_a_practice_game_teaches_only_what_the_coach_did(tmp_path):

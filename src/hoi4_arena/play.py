@@ -350,6 +350,12 @@ class Watch:
         self.pool.shutdown(wait=True)
 
 
+def sampling_of(actor):
+    """How `actor` draws its actions (runner.Actor.sampling), for a manifest: its
+    temperatures, or those of plain sampling for an actor that names none."""
+    return {"temperature": 1.0, "pointer_temperature": 1.0, **getattr(actor, "sampling", {})}
+
+
 def run_game(desk, pointer, rules=None, space=True):
     """Unpause (space) and set speed 5 with clicks on +, then put the pointer back.
 
@@ -609,6 +615,8 @@ def play_policy_game(
             labels="scripted_events",
             station=station,
             checkpoint=actor.digest,
+            # The temperatures it played at, so games at each can be told apart.
+            **sampling_of(actor),
             harness={"starts": referee.starts, "restarts": referee.restarts},
             presses=watch.presses,
             forced_releases=dispatcher.holds.forced,
@@ -771,6 +779,7 @@ def evaluate_policy(
     memory_window=None,
     point=False,
     temperature=1.0,
+    pointer_temperature=None,
     model_path=None,
     seed=None,
     saves=None,
@@ -782,7 +791,9 @@ def evaluate_policy(
     (reserve) and handed back when done, with HOI4 closed. Countries alternate. Returns
     the results, as record-ai writes them, so win-rate reads them too. `saves`, {country:
     save name}, launches each game straight into a save made paused at the start of a new
-    game as that country, as record-ai does, skipping the menus.
+    game as that country, as record-ai does, skipping the menus. `temperature`,
+    `pointer_temperature` and `point` are how it samples (runner.resolve_temperatures),
+    and each result names the two temperatures.
     """
     from .runner import Actor
     from .scripted import win_rate
@@ -805,6 +816,7 @@ def evaluate_policy(
             memory_window=memory_window,
             point=point,
             temperature=temperature,
+            pointer_temperature=pointer_temperature,
         )
         actor.lean = True  # Only the action is needed: no training sample, no clip.
         # Shown what it holds even if trained without (a checkpoint trained with it is).
@@ -819,6 +831,7 @@ def evaluate_policy(
             entry.update(arena=mod, plan={"variant": "learned"})
             entry["declare_drawn"] = rng.choice(("BLU", "RED"))
             entry["checkpoint"] = actor.digest
+            entry.update(sampling_of(actor))
             save = (saves or {}).get(country)
             entry["start_save"] = save
             try:
