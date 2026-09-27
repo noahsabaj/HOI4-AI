@@ -33,13 +33,15 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from .ai_games import SPEED_UP, Station, act, focus, on_screen, recentre, start_game, tap
 from .arena_log import ArenaLog
 from .desktop import DesktopError
 
 log = logging.getLogger(__name__)
+# The rulers' numbers, large enough to read in a scaled screenshot.
+FONT = ImageFont.load_default(size=14)
 
 API = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"
@@ -263,10 +265,10 @@ def view(rgb):
     # The top ruler sits under the game's top bar (56 px deep here), not over its numbers.
     for x in range(RULER, width, RULER):
         draw.line([(x, 56), (x, 64)], fill=(255, 255, 0), width=2)
-        draw.text((x + 2, 62), str(x), fill=(255, 255, 0))
+        draw.text((x + 2, 62), str(x), fill=(255, 255, 0), font=FONT)
     for y in range(RULER, height, RULER):
         draw.line([(0, y), (8, y)], fill=(255, 255, 0), width=2)
-        draw.text((10, y - 5), str(y), fill=(255, 255, 0))
+        draw.text((10, y - 5), str(y), fill=(255, 255, 0), font=FONT)
     return picture
 
 
@@ -499,9 +501,14 @@ def play_llm_game(desk, brain, root, *, rules, country, cap_minutes=60.0, max_tu
 def evaluate_llm(output, *, games, peer, mod="arena-plains-v6", saves=None,
                  rules="artifacts/calibration-1080p/rules.json", countries=("BLU", "RED"),
                  budget_usd=5.0, cap_minutes=60.0, max_turns=400, model=MODEL,
-                 thinking=True, seed=None, manual=False):  # fmt: skip
+                 thinking=True, seed=None, manual=False, harness="agent",
+                 lessons=None):  # fmt: skip
     """Up to `games` games of the model against the game's AI on the second PC, sides
-    alternating, until the budget is spent. HOI4 is left closed. Results as play-policy's."""
+    alternating, until the budget is spent. HOI4 is left closed. Results as play-policy's.
+
+    `harness` "agent" plays through llm_agent's tool loop, learning between games in the
+    lessons file `lessons` (read at the start, rewritten after each game); "turns" is the
+    first harness, one screenshot and a batch of actions a turn."""
     from .scripted import win_rate
     from .vision import ScreenRules
 
@@ -510,6 +517,11 @@ def evaluate_llm(output, *, games, peer, mod="arena-plains-v6", saves=None,
     screen_rules = ScreenRules(rules)
     rng = random.Random(seed)
     brain = Brain(model=model, budget_usd=budget_usd, thinking=thinking)
+    agent = None
+    if harness == "agent":
+        from .llm_agent import Agent
+
+        agent = Agent(brain, lessons_path=lessons, manual=manual)
     station = Station("peer", peer)
     results = []
     try:
@@ -517,8 +529,8 @@ def evaluate_llm(output, *, games, peer, mod="arena-plains-v6", saves=None,
             country = countries[index % len(countries)]
             name = time.strftime("llm-peer-%Y%m%d-%H%M%S")
             entry = {"game": name, "station": "peer", "started_as": country, "arena": mod,
-                     "model": model, "manual": manual,
-                     "plan": {"variant": "llm-manual" if manual else "llm"}}  # fmt: skip
+                     "model": model, "manual": manual, "harness": harness,
+                     "plan": {"variant": f"llm-{harness}" + ("-manual" if manual else "")}}  # fmt: skip
             entry["declare_drawn"] = rng.choice(("BLU", "RED"))
             save = (saves or {}).get(country)
             entry["start_save"] = save
@@ -535,11 +547,20 @@ def evaluate_llm(output, *, games, peer, mod="arena-plains-v6", saves=None,
                         observe=False, declarer=entry["declare_drawn"], saved=bool(save),
                     )  # fmt: skip
                     log.info("%s: %s plays %s on %s", name, model, country, mod)
-                    outcome, reason, manifest = play_llm_game(
-                        desk, brain, out_root / name, rules=screen_rules, country=country,
-                        cap_minutes=cap_minutes, max_turns=max_turns, arena_name=mod,
-                        manual=manual,
-                    )  # fmt: skip
+                    if agent is not None:
+                        from .llm_agent import play_agent_game
+
+                        outcome, reason, manifest = play_agent_game(
+                            desk, agent, out_root / name, rules=screen_rules,
+                            country=country, cap_minutes=cap_minutes, max_turns=max_turns,
+                            arena_name=mod,
+                        )  # fmt: skip
+                    else:
+                        outcome, reason, manifest = play_llm_game(
+                            desk, brain, out_root / name, rules=screen_rules,
+                            country=country, cap_minutes=cap_minutes, max_turns=max_turns,
+                            arena_name=mod, manual=manual,
+                        )  # fmt: skip
             except (DesktopError, RuntimeError, OSError) as error:
                 entry["error"] = f"{type(error).__name__}: {error}"
                 log.warning("%s failed: %s", name, entry["error"])

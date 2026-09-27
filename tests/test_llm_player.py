@@ -70,3 +70,34 @@ def test_changed_ignores_a_still_screen_and_sees_a_new_one():
 
 def test_view_is_the_models_size():
     assert view(np.zeros((1080, 1920, 3), dtype=np.uint8)).size == VIEW
+
+
+def test_close_up_crops_in_view_pixels_and_magnifies():
+    from hoi4_arena.llm_agent import LOOK_SIZE, close_up
+
+    rgb = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    rgb[100:200, 100:200] = 255
+    crop, label = close_up(rgb, 0, 0, 200, 100)
+    assert max(crop.size) <= LOOK_SIZE
+    assert crop.width / crop.height == pytest.approx(2, rel=0.02)
+    assert "x 0-200, y 0-100" in label
+
+
+def test_prune_keeps_the_last_screenshots():
+    from hoi4_arena.llm_agent import prune, screenshot_message
+
+    picture = view(np.zeros((1080, 1920, 3), dtype=np.uint8))
+    messages = [screenshot_message(str(i), picture) for i in range(5)]
+    prune(messages, keep=2)
+    kinds = [m["content"][1]["type"] for m in messages]
+    assert kinds == ["text", "text", "text", "image_url", "image_url"]
+
+
+def test_tool_calls_become_actions():
+    from hoi4_arena.llm_agent import action_of
+
+    click = action_of("click", {"x": 10, "y": 20, "double": True, "button": "right"})
+    assert click["type"] == "double_click" and click["button"] == "right"
+    assert to_events(action_of("hover", {"x": 0, "y": 0})) == [{"kind": "move", "x": 0, "y": 0}]
+    with pytest.raises(ValueError):
+        action_of("end_game", {})

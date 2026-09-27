@@ -406,6 +406,18 @@ def build_parser():
     llm.add_argument(
         "--manual", action="store_true", help="Tell the model the game's controls (MANUAL)"
     )
+    llm.add_argument(
+        "--harness",
+        choices=["agent", "turns"],
+        default="agent",
+        help="agent: tool calls while paused, each returning the screen, with a notebook and "
+        "lessons between games (llm_agent); turns: one screenshot and a batch of actions a turn",
+    )
+    llm.add_argument(
+        "--lessons",
+        help="The lessons file the agent reads at the start and rewrites after each game "
+        "(default: OUTPUT/lessons.md)",
+    )
     llm.add_argument("--start-save", nargs="+", metavar="COUNTRY:SAVE")
     llm.add_argument("--seed", type=int)
     live = sub.add_parser(
@@ -1445,6 +1457,7 @@ def _dispatch(command, args):
 
         args["countries"] = tuple(args["countries"])
         args["saves"] = dict(item.split(":", 1) for item in args.pop("start_save") or [])
+        args["lessons"] = args["lessons"] or str(Path(args["output"]) / "lessons.md")
         result = evaluate_llm(args.pop("output"), **args)
     elif command == "play-policy":
         from .play import evaluate_policy
