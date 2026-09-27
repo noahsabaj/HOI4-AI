@@ -36,7 +36,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .ai_games import act, focus, on_screen, recentre
 from .arena_log import ArenaLog
-from .desktop import DesktopError
+from .desktop import DesktopError, EmergencyStop
 from .llm_player import (
     CHANGED,
     KEYS,
@@ -70,6 +70,9 @@ KEEP_IMAGES = 3
 SETTLE = 0.35
 # The notebook's and the lessons' length, in characters.
 NOTEBOOK, LESSONS = 4000, 6000
+# Times a game may lose its connection to the worker and carry on over a new one: the
+# tunnel dropped a frame mid-game on 2026-09-27 ("Truncated frame").
+RECONNECTS = 3
 # The close-up's longest side, and its greatest magnification.
 LOOK_SIZE, LOOK_ZOOM = 1024, 3.0
 
@@ -334,10 +337,13 @@ def screenshot_message(text, picture):
 
 
 def play_agent_game(desk, agent, root, *, rules, country, cap_minutes=90.0, max_turns=400,
-                    arena_name=None, after_surrender=3.0, recentred=True):  # fmt: skip
+                    arena_name=None, after_surrender=3.0, recentred=True,
+                    reconnect=None):  # fmt: skip
     """One game, `agent` playing `country` from the game paused at its start. Ends when
     the arena log names a winner, or at `cap_minutes` or `max_turns` (a draw); then the
-    agent rewrites its lessons."""
+    agent rewrites its lessons. `reconnect`, if given, opens a new connection to the
+    worker: a game whose connection drops carries on over it (RECONNECTS times), the turn
+    in progress played again from the paused screen."""
     root = Path(root)
     (root / "steps").mkdir(parents=True, exist_ok=True)
     agent.notebook, agent.notes = "", []
@@ -354,10 +360,33 @@ def play_agent_game(desk, agent, root, *, rules, country, cap_minutes=90.0, max_
         set_speed(desk)
         if recentred:
             recentre(desk)
+        reconnects = 0
         while time.monotonic() - start < cap_minutes * 60 and turns < max_turns:
             turns += 1
-            seconds, note = play_turn(desk, agent, root, book, system, country, turns, ran)
-            run_for(desk, rules, seconds)
+            try:
+                seconds, note = play_turn(desk, agent, root, book, system, country, turns, ran)
+                run_for(desk, rules, seconds)
+            except EmergencyStop:
+                raise
+            except DesktopError as error:
+                if reconnect is None or reconnects >= RECONNECTS or "invalid_event" in str(error):
+                    raise
+                reconnects += 1
+                log.warning("lost the worker (%s); connecting again (%d of %d)", error,
+                            reconnects, RECONNECTS)  # fmt: skip
+                # The worker takes one connection at a time: the dead one goes first.
+                try:
+                    desk.close()
+                except Exception:  # noqa: BLE001 - it is already broken.
+                    pass
+                time.sleep(5)
+                desk = reconnect()
+                arena.desktop = desk
+                if not focus(desk):
+                    raise RuntimeError("could not bring the game window to the front") from error
+                pause(desk, rules)
+                turns -= 1
+                continue
             ran += seconds
             agent.notes.append((turns, note))
             arena.poll()

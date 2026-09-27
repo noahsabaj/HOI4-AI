@@ -20,6 +20,7 @@ the picture it saw, its reasoning, its answer, what was applied and what it cost
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import io
 import json
@@ -539,7 +540,8 @@ def evaluate_llm(output, *, games, peer, mod="arena-plains-v6", saves=None,
                 station.launch(mod, save=save)
                 if not save:
                     time.sleep(25)
-                with station.connect() as desk:
+                with contextlib.ExitStack() as stack:
+                    desk = stack.enter_context(station.connect())
                     if not focus(desk):
                         raise RuntimeError("could not bring the game window to the front")
                     start_game(
@@ -550,10 +552,13 @@ def evaluate_llm(output, *, games, peer, mod="arena-plains-v6", saves=None,
                     if agent is not None:
                         from .llm_agent import play_agent_game
 
+                        def reconnect(stack=stack):
+                            return stack.enter_context(station.connect())
+
                         outcome, reason, manifest = play_agent_game(
                             desk, agent, out_root / name, rules=screen_rules,
                             country=country, cap_minutes=cap_minutes, max_turns=max_turns,
-                            arena_name=mod,
+                            arena_name=mod, reconnect=reconnect,
                         )  # fmt: skip
                     else:
                         outcome, reason, manifest = play_llm_game(
