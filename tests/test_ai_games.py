@@ -127,6 +127,11 @@ def test_picking_a_country_clicks_its_land_until_its_flag_shows(monkeypatch):
     # No Blue land and Blue not selected: the pick never takes.
     frame[300:700, 700:1152] = SEA
     assert not pick_country(None, "BLU")
+    # Not the picker at all (no selected flag): nothing is clicked, however blue it is.
+    clicks.clear()
+    frame[:] = SEA
+    frame[600:700, 800:1100] = BLUE_LAND  # say, the main menu's store banner
+    assert not pick_country(None, "BLU") and not clicks
 
 
 def test_the_front_is_where_blue_land_meets_red():
@@ -733,3 +738,19 @@ def test_a_game_kept_from_the_front_waits_open_and_says_what_is_in_front(monkeyp
     # Still held when the wait runs out: given up, to be launched again.
     assert not ai_games.await_focus(Desk(free_after=10**6), "peer", minutes=1, clock=clock,
                                     sleep=lambda s: None)  # fmt: skip
+
+
+def test_no_menu_click_is_made_before_the_main_menu_shows(monkeypatch, tmp_path):
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    clicks, found = [], {"at": None}
+    monkeypatch.setattr(ai_games, "screen", lambda desk: frame)
+    monkeypatch.setattr(ai_games, "menu_ready", lambda desk: True)
+    monkeypatch.setattr(ai_games, "click", lambda desk, x, y: clicks.append((x, y)))
+    monkeypatch.setattr(ai_games, "shown", lambda rgb, name, threshold=0: found["at"])
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    assert not ai_games.main_menu(None, seconds=0)
+    with pytest.raises(RuntimeError, match="nothing was clicked"):
+        ai_games.start_game(None, None, tmp_path / "failed.png")
+    assert not clicks and (tmp_path / "failed.png").exists()
+    found["at"] = (0.5, 290 / 1080)
+    assert ai_games.main_menu(None, seconds=0)

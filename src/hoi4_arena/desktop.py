@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -27,6 +28,14 @@ def worker_executable() -> str:
     if candidate.exists():
         return str(candidate)
     return str(Path("target/release/hoi4-desktop-worker.exe").resolve())
+
+
+def worker_command() -> list[str]:
+    """How to start this computer's worker: the Rust build on Windows, and on Linux the
+    X11 worker in this package (xworker), which speaks the same protocol."""
+    if sys.platform.startswith("linux"):
+        return [sys.executable, "-m", "hoi4_arena.xworker"]
+    return [worker_executable()]
 
 
 def local_control_args() -> list[str]:
@@ -86,7 +95,7 @@ class Desktop:
         restart_discord), which need no game: with none running, attach fails.
         `worker_args` go on the worker's command line, such as `local_control_args()`.
         """
-        command = [*(command or [worker_executable()]), *worker_args]
+        command = [*(command or worker_command()), *worker_args]
         # The worker's only diagnostic channel is stderr. Capture it instead of letting it
         # escape to an inherited console, so failures land beside the run's other evidence.
         self.process = subprocess.Popen(

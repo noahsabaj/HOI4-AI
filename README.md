@@ -65,6 +65,29 @@ While a session holds the second PC's worker, read-only observer connections sti
 
 The connection uses a pinned TLS certificate and a random token, and the worker accepts it only from its own PC's loopback. Other PCs reach it only through fleet's tunnel. It exposes worker operations, not a remote shell, and no port or firewall rule is opened. Actual second-PC screenshots, menu mouse/keyboard input and watchdog release have passed.
 
+### A Linux station
+
+A Linux fleet node with HOI4 installed through Steam is a third station for games that need no GPU: the scripted player and AI-vs-AI recordings. On Linux, `Desktop` starts `hoi4_arena.xworker` instead of the Rust worker. It speaks the same protocol over the node's X display, through ctypes on libX11, libXtst and libXfixes:
+- capture: the game window, with the pointer drawn in;
+- input: XTest, under the same arm and key rules and the 750 ms watchdog;
+- the arena's `game.log` lines;
+- launch and quit: HOI4 runs straight from its folder with `-userdir artifacts/hoi4-user`, so nothing lands outside the project.
+
+So `record-ai` runs there unchanged:
+
+```powershell
+fleet run --on <linux-node> --name hoi4-ai-linux -- sh scripts/linux_station.sh artifacts/record-NAME --minutes 240 --player scripted --mod artifacts/mods/arena-12x8-v4 --speeds 5
+```
+
+The pushed folder needs `artifacts/mods/<arena>`, `artifacts/screens-1080p` and `artifacts/calibration-1080p` beside the code. The display is the node's own X server (`DISPLAY=:0`, the default). A private Xwayland display renders on the GPU but passes no keys to the game, so the console and hotkeys fail there.
+
+Not there yet:
+- recording streams and the policy's worker-side views (protocol 2): recordings are encoded with x264 by the recorder, and learned play needs a GPU elsewhere;
+- the F12 stop;
+- telemetry.
+
+A new user folder shows the game's news once at the first launch. Close it before the first run.
+
 ## Demonstrations and learning
 
 Record 1–4 hours of human play, in complete sessions, with HOI4 in front. Reserve entire sessions for validation and test. Real input timestamps, the pointer position and frame capture times are stored beside the video; the video's frame rate is not the timing source. `--game-speed` is the speed the game is set to for the whole session. It is required and written into the manifest, and the policy is told it, so sessions at different speeds can train together.
@@ -223,8 +246,8 @@ cargo clippy --locked -- -D warnings
 This PC trains, plays and records, so run the Python tests on the fleet's CPU-only Linux laptops instead, with the fleet project's `fleet` command. Run it from a git worktree, which holds only tracked files: `--mirror` copies the folder as it is and deletes whatever it no longer has from the node's copy. Never run it from the main checkout, whose ignored data folders would be copied too.
 
 ```powershell
-fleet submit --mirror --wait --name hoi4-ai-tests --cpus 8 --ram-gb 12 -- sh scripts/test_on_linux.sh -n 8
-fleet submit --mirror --wait --name hoi4-ai-tests --cpus 4 --ram-gb 6 -- sh scripts/test_on_linux.sh -n 4 tests/test_live.py
+fleet submit --mirror --wait --name hoi4-ai-tests --os linux --cpus 8 --ram-gb 12 -- sh scripts/test_on_linux.sh -n 8
+fleet submit --mirror --wait --name hoi4-ai-tests --os linux --cpus 4 --ram-gb 6 -- sh scripts/test_on_linux.sh -n 4 tests/test_live.py
 ```
 
 Arguments after the script go to pytest. Keep `-n` equal to `--cpus`, because each worker runs one thread. The whole suite takes about 4.5 minutes at `-n 8`, against about 5.5 minutes for CI's job. [`scripts/test_on_linux.sh`](scripts/test_on_linux.sh) installs the locked environment with the CPU builds of torch and torchvision in place of the CUDA ones, and keeps it between runs.
