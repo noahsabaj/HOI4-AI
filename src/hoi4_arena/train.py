@@ -377,6 +377,9 @@ def _train_bc(
     held_previous=False,
     gpu_views=False,
     balance=False,
+    rung=None,
+    dagger=0.0,
+    dagger_data=(),
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -399,8 +402,10 @@ def _train_bc(
     exactly the order training has always seen. Clips are read only for an encoder that
     reads them: the default Qwen3.5 tower reads the quadrants alone.
 
-    `lead_in`, `drop_keys`, `loser_weight`, `press_weight`, `drop_parking` and
-    `setup_weight` pass to dataset.session_labels, and `camera_since` to VideoSessions.
+    `lead_in`, `drop_keys`, `loser_weight`, `press_weight`, `drop_parking`,
+    `setup_weight` and `rung` (the curriculum's cut: only what follows the moment a rung
+    save stands for teaches) pass to dataset.session_labels, and `camera_since` to
+    VideoSessions.
     `state_weight` > 0 adds the privileged-state loss: a linear read-out of the memory
     predicts the arena's true state at each decision (privileged.NAMES), from the
     arena log, weighted by it; the read-out is saved beside the policy and never used to
@@ -416,7 +421,15 @@ def _train_bc(
     `batch_size` games side by side (dataset.GameSequences), by truncated
     backpropagation through time, instead of from empty in shuffled windows after a
     burn-in; validation is carried through each held-out game the same way.
+
+    `dagger_data` are folders of practice games read beside `data`, and `dagger` > 0
+    trains every practice game that has the scripted player's labels (dagger.relabel) on
+    them, each labelled decision weighing `dagger` (dataset.session_labels): DAgger's
+    aggregate, the learner's own states with the expert's actions, mixed into the base
+    data at that weight.
     """
+    if dagger > 0 and "policy" not in sources:
+        raise ValueError("--dagger trains practice games: add policy to --sources")
     if carry:
         burn_in = 0
     if not 0 < idm_weight <= 1:
@@ -453,6 +466,9 @@ def _train_bc(
         "held_previous": held_previous,
         "gpu_views": gpu_views,
         "balance": balance,
+        "rung": rung,
+        "dagger": dagger,
+        "more": tuple(dagger_data),
     }
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
@@ -560,7 +576,12 @@ def _train_bc(
         "camera_since": camera_since,
         "held_previous": held_previous,
         "balance": balance,
+        # Only when set, so runs saved before it existed still resume.
+        **({"rung": rung} if rung else {}),
     }
+    if dagger or dagger_data:
+        # Named only when used, so a run from before resumes with the same settings.
+        config.update(dagger=dagger, dagger_data=[str(Path(p).resolve()) for p in dagger_data])
     output.mkdir(parents=True, exist_ok=True)
     # The loader's workers are not the model's, but a resume needs the same (Progress).
     progress = Progress(output, {**config, "workers": workers}, every=save_every, resume=resume)

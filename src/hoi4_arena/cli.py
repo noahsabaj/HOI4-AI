@@ -277,7 +277,17 @@ def build_parser():
     )
     drill.add_argument("checkpoint")
     drill.add_argument("output", help="A folder for the episodes and practice-peer.json")
-    drill.add_argument("--peer", required=True, help="The second PC's pairing file")
+    where = drill.add_mutually_exclusive_group(required=True)
+    where.add_argument("--peer", help="The second PC's pairing file")
+    where.add_argument(
+        "--here", action="store_true",
+        help="Practise on this PC's game instead (practice-here.json); hold its lock",
+    )  # fmt: skip
+    drill.add_argument(
+        "--arenas", nargs="+", default=["arena-12x8-v4"],
+        help="Arenas to practise on, each with start saves (artifacts/arenas/saves-peer.json)",
+    )  # fmt: skip
+    drill.add_argument("--block", type=int, default=4, help="Episodes in a row on an arena")
     drill.add_argument("--episodes", type=int, default=20)
     drill.add_argument("--minutes", type=float, required=True, help="Time budget for all")
     drill.add_argument("--seconds", type=float, default=90.0, help="Each episode's length")
@@ -291,6 +301,36 @@ def build_parser():
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill.add_argument("--model", dest="model_path")
     drill.add_argument("--seed", type=int)
+    dagger = sub.add_parser(
+        "dagger-label",
+        help="DAgger: the scripted player's label for every decision of practice games, "
+        "from their frames and the inputs before each (dagger.py), for train-bc --dagger",
+    )
+    dagger.add_argument("recordings", nargs="+", help="Recording folders, or folders of them")
+    dagger.add_argument("--force", action="store_true", help="Label again what has labels")
+    dagger.add_argument("--jobs", type=int, default=1, help="Recordings labelled at once")
+    dagger.add_argument(
+        "--into",
+        help="A DAgger data folder to link every labelled game into (train-bc --dagger-data)",
+    )
+    dagger.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    dagger = sub.add_parser(
+        "dagger-score",
+        help="A policy's likelihood of the DAgger expert's labels on practice games (the "
+        "held-out ones of an aggregate): how well it acts as the expert would where a "
+        "learner led the game",
+    )
+    dagger.add_argument("checkpoint")
+    dagger.add_argument("recordings", nargs="+", help="Recording folders, or folders of them")
+    dagger.add_argument("--model", dest="model_path")
+    dagger = sub.add_parser(
+        "dagger-check",
+        help="How often the DAgger expert presses what the scripted player pressed, on the "
+        "scripted player's own recordings (drills or games), over their setup",
+    )
+    dagger.add_argument("recordings", nargs="+", help="Recording folders, or folders of them")
+    dagger.add_argument("--jobs", type=int, default=1, help="Recordings checked at once")
+    dagger.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill = sub.add_parser(
         "drills",
         help="The scripted player's setup alone, over and over, on the second PC: recorded "
@@ -351,6 +391,58 @@ def build_parser():
     )
     live.add_argument("--model", dest="model_path")
     live.add_argument("--seed", type=int)
+    rungs = sub.add_parser(
+        "make-ladder",
+        help="The curriculum's rung saves (curriculum.py): from each arena's start save, the "
+        "scripted player's setup steps while the game stays paused, saved after each (S1 the "
+        "army, S2 its general, S3 its front and offensive), on this PC or the second",
+    )
+    rungs.add_argument("output", help="A folder for each rung's picture and ladder.json")
+    rungs.add_argument("--peer", help="The second PC's pairing file (else this PC)")
+    rungs.add_argument("--arenas", nargs="+", default=["arena-12x8-v4"])
+    rungs.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    rungs.add_argument("--rungs", nargs="+", choices=["S1", "S2", "S3"], default=["S1", "S2", "S3"])
+    rungs.add_argument(
+        "--fresh-starts", action="store_true",
+        help="Make every start save anew through the menus rather than use one found there",
+    )  # fmt: skip
+    rungs.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    rungs.add_argument("--seed", type=int)
+    rungs = sub.add_parser(
+        "rung-games",
+        help="Full games from the curriculum's rung saves, by a checkpoint or the scripted "
+        "player, each rung's wins and setup reported, with the rung its record promotes to "
+        "(curriculum.rung_games)",
+    )
+    rungs.add_argument("checkpoint", help='A policy checkpoint, or "scripted"')
+    rungs.add_argument("output", help="A folder for the games and rung-games.json")
+    rungs.add_argument("--peer", help="The second PC's pairing file (else this PC)")
+    rungs.add_argument("--rungs", nargs="+", choices=["S0", "S1", "S2", "S3"], default=["S3"])
+    rungs.add_argument("--arenas", nargs="+", default=["arena-12x8-v4"])
+    rungs.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    rungs.add_argument("--games", type=int, default=10)
+    rungs.add_argument("--minutes", type=float, required=True, help="Time budget for all games")
+    rungs.add_argument("--cap-minutes", type=float, default=10.0)
+    rungs.add_argument(
+        "--setup-seconds", type=float,
+        help="Run a game the policy has not started by then (default 30 from S3, else 90)",
+    )  # fmt: skip
+    rungs.add_argument("--block", type=int, default=4, help="Games in a row on an arena")
+    rungs.add_argument(
+        "--schedule", choices=["fixed", "adaptive"], default="fixed",
+        help="fixed: arenas in blocks, sides alternating, rungs interleaved; adaptive: each "
+        "game where the student's success is nearest 50%% and changing most "
+        "(curriculum.frontier)",
+    )  # fmt: skip
+    rungs.add_argument(
+        "--history", nargs="+", default=[],
+        help="Globs of earlier rung-games.json files the adaptive schedule also counts",
+    )  # fmt: skip
+    rungs.add_argument("--held-previous", action="store_true", help="As play-policy's")
+    add_sampling(rungs)
+    rungs.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    rungs.add_argument("--model", dest="model_path")
+    rungs.add_argument("--seed", type=int)
     heat = sub.add_parser(
         "heatmap",
         help="Draw where a policy wants to point, as a heat map over a recording's frames, "
@@ -676,6 +768,19 @@ def build_parser():
         "(dataset.balance_weights)",
     )
     train.add_argument(
+        "--dagger",
+        type=float,
+        default=0.0,
+        help="Train practice games on the scripted player's labels for their decisions "
+        "(hoi4-arena dagger-label), each labelled decision at this weight (DAgger; 0: off)",
+    )
+    train.add_argument(
+        "--dagger-data",
+        nargs="+",
+        default=[],
+        help="Folders of practice games read beside DATA, as DAgger aggregates them",
+    )
+    train.add_argument(
         "--held-previous",
         action="store_true",
         help="Show the policy, in its previous action, every key and button it still holds "
@@ -687,6 +792,13 @@ def build_parser():
         default=1.0,
         help="Loss weight of the setup's decisions, before the scripted player's run order "
         "(dataset.setup_end), on top of --press-weight",
+    )
+    train.add_argument(
+        "--rung",
+        choices=["S0", "S1", "S2", "S3"],
+        help="The curriculum's cut (curriculum.py): only what follows the moment this rung's "
+        "save stands for teaches (S3: after the scripted player's offensive; S2: its general; "
+        "S1: its army); a game recorded from a rung save starts there already",
     )
     train.add_argument(
         "--camera-since",
@@ -1141,6 +1253,22 @@ def _dispatch(command, args):
             fast=args["fast"],
             dry_run=args["dry_run"],
         )
+    elif command == "dagger-label":
+        from .dagger import aggregate, label_all
+
+        result = label_all(
+            args["recordings"], force=args["force"], jobs=args["jobs"], rules=args["rules"]
+        )
+        if args["into"]:
+            result["aggregate"] = aggregate(args["into"], args["recordings"])
+    elif command == "dagger-score":
+        from .dagger import expert_nll
+
+        result = expert_nll(args["checkpoint"], args["recordings"], model_path=args["model_path"])
+    elif command == "dagger-check":
+        from .dagger import check_all
+
+        result = check_all(args["recordings"], jobs=args["jobs"], rules=args["rules"])
     elif command == "drills":
         from .practice import drills
 
@@ -1150,8 +1278,22 @@ def _dispatch(command, args):
     elif command == "practice":
         from .practice import practice
 
+        args.pop("here")
         args["countries"] = tuple(args["countries"])
+        args["arenas"] = tuple(args["arenas"])
         result = practice(args.pop("checkpoint"), args.pop("output"), **args)
+    elif command == "make-ladder":
+        from .curriculum import make_ladder
+
+        for key in ("arenas", "countries", "rungs"):
+            args[key] = tuple(args[key])
+        result = make_ladder(args.pop("output"), **args)
+    elif command == "rung-games":
+        from .curriculum import rung_games
+
+        for key in ("arenas", "countries", "rungs", "history"):
+            args[key] = tuple(args[key])
+        result = rung_games(args.pop("checkpoint"), args.pop("output"), **args)
     elif command == "play-policy":
         from .play import evaluate_policy
 

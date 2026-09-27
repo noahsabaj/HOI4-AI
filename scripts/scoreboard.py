@@ -48,7 +48,8 @@ def score(root):
     """{(checkpoint, temperature, pointer temperature): its practice and live scores}."""
     board = defaultdict(lambda: {"practice": 0, "own": defaultdict(int), "coach": defaultdict(lambda: [0, 0]),
                                  "live": 0, "wins": 0, "complete": 0, "live_complete": 0})  # fmt: skip
-    for path in sorted(Path(root).glob("practice-*/practice-peer.json")):
+    # practice-peer.json, or practice-here.json for a run on this PC.
+    for path in sorted(Path(root).glob("practice-*/practice-*.json")):
         run = json.loads(path.read_text())
         # Each episode names its own; a summary's are a list when its episodes differ.
         summary = run.get("summary", {})

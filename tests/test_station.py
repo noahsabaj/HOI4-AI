@@ -71,6 +71,10 @@ def test_it_stops_between_sessions_for_a_restart_or_a_drain(station, tmp_path):
         ("practice", None, False),
         ("record-ai", [{"game": "a", "error": "no launch"}], False),
         ("record-ai", [{"game": "a", "error": "x"}, {"game": "b", "winner": "timeout"}], True),
+        ("rung-games", {"summary": {}, "games": [{"error": "no save"}]}, False),
+        ("rung-games", {"summary": {}, "games": [{"winner": "timeout"}]}, True),
+        ("make-ladder", [{"arena": "a", "rungs": {}, "error": "x"}], False),
+        ("make-ladder", [{"arena": "a", "rungs": {"S3": "frontv4blu"}}], True),
     ],
 )
 def test_a_session_counts_as_played_only_if_its_summary_says_so(
@@ -106,7 +110,17 @@ def test_the_plan_s_recording_run_plays_here_once_per_name(station):
     assert listed[0]["output"] == "artifacts/record-sv6", "collected like any session"
 
 
+def test_the_plan_s_rung_saves_are_made_here_once_per_name(station):
+    ran = []
+    entry = {"name": "v4", "args": ["--arenas", "arena-12x8-v4"]}
+    assert station.ladder(entry, run=lambda *a: ran.append(a) or 0) is True
+    assert ran == [("make-ladder", "artifacts/ladder-v4", "--peer", station.PEER,
+                    "--arenas", "arena-12x8-v4")]  # fmt: skip
+    assert station.ladder(entry, run=lambda *a: ran.append(a) or 0) is False, "once"
+
+
 @pytest.mark.parametrize("command, policy", [("practice", True), ("play-policy", True),
+                                             ("rung-games", True),
                                              ("drills", False), ("record-ai", False)])  # fmt: skip
 def test_the_session_in_progress_is_announced_for_other_projects(station, command, policy):
     seen = []

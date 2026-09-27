@@ -371,6 +371,8 @@ class Planner:
         self.decisions, self.decide_day, self.decided_day = 0, 0.0, None
         self.controls_seen, self.changed_day, self.pending_event = 0, None, None
         self.waited, self.waiting_since, self.waits = 0.0, None, []
+        # The setup's steps the game started with done (a rung save): setup skips them.
+        self.done = frozenset()
 
     def order(self, kind, **details):
         self.orders.append({"frame": self.frame(), "order": kind, **details})
@@ -912,14 +914,22 @@ class Planner:
         return max(guard, self.left_behind + POCKET_GROWTH) if self.left_behind else guard
 
     def setup(self, desk):
-        """While paused: the army, its general, its front, its offensive; then run. With a
+        """While paused: the army, its general, its front, its offensive; then run. The
+        steps in `done` (a game from a rung save, curriculum.DONE) are skipped; the map is
+        still looked at once, for the land held at the start (incursion). With a
         strategist, it decides after the front, in place of the offensive."""
-        self.form_army(desk)
-        self.assign_general(desk)
-        self.draw_front(desk)
+        done = self.done
+        if "army" not in done:
+            self.form_army(desk)
+        if "general" not in done:
+            self.assign_general(desk)
+        if "front" not in done:
+            self.draw_front(desk)
+        else:
+            self.overview(desk)
         if self.strategist is not None:
             self.consult(desk, "start")
-        elif self.plan["attack"] in OFFENSIVES:
+        elif self.plan["attack"] in OFFENSIVES and "offensive" not in done:
             self.draw_offensive(desk)
         with doing(desk, "run"):
             run_at(desk, self.rules, self.speed)

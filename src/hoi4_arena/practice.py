@@ -300,11 +300,13 @@ def practice(
     checkpoint,
     output,
     *,
-    peer,
+    peer=None,
     episodes=20,
     minutes=60.0,
     seconds=90.0,
     countries=("BLU", "RED"),
+    arenas=(MAIN_ARENA,),
+    block=4,
     coach=True,
     held_previous=False,
     temperature=1.0,
@@ -316,10 +318,13 @@ def practice(
     fast=False,
 ):
     """Up to `episodes` practice episodes of `seconds` each (or until `minutes` run out) on
-    the second PC, from the main arena's start saves, alternating countries. `temperature`,
+    the second PC (`peer`, its pairing), or on this PC without one, from the start saves
+    of `arenas` (drill_saves; the main arena's by default), `block` episodes in a row on
+    each (drill_order), alternating countries. Only the main arena's saves load from
+    inside the game; another arena's episode launches HOI4 afresh (~3 minutes). `temperature`,
     `pointer_temperature` and `point` are how the policy samples, as play-policy's
     (runner.resolve_temperatures); each episode and the summary name the two temperatures.
-    Returns the episodes and the summary (practice-peer.json in `output`)."""
+    Returns the episodes and the summary (practice-<station>.json in `output`)."""
     from PIL import Image
 
     from .ai_games import EVENT_OK, Station, focus, log_end, start_game
@@ -333,32 +338,35 @@ def practice(
     ok = [np.asarray(Image.open(path).convert("RGB")) for path in (
         "artifacts/screens-1080p/ok-button.png", EVENT_OK)]  # fmt: skip
     rng = random.Random(seed)
-    station = Station("peer", peer)
+    station = Station("peer", peer) if peer else Station("here")
+    saves = drill_saves()
+    missing = [(a, c) for a in arenas for c in countries if (a, c) not in saves]
+    if missing:
+        raise ValueError(f"no start save for {missing}")
     end = time.monotonic() + minutes * 60
-    results, running = [], False
+    results, running = [], None
     try:
         actor = Actor(
             checkpoint, model_path, game_speed=5, temperature=temperature,
             pointer_temperature=pointer_temperature, point=point, lean=True, fast=fast,
         )  # fmt: skip
         actor.held_previous = actor.held_previous or held_previous
-        for index in range(episodes):
+        for arena, country in drill_order(list(arenas), countries, episodes, block):
             if time.monotonic() + seconds + 60 > end:
                 break
-            country = countries[index % len(countries)]
-            save = f"arenav4{country.lower()}"
-            name = time.strftime("practice-peer-%Y%m%d-%H%M%S")
-            entry = {"game": name, "station": "peer", "started_as": country, "arena": MAIN_ARENA,
+            save = saves[(arena, country)]
+            name = time.strftime(f"practice-{station.name}-%Y%m%d-%H%M%S")
+            entry = {"game": name, "station": station.name, "started_as": country, "arena": arena,
                      "start_save": save, "checkpoint": actor.digest, "coach": coach,
                      **sampling_of(actor)}  # fmt: skip
             failure_shot = out_root / f"{name}-start-failed.png"
             try:
                 log_from = None
                 loaded = load_or_launch(
-                    station, MAIN_ARENA, save, running, ok, screen_rules, failure_shot
+                    station, arena, save, running == arena, ok, screen_rules, failure_shot
                 )
                 entry["loaded_in_game"] = loaded
-                running = False
+                running = None
                 with station.connect() as desk:
                     if not focus(desk):
                         raise RuntimeError("could not bring the game window to the front")
@@ -373,8 +381,8 @@ def practice(
                     watcher = Coach(country, screen_rules, intervene=coach, rng=rng)
                     outcome, reason, manifest = play_policy_game(
                         desk, actor, out_root / name, rules=screen_rules, country=country,
-                        cap_minutes=seconds / 60, setup_seconds=seconds, arena_name=MAIN_ARENA,
-                        coach=watcher, log_from=log_from,
+                        cap_minutes=seconds / 60, setup_seconds=seconds, arena_name=arena,
+                        coach=watcher, log_from=log_from, station=station.name,
                     )  # fmt: skip
             except Exception as error:  # noqa: BLE001 - reported, then the next episode.
                 entry["error"] = f"{type(error).__name__}: {error}"
@@ -389,10 +397,10 @@ def practice(
                     forced_releases=manifest.get("forced_releases"),
                     milestones=manifest.get("milestones"),
                 )
-                running = reason is None
-                log.info("[peer] %s: %s", name, json.dumps(entry["setup"]))
+                running = arena if reason is None else None
+                log.info("[%s] %s: %s", station.name, name, json.dumps(entry["setup"]))
             results.append(entry)
-            (out_root / "practice-peer.json").write_text(
+            (out_root / f"practice-{station.name}.json").write_text(
                 json.dumps({"summary": summary(results), "episodes": results}, indent=2)
             )
     finally:
