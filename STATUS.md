@@ -1269,6 +1269,56 @@ beat (`win-rate`).
   (51, averaging +0.84 on arenas but marsh); on those, the redraw period and the hold
   explain most of the score (importance 0.57 and 0.38). `tune STUDY.db show` reports it.
 
+## The state channel (2026-09-26)
+
+A teacher that acts on the game's state needs more than the daily `day` lines: whose
+each province is, what laws each side has, and above all its armies, their generals
+and their plans, which decide whether setup happened. The arena mod now logs those too
+(`state_channel.py`; the format is in its docstring). Once at startup it lists each
+state's provinces. Then each day, for each side, it logs a `state` line: a province
+control mask per state, the conscription, economy and trade laws, political and command
+power, stability, war support, manpower, the rifle stockpile and the count of orders
+groups. After it comes an `army` line per leader in command: divisions, battle plans,
+planning bonus, divisions fighting and the progress of their battles, entrenchment,
+rifles, and divisions per state. It uses only on_actions, temporary variables and
+`log`, the path the arena's reports already take, so it changes no rule and nothing
+on screen. `upgrade-channel` adds it to the arenas made before it without regenerating
+them; a test holds the upgrade to what `generate-map` writes.
+
+Save games were the other option. They hold everything, fronts included, but this PC
+saves them compressed and binary (`save_as_binary=yes`), autosave is off, and a save made
+on demand opens the console on screen or stalls the game while it writes. The mod's log
+costs neither.
+
+Checked live on this PC on 2026-09-26: the v4 arena, AI against AI at speed 5, 150 s
+per game, three games with the channel and two without, alternated, the worker's
+`game_log` polled every 0.1 s. The first game ran an earlier draft that also logged
+`any_war_score` and `is_field_marshal`:
+
+| | with the channel (3) | without (2) |
+|---|---|---|
+| game speed, game-days/s | 2.499, 2.500, 2.500 | 2.496, 2.500 |
+| lines that failed to parse or left a variable unresolved | 0 | 0 |
+| script errors in error.log | 0 | 0 |
+| a game_log request, median / p95 ms | 0.4-0.6 / 8-14 | 0.6 / 11-18 |
+
+- **Coverage:** every day brought a `state` line from each side and an `army` line per
+  leader, 752 a game (each 150 s run covered 376 days). The two sides' province masks
+  agreed: in each checked game, each of the 192 provinces was held by exactly one side.
+- **Latency:** game.log stamps its lines to the second. The time from that stamp to the
+  line in hand was at least 12-152 ms, 5th percentile 0.09-0.19 s, and median 0.54-0.62
+  s, of which about 0.5 s is the stamp's truncation. So a report is in hand about 0.1 s
+  after the game writes it, the poll's period, and a new day comes every 0.4 s at speed 5.
+- **Speed:** at speed 5 the game runs at its tick cap, as before: no slowdown was seen.
+  This can't show extra CPU the game has room for.
+- **Volume:** the channel adds about 1.6 KB of log a game day (0.5 KB for the `day`
+  lines), about 1 MB over a 600-day game's arena-log.jsonl.
+- **Known limits:** it has no front lines as drawn, only their count per leader (a front
+  or an offensive is a battle plan), and no execute flag, which the planning bonus and
+  the battles show indirectly. In AI games two of the four leaders read
+  is_leading_army_group, and their division counts overlap. `any_war_score` read 0
+  throughout and was dropped.
+
 ## A learned player from the scripted games (2026-09-24)
 
 The goal: a policy that reads only the screen and beats the game's AI in at least half

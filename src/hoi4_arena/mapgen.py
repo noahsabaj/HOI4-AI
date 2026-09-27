@@ -27,6 +27,7 @@ from scipy.spatial import cKDTree
 
 from . import arenas
 from .arenas import PRESETS
+from .state_channel import daily_effect, startup_effect
 
 # Graphical terrain palette indices. These are the two the stock terrain.bmp actually
 # paints most land with: index 0 covers 9.8% of the stock map as terrain_0 (type plains)
@@ -1080,12 +1081,18 @@ def generate(
         " manpower [?manpower_k] deployed [?deployed_army_manpower_k] rifles [?arena_rifles]"
         " needed [?arena_needed] at" + "".join(f" {s}=[?arena_d{s}]" for s in state_ids) + '"'
     )
+    # The state channel (state_channel.py): each province's controller, the laws, the
+    # armies with their plans and divisions per state, and more, for a teacher that reads
+    # the game's state. Arenas made before it get it from state_channel.upgrade.
+    daily += daily_effect(states)
     write(
         "common/on_actions/arena.txt",
         "on_actions = {\n"
         "\ton_startup = { effect = {"
         ' log = "ARENA start [GetDateText]"'
-        ' every_country = { limit = { is_ai = no } log = "ARENA player [THIS.GetTag]" } } }\n'
+        ' every_country = { limit = { is_ai = no } log = "ARENA player [THIS.GetTag]" } '
+        + startup_effect(states).strip()
+        + " } }\n"
         '\ton_weekly = { effect = { log = "ARENA week [GetDateText] [ROOT.GetTag] states'
         " [?num_controlled_states] owned [?num_owned_controlled_states] divisions"
         ' [?num_divisions] surrender [?surrender_progress]" } }\n'

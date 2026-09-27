@@ -1078,6 +1078,12 @@ def build_parser():
     )
     picture.add_argument("mod")
     picture.add_argument("output")
+    channel = sub.add_parser(
+        "upgrade-channel",
+        help="Add the state channel (state_channel.py) to arenas made before it, in place: "
+        "only their on_actions change, so maps and start saves stay as they are",
+    )
+    channel.add_argument("mods", nargs="+")
     collect = sub.add_parser("collect-pair")
     collect.add_argument("config")
     collect.add_argument("output")
@@ -1560,6 +1566,10 @@ def _dispatch(command, args):
         from .mapgen import preview
 
         result = preview(args["mod"], args["output"])
+    elif command == "upgrade-channel":
+        from .state_channel import upgrade
+
+        result = {mod: "upgraded" if upgrade(mod) else "had it" for mod in args["mods"]}
     elif command == "collect-pair":
         from .runner import collect_pair
 
