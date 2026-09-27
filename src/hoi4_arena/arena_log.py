@@ -12,6 +12,15 @@ The mod logs, without changing any rule (see mapgen's on_actions):
     capitulated RED winner BLU 12:00, 2 June, 1936
     peace RED BLU 12:00, 3 June, 1936
 
+A multi-nation arena (mapgen_multi.py) also states its wars at startup, and names both
+sides of each declaration:
+
+    wars BLU+RED:PUR+GRN fair yes
+    declare BLU PUR
+
+Its game ends when one side is left, every nation of every other side having
+capitulated; the winner is that side's nations joined by "+" ("BLU+RED").
+
 The worker's game_log request returns these lines with the "ARENA " prefix removed, on
 either PC. They are exact where the screen is not: a surrender names both sides, and the
 weekly counts do not depend on where the camera is. They are for scoring and for training
@@ -31,7 +40,11 @@ import time
 DATE = r"(?P<date>\d{1,2}:\d{2}, \d{1,2} \w+, \d{4})"
 PATTERNS = {
     "start": re.compile(rf"^start\s+{DATE}$"),
-    "declare": re.compile(r"^declare (?P<tag>[A-Z]{3})$"),
+    "declare": re.compile(r"^declare (?P<tag>[A-Z]{3})(?: (?P<target>[A-Z]{3}))?$"),
+    "wars": re.compile(
+        r"^wars (?P<sides>[A-Z]{3}(?:[+:][A-Z]{3})+)(?: neutral (?P<neutral>[A-Z+]+))?"
+        r" fair (?P<fair>yes|no)$"
+    ),
     "player": re.compile(r"^player (?P<tag>[A-Z]{3})$"),
     "week": re.compile(
         rf"^week\s+{DATE} (?P<tag>[A-Z]{{3}}) states (?P<states>\d+) owned (?P<owned>\d+)"
@@ -71,7 +84,9 @@ def parse(line):
     for kind, pattern in PATTERNS.items():
         match = pattern.match(line.strip())
         if match:
-            event = {"kind": kind, **match.groupdict()}
+            # An optional part left out is left out of the event, not given as None.
+            found = {key: value for key, value in match.groupdict().items() if value is not None}
+            event = {"kind": kind, **found}
             for key in NUMBERS & event.keys():
                 event[key] = int(event[key])
             for key in REALS & event.keys():
@@ -93,8 +108,8 @@ def potential(weeks, country, states_per_country):
     adds signal without changing which policy is best: over a whole match it sums to the
     final potential minus the first. None until both sides have reported.
     """
-    enemy = ENEMY[country]
-    if country not in weeks or enemy not in weeks:
+    enemy = ENEMY.get(country)
+    if enemy is None or country not in weeks or enemy not in weeks:
         return None
     own, other = weeks[country], weeks[enemy]
     states = (own["states"] - other["states"]) / states_per_country
@@ -120,6 +135,10 @@ class ArenaLog:
         self.winner = self.loser = self.surrendered = None
         # Who declared the war (arenas since v2) and the countries humans started as.
         self.declarer, self.players = None, []
+        # A multi-nation arena's sides (from its `wars` line), every declaration as
+        # (declarer, target), the nations that have capitulated in order, and the nations
+        # of the side left standing once the game is over.
+        self.sides, self.declarations, self.capitulated, self.winners = None, [], [], []
         # A weekly report missing for this long means the game clock has stopped. None
         # turns the check off: at speed 2 a week takes 84 s, longer than the screen's own
         # clock check allows.
@@ -144,15 +163,36 @@ class ArenaLog:
             elif event["kind"] == "day":
                 self.days[event["tag"]] = event
             elif event["kind"] == "capitulated" and self.winner is None:
-                self.winner, self.loser = event["winner"], event["loser"]
-                self.surrendered = event["date"]
+                if self.sides is None:
+                    self.winner, self.loser = event["winner"], event["loser"]
+                    self.surrendered = event["date"]
+                    self.winners = [self.winner]
+                else:
+                    self._fell(event)
+            elif event["kind"] == "wars":
+                self.sides = [side.split("+") for side in event["sides"].split(":")]
             elif event["kind"] == "declare":
-                self.declarer = event["tag"]
+                if event.get("target"):
+                    self.declarations.append((event["tag"], event["target"]))
+                    self.declarer = self.declarer or event["tag"]
+                else:
+                    self.declarer = event["tag"]
             elif event["kind"] == "player":
                 self.players.append(event["tag"])
         if self.silence is not None and self.clock() - self.last_week > self.silence:
             raise RuntimeError(f"the game clock stopped: no weekly report for {self.silence} s")
         return events
+
+    def _fell(self, event):
+        """A nation of a multi-nation arena capitulated: the game is over once only one
+        side has a nation standing."""
+        if event["loser"] not in self.capitulated:
+            self.capitulated.append(event["loser"])
+        standing = [side for side in self.sides if set(side) - set(self.capitulated)]
+        if len(standing) <= 1:
+            self.winners = list(standing[0]) if standing else [event["winner"]]
+            self.winner = "+".join(self.winners)
+            self.loser, self.surrendered = event["loser"], event["date"]
 
     def potential(self, country):
         """`potential` for this game, scaled by what `country` owned at its first report."""
@@ -165,4 +205,4 @@ class ArenaLog:
         """Whether `country` won ("win") or lost ("loss"), or None before a surrender."""
         if self.winner is None:
             return None
-        return "win" if self.winner == country else "loss"
+        return "win" if country in (self.winners or [self.winner]) else "loss"

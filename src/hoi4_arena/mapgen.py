@@ -191,6 +191,32 @@ def shore_heights(ground):
     return np.round(middle + half * ramp).astype(np.uint8)
 
 
+# Each country's character names: male, female, surnames.
+_NAME_LISTS = {
+    "BLU": (
+        "Alan Arthur Bernard Charles David Edward Francis George Harold Henry "
+        "James John Leonard Martin Michael Norman Oliver Philip Richard Robert "
+        "Samuel Stephen Thomas Victor Walter William",
+        "Alice Barbara Catherine Dorothy Edith Eleanor Frances Grace Helen Irene "
+        "Joan Katherine Louise Margaret Marion Nancy Olive Rachel Ruth Sarah "
+        "Sylvia Vera Violet Winifred",
+        "Ashton Baker Bennett Carter Chapman Clarke Cooper Dawson Ellis Fletcher "
+        "Gibson Hale Harper Hayes Hudson Kent Lawson Marsh Newton Osborne Palmer "
+        "Reed Sinclair Stanton Thornton Vance Warren Whitfield Wilkins Young",
+    ),
+    "RED": (
+        "Adrian Alexis Anton Boris Dimitri Fedor Gregor Ivan Konstantin Leonid "
+        "Maksim Mikhail Nikolai Oleg Pavel Roman Sergei Stepan Timur Valentin "
+        "Vasili Viktor Vladimir Yakov Yuri Zakhar",
+        "Anna Daria Ekaterina Elena Galina Inna Irina Klavdia Larisa Lidia "
+        "Lyudmila Marina Nadezhda Natalia Nina Olga Polina Raisa Svetlana Tamara "
+        "Tatiana Valentina Yelena Zoya",
+        "Agapov Belov Chernov Dorokhov Ermakov Gorelik Ivashov Kalinin Komarov "
+        "Lapin Maslov Nesterov Orlov Panov Rodin Savelev Shestakov Sokolov "
+        "Tarasov Ustinov Vlasov Volkov Yudin Zaitsev Zhukov",
+    ),
+}
+
 SEA, LAND, LAKE = 0, 1, 2
 DESCRIPTION = "Equal infantry armies. Multiple routes. Normal supply and fog of war."
 VICTORY_POINT_NAMES = "localisation/english/replace/arena_victory_points_l_english.yml"
@@ -811,32 +837,7 @@ def generate(
             f"{tag} = {{\n\tmale = {{ names = {{ {male} }} }}\n"
             f"\tfemale = {{ names = {{ {female} }} }}\n"
             f"\tsurnames = {{ {surnames} }}\n\tcallsigns = {{ }}\n}}"
-            for tag, male, female, surnames in [
-                (
-                    "BLU",
-                    "Alan Arthur Bernard Charles David Edward Francis George Harold Henry "
-                    "James John Leonard Martin Michael Norman Oliver Philip Richard Robert "
-                    "Samuel Stephen Thomas Victor Walter William",
-                    "Alice Barbara Catherine Dorothy Edith Eleanor Frances Grace Helen Irene "
-                    "Joan Katherine Louise Margaret Marion Nancy Olive Rachel Ruth Sarah "
-                    "Sylvia Vera Violet Winifred",
-                    "Ashton Baker Bennett Carter Chapman Clarke Cooper Dawson Ellis Fletcher "
-                    "Gibson Hale Harper Hayes Hudson Kent Lawson Marsh Newton Osborne Palmer "
-                    "Reed Sinclair Stanton Thornton Vance Warren Whitfield Wilkins Young",
-                ),
-                (
-                    "RED",
-                    "Adrian Alexis Anton Boris Dimitri Fedor Gregor Ivan Konstantin Leonid "
-                    "Maksim Mikhail Nikolai Oleg Pavel Roman Sergei Stepan Timur Valentin "
-                    "Vasili Viktor Vladimir Yakov Yuri Zakhar",
-                    "Anna Daria Ekaterina Elena Galina Inna Irina Klavdia Larisa Lidia "
-                    "Lyudmila Marina Nadezhda Natalia Nina Olga Polina Raisa Svetlana Tamara "
-                    "Tatiana Valentina Yelena Zoya",
-                    "Agapov Belov Chernov Dorokhov Ermakov Gorelik Ivashov Kalinin Komarov "
-                    "Lapin Maslov Nesterov Orlov Panov Rodin Savelev Shestakov Sokolov "
-                    "Tarasov Ustinov Vlasov Volkov Yudin Zaitsev Zhukov",
-                ),
-            ]
+            for tag, (male, female, surnames) in _NAME_LISTS.items()
         )
         + "\n",
     )
@@ -1313,7 +1314,9 @@ def _audit_pixels(root, rows, graphical, heights):
         problems.append(f"{len(flooded)} land provinces lie below sea level, first {flooded[0]}")
     problems += _audit_rivers(np.array(Image.open(root / "map/rivers.bmp")), ids, wet)
     report = root / "generation.json"
-    if report.exists() and json.loads(report.read_text()).get("preset"):
+    found = json.loads(report.read_text()) if report.exists() else {}
+    # A multi-nation arena is a turn, not a half turn: mapgen_multi.audit_nations.
+    if found.get("preset") and found.get("nations", 2) == 2:
         half = count // 2
         mirrored = (ids[::-1, ::-1] + half - 1) % count + 1
         if (mirrored != ids).any():
@@ -1599,6 +1602,13 @@ def audit(root):
     if step > 48:
         problems.append(f"heightmap has a {step}-byte neighbour step, steeper than any stock coast")
     problems += _audit_pixels(root, rows, graphical, heights)
+    report = root / "generation.json"
+    found = json.loads(report.read_text()) if report.exists() else {}
+    if found.get("nations", 2) > 2:
+        from .mapgen_multi import audit_nations
+
+        ids, _ = _province_ids(root)
+        problems += audit_nations(root, found, rows, ids, graphical, heights)
     for name, divisor in [
         ("map/terrain/colormap_rgb_cityemissivemask_a.dds", 2),
         ("map/terrain/fow_rgb_waterspec_a.dds", 2),
@@ -1663,7 +1673,10 @@ def audit(root):
             if f"recruit_character = {key}" not in recruited:
                 problems.append(f"{key} is defined but never recruited, so it does not exist")
         strategy = root / "common/ai_strategy/arena.txt"
-        if not strategy.exists() or f"tag = {tags[1 - index]}" not in strategy.read_text():
+        # A multi-nation arena's strategies, one per enemy, are checked by audit_nations.
+        if len(tags) == 2 and (
+            not strategy.exists() or f"tag = {tags[1 - index]}" not in strategy.read_text()
+        ):
             problems.append(f"{tag} has no front_control strategy, so the AI may never attack")
         for suffix in ["", "_DEF", "_ADJ"]:
             if f" {tag}{suffix}:" not in localised:
@@ -1737,15 +1750,19 @@ def preview(root, output, width=1800):
         owner = re.search(r"owner\s*=\s*(\w+)", text).group(1)
         for province in _block(text, "provinces"):
             owner_of[province], state_of[province] = owner, state
+    from .multination import COLOUR
+
     owners = np.zeros(count + 1, np.int8)
     states = np.zeros(count + 1, np.int32)
+    # Each country's own colour: Blue and Red, and on a multi-nation arena the others.
+    tags = sorted(set(owner_of.values()), key=lambda t: (t != "BLU", t != "RED", t))
     for province, tag in owner_of.items():
-        owners[province] = 1 if tag == "BLU" else 2
+        owners[province] = tags.index(tag) + 1
         states[province] = state_of[province]
     own = owners[crop]
     tint = np.zeros_like(image)
-    tint[own == 1] = (40, 100, 220)
-    tint[own == 2] = (220, 60, 60)
+    for number, tag in enumerate(tags, 1):
+        tint[own == number] = COLOUR.get(tag, (200, 200, 200))
     image = np.where((own > 0)[..., None], 0.8 * image + 0.2 * tint, image)
 
     def edges(labels):

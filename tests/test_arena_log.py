@@ -143,3 +143,40 @@ def test_the_declarer_and_the_players_are_kept():
     log = ArenaLog(_log(["declare RED", "start  12:00, 1 January, 1936", "player BLU", WEEK]))
     log.poll()
     assert (log.declarer, log.players) == ("RED", ["BLU"])
+
+
+def test_a_multi_nation_game_ends_when_one_side_is_left():
+    log = ArenaLog(
+        _log(
+            ["wars BLU+RED:PUR+GRN fair yes", "declare BLU PUR", "declare BLU GRN"],
+            ["capitulated PUR winner BLU 12:00, 2 June, 1936"],
+            ["capitulated RED winner GRN 12:00, 9 June, 1936"],
+            ["capitulated GRN winner RED 12:00, 3 July, 1936"],
+        )
+    )
+    log.poll()
+    assert log.sides == [["BLU", "RED"], ["PUR", "GRN"]]
+    assert log.declarer == "BLU" and log.declarations == [("BLU", "PUR"), ("BLU", "GRN")]
+    assert parse("declare BLU PUR") == {"kind": "declare", "tag": "BLU", "target": "PUR"}
+    assert parse("wars BLU:RED:PUR neutral GRN fair no")["neutral"] == "GRN"
+    # A nation down is not a side down: Blue's ally fell, its own side still stands.
+    log.poll()
+    log.poll()
+    assert log.winner is None and log.capitulated == ["PUR", "RED"]
+    log.poll()
+    assert log.winner == "BLU+RED" and log.winners == ["BLU", "RED"]
+    assert log.surrendered == "12:00, 3 July, 1936" and log.loser == "GRN"
+    assert (log.outcome("RED"), log.outcome("GRN")) == ("win", "loss")
+
+
+def test_every_nation_for_itself_ends_with_the_last_one_standing():
+    log = ArenaLog(
+        _log(
+            ["wars BLU:RED:PUR fair yes", "capitulated RED winner BLU 12:00, 2 June, 1936"],
+            ["capitulated BLU winner PUR 12:00, 2 May, 1937"],
+        )
+    )
+    log.poll()
+    assert log.winner is None
+    log.poll()
+    assert log.winner == "PUR" and log.outcome("PUR") == "win"
