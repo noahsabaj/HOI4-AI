@@ -1401,6 +1401,70 @@ of 20 live games. It learns by imitating the scripted player's recorded games.
   --camera-since 20260924-131000` leaves the arrow keys out of the recordings made before
   the front director; the 72 games recorded since keep theirs.
 
+## DAgger: the scripted player labels the learner's states (2026-09-26)
+
+Behaviour cloning learns only the states the scripted player visits. The learned player
+drifts into others and never learned the way back: bc5 e0 formed an army in 24 of 80
+practice episodes and drew a front in none. DAgger (Ross et al. 2011) asks the expert
+what it would do in every state the learner reached, and trains on those labels (#147).
+
+- **The expert** (`dagger.Expert`) is the scripted setup made reactive. It runs the
+  same steps, detectors and geometry as `scripted.Planner`, answered one 200 ms decision
+  at a time. The Planner itself is a procedure (click, sleep, look again), so it has no
+  answer for a single screen.
+- **What it knows:** the frame the learner saw, and the inputs applied so far, by
+  anyone. The step due comes from the screen. The rest is rebuilt from the inputs each
+  decision: a click under way, the commander list open, the offensive tool on, and an
+  offensive drawn since the front showed. It presses only once the pointer is on its
+  target, waits 0.8 s after a press, and abstains where it can't read the screen.
+- **Labels are made offline**, from a practice game's video and input record
+  (`hoi4-arena dagger-label`), so nothing extra runs while the learner plays. A coach's
+  takeover keeps its own inputs as the label.
+- **Training:** `train-bc --dagger W --dagger-data FOLDER` trains the labelled decisions
+  at weight W beside the base data. What a decision reads as its previous action stays
+  what the policy did.
+- **Faithful to the scripted player** (`dagger-check`, 20 drills and 4 held-out scripted
+  games, 251 setup presses):
+  - it made or aimed at 94.8% of the scripted player's presses within 0.6 s (83.7% the
+    same key or button at once);
+  - 93.9% of its own presses match one of the scripted player's;
+  - the misses are the scripted player's arrow-key recentring, which the expert skips
+    when the border is already on screen.
+- **Iteration 0 data:** the 136 existing bc5 and bc6 practice episodes are labelled, 60,610
+  of 61,974 decisions. The commonest states are:
+  - the alert not yet clicked (12.7k);
+  - inputs left held (10.6k);
+  - waiting for the screen (7.4k);
+  - the front tool (5.6k) and the portrait (4.7k);
+  - screens the learner opened and must close (law list, political screen, dialogs, 5.5k).
+- **Not yet done:** the fine-tune and the before/after practice scores. The GPU queue
+  didn't reach it before the evening's wrap-up. The data for it is ready:
+  `C:\hoi4-data\dagger-1` holds bc5's 94 labelled episodes (8 held out) and
+  `C:\hoi4-data\dagger-base-1` holds 26 of bc5's own scripted games plus the 4
+  validation games. The fine-tune is about 1,245 steps, ~52 min.
+
+To resume, from a checkout with `artifacts` and `models` in place, `PYTHONPATH=src`:
+
+```
+# 1. Tower cache for the practice games (GPU lock, ~20 min, ~35 GB int8, mostly D:)
+hoi4-arena cache-tower C:/hoi4-data/dagger-1 artifacts/bc-v2s5/epoch-0000.pt C:/hoi4-cache/tower-v2s5 --spill D:/hoi4-cache/tower-v2s5 --keep-free 75
+# 2. Fine-tune bc5 e0 (GPU lock, ~52 min; --resume continues a stopped run)
+hoi4-arena --gpu-memory 0.6 train-bc C:/hoi4-data/dagger-base-1 artifacts/learned/dagger1 --dagger-data C:/hoi4-data/dagger-1 --dagger 1.0 --sources scripted policy --lead-in 0 --drop-keys 0x20 --look-before-click --state-weight 0.5 --order-weight 0.2 --init artifacts/learned/bc5/epoch-0000.pt --train-last 0 --press-weight 4 --tower-cache C:/hoi4-cache/tower-v2s5 --carry --sequence 32 --epochs 1 --batch-size 2 --workers 1 --save-every 300 --drop-parking --setup-weight 4 --camera-since 20260924-131000
+# 3. Expert likelihood on the 8 held-out learner games, before and after
+hoi4-arena dagger-score artifacts/learned/bc5/epoch-0000.pt <the validation games in C:/hoi4-data/dagger-1/splits.json>
+hoi4-arena dagger-score artifacts/learned/dagger1/epoch-0000.pt <the same games>
+# 4. Practice on the second PC, interleaved, both checkpoints, main arena and two
+#    held-out arenas (no DAgger data there), T=1 with the coach as bc5's baseline
+hoi4-arena practice CKPT OUT --peer ... --minutes 40 --episodes 12 --arenas arena-12x8-v4
+hoi4-arena practice CKPT OUT --peer ... --minutes 60 --episodes 8 --arenas arena-river-v6 arena-plains-v6 --block 4
+# 5. Iteration 2: the new checkpoint's main-arena practice games are the next labels
+hoi4-arena dagger-label artifacts/learned/practice-dagger1-* --jobs 4 --into C:/hoi4-data/dagger-1
+```
+
+Compare with the scoreboard's `complete` column (practice.setup_complete) and the
+per-step rates. Today every checkpoint scores 0 complete: bc5 e0 0/80, with army 24/80,
+general 24/80 and front 0/80.
+
 ## The memory study (2026-09-24)
 
 **Withdrawn: the GRU arms were dead.** A check after the study found every GRU arm's
