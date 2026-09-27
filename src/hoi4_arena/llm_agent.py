@@ -72,7 +72,7 @@ SETTLE = 0.35
 NOTEBOOK, LESSONS = 4000, 6000
 # Times a game may lose its connection to the worker and carry on over a new one: the
 # tunnel dropped a frame mid-game on 2026-09-27 ("Truncated frame").
-RECONNECTS = 3
+RECONNECTS = 20
 # The close-up's longest side, and its greatest magnification.
 LOOK_SIZE, LOOK_ZOOM = 1024, 3.0
 
