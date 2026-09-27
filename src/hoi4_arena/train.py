@@ -230,6 +230,43 @@ class OrderHead(torch.nn.Module):
         return self.kind(memory.float()), self.eta(memory.float()).squeeze(-1)
 
 
+class SkillHead(torch.nn.Module):
+    """The skill a learned hand carries out (intents.SKILLS, one more for none), as a
+    vector added to the memory the action head reads: the policy conditioned on its
+    intent. It starts at zero, so a policy it is added to acts exactly as before until it
+    trains."""
+
+    def __init__(self, memory_dim):
+        from .intents import SKILLS
+
+        super().__init__()
+        self.embedding = torch.nn.Embedding(len(SKILLS) + 1, memory_dim)
+        torch.nn.init.zeros_(self.embedding.weight)
+
+    def forward(self, memory, skill):
+        return memory + self.embedding(skill).to(memory.dtype)
+
+
+def skill_report(losses, skills, pressing):
+    """Held-out negative log-likelihood by skill, over every decision and over those that
+    press (the clicks and keys that do the work)."""
+    from .intents import SKILLS
+
+    names = [*SKILLS, "none"]
+    report = {}
+    for k, name in enumerate(names):
+        chosen = [x for x, s in zip(losses, skills, strict=True) if s == k]
+        pressed = [x for x, s, p in zip(losses, skills, pressing, strict=True) if s == k and p]
+        if chosen:
+            report[name] = {
+                "decisions": len(chosen),
+                "nll": round(sum(chosen) / len(chosen), 4),
+                "presses": len(pressed),
+                "nll_presses": round(sum(pressed) / len(pressed), 4) if pressed else None,
+            }
+    return report
+
+
 def order_loss(head, memory, kind, eta):
     """Cross-entropy of the next order's kind plus half the squared error of its log time.
 
@@ -383,6 +420,9 @@ def _train_bc(
     probe=None,
     dagger=0.0,
     dagger_data=(),
+    skills=False,
+    skills_only=False,
+    max_steps=None,
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -440,6 +480,13 @@ def _train_bc(
     them, each labelled decision weighing `dagger` (dataset.session_labels): DAgger's
     aggregate, the learner's own states with the expert's actions, mixed into the base
     data at that weight.
+
+    `skills` conditions the action head on the skill each decision carries out (SkillHead,
+    from the recordings relabelled into intents): the learned hand of the split between
+    strategy and execution. Its embedding is saved beside the checkpoint (skill-head-N.pt)
+    and validation reports the held-out likelihood by skill. `skills_only` trains only on
+    the planner's procedures (dataset.session_labels). `max_steps` ends each epoch after
+    that many batches (0: validation alone, of the policy as it starts).
     """
     if dagger > 0 and "policy" not in sources:
         raise ValueError("--dagger trains practice games: add policy to --sources")
@@ -482,7 +529,10 @@ def _train_bc(
         "rung": rung,
         "dagger": dagger,
         "more": tuple(dagger_data),
+        "skills": skills or skills_only,
+        "skills_only": skills_only,
     }
+    skills = skills or skills_only
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
     dataset = VideoSessions(data, **common)
@@ -543,18 +593,32 @@ def _train_bc(
 
     state_head = torch.nn.Linear(policy.memory_dim, STATE_DIM)
     order_head = OrderHead(policy.memory_dim)
+    skill_head = SkillHead(policy.memory_dim)
     if init is not None and Path(init).name.startswith("epoch-"):
         # The read-outs saved beside the checkpoint start where they left off too.
-        for head, prefix in ((state_head, "state-head-"), (order_head, "order-head-")):
+        heads = (
+            (state_head, "state-head-"),
+            (order_head, "order-head-"),
+            (skill_head, "skill-head-"),
+        )
+        for head, prefix in heads:
             saved_head = Path(init).with_name(Path(init).name.replace("epoch-", prefix))
             if saved_head.exists():
                 head.load_state_dict(torch.load(saved_head, map_location="cpu", weights_only=True))
     state_head, order_head = state_head.to(device), order_head.to(device)
+    skill_head = skill_head.to(device)
     trained = [*policy.parameters(), *aux.parameters()]
     if state_weight > 0:
         trained += list(state_head.parameters())
     if order_weight > 0:
         trained += list(order_head.parameters())
+    if skills:
+        trained += list(skill_head.parameters())
+
+    def acting_memory(memory, batch, first):
+        """The memory the action head reads: conditioned on the skill with `skills`."""
+        return skill_head(memory, batch["skill"][:, first:]) if skills else memory
+
     params = [p for p in trained if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=lr)
     config = {
@@ -597,6 +661,7 @@ def _train_bc(
         "balance": balance,
         # Only when set, so runs saved before it existed still resume.
         **({"rung": rung} if rung else {}),
+        **({"skills": skills, "skills_only": skills_only} if skills else {}),
     }
     if fast_perception:
         # Only when on, so that runs saved before the option existed still resume.
@@ -613,6 +678,9 @@ def _train_bc(
         "state_head": state_head,
         "order_head": order_head,
     }
+    if skills:
+        # Only with skills: a resume of an earlier run finds the modules it saved.
+        modules["skill_head"] = skill_head
     first_epoch, skip = progress.start(modules, optimizer)
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
     with (output / "metrics.jsonl").open("a") as log:
@@ -638,6 +706,8 @@ def _train_bc(
                 else:
                     store = {slot: value.to(device) for slot, value in progress.carried.items()}
             for step, batch in enumerate(loader):
+                if max_steps is not None and step >= max_steps:
+                    break
                 if epoch == first_epoch and step < skip:
                     continue  # Trained before the run was interrupted.
                 if "skipped" in batch:
@@ -665,7 +735,13 @@ def _train_bc(
                         actions = batch["actions"][:, burn_in:]
                         weight = batch["weight"][:, burn_in:]
                     score = imitation_score(
-                        policy, memory, cells, actions, objective, xm, sigma=pointer_sigma
+                        policy,
+                        acting_memory(memory, batch, 0 if carry else burn_in),
+                        cells,
+                        actions,
+                        objective,
+                        xm,
+                        sigma=pointer_sigma,
                     )
                     bc = imitation_loss(score, weight)
                     predictive = aux(memory, features, actions, batch["valid"][:, burn_in:])
@@ -713,6 +789,7 @@ def _train_bc(
                     return config
             policy.eval()
             validation_losses, acting, predicted, truths = [], [], [], []
+            skill_ids, unconditioned = [], []
             order_right, order_known = 0, 0
             with torch.no_grad():
                 if carry:
@@ -744,11 +821,27 @@ def _train_bc(
                             keep = [True] * (labels.shape[0] * labels.shape[1])
                         # For xm, the same choice among candidates the training loss
                         # makes, not a score of candidates the optimizer never saw.
-                        score = imitation_score(policy, memory, cells, labels, objective, xm)
+                        first = 0 if carry else burn_in
+                        score = imitation_score(
+                            policy,
+                            acting_memory(memory, batch, first),
+                            cells,
+                            labels,
+                            objective,
+                            xm,
+                        )
                         losses = (-score).float().cpu().tolist()
                         pressing = presses(labels.flatten(0, 1)).cpu().tolist()
                         validation_losses.extend(x for x, k in zip(losses, keep) if k)
                         acting.extend(a for a, k in zip(pressing, keep) if k)
+                        if skills:
+                            # The same decisions scored with no skill given, to see what
+                            # the conditioning adds.
+                            plain = imitation_score(policy, memory, cells, labels, objective, xm)
+                            plain = (-plain).float().cpu().tolist()
+                            ids = batch["skill"][:, first:].flatten().cpu().tolist()
+                            skill_ids.extend(s for s, k in zip(ids, keep) if k)
+                            unconditioned.extend(x for x, k in zip(plain, keep) if k)
                         if state_weight > 0:
                             predicted.append(state_head(memory.float()).flatten(0, 1).cpu())
                             truths.append(batch["state"][:, burn_in:].flatten(0, 1).cpu())
@@ -773,8 +866,15 @@ def _train_bc(
                 report["validation_state_r2"] = state_r2(torch.cat(predicted), torch.cat(truths))
             if order_known:
                 report["validation_next_order_accuracy"] = order_right / order_known
+            if skill_ids:
+                report["validation_by_skill"] = skill_report(validation_losses, skill_ids, acting)
+                report["validation_by_skill_unconditioned"] = skill_report(
+                    unconditioned, skill_ids, acting
+                )
             log.write(json.dumps(report) + "\n")
             log.flush()
+            if skills:
+                torch.save(skill_head.state_dict(), output / f"skill-head-{epoch:04d}.pt")
             if state_weight > 0:
                 torch.save(state_head.state_dict(), output / f"state-head-{epoch:04d}.pt")
             if order_weight > 0:

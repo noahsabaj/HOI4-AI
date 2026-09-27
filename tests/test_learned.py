@@ -448,6 +448,39 @@ def test_behaviour_cloning_on_scripted_games_learns_the_true_state_beside_the_ac
     assert tuned["init"].endswith("epoch-0000.pt") and tuned["lr"] == 1e-5
 
 
+@needs_ffmpeg
+def test_a_skill_conditioned_hand_starts_as_its_policy_and_reports_by_skill(tmp_path, monkeypatch):
+    from test_unroll import _Screen
+
+    import hoi4_arena.train as train
+
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("game", "held-out"):
+        _recording(
+            data / name,
+            [8, 6],
+            source="scripted",
+            events=[(300_000_000, CLICK), (900_000_000, SPACE)],
+        )
+    (data / "splits.json").write_text(json.dumps({"game": "train", "held-out": "validation"}))
+    monkeypatch.setattr(train, "build_encoder", lambda path, variant: _Screen())
+    options = {"sources": ("scripted",), "sequence": 2, "burn_in": 1, "workers": 0,
+               "lead_in": 0, "look_before_click": True, "skills": True}  # fmt: skip
+    # No step taken: the zero skill embedding leaves every likelihood as it was.
+    train.train_bc(data, "model", tmp_path / "start", max_steps=0, **options)
+    rows = [json.loads(line) for line in (tmp_path / "start" / "metrics.jsonl").open()]
+    report = rows[-1]
+    assert not [row for row in rows if "step" in row]
+    assert report["validation_by_skill"] == report["validation_by_skill_unconditioned"]
+    assert (tmp_path / "start" / "skill-head-0000.pt").exists()
+    train.train_bc(data, "model", tmp_path / "out", lr=1e-2, **options)
+    rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
+    head = torch.load(tmp_path / "out" / "skill-head-0000.pt", weights_only=True)
+    assert head["embedding.weight"].abs().sum() > 0, "the embedding trained"
+    assert json.loads((tmp_path / "out" / "epoch-0000.json").read_text())["config"]["skills"]
+
+
 def test_an_aimed_move_is_one_a_press_follows_before_any_other_move():
     from hoi4_arena.heatmap import aimed
 

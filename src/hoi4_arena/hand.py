@@ -133,3 +133,169 @@ class ScriptedHand:
         if intent.arg("slots"):
             planner.plan["recruit"] = intent.arg("slots")
         return planner.recruit(desk)
+
+
+# The skills each intent is carried out by, in order, for a learned hand.
+SKILL_STEPS = {
+    "form_army": ("form_army",),
+    "assign_general": ("assign_general",),
+    "draw_front": ("draw_front",),
+    "draw_offensive": ("draw_offensive",),
+    "execute": ("execute",),
+    "redraw": ("clear_orders", "draw_front", "draw_offensive"),
+    "set_law": ("set_law",),
+}
+# Seconds a learned skill may take: twice the scripted player's 90th percentile on the
+# scripted-v6 games (form_army 4.1, assign_general 3.0, clear_orders 5.8, draw_front 8.2,
+# draw_offensive 7.2, execute 5.7, set_law 9.6).
+SKILL_SECONDS = {
+    "form_army": 8.0,
+    "assign_general": 6.0,
+    "clear_orders": 12.0,
+    "draw_front": 16.0,
+    "draw_offensive": 14.0,
+    "execute": 12.0,
+    "set_law": 20.0,
+}
+
+
+class LearnedHand:
+    """A hand whose `learned` intents a skill-conditioned policy carries out from the
+    screen (train-bc --skills), and the rest the scripted hand. So each learned skill is
+    judged on its own, beside scripted ones.
+
+    `actor` is a runner.Actor on the skill-conditioned checkpoint, `skill_head` its
+    train.SkillHead. A skill runs from an empty memory, reading the screen for
+    `burn_in` decisions before it acts (as it trained: windows after a burn-in), until its
+    check passes or SKILL_SECONDS run out. Done is judged the scripted player's way, on
+    the screen (the army selected with no unassigned divisions left, a commander, a plan
+    shown, the plan executing), and each run is kept in `log`.
+    """
+
+    def __init__(self, scripted, actor, skill_head, learned, *, burn_in=4, log=None):
+        self.scripted, self.planner = scripted, scripted.planner
+        self.actor, self.skill_head = actor, skill_head
+        self.learned = set(learned)
+        self.burn_in = burn_in
+        self.log = log if log is not None else []
+        _condition(actor, skill_head)
+
+    def execute(self, desk, intent):
+        if not isinstance(intent, Intent):
+            intent = Intent.from_json(intent)
+        if intent.name not in self.learned or intent.name not in SKILL_STEPS:
+            return self.scripted.execute(desk, intent)
+        steps = []
+        for skill in SKILL_STEPS[intent.name]:
+            steps.append(self.run_skill(desk, skill))
+            if not steps[-1]["done"]:
+                break
+        done = all(s["done"] for s in steps) and len(steps) == len(SKILL_STEPS[intent.name])
+        self.log.append({"intent": intent.name, "done": done, "steps": steps})
+        if done and intent.name == "execute":
+            self.planner.order("activate")
+        return done
+
+    def run_skill(self, desk, skill):
+        """One skill from the screen until its check passes or its time runs out."""
+        import time
+
+        from .ai_games import on_screen
+        from .intents import SKILLS
+        from .play import Dispatcher
+
+        actor = self.actor
+        actor.reset_episode()
+        actor.skill = SKILLS.index(skill)
+        began = time.perf_counter()
+        end = began + SKILL_SECONDS[skill]
+        dispatcher = Dispatcher(desk)
+        decisions = presses = 0
+        done = False
+        try:
+            with doing(desk, skill):
+                deadline = began
+                while time.perf_counter() < end:
+                    time.sleep(max(0.0, deadline - time.perf_counter()))
+                    deadline = time.perf_counter() + 0.2
+                    frame = on_screen(desk.capture(full=True))
+                    cursor = frame.meta["cursor"]
+                    action, _ = actor.act(frame.rgb, frame.meta["t_ns"], cursor=cursor)
+                    dispatcher.join()
+                    decisions += 1
+                    if decisions <= self.burn_in:
+                        continue  # Reading the screen first, as in training's burn-in.
+                    presses += int(
+                        sum(1 for e in dispatcher.take() if e["event"]["kind"] != "move")
+                    )
+                    if decisions % 5 == 0 and self.check(desk, skill, frame.rgb):
+                        done = True
+                        break
+                    dispatcher.start(
+                        action, time.perf_counter(), (float(cursor[0]), float(cursor[1]))
+                    )
+        finally:
+            dispatcher.close()
+            try:
+                desk.release()
+            except Exception:  # noqa: BLE001 - the check below looks afresh.
+                pass
+        if not done:
+            from .ai_games import screen
+
+            done = self.check(desk, skill, screen(desk))
+        if done:
+            self.planner.order({"clear_orders": "clear"}.get(skill, skill), learned=True)
+        return {
+            "skill": skill,
+            "done": bool(done),
+            "seconds": round(time.perf_counter() - began, 1),
+            "decisions": decisions,
+            "presses": presses,
+        }
+
+    def check(self, desk, skill, rgb):
+        """Whether the screen shows `skill` done, as the scripted player judges its own."""
+        from .scripted import arrow_lit, plan_shown
+
+        planner = self.planner
+        if skill == "form_army":
+            return planner.find(rgb, "plans_bar") is not None and (
+                planner.find(rgb, "unassigned") is None
+            )
+        if skill == "assign_general":
+            return planner.find(rgb, "plans_bar") is not None and (
+                planner.find(rgb, "no_commander") is None
+            )
+        if skill in ("draw_front", "draw_offensive"):
+            return plan_shown(rgb)
+        if skill == "clear_orders":
+            return not plan_shown(rgb)
+        if skill == "execute":
+            return plan_shown(rgb) and arrow_lit(rgb)
+        return False
+
+
+def _condition(actor, skill_head):
+    """Have `actor`'s action head read its memory conditioned on `actor.skill`."""
+    import torch
+
+    from .intents import SKILLS
+
+    inner = actor.policy.actor
+    head = skill_head.to(next(inner.parameters()).device).eval()
+    actor.skill = len(SKILLS)
+
+    class Conditioned(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner, self.head = inner, head
+            self.noise_dim = inner.noise_dim
+            if hasattr(inner, "latents"):
+                self.latents = inner.latents
+
+        def forward(self, memory, cells, *args, **kwargs):
+            skill = torch.full((memory.shape[0],), actor.skill, device=memory.device)
+            return self.inner(self.head(memory, skill), cells, *args, **kwargs)
+
+    actor.policy.actor = Conditioned()

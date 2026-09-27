@@ -201,6 +201,42 @@ def build_parser():
         "arena switch is a launch of HOI4).",
     )
     ai.add_argument(
+        "--intent-policy",
+        help="An intent policy (train-intents) chooses the scripted player's orders from the "
+        "screen, once a second; the scripted hand carries them out. Needs --intent-tower.",
+    )
+    ai.add_argument(
+        "--intent-tower",
+        help="The checkpoint whose frozen tower the intent policy read in training (its "
+        "tower cache's).",
+    )
+    ai.add_argument(
+        "--learned-skills",
+        help="A checkpoint trained with train-bc --skills: it carries out --learned-intents "
+        "from the screen in place of the scripted hand",
+    )
+    ai.add_argument(
+        "--learned-intents",
+        nargs="+",
+        default=[],
+        choices=[
+            "form_army",
+            "assign_general",
+            "draw_front",
+            "draw_offensive",
+            "execute",
+            "redraw",
+            "set_law",
+        ],  # fmt: skip
+        help="The intents the learned skills carry out; the rest stay the scripted hand's",
+    )
+    ai.add_argument(
+        "--intent-threshold",
+        type=float,
+        help="Act once the chance of waiting falls below this; by default acting is drawn "
+        "from that chance.",
+    )
+    ai.add_argument(
         "--camera-kicks",
         nargs=2,
         type=float,
@@ -479,6 +515,25 @@ def build_parser():
     )
     relabel.add_argument("data", help="A recording, or a folder of them")
     relabel.add_argument("--segments", help="Also write one recording's segments to this JSON file")
+    steps = sub.add_parser(
+        "intent-data",
+        help="The intent policy's data: scripted recordings relabelled into one choice a "
+        "second, with the frozen tower's summary of each second's frame from a tower cache",
+    )
+    steps.add_argument("data", help="A folder of scripted recordings")
+    steps.add_argument("cache", help="Their tower cache (cache-tower)")
+    steps.add_argument("output", help="An .npz file; its report goes beside it as .json")
+    learn = sub.add_parser(
+        "train-intents",
+        help="Train an intent policy on intent-data's file and report it on the held-out games",
+    )
+    learn.add_argument("data")
+    learn.add_argument("output")
+    learn.add_argument("--epochs", type=int, default=200)
+    learn.add_argument("--seed", type=int, default=0)
+    learn.add_argument("--no-pixels", action="store_true", help="Ablation: the history alone")
+    learn.add_argument("--no-history", action="store_true", help="Ablation: the screen alone")
+    learn.add_argument("--wait-weight", type=float, default=1.0)
     rate = sub.add_parser(
         "win-rate",
         help="The scripted player's record against the game's AI, from record-ai results",
@@ -792,6 +847,23 @@ def build_parser():
         action="store_true",
         help="Show the policy, in its previous action, every key and button it still holds "
         "(actions.with_held), so it knows to let them go",
+    )
+    train.add_argument(
+        "--skills",
+        action="store_true",
+        help="Condition the action head on the skill each decision carries out, from the "
+        "recordings relabelled into intents (train.SkillHead): the learned hand",
+    )
+    train.add_argument(
+        "--skills-only",
+        action="store_true",
+        help="With --skills, train only on the scripted player's procedures, not the camera "
+        "between them",
+    )
+    train.add_argument(
+        "--max-steps",
+        type=int,
+        help="End each epoch after this many batches (0: validation alone, of the starting policy)",
     )
     train.add_argument(
         "--setup-weight",
@@ -1395,6 +1467,23 @@ def _dispatch(command, args):
         else:
             roots = [path.parent for path in sorted(data.glob("*/manifest.json"))]
             result = intents.folder_report(roots)
+    elif command == "intent-data":
+        from .intent_policy import build
+
+        result = build(args["data"], args["cache"], args["output"])
+    elif command == "train-intents":
+        from .intent_policy import train
+
+        report = train(
+            args["data"],
+            args["output"],
+            epochs=args["epochs"],
+            seed=args["seed"],
+            pixels=not args["no_pixels"],
+            history=not args["no_history"],
+            wait_weight=args["wait_weight"],
+        )
+        result = {"held_out": report["held_out"], "train": report["train"]}
     elif command == "win-rate":
         from .scripted import win_rate
 
