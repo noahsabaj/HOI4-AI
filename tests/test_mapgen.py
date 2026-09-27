@@ -701,7 +701,8 @@ def test_the_archipelago_sea_regions_are_whole_and_turn_with_the_map(archipelago
     assert sum(len(listed) for listed, _ in regions.values()) == len(rows) == len(region_of)
     seas = [r for r, (listed, _) in regions.items() if listed <= sea]
     lands = [r for r, (listed, _) in regions.items() if not listed & sea]
-    assert len(seas) >= 8 and len(lands) >= 2 and len(seas) + len(lands) == len(regions)
+    # All land in one region: several land regions crashed the game at load.
+    assert len(seas) >= 8 and len(lands) == 1 and len(seas) + len(lands) == len(regions)
     assert all(regions[r][1] in ("water_shallow_sea", "water_deep_ocean") for r in seas)
     assert all(regions[r][1] is None for r in lands)
     for province, region in region_of.items():
@@ -823,7 +824,7 @@ def test_a_seed_redraws_the_archipelago_and_the_same_seed_repeats_it(archipelago
         "map/buildings.txt",
         "map/heightmap.bmp",
         "history/units/BLU_1936_naval_mtg.txt",
-        *(f"map/strategicregions/{r}-arena.txt" for r in range(1, 14)),
+        *(f"map/strategicregions/{r}-arena.txt" for r in range(1, 12)),
         *(f"history/states/{s}-arena.txt" for s in range(1, 17)),
     ]
     for name in files:

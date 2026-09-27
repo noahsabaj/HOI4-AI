@@ -421,9 +421,11 @@ PRESETS = {
             ((-4.0, 4.4), 1),
         ),
         air_bases=(((5.8, 3.4), 3), ((11.3, 1.4), 2), ((10.0, -3.2), 1)),
+        # All land is one region, as on every other arena: with a region per island (and
+        # no state split between them) the game still divided by zero at load, on the
+        # second PC, 2026-09-27. One land region with these sea regions loaded.
         regions=(
-            Region("land", (4.8, 3.8), "Western Isle", "Eastern Isle"),
-            Region("land", (12.0, 4.0), "Channel Isles"),
+            Region("land", (12.0, 4.0), "The Islands"),
             Region("sea", (12.0, 4.0), "The Channel"),
             Region("sea", (12.0, -4.5), "North Sound", "South Sound"),
             Region("sea", (-1.5, 3.5), "Western Approaches", "Eastern Approaches"),
