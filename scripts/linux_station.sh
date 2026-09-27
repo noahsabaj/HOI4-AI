@@ -2,7 +2,7 @@
 # record-ai on a Linux fleet node's own HOI4, through the X11 worker (hoi4_arena.xworker),
 # on the node's station display. Arguments are record-ai's, output folder first:
 #
-#   fleet run --on samsung-1 --name hoi4-ai-linux -- sh scripts/linux_station.sh \
+#   fleet run --on <linux-node> --name hoi4-ai-linux -- sh scripts/linux_station.sh \
 #       artifacts/record-NAME --minutes 240 --player scripted \
 #       --mod artifacts/mods/arena-12x8-v4 --speeds 5
 #
