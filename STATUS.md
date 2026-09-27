@@ -536,6 +536,23 @@ variant and two runs (p50 / p95 ms, paced):
   to 0.13 (float32 moves it by up to 24), and every sampled action stays the same.
 - **Tried and dropped.** cuDNN attention was no faster. Float8 changed 4% of the actions
   and was no faster than float16. Compiling alone flipped one action.
+- **`--fast` attends by Triton (later the same day).** Its attention now runs on
+  `fast_attention.py`'s flash-attention kernel (float16 accumulation, from the cache-tower
+  work below), reached from the trimmed tower's own attention by a flag that `FastTower`
+  sets, so the exact path never calls it and stays bit-identical. On this PC's GPU (no
+  game), interleaved, three runs of 300 decisions a variant (p50 / p95 ms, paced):
+
+  | | Today's tower (bc5) | The Qwen3.5-4B model's tower |
+  |---|---|---|
+  | `--fast` before | 32-54 / 39-78 | 65-71 / 70-147 |
+  | `--fast` with Triton attention | 27-43 / 31-63 (-17 to -20%) | 53-58 / 57-91 (-19 to -20%) |
+
+  The attention's GPU time halved (9.4 to 5.2 ms a decision; 27.1 to 13.1 ms on the 4B
+  tower). Over 30 seeded games of the 32 recorded decisions, `--fast` already sampled a
+  different action from the exact path in 1.4% (bc5) and 2.2% (4B) of decisions. The
+  "every action the same" above held for the gate's one seed only. With the Triton
+  attention it is 1.6% and 2.3%, and each head's log-probability drifts as much as
+  before: mean 0.019 against 0.020 (bc5), 0.0064 against 0.0059 (4B).
 
 **`train-memory`, 2026-09-24.** One seed of the memory study's six arms (seed 1, 8
 epochs each, cache on the NVMe) took 64.1 min before and 21.2 min after. Every run was
@@ -626,9 +643,9 @@ Every run is in `bench/cache-ledger.tsv`.
   the same frames a second, since the clock falls as the power rises); what helps is
   less work per frame. Run to run, the same build varied 7.3-8.2 frames a second with
   the card's temperature.
-- **Not yet used live.** The live actor's `--fast` (above) attends through PyTorch's
-  kernel from its own lean attention, which `fast_attention.install` does not reach; the
-  same kernel would take about half its attention time.
+- **Used live too.** The live actor's `--fast` (above) attends through its own lean
+  attention, which `fast_attention.install` does not reach; that attention now calls the
+  kernel itself when `FastTower` marks it, and it took half the attention time there too.
 - Tried and dropped: batches of 4, 16 and 32 (8 is as fast), `max-autotune` (no faster),
   CUDA graphs (the launch overhead is under 1%), float8 (per-row scaling is unsupported
   on this card; per-tensor was slower and 20% off), float16 without the overflow check

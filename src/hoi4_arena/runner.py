@@ -177,10 +177,11 @@ class Actor:
         fast.lean_tower): the same numbers as eager, measured on the second PC's GPU beside
         its game about 12% faster back to back and 7% paced at 5 Hz (scripts/bench_decide.py,
         bench/decide-ledger.tsv). `fast` (True, or fast.apply_fast's options) is fast mode:
-        the tower in float16 with float16 accumulation, compiled by inductor, which changes
-        the numbers slightly (under 0.13 nats a head on the benchmark's decisions, every
-        sampled action the same) for about a third less time, and half on the Qwen3.5-4B
-        model's tower. `compile_tower` compiles the tower alone (see _compile_tower)."""
+        the tower in float16 with float16 accumulation, compiled by inductor, attending
+        through fast_attention's Triton kernel, which changes the numbers slightly (each
+        head's log-probability by 0.006-0.02 nats on average and 0.5 at most over 30
+        seeded replays of the benchmark's decisions; about 2% of sampled decisions differ)
+        for about half the time on both towers. `compile_tower` compiles the tower alone (see _compile_tower)."""
         self.temperature, self.pointer_temperature = resolve_temperatures(
             temperature, pointer_temperature, point
         )

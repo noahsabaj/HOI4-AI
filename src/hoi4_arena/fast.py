@@ -19,7 +19,12 @@ def _lean_attention(self, x, rope=None, attn_mask=None, is_causal=False):
     """timm's AttentionRope.forward for a fused qkv, no prefix tokens, no gate and no grouped
     heads (the Qwen3.5 towers), without its two largest copies: timm applies RoPE to q and
     k and then concatenates each with an empty prefix, which copies the whole tensor. The
-    same kernels otherwise, so the same numbers."""
+    same kernels otherwise, so the same numbers.
+
+    A fast-mode tower (FastTower with attention="triton") marks its blocks' attention
+    `triton_attention`, and those attend through fast_attention's Triton kernel when it
+    handles the call (float16 on the GPU); an unmarked one, the exact path, calls PyTorch's
+    kernel as before."""
     from timm.layers import apply_rot_embed_cat
 
     B, N, C = x.shape
@@ -30,7 +35,11 @@ def _lean_attention(self, x, rope=None, attn_mask=None, is_causal=False):
         half = getattr(self, "rotate_half", False)
         q = apply_rot_embed_cat(q, rope, half=half).type_as(v)
         k = apply_rot_embed_cat(k, rope, half=half).type_as(v)
-    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+    if getattr(self, "triton_attention", False):
+        from .fast_attention import scaled_dot_product_attention as attend
+    else:
+        attend = F.scaled_dot_product_attention
+    x = attend(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
     x = self.norm(x.transpose(1, 2).reshape(B, N, self.attn_dim))
     return self.proj_drop(self.proj(x))
 
@@ -88,10 +97,13 @@ def lean_tower(encoder):
 # What `--fast` turns on (runner.Actor): the tower in float16 with float16 accumulation,
 # compiled by inductor. Measured on the second PC beside its game (bench/decide-ledger.tsv):
 # today's tower 26 ms of GPU a decision from 38, the Qwen3.5-4B model's paced p50 72 ms
-# from 135, every sampled action on the benchmark's decisions the same, each head's
-# log-probability within 0.13. Float8 moved actions (4% of slots) and was no faster; cuDNN
-# attention was no faster.
-FAST = {"half": True, "compile": True}
+# from 135, each head's log-probability within 0.13. Float8 moved actions (4% of slots) and
+# was no faster; cuDNN attention was no faster. The attention is fast_attention's Triton
+# kernel (float16 accumulation) since 2026-09-26 (FastTower's attention="triton"): the
+# tower's attention in half the GPU time of PyTorch's memory-efficient kernel, a decision
+# 16-20% faster, and its sampled actions differ from the exact path's no more often than
+# without it (about 2% of decisions over 30 seeded games; STATUS.md).
+FAST = {"half": True, "compile": True, "attention": "triton"}
 
 
 class Float8Linear(nn.Module):
@@ -137,7 +149,10 @@ def float8_tower(encoder):
 class FastTower(nn.Module):
     """A tower run in its own precision and attention kernel. `half` runs it in float16
     with float16 accumulation in the matmuls (twice bfloat16's rate on this card's tensor
-    cores), `attention` names the SDPA backend to prefer ("cudnn")."""
+    cores). `attention` names the attention kernel: "triton" is fast_attention's (float16
+    accumulation, about twice PyTorch's memory-efficient kernel), reached from the trimmed
+    tower's own attention (lean_tower, which a lean actor runs first); "cudnn" is an SDPA
+    backend to prefer."""
 
     reads_clip = False
 
@@ -153,12 +168,23 @@ class FastTower(nn.Module):
             for parameter in inner.parameters():
                 parameter.data = parameter.data.half()
             torch.backends.cuda.matmul.allow_fp16_accumulation = True
+        if attention == "triton":
+            # A flag on each trimmed attention, not a patched torch: the exact path and
+            # every other tower in the process keep PyTorch's kernel.
+            reached = 0
+            for block in getattr(getattr(inner, "model", None), "blocks", ()):
+                forward = getattr(block.attn, "forward", None)
+                if getattr(forward, "__func__", None) is _lean_attention:
+                    block.attn.triton_attention = True
+                    reached += 1
+            if not reached:
+                self.attention = None
 
     def forward(self, clip, quadrants):
         with contextlib.ExitStack() as stack:
             if self.half:
                 stack.enter_context(torch.autocast("cuda", dtype=torch.float16))
-            if self.attention:
+            if self.attention and self.attention != "triton":
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
                 chosen = {"cudnn": SDPBackend.CUDNN_ATTENTION}[self.attention]
