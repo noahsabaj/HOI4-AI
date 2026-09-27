@@ -44,6 +44,7 @@ def add_sampling(parser):
 # Commands that never touch a model, so they run without importing torch.
 NO_TORCH = {
     "record",
+    "play-llm",
     "record-ai",
     "control",
     "telemetry",
@@ -386,6 +387,27 @@ def build_parser():
     drill.add_argument("--after", type=float, default=8.0, help="Seconds run after the setup")
     drill.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
     drill.add_argument("--seed", type=int)
+    llm = sub.add_parser(
+        "play-llm",
+        help="A vision-language model (DeepSeek's by default) plays arena games against the "
+        "game's AI on the second PC, from pixels, in turns; prints its record",
+    )
+    llm.add_argument("output", help="A folder for the games and results-llm.json")
+    llm.add_argument("--peer", required=True, help="The second PC's pairing file")
+    llm.add_argument("--games", type=int, default=1)
+    llm.add_argument("--mod", default="arena-plains-v6", help="The arena, as deployed there")
+    llm.add_argument("--rules", default="artifacts/calibration-1080p/rules.json")
+    llm.add_argument("--countries", nargs="+", choices=["BLU", "RED"], default=["BLU", "RED"])
+    llm.add_argument("--budget-usd", type=float, default=2.0, help="Stop once the API cost this")
+    llm.add_argument("--cap-minutes", type=float, default=60.0, help="Real minutes per game")
+    llm.add_argument("--max-turns", type=int, default=400)
+    llm.add_argument("--model", default="deepseek-flash")
+    llm.add_argument("--no-thinking", dest="thinking", action="store_false")
+    llm.add_argument(
+        "--manual", action="store_true", help="Tell the model the game's controls (MANUAL)"
+    )
+    llm.add_argument("--start-save", nargs="+", metavar="COUNTRY:SAVE")
+    llm.add_argument("--seed", type=int)
     live = sub.add_parser(
         "play-policy",
         help="A trained policy plays arena games against the game's AI on the second PC, "
@@ -1418,6 +1440,12 @@ def _dispatch(command, args):
         for key in ("arenas", "countries", "rungs", "history"):
             args[key] = tuple(args[key])
         result = rung_games(args.pop("checkpoint"), args.pop("output"), **args)
+    elif command == "play-llm":
+        from .llm_player import evaluate_llm
+
+        args["countries"] = tuple(args["countries"])
+        args["saves"] = dict(item.split(":", 1) for item in args.pop("start_save") or [])
+        result = evaluate_llm(args.pop("output"), **args)
     elif command == "play-policy":
         from .play import evaluate_policy
 
