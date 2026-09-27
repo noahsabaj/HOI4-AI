@@ -205,6 +205,22 @@ def test_a_small_country_keeps_every_province_arena_sized(tmp_path):
     for state in range(1, 2 * report["states_per_country"] + 1):
         assert f"arena_d{state} = num_armies_in_state@{state} }}" in daily
         assert f" {state}=[?arena_d{state}]" in daily
+    # The state channel is in a new arena, and upgrading an arena made before it gives the
+    # same file as making it afresh.
+    from hoi4_arena.state_channel import daily_effect, mod_states, startup_effect, upgrade
+
+    states = mod_states(output)
+    assert len(states) == 2 * report["states_per_country"]
+    assert 'log = "ARENA state [GetDateText] [ROOT.GetTag]' in daily
+    assert "ARENA provinces 1 " in startup
+    path = output / "common/on_actions/arena.txt"
+    before = on_actions.replace(daily_effect(states), "").replace(
+        " " + startup_effect(states).strip(), ""
+    )
+    assert "ARENA state" not in before and "ARENA provinces" not in before
+    path.write_text(before)
+    assert upgrade(output)
+    assert path.read_text() == on_actions
     bitmap = np.asarray(Image.open(output / "map/provinces.bmp"))
     packed = (
         bitmap[:, :, 0].astype(np.uint32) << 16
