@@ -1557,6 +1557,36 @@ What the numbers say besides:
 Next: train the policy with its memory carried, and repeat the GRU against Mamba-3 on the
 scripted player's games, whose plans run for minutes, before closing the question.
 
+## A curriculum that skips the setup (2026-09-26, #143, #148)
+
+Every learned game lost in its setup (0 of 14), so none had shown whether the policy can
+fight a war it didn't set up. Rung saves start it later: the arena's start save with the
+scripted player's first setup steps done while paused, before the war is declared. The
+rungs are S1 (the army), S2 (its general) and S3 (its front and a broad offensive drawn),
+and `rung-games` plays full games from them (`curriculum.py`, README).
+
+- **The ladder:**
+  - On the second PC, make-ladder made all 24 rung saves in 11 min (19:00-19:11): arena v4,
+    ford, passes and river, both sides, S1-S3 (`artifacts/ladder-v4`, a screenshot each).
+    Each shows the expected state at 12:00 on 1 Jan 1936. S3 shows Army 1 with its general,
+    8/24 divisions and "Arena Offensive Operation".
+  - On this PC only the main arena exists: Red (`arenav4red` and its rungs) and Blue under
+    an older name (`arena12x8v4blu`, `army12x8v4blu`, ...). HOI4 on this PC was then closed
+    to the routes.
+- **The scripted player from S3** (this PC, main arena) won 3 of 3 (Wilson 95% 0.44-1.0):
+  Blue in 466 s, Red in 303 s twice. It skipped the steps its save held, with no planner
+  errors. A fourth game lost the foreground after 4 s and is not counted.
+- **Where the rung moments fall in the scripted games** (median over 108 main-arena games;
+  presets alike): army at 5.8 s, general 11.2 s, offensive (S3) 25.4 s, run 30.9 s,
+  execute 210 s, game 339 s. So `train-bc --rung S3` keeps about 92% of a scripted game's
+  decisions. The curriculum's lever is where the policy plays and practises, not the
+  imitation data.
+- **Found on the way:** start saves copied from the second PC show a red "!" in this
+  PC's load dialog and don't load. `load_in_game` had taken the paused game behind the
+  open dialog for the new one; it now raises (#148).
+- **bc5 e0 from S3** is queued on the second PC's station: 12 games of S3 interleaved with
+  S0, then 8 at temperature 0.5 (`artifacts/learned/rung-bc5-e0000-s3`, `-s3t05`).
+
 ## Open work
 
 In order. Since 2026-09-23 the scripted player comes first: it gives a win rate to beat
