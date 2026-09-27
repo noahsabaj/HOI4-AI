@@ -339,7 +339,8 @@ def smooth(rng, shape, scale, mirrored=True):
     spacing and stretched linearly to full size: the same field to the eye, at a tenth of
     the cost of evaluating the spline at every pixel. `mirrored` makes it the same turned
     round, so a picture painted from it needs no seam where its halves meet: copying one
-    half's turn onto the other left a 42-byte cliff down the middle of the heightmap.
+    half's turn onto the other left a 42-byte cliff down the middle of the heightmap. A
+    multi-nation arena passes its own symmetry (mapgen_multi.Turn.field) instead.
     """
     import cv2
 
@@ -349,7 +350,9 @@ def smooth(rng, shape, scale, mirrored=True):
     middle = ndimage.zoom(coarse, scale / step, order=3, prefilter=False)
     size = (middle.shape[1] * step, middle.shape[0] * step)
     field_ = cv2.resize(middle, size, interpolation=cv2.INTER_LINEAR)[:rows, :columns]
-    if mirrored:
+    if callable(mirrored):
+        field_ = mirrored(field_)
+    elif mirrored:
         field_ = field_ + field_[::-1, ::-1]
     return (field_ - field_.mean()) / (field_.std() + 1e-6)
 
@@ -365,6 +368,14 @@ def blur(pixels, sigma):
     small = cv2.resize(pixels, (columns // 4, rows // 4), interpolation=cv2.INTER_AREA)
     small = cv2.GaussianBlur(small, (0, 0), sigma / 4)
     return cv2.resize(small, (columns, rows), interpolation=cv2.INTER_LINEAR)
+
+
+def _symmetry(turn):
+    """How a picture is made the same turned: the two-country half turn, or a multi-nation
+    arena's `turn` (mapgen_multi.Turn): (the noise's mirroring, the final copy)."""
+    if turn is None:
+        return True, symmetric
+    return turn.field, turn.copy
 
 
 def distance(mask):
@@ -696,9 +707,10 @@ def river_pixels(paths, joins, shape):
 # Pictures.
 
 
-def relief(rng, types, kind, rivers):
+def relief(rng, types, kind, rivers, turn=None):
     """The heightmap: relief by terrain type, coasts ramped down to the water, rivers in
     shallow valleys. `types` holds a LAND_TYPES index per pixel (-1 for water)."""
+    mirror, copy = _symmetry(turn)
     shape = types.shape
     base = np.full(shape, float(WATER_FLOOR), np.float32)
     spread = np.zeros(shape, np.float32)
@@ -711,9 +723,11 @@ def relief(rng, types, kind, rivers):
     base = blur(np.where(land, base, 100.0), 18)
     spread = blur(spread, 14)
     detail = (
-        smooth(rng, shape, 150) + 0.55 * smooth(rng, shape, 64) + 0.3 * smooth(rng, shape, 26)
+        smooth(rng, shape, 150, mirror)
+        + 0.55 * smooth(rng, shape, 64, mirror)
+        + 0.3 * smooth(rng, shape, 26, mirror)
     ) / 1.2
-    ridges = np.clip(1 - np.abs(smooth(rng, shape, 110)), 0, 1)
+    ridges = np.clip(1 - np.abs(smooth(rng, shape, 110, mirror)), 0, 1)
     mountain = blur(types == LAND_TYPES.index("mountain"), 10)
     shape_ = (1 - mountain) * detail + mountain * (1.8 * ridges**2 - 0.2 + 0.4 * detail)
     ground = base + spread * shape_
@@ -733,15 +747,19 @@ def relief(rng, types, kind, rivers):
         SEA_LEVEL + (ground - SEA_LEVEL) * rise,
         SEA_LEVEL - (SEA_LEVEL - WATER_FLOOR) * fall,
     )
-    return symmetric(np.clip(np.round(heights), 0, 255).astype(np.uint8))
+    return copy(np.clip(np.round(heights), 0, 255).astype(np.uint8))
 
 
-def normals(heights):
+def normals(heights, turn=None):
     """world_normal.bmp from the heightmap, at half its resolution.
 
     Stock: red falls as the ground rises eastward, green rises as it rises southward,
     blue is near 255, at about 0.05 per byte of height a half-resolution pixel, which is
     the physical slope (a byte is 0.1 world units, a half-resolution pixel two).
+
+    With a multi-nation `turn` the normals are left as computed: the heights are already
+    the same turned, and a picture of normals copied round would point its slopes the
+    wrong way in the turned quarters.
     """
     rows, columns = heights.shape
     half = heights.astype(np.float32).reshape(rows // 2, 2, columns // 2, 2).mean(axis=(1, 3))
@@ -749,16 +767,18 @@ def normals(heights):
     gy = np.gradient(half, axis=0) * 0.05
     vector = np.stack([-gx, gy, np.ones_like(gx)], -1)
     vector /= np.linalg.norm(vector, axis=-1, keepdims=True)
-    return symmetric(np.clip(np.round(127.5 + 127.5 * vector), 0, 255).astype(np.uint8))
+    encoded = np.clip(np.round(127.5 + 127.5 * vector), 0, 255).astype(np.uint8)
+    return encoded if turn is not None else symmetric(encoded)
 
 
-def terrain_pixels(rng, types, heights, city_mask):
+def terrain_pixels(rng, types, heights, city_mask, turn=None):
     """terrain.bmp indices: each type painted with its stock variants in patches, bare rock
     above the rock line, and the city where one stands. `types` holds a LAND_TYPES index
     per pixel (-1 for water)."""
+    mirror, copy = _symmetry(turn)
     shape = types.shape
     out = np.full(shape, WATER_INDEX, np.uint8)
-    patches, clumps = smooth(rng, shape, 44), smooth(rng, shape, 30)
+    patches, clumps = smooth(rng, shape, 44, mirror), smooth(rng, shape, 30, mirror)
     plains = np.where(patches > 0.45, FARMLAND, PLAINS)
     variants = {
         "plains": plains,
@@ -771,20 +791,21 @@ def terrain_pixels(rng, types, heights, city_mask):
     for n, name in enumerate(LAND_TYPES):
         where = types == n
         out[where] = variants[name][where]
-    return symmetric(out)
+    return copy(out)
 
 
-def city_layers(rng, ids, cities, anchors):
+def city_layers(rng, ids, cities, anchors, turn=None):
     """Where each city is built: (urban mask, cities.bmp indices, city lights).
 
     A city covers CITY_SHARE of its province around the province's inmost point, with a
     ragged edge; the middle CITY_CORE of it is dense city, the rest houses.
     """
+    mirror, copy = _symmetry(turn)
     shape = ids.shape
     urban = np.zeros(shape, bool)
     style = np.full(shape, -1, np.int16)
     lights = np.zeros(shape, np.uint8)
-    ragged = smooth(rng, shape, 18)
+    ragged = smooth(rng, shape, 18, mirror)
     for province in cities:
         ys, xs = np.nonzero(ids == province)
         x0, y0 = anchors[province - 1]
@@ -796,11 +817,12 @@ def city_layers(rng, ids, cities, anchors):
         style[ys[core], xs[core]] = CITY_CORE_INDEX
         lights[ys[built], xs[built]] = CITY_LIGHTS[1]
         lights[ys[core], xs[core]] = CITY_LIGHTS[0]
-    return symmetric(urban), symmetric(style), symmetric(lights)
+    return copy(urban), copy(style), copy(lights)
 
 
-def tree_pixels(rng, types, size):
+def tree_pixels(rng, types, size, turn=None):
     """trees.bmp at its own resolution: woods in the forests, a few trees elsewhere."""
+    mirror, copy = _symmetry(turn)
     columns, rows = size
     height, width = types.shape
     ty = ((np.arange(rows) + 0.5) * height / rows).astype(int)
@@ -811,16 +833,17 @@ def tree_pixels(rng, types, size):
         cover[sampled == n] = TREE_COVER.get(name, 0.0)
     # Clumped rather than scattered: a smooth field, thresholded at the cover share.
     clumps = ndimage.gaussian_filter(rng.standard_normal(sampled.shape).astype(np.float32), 1.2)
-    clumps = clumps + clumps[::-1, ::-1]
+    clumps = mirror(clumps) if callable(mirror) else clumps + clumps[::-1, ::-1]
     rank = ndtr((clumps - clumps.mean()) / (clumps.std() + 1e-6))
-    kind = smooth(rng, sampled.shape, 12)
+    kind = smooth(rng, sampled.shape, 12, mirror)
     trees = np.where(rank < cover, np.where(kind > -0.3, TREE_INDICES[0], TREE_INDICES[1]), 0)
-    return symmetric(trees.astype(np.uint8))
+    return copy(trees.astype(np.uint8))
 
 
-def colour_map(rng, graphical, lights, ocean):
+def colour_map(rng, graphical, lights, ocean, turn=None):
     """The colour map at half resolution: ground colour by painted terrain, gently mottled,
     with the city lights in its alpha."""
+    mirror, copy = _symmetry(turn)
     half = graphical[::2, ::2]
     colour = np.empty((*half.shape, 4), np.float32)
     colour[...] = ocean
@@ -828,10 +851,10 @@ def colour_map(rng, graphical, lights, ocean):
         colour[half == index, :3] = rgb
     land = half != WATER_INDEX
     colour[..., :3] = ndimage.gaussian_filter(colour[..., :3], (1.5, 1.5, 0))
-    mottle = 1 + 0.045 * smooth(rng, half.shape, 50)
+    mottle = 1 + 0.045 * smooth(rng, half.shape, 50, mirror)
     colour[..., :3] = np.where(land[..., None], colour[..., :3] * mottle[..., None], ocean[:3])
     colour[..., 3] = np.where(land, lights[::2, ::2], ocean[3])
-    return symmetric(np.clip(np.round(colour), 0, 255).astype(np.uint8))
+    return copy(np.clip(np.round(colour), 0, 255).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------------------

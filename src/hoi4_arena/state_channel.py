@@ -17,7 +17,9 @@ This adds what a teacher that acts on state needs and the screen shows only in p
 - `provinces`, once at startup: each state's land provinces, in the order of its mask bits.
 - `state`, each day for each side:
   - `day`: the game's own day count (global.num_days, from year 1);
-  - `held`: a bit per state (state s is bit s-1) that the side controls;
+  - `held`: a bit per state (state s is bit s-1) that the side controls. A game variable
+    holds about 21 bits, so an arena of more than 16 states (the multi-nation arenas) logs
+    it as one number per 16 states, lowest first;
   - `mask`: per state, a bit per province (in `provinces` order) that it controls; the two
     sides' masks for a state add up to all its provinces;
   - the conscription, economy and trade laws as indexes into CONSCRIPTION, ECONOMY and
@@ -62,6 +64,8 @@ ECONOMY = (
     "partial_economic_mobilisation", "war_economy", "tot_economic_mobilisation",
 )  # fmt: skip
 TRADE = ("free_trade", "export_focus", "limited_exports", "closed_economy")
+# States per `held` number: a variable is fixed point, and 2^21 is about its largest.
+HELD_BITS = 16
 
 # Number variables of the country, as logged: (field, script value).
 COUNTRY = (
@@ -114,11 +118,14 @@ def daily_effect(states):
     """The effect run by each side every day: its `state` line, then an `army` line for
     each of its leaders in command. `states` maps state id to its land provinces."""
     ids = sorted(states)
-    parts = [" set_temp_variable = { arena_held = 0 }"]
+    chunks = (max(ids, default=1) - 1) // HELD_BITS + 1
+    held = ["arena_held"] + [f"arena_held{c + 1}" for c in range(1, chunks)]
+    parts = [f" set_temp_variable = {{ {name} = 0 }}" for name in held]
     for state in ids:
         parts.append(
             f" if = {{ limit = {{ {state} = {{ is_controlled_by = ROOT }} }}"
-            f" add_to_temp_variable = {{ arena_held = {2 ** (state - 1)} }} }}"
+            f" add_to_temp_variable = {{ {held[(state - 1) // HELD_BITS]} ="
+            f" {2 ** ((state - 1) % HELD_BITS)} }} }}"
         )
         parts.append(f" set_temp_variable = {{ arena_m{state} = 0 }}")
         for bit, province in enumerate(states[state]):
@@ -132,8 +139,9 @@ def daily_effect(states):
     parts.extend(f" set_temp_variable = {{ arena_{name} = {value} }}" for name, value in COUNTRY)
     parts.append(" set_temp_variable = { arena_days = global.num_days }")
     parts.append(
-        ' log = "ARENA state [GetDateText] [ROOT.GetTag] day [?arena_days] held [?arena_held]'
-        " mask"
+        ' log = "ARENA state [GetDateText] [ROOT.GetTag] day [?arena_days] held'
+        + "".join(f" [?{name}]" for name in held)
+        + " mask"
         + "".join(f" [?arena_m{state}]" for state in ids)
         + " law [?arena_law] economy [?arena_economy] trade [?arena_trade]"
         + "".join(f" {name} [?arena_{name}]" for name, _ in COUNTRY)
@@ -201,7 +209,8 @@ NUMBER = r"-?[\d.]+"
 PATTERNS = {
     "provinces": re.compile(r"^provinces (?P<state>\d+)(?P<list>(?: \d+)+)$"),
     "state": re.compile(
-        rf"^state\s+{DATE} (?P<tag>[A-Z]{{3}}) day (?P<day>{NUMBER}) held (?P<held>{NUMBER})"
+        rf"^state\s+{DATE} (?P<tag>[A-Z]{{3}}) day (?P<day>{NUMBER})"
+        rf" held (?P<held>{NUMBER}(?: {NUMBER})*)"
         rf" mask(?P<mask>(?: {NUMBER})+) law (?P<law>{NUMBER}) economy (?P<economy>{NUMBER})"
         rf" trade (?P<trade>{NUMBER})(?P<rest>.*)$"
     ),
@@ -234,7 +243,9 @@ def parse(line):
         event.update(_fields(found["rest"]))
         if kind == "state":
             event["day"] = int(float(found["day"]))
-            event["held"] = int(float(found["held"]))
+            event["held"] = sum(
+                int(float(part)) << (HELD_BITS * c) for c, part in enumerate(found["held"].split())
+            )
             event["mask"] = [int(float(m)) for m in found["mask"].split()]
             for key in ("law", "economy", "trade"):
                 event[key] = int(float(found[key]))

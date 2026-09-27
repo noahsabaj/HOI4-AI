@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from hoi4_arena import arena_log
@@ -160,3 +162,18 @@ def test_the_channel_keeps_each_sides_latest_state_and_armies():
     # The next day's report replaces the armies: the general left command.
     channel.feed("ARENA " + STATE.replace("day 3", "day 4"))
     assert channel.snapshot("BLU")["armies"] == 0 and channel.snapshot("BLU")["day"] == 4
+
+
+def test_held_is_logged_sixteen_states_a_number_past_sixteen_states():
+    """A game variable holds about 21 bits: 32 states' held bits in one would overflow."""
+    states = {s: [100 + s] for s in range(1, 33)}
+    effect = daily_effect(states)
+    assert "add_to_temp_variable = { arena_held = 32768 }" in effect
+    assert "add_to_temp_variable = { arena_held2 = 1 }" in effect
+    assert "add_to_temp_variable = { arena_held2 = 32768 }" in effect
+    assert "held [?arena_held] [?arena_held2] mask" in effect
+    assert max(int(v) for v in re.findall(r"arena_held\d? = (\d+)", effect)) < 2**21
+    line = STATE.replace("held 3", "held 3 32768")
+    assert parse(line)["held"] == 3 + (32768 << 16)
+    # Sixteen states log one number, as before.
+    assert "[?arena_held2]" not in daily_effect(STATES)

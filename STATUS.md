@@ -283,6 +283,89 @@ hands before the surrender; most plain-arena games were a single sweep of 8.
 - Also fixed on the way: `marsh-v3` could not pick Red (the capital was off the picker's
   screen), and `marsh-v4` could not draw a front on dark ground.
 
+## Multi-nation arenas (2026-09-26)
+
+`generate-map --preset tri-plains|tri-ridges|quad-plains|quad-ridges [--wars SETUP]
+[--lone-bonus F]` writes an arena for three or four nations (mapgen_multi.py,
+multination.py). One nation's share is drawn and turned round the map's centre, so every
+nation holds the same ground, the same borders and the same distances to the others. The
+two-country presets are unchanged, byte for byte (checked on the plain arena, salient and
+marsh against main; only the plain full-grid diagnostic arena's state channel
+changed, see below).
+
+- **Four nations** (Blue, Red, Purple, Green) stand on a 23 by 23 square lattice filling
+  the map's middle 2048 by 2048. A quarter turn maps that square's pixels onto
+  themselves, so the province bitmap and every picture are exact quarter-turn copies, as
+  the two-country arenas are half-turn copies, and the audit checks it pixel by pixel.
+  The nations stand in a pinwheel round a one-province lake at the centre: a turn fixes
+  the centre, and four provinces meeting at one pixel is a corner the engine cannot trace.
+  Each borders two others (9-province borders) and touches the third only at the lake.
+- **Three nations** (Blue, Red, Purple) stand on a hexagonal lattice whose triangle
+  centre is the map's, so a third of a turn maps it onto itself and the three meet at one
+  point; each borders both others. A third of a turn is not a pixel map, so the symmetry
+  is exact in the province graph and everything the game plays on (provinces, owners,
+  terrain, neighbours, coasts, states, victory points, hubs, railways, divisions) and
+  holds to about a pixel in the pictures. The generator checks the graph and redraws with
+  a gentler warp if it ever broke (it has not: every preset holds on the first draw).
+- Each nation: 90 (four) or 102 (three) land provinces in 8 states, a capital of 20 points
+  mid-country and three cities of 5, a hub a state, a trunk railway with two lines across
+  every border, 9 divisions on its fronts. Borders wander with the two-country warp.
+  No rivers yet.
+- **Colours:** Purple (130, 40, 240) and Green (120, 200, 40), not yellow: fitted to
+  Blue's and Red's measured land tint (about 0.18 of a colour's chroma over a slight
+  olive), yellow's predicted tint falls within 35 degrees of Red's, violet's and lime's 64
+  to 180 degrees from every other. Round the four-nation centre the nations alternate
+  between what vision.country_pixels reads as Blue's kind and Red's, so each border is
+  still a front to it. Uncalibrated until seen in the game.
+
+**Wars** are set by `--wars` (default: every nation for itself): 1v1v1, 2v1, 1v1+1 for
+three; 1v1v1v1, 2v2 (allies neighbours), 2v2x (allies apart), 3v1, 2v1v1, 1v1v1+1, 2v1+1,
+1v1+2 for four; or explicit sides, `BLU+PUR:RED:GRN` (left-out nations neutral). With the
+game's own mechanics: a side of more than one is a faction, created in its leader's
+history from a script-only template with no dismissal or joining rules; `arena.k` (fired
+from the console by the recorder, or drawn on the first day when nobody does) declares
+every war, one side's leader on the other's with an annex-everything goal, the side
+whose nation comes first counting from nation k declaring, and adds every ally with
+`add_to_war`. Every nation has a front_control strategy against every other, enabled at
+war. The mod logs `wars <sides> [neutral X] fair yes|no` at startup and `declare A B` per
+war.
+
+A setup is fair when some turn of the map carries any side onto any other: 1v1v1,
+1v1v1v1, 2v2 and 2v2x are; 3v1, 2v1 and 2v1v1 are unfair by design, and 1v1+1, 1v1+2,
+2v1+1 and 1v1v1+1 are not exactly fair either, since the turn is not a mirror and the two
+enemies meet the neutral on different sides. generation.json and the bookmark say which.
+`--lone-bonus 0.25` gives every nation on a side smaller than the largest +25% attack and
+defence (the idea `arena_underdog`); off by default.
+
+**The end of a game:** arena_log follows the `wars` line: a game ends when only one side
+has a nation that has not capitulated, and its winner is that side ("BLU+RED"). The
+recorder cycles the countries it plays through all N (`game_plan`), draws the first say
+among all N, picks any nation on the picker by the nearest tint (and, if the pick fails,
+starts as Blue and takes the nation over with the console's `tag`), and records winners,
+sides and the order of capitulations. `record-ai --player observe` needs nothing else.
+
+**The state channel** logs `held` as one number per 16 states past 16 (a game variable
+holds about 21 bits): the plain full-grid diagnostic arena's 60 states had overflowed it.
+
+Measured on the generated files, each preset's own seed:
+
+| Preset | Land a nation | Front pairs a border | Attack across it | Terrain a nation (plains/forest/hills/mountain/marsh/urban) |
+|---|---|---|---|---|
+| `quad-plains` | 90 | 17 | 0 to -4% | 68/9/7/0/2/4 |
+| `quad-ridges` | 90 | 18 | -22 to -33% | 56/4/16/10/0/4 |
+| `tri-plains` | 102 | 18 | 0% | 78/10/7/0/3/4 |
+| `tri-ridges` | 102 | 18 | -24 to -25% | 66/3/21/8/0/4 |
+
+A nation's two borders cost different amounts to attack across, since the turn is not a
+mirror; every nation's pair is the same. Generation takes 30-47 s and the audit 13 s an
+arena. Not yet loaded in the game.
+
+Still two-country, for later player work: vision.country_pixels (two tints), the scripted
+player (scripted.Planner: one enemy, Blue's half west of the seam, `state_at`'s layout),
+the strategist, tuning's scores, the curriculum and practice runs (`--countries BLU RED`),
+the live view (live/state.py, live/feed.py), privileged features, state_value, features,
+dataset and offline's winner signs, and the scoreboard's win rates (scripted.win_rate).
+
 ## The model and its data (2026-09-23)
 
 The policy was rebuilt so it can read the screen and point at what it sees:

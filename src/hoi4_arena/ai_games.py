@@ -43,6 +43,7 @@ from PIL import Image
 
 from .arena_log import ArenaLog
 from .desktop import Desktop, DesktopError, local_control_args
+from .multination import arena_tags, classify
 from .recording import open_recorder, pixels
 from .remote import RemoteDesktop
 from .telemetry import game_fits, pagefile_policy
@@ -68,6 +69,16 @@ GRAVE, ENTER = 0xC0, 0x0D
 CONSOLE_KEYS = {" ": 0x20, ".": 0xBE}
 # The arena's events that start the war (arenas since v4): Blue declares, Red declares.
 DECLARE_EVENT = {"BLU": "arena.1", "RED": "arena.2"}
+TWO = ("BLU", "RED")
+
+
+def declare_event(declarer, tags=TWO):
+    """The event that starts the wars with `declarer` having the first say: arena.k for
+    the k-th of the arena's countries (multination.events), as DECLARE_EVENT on Blue and
+    Red's."""
+    return f"arena.{tuple(tags).index(declarer) + 1}"
+
+
 # Fired from the console, even a hidden event opens its window ("Blue declares war on
 # Red", Ok), wider than a popup's Ok. Left open, it covered the map through the scripted
 # player's setup on 2026-09-23. The crop of its Ok scored 0.000 there, 0.26 and up
@@ -494,12 +505,17 @@ def recentre(desk, tries=10):
     return False
 
 
-def picked(rgb, box=PICKER_FLAG):
+def picked(rgb, box=PICKER_FLAG, tags=TWO):
     """The country the picker shows as selected, by its flag in the top bar, or None; with
-    `box` TOP_FLAG, the country played, by its flag at the top left of the map."""
+    `box` TOP_FLAG, the country played, by its flag at the top left of the map. On a
+    multi-nation arena's `tags`, the flag's colour nearest in tint (multination.classify)."""
     x0, y0, x1, y1 = box
-    r, _, b = rgb[y0:y1, x0:x1].reshape(-1, 3).mean(0)
-    return "RED" if r - b > 40 else "BLU" if b - r > 40 else None
+    mean = rgb[y0:y1, x0:x1].reshape(-1, 3).mean(0)
+    if set(tags) == set(TWO):
+        r, _, b = mean
+        return "RED" if r - b > 40 else "BLU" if b - r > 40 else None
+    found = int(classify(mean, tags, least=20, agree=0.8))
+    return tags[found] if found >= 0 else None
 
 
 def shown(rgb, name, threshold=SHOWN):
@@ -618,19 +634,23 @@ def main_menu(desk, seconds=60):
         time.sleep(1)
 
 
-def own_land(crop, country):
+def own_land(crop, country, tags=TWO):
     """The largest patch of `country`'s land colour in `crop`, or None if there is little.
 
     Not vision.country_pixels, which keeps the largest patch of either colour: on the
     picker that is the selected country, and the other shows only as a sliver beside it,
-    cut off by the glowing border.
+    cut off by the glowing border. On a multi-nation arena each land pixel goes to the
+    country whose tint it is nearest (multination.classify, uncalibrated there).
     """
     import cv2
 
     pixels = np.asarray(crop, dtype=np.int32)
     r, b = pixels[..., 0], pixels[..., 2]
     land = pixels.sum(-1) > 250
-    mask = land & ((r - b > 15) if country == "RED" else (b - r > 10))
+    if set(tags) == set(TWO):
+        mask = land & ((r - b > 15) if country == "RED" else (b - r > 10))
+    else:
+        mask = land & (classify(pixels, tags, land=True) == tags.index(country))
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         mask.astype(np.uint8), connectivity=4
     )
@@ -642,7 +662,7 @@ def own_land(crop, country):
     return labels == largest
 
 
-def pick_country(desk, country, tries=8):
+def pick_country(desk, country, tries=8, tags=TWO):
     """On the country picker, click the middle of `country`'s land until its flag shows.
 
     The picker's map can still be black when the recorder gets there, and on the second
@@ -650,14 +670,14 @@ def pick_country(desk, country, tries=8):
     is checked against the selected flag. The picker's camera closes in on Blue: on the
     first marsh arena Red's land was off the screen (2026-09-24), so when the country
     does not show, the map is zoomed out a little and looked at again. False if the pick
-    never took.
+    never took. `tags` are the arena's countries (multination.arena_tags).
     """
     for _ in range(tries):
         # The drawn pointer's glove reads as red land, and where little of Red shows it
         # was the largest red patch: move it up onto the top bar, off the map, first.
         act(desk, [{"kind": "move", "x": 0.3, "y": 0.015}])
         rgb = screen(desk)
-        selected = picked(rgb)
+        selected = picked(rgb, tags=tags)
         if selected == country:
             return True
         if selected is None:
@@ -669,7 +689,7 @@ def pick_country(desk, country, tries=8):
             time.sleep(2)
             continue
         top, bottom = MAP_TOP, rgb.shape[0] - MAP_BOTTOM
-        land = own_land(rgb[top:bottom], country)
+        land = own_land(rgb[top:bottom], country, tags)
         if land is None:
             act(
                 desk,
@@ -682,7 +702,7 @@ def pick_country(desk, country, tries=8):
         k = np.argmin((ys - np.median(ys)) ** 2 + (xs - np.median(xs)) ** 2)
         click(desk, xs[k] / rgb.shape[1], (ys[k] + top) / rgb.shape[0])
         time.sleep(1.5)
-    return picked(screen(desk)) == country
+    return picked(screen(desk), tags=tags) == country
 
 
 def run_at(desk, rules, speed, failure_shot=None):
@@ -750,6 +770,7 @@ def start_game(
     saved=False,
     opening=0.0,
     save_as=None,
+    tags=TWO,
 ):
     """From the main menu to an AI-vs-AI game running at `speed` (4 or 5), as `country`.
 
@@ -767,10 +788,15 @@ def start_game(
     With `saved`, the game was launched straight into a start save of `country` (made
     paused at the start of a new game), so the menus are skipped and the map is waited
     for. `opening` runs the game that many seconds at speed 1 first (run_briefly).
+
+    `tags` are the arena's countries (multination.arena_tags). On a multi-nation arena a
+    country the picker could not select is taken over from the console (`tag`) once the
+    game has started as the one preselected; the arena logs the player it started as.
     """
+    switch = False
     if saved:
         wait_paused(desk, rules, failure_shot, SAVE_LOAD)
-        if picked(screen(desk), TOP_FLAG) != country:
+        if picked(screen(desk), TOP_FLAG, tags) != country:
             Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
             raise RuntimeError(f"the start save does not play {country}")
     else:
@@ -790,12 +816,20 @@ def start_game(
         click(desk, *SELECT_COUNTRY)  # Blue is preselected.
         time.sleep(4)
         # Clicking a country's land on the picker's map selects it; Blue is the default.
-        if not pick_country(desk, country):
-            Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
-            raise RuntimeError(f"could not pick {country} on the country picker")
+        if not pick_country(desk, country, tags=tags):
+            if set(tags) == set(TWO):
+                Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
+                raise RuntimeError(f"could not pick {country} on the country picker")
+            switch = True
         click(desk, *START)
         # A new game starts paused, its map up 3.5-4.5 s after Start.
         wait_paused(desk, rules, failure_shot, 60)
+        if switch:
+            console(desk, f"tag {country}")
+            time.sleep(1)
+            if picked(screen(desk), TOP_FLAG, tags) != country:
+                Image.fromarray(screen(desk)).resize((960, 540)).save(failure_shot)
+                raise RuntimeError(f"could not pick {country}, nor take it over with tag")
         if save_as:
             # Saved paused at the start, before the opening hours or the war: the next
             # game on this arena and side starts from here, skipping the menus.
@@ -804,7 +838,7 @@ def start_game(
     if opening > 0:
         run_briefly(desk, rules, opening)
     if declarer:
-        console(desk, f"event {DECLARE_EVENT[declarer]}")
+        console(desk, f"event {declare_event(declarer, tags)}")
         close_event(desk)
     if not observe:
         return
@@ -1424,6 +1458,11 @@ def play(
             out.writelines(json.dumps(entry) + "\n" for entry in stamped)
         rec.manifest.update(
             winner=outcome,
+            # On a multi-nation arena: the winning side's nations, the sides, and the
+            # nations in the order they capitulated.
+            winners=arena.winners,
+            sides=arena.sides,
+            capitulated=arena.capitulated,
             surrendered=arena.surrendered,
             # The country the recorder picked, and what the arena logged: who declared the
             # war and the country the human started as (None on arenas before v2).
@@ -1468,14 +1507,17 @@ def play(
     return outcome, reason, rec.manifest
 
 
-def game_plan(station, index, speeds):
+def game_plan(station, index, speeds, tags=TWO):
     """The country and speed of a station's `index`-th game.
 
-    The country alternates, the two PCs out of step so both sides are covered at once, and
-    each speed is played as both countries in turn, so side and speed are not confounded.
+    The country takes turns through the arena's `tags` (Blue and Red, or a multi-nation
+    arena's), the two PCs a country out of step so different sides are covered at once,
+    and each speed is played as every country in turn, so side and speed are not
+    confounded.
     """
-    countries = ("BLU", "RED") if station == "here" else ("RED", "BLU")
-    return countries[index % 2], speeds[index // 2 % len(speeds)]
+    tags = tuple(tags)
+    countries = tags if station == "here" else tags[1:] + tags[:1]
+    return countries[index % len(tags)], speeds[index // len(tags) % len(speeds)]
 
 
 def game_arena(mods, index, accepted=()):
@@ -1772,7 +1814,7 @@ def test_result(request, entry, root, stages):
         "recording": str(Path(root).resolve()),
         "screenshots": {k: str(Path(v).resolve()) for k, v in stages["shots"].items()},
     }
-    played = entry.get("winner") in ("BLU", "RED", "timeout") and not entry.get("reason")
+    played = bool(entry.get("winner")) and not entry.get("reason")
     result["accepted"] = bool(stages["loaded"] and stages["started"] and played)
     return result
 
@@ -1869,15 +1911,16 @@ def run_station(station, out_root, rules, templates, settings, end):
             rotation += 1
         kind = "scripted" if scripted else "ai"
         name = time.strftime(f"{kind}-{station.name}-%Y%m%d-%H%M%S")
-        country, speed = game_plan(station.name, len(results), settings["speeds"])
+        tags = arena_tags(mod)
+        country, speed = game_plan(station.name, len(results), settings["speeds"], tags)
         if request:
             # Tests come every other game, which game_plan's turns would always give the
             # same side: all of the first eight were played as Red (2026-09-24).
-            country = rng.choice(("BLU", "RED"))
+            country = rng.choice(tags)
         entry = {"game": name, "station": station.name, "started_as": country, "speed": speed}
         entry["arena"] = Path(mod).name
         # A fair coin for who declares, independent of the side played (start_game).
-        entry["declare_drawn"] = rng.choice(("BLU", "RED"))
+        entry["declare_drawn"] = rng.choice(tags)
         player = None
         if scripted:
             plan = pick_plan(rng, entry["arena"], settings, request)
@@ -1932,7 +1975,7 @@ def run_station(station, out_root, rules, templates, settings, end):
                     start_game(
                         desk, rules, failure_shot, country, speed,
                         observe=not scripted, declarer=entry["declare_drawn"],
-                        saved=bool(save), opening=opening, save_as=save_as,
+                        saved=bool(save), opening=opening, save_as=save_as, tags=tags,
                     )  # fmt: skip
                     if save_as:
                         remember_save(settings["save_registry"], entry["arena"], country, save_as)

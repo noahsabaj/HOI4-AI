@@ -754,3 +754,46 @@ def test_no_menu_click_is_made_before_the_main_menu_shows(monkeypatch, tmp_path)
     assert not clicks and (tmp_path / "failed.png").exists()
     found["at"] = (0.5, 290 / 1080)
     assert ai_games.main_menu(None, seconds=0)
+
+
+def test_a_multi_nation_arena_is_played_as_each_nation_in_turn(tmp_path):
+    tags = ("BLU", "RED", "PUR", "GRN")
+    here = [ai_games.game_plan("here", i, [4, 5], tags) for i in range(8)]
+    peer = [ai_games.game_plan("peer", i, [4, 5], tags) for i in range(4)]
+    assert [c for c, _ in here] == list(tags) * 2 and [s for _, s in here] == [4] * 4 + [5] * 4
+    assert [c for c, _ in peer] == ["RED", "PUR", "GRN", "BLU"]
+    assert ai_games.declare_event("PUR", tags) == "arena.3"
+    assert [ai_games.declare_event(t) for t in ("BLU", "RED")] == [
+        ai_games.DECLARE_EVENT[t] for t in ("BLU", "RED")
+    ]
+    (tmp_path / "generation.json").write_text(json.dumps({"tags": list(tags)}))
+    assert ai_games.arena_tags(tmp_path) == tags
+
+
+def test_the_picker_tells_four_nations_apart_by_flag_and_by_land():
+    from hoi4_arena.multination import COLOUR, GROUND_TINT, SCREEN_TINT
+
+    tags = ("BLU", "RED", "PUR", "GRN")
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = SEA
+    x0, y0, x1, y1 = ai_games.PICKER_FLAG
+    for tag in tags:
+        frame[y0:y1, x0:x1] = COLOUR[tag]
+        assert ai_games.picked(frame, tags=tags) == tag
+    frame[y0:y1, x0:x1] = (128, 128, 128)
+    assert ai_games.picked(frame, tags=tags) is None
+    # Land as the map draws it: a faint tint of the colour over the ground, predicted from
+    # Blue's and Red's measured land; those two themselves still read as before.
+    for k, tag in enumerate(tags):
+        colour = np.array(COLOUR[tag], float)
+        tint = SCREEN_TINT * (colour - colour.mean()) + np.array(GROUND_TINT)
+        frame[300:700, 300 + 300 * k : 600 + 300 * k] = np.round(140 + tint)
+    for k, tag in enumerate(tags):
+        land = ai_games.own_land(frame[ai_games.MAP_TOP : 1080 - ai_games.MAP_BOTTOM], tag, tags)
+        ys, xs = np.nonzero(land)
+        assert xs.min() == 300 + 300 * k and xs.max() == 599 + 300 * k, tag
+    frame[300:700, 300:600] = BLUE_LAND
+    frame[300:700, 600:900] = RED_LAND
+    crop = frame[ai_games.MAP_TOP : 1080 - ai_games.MAP_BOTTOM]
+    assert np.nonzero(ai_games.own_land(crop, "BLU", tags))[1].max() == 599
+    assert np.nonzero(ai_games.own_land(crop, "RED", tags))[1].min() == 600

@@ -1086,8 +1086,26 @@ def build_parser():
     generation.add_argument("--game", required=True)
     generation.add_argument(
         "--preset",
-        help="A named arena design (arenas.PRESETS: plains, river, passes, marsh, bay): "
-        "terrain, rivers, lakes and cities on the 12x8 grid. Without one, the plain arena.",
+        help="A named arena design (arenas.PRESETS: plains, river, passes, marsh, bay, "
+        "salient, ford): terrain, rivers, lakes and cities on the 12x8 grid. Without one, "
+        "the plain arena. A multi-nation design (multination.NATION_PRESETS: tri-plains, "
+        "tri-ridges for three nations, quad-plains, quad-ridges for four) turns one "
+        "nation's share round the centre instead",
+    )
+    generation.add_argument(
+        "--wars",
+        help="Multi-nation presets only: who fights whom from the first day. A named setup "
+        "(three nations: 1v1v1, 2v1, 1v1+1; four: 1v1v1v1, 2v2, 2v2x, 3v1, 2v1v1, 1v1v1+1, "
+        "2v1+1, 1v1+2; 'AvB' sides of neighbours, '+K' neutrals, 'x' allies apart) or the "
+        "sides themselves, e.g. BLU+PUR:RED:GRN. Default: every nation for itself",
+    )
+    generation.add_argument(
+        "--lone-bonus",
+        type=float,
+        default=0.0,
+        help="Multi-nation presets only: raise the attack and defence of every nation on a "
+        "side smaller than the largest by this fraction (0.25 is +25%%), to even an unfair "
+        "setup such as 3v1. Off by default",
     )
     generation.add_argument(
         "--seed",
@@ -1237,6 +1255,13 @@ def main():
         raise SystemExit(1) from None
     if result is not None:
         print(json.dumps(result, indent=2))
+
+
+def _nation_preset(name):
+    """Whether `name` is a multi-nation arena (multination.NATION_PRESETS)."""
+    from .multination import NATION_PRESETS
+
+    return name in NATION_PRESETS
 
 
 def _report(problems):
@@ -1591,9 +1616,41 @@ def _dispatch(command, args):
         from .learning import League
 
         result = League(args["league"], seed=args["seed"]).sample()
+    elif command == "generate-map" and _nation_preset(args["preset"]):
+        from .mapgen import audit
+        from .mapgen_multi import generate_multi
+
+        refused = [
+            flag
+            for flag, key in [
+                ("--undefended", "undefended"),
+                ("--victory-points-on-border", "victory_points_on_border"),
+                ("--columns-per-half", "columns_per_half"),
+                ("--rows", "rows"),
+                ("--state-columns", "state_columns"),
+                ("--state-rows", "state_rows"),
+                ("--land-columns", "land_columns"),
+                ("--land-rows", "land_rows"),
+            ]
+            if args[key]
+        ]
+        if refused:
+            raise ValueError(f"{', '.join(refused)} belong to the two-country arena")
+        result = generate_multi(
+            args["game"],
+            args["output"],
+            preset=args["preset"],
+            seed=args["seed"],
+            wars=args["wars"],
+            lone_bonus=args["lone_bonus"],
+        )
+        result["audit"] = audit(args["output"])
+        _report(result["audit"]["problems"])
     elif command == "generate-map":
         from .mapgen import audit, generate
 
+        if args["wars"] or args["lone_bonus"]:
+            raise ValueError("--wars and --lone-bonus need a multi-nation preset")
         grid = {
             "columns_per_half": args["columns_per_half"],
             "rows": args["rows"],
