@@ -51,6 +51,13 @@ Full games for data are a recording run in the plan (`--record NAME`, with `reco
 .venv\Scripts\python.exe scripts\collect_station.py deploy --record scripted-v7 --record-minutes 240 -- --player scripted --mod artifacts/mods/arena-12x8-v4 --speeds 5
 ```
 
+The curriculum that skips the setup (`curriculum.py`) plays from rung saves. Each is an arena's start save with the scripted player's first setup steps done while the game stays paused: S1 the army, S2 its general, S3 its front and a broad offensive. `make-ladder` makes them on a PC, and the plan's `ladder` entry (`{"name", "args"}`) makes them on the second PC once per name. `rung-games CHECKPOINT|scripted OUTPUT --rungs S3 S0` plays full games from them and reports each rung's wins, setups and promotion (60% of the last 10 moves a checkpoint one rung down). `--schedule adaptive` picks each game's rung, arena and side where the student's success is nearest even and changing most. In the plan's `evaluate` it writes to `artifacts/learned/rung-<name>-<entry>`. `train-bc --rung S3` trains only on what follows a rung's moment in full games.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe make-ladder artifacts/ladder-here --arenas arena-12x8-v4 arena-ford-v6 --fresh-starts
+.venv\Scripts\hoi4-arena.exe rung-games artifacts/learned/bc5/epoch-0000.pt artifacts/learned/rung-bc5 --rungs S3 S0 --games 12 --minutes 150 --peer artifacts/pairing/peer-fleet.json
+```
+
 Game control goes through the same worker. `control launch --mod <arena>` starts HOI4 there with an arena its project holds and prints the outcome. It is refused if HOI4 is already running there. `control quit` closes HOI4, `control restart-discord` restarts Discord, and `control report` prints its windows, busiest processes and log ends. `control launch --save <name>` loads that save game at startup, skipping the main menu (the game's `-start_save`), so a match can start mid-game; `control saves` lists the save games there. Without `--peer` they act on this PC. The worker runs these through `Game-Control.ps1` and refuses them while input is armed. A session running there holds the one full connection, so anything else wanting the game meanwhile is told `worker_busy`.
 
 ```powershell
