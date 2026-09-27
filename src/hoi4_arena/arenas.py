@@ -161,6 +161,21 @@ class River:
 
 
 @dataclass(frozen=True)
+class Region:
+    """A strategic region, drawn round a point: each province of its kind joins the
+    region whose point is nearest. Its half turn is `twin_name`'s region, or the same
+    region when the point is its own half turn (the middle of the map, or the wrap seam),
+    in which case `twin_name` is left empty. `kind` is "land" or "sea", and a sea region
+    has a stock naval terrain (shallow sea, deep ocean or fjords)."""
+
+    kind: str
+    at: tuple
+    name: str
+    twin_name: str = ""
+    terrain: str = "water_shallow_sea"
+
+
+@dataclass(frozen=True)
 class Preset:
     """A named arena. The eastern half is always the western half turned round."""
 
@@ -191,6 +206,23 @@ class Preset:
     land_rows: int = 8
     state_columns: int = 4
     state_rows: int = 2
+    # A naval arena. `islands` are the land, as Patch shapes (terrain unused) anywhere on
+    # the map inside the ocean rings, not the 12x8 block: a cell is land if a shape covers
+    # it or its half turn, and no Blue land may touch Red land. The design grid stays the
+    # frame the other fields are written in. `states` are Blue's state seeds: each land
+    # cell joins the nearest seed on its own island. `ports` ((x, y), level) put a naval
+    # base on the coastal cell nearest each point, `air_bases` ((x, y), level) an air
+    # base in the state there. `regions` replace the one land and one sea strategic
+    # region. `fleet` is each side's starting navy, (ship type, count) with the types
+    # mapgen.FLEET_SHIPS knows, and `convoys` the transports each side starts with.
+    islands: tuple = ()
+    states: tuple = ()
+    ports: tuple = ()
+    air_bases: tuple = ()
+    regions: tuple = ()
+    dockyards: int = 0
+    fleet: tuple = ()
+    convoys: int = 0
 
 
 PRESETS = {
@@ -324,6 +356,86 @@ PRESETS = {
             River(((8.6, 0.8), (7.2, 2.2), (6.1, 3.9)), joins=0),
         ),
         cities=((6.2, 3.0), (7.6, 1.2), (5.0, 6.4), (10.4, 4.6)),
+    ),
+    "archipelago": Preset(
+        title="Archipelago",
+        summary="Two islands face each other across a channel, with smaller islands between "
+        "and around them. No land joins them: every attack is a naval invasion, and whoever "
+        "holds the sea decides where one can land.",
+        seed=808,
+        islands=(
+            # Blue's island, with a headland to the north-east and a lobe reaching into
+            # the channel; Red's is its half turn, across the channel.
+            Patch("land", "blob", (4.4, 3.4), 3.4, 0.16),
+            Patch("land", "blob", (7.2, 5.0), 2.4, 0.16),
+            Patch("land", "blob", (2.2, 6.2), 1.8, 0.16),
+            Patch("land", "blob", (6.6, 0.8), 1.6, 0.16),
+            # A channel isle, Blue's stepping stone toward Red.
+            Patch("land", "blob", (11.3, 1.4), 1.05, 0.1),
+            # Isles off the channel's northern mouth, behind the island to the south and
+            # off its west coast.
+            Patch("land", "blob", (10.0, -3.2), 1.1, 0.1),
+            Patch("land", "blob", (3.6, 10.8), 1.15, 0.1),
+            Patch("land", "blob", (-4.0, 4.4), 1.2, 0.1),
+        ),
+        # Four states on the island, one on each isle.
+        states=(
+            (3.0, 1.6),
+            (6.4, 2.4),
+            (7.6, 5.6),
+            (2.6, 5.6),
+            (11.3, 1.4),
+            (10.0, -3.2),
+            (3.6, 10.8),
+            (-4.0, 4.4),
+        ),
+        patches=(
+            Patch("hills", "blob", (3.6, 4.0), 1.4),
+            Patch("mountain", "blob", (3.4, 4.2), 0.6, 0.2),
+            Patch("forest", "blob", (6.6, 0.6), 1.0),
+            Patch("forest", "blob", (1.8, 6.6), 1.0),
+            Patch("marsh", "blob", (1.8, 1.4), 1.0),
+            Patch("forest", "blob", (10.0, -3.2), 0.7),
+            Patch("hills", "blob", (-4.0, 4.4), 0.6),
+        ),
+        # A large river runs from the north of the island past the capital to the south
+        # coast, a line to hold behind a landing on either shore, with a tributary from
+        # the east; a small one drains the hills to the north-west coast.
+        rivers=(
+            River(((5.2, 1.6), (5.0, 4.4), (5.6, 6.4), (5.6, 8.2)), large=True),
+            River(((8.2, 5.4), (6.8, 6.0), (5.8, 6.2)), joins=0),
+            River(((3.6, 2.6), (2.4, 1.2), (1.0, 0.2))),
+        ),
+        # The capital mid-island, the home port on the channel, a western town and the
+        # channel isle: a city worth an invasion of its own.
+        cities=((5.8, 3.4), (9.2, 5.0), (1.4, 3.6), (11.3, 1.4)),
+        crossings=(),
+        # The home port faces the channel; the fleet starts there.
+        ports=(
+            ((9.6, 4.6), 6),
+            ((0.8, 3.4), 3),
+            ((4.4, -0.4), 2),
+            ((11.3, 1.4), 3),
+            ((10.0, -3.2), 2),
+            ((3.6, 10.8), 2),
+            ((-4.0, 4.4), 1),
+        ),
+        air_bases=(((5.8, 3.4), 3), ((11.3, 1.4), 2), ((10.0, -3.2), 1)),
+        # All land is one region, as on every other arena: with a region per island (and
+        # no state split between them) the game still divided by zero at load, on the
+        # second PC, 2026-09-27. One land region with these sea regions loaded.
+        regions=(
+            Region("land", (12.0, 4.0), "The Islands"),
+            Region("sea", (12.0, 4.0), "The Channel"),
+            Region("sea", (12.0, -4.5), "North Sound", "South Sound"),
+            Region("sea", (-1.5, 3.5), "Western Approaches", "Eastern Approaches"),
+            Region("sea", (2.0, -5.0), "Northwest Sea", "Southeast Sea", "water_deep_ocean"),
+            Region("sea", (2.0, 13.0), "Southwest Sea", "Northeast Sea", "water_deep_ocean"),
+            Region("sea", (-19.5, 4.0), "Far Ocean", terrain="water_deep_ocean"),
+        ),
+        dockyards=4,
+        fleet=(("light_cruiser", 1), ("destroyer", 4), ("submarine", 2)),
+        convoys=100,
     ),
 }
 
@@ -528,6 +640,92 @@ def design_terrain(preset, cells, rng):
                 chosen = patch.terrain
         terrain.append(chosen)
     return terrain
+
+
+def island_land(preset, cells, rng):
+    """Which of the western cells (positions in design units) a naval arena's islands
+    cover: a cell is land if a shape covers it or its half turn, so both sides get the
+    same islands, turned round."""
+    wobble = rng.uniform(-0.5, 0.5, len(cells))
+    land = []
+    for (x, y), shake in zip(cells, wobble):
+        twin = (DESIGN_COLUMNS - x, DESIGN_ROWS - y)
+        land.append(
+            any(_covers(p, (x, y), shake) or _covers(p, twin, shake) for p in preset.islands)
+        )
+    return np.array(land, bool)
+
+
+def islands_of(provinces, neighbours):
+    """The islands among `provinces`: {province: the smallest province id of its piece of
+    land}, joined through the shared edges in `neighbours`."""
+    provinces = set(provinces)
+    found = {}
+    for start in sorted(provinces):
+        if start in found:
+            continue
+        found[start] = start
+        todo = [start]
+        while todo:
+            for step in neighbours[todo.pop()]:
+                if step in provinces and step not in found:
+                    found[step] = start
+                    todo.append(step)
+    return found
+
+
+def island_states(seeds, cells, positions, island):
+    """Each western land cell's state, counted from zero: the nearest of Blue's state
+    `seeds` on its own island, or the nearest of all when its island has none.
+
+    `cells` are the cells' province ids, `positions` their places in design units and
+    `island` their islands (islands_of)."""
+    positions = np.asarray(positions, float)
+    homes = []
+    for x, y in seeds:
+        nearest = int(np.argmin(np.hypot(*(positions - [x, y]).T)))
+        homes.append(island[cells[nearest]])
+    seeds = np.asarray(seeds, float)
+    states = {}
+    for cell, place in zip(cells, positions):
+        distance = np.hypot(*(seeds - place).T)
+        own = [k for k, home in enumerate(homes) if home == island[cell]]
+        states[cell] = int(min(own, key=lambda k: distance[k]) if own else np.argmin(distance))
+    return states
+
+
+def region_seeds(regions, to_pixel, shape):
+    """Every strategic region's seed points in pixels, with its kind and name: a region
+    and its half turn are two regions, and a region that is its own half turn keeps both
+    points, so the assignment stays symmetric exactly."""
+    rows, columns = shape
+    out = []
+    for region in regions:
+        point = np.array(to_pixel(*region.at), float)
+        turned = np.array([columns - 1, rows - 1], float) - point
+        if region.twin_name:
+            out.append((region.kind, region.name, [point]))
+            out.append((region.kind, region.twin_name, [turned]))
+        else:
+            out.append((region.kind, region.name, [point, turned]))
+    return out
+
+
+def nearest_region(points, seeds, width):
+    """For each point (x, y) in pixels, the index of the seed group nearest it, with the
+    distance taken round the map's east-west wrap."""
+    points = np.asarray(points, float)
+    best = np.full(len(points), np.inf)
+    chosen = np.zeros(len(points), int)
+    for index, group in enumerate(seeds):
+        for seed in group:
+            dx = np.abs(points[:, 0] - seed[0])
+            dx = np.minimum(dx, width - dx)
+            d = np.hypot(dx, points[:, 1] - seed[1])
+            closer = d < best
+            best[closer] = d[closer]
+            chosen[closer] = index
+    return chosen
 
 
 # ---------------------------------------------------------------------------------------

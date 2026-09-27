@@ -1158,8 +1158,9 @@ def build_parser():
     generation.add_argument("--game", required=True)
     generation.add_argument(
         "--preset",
-        help="A named arena design (arenas.PRESETS: plains, river, passes, marsh, bay): "
-        "terrain, rivers, lakes and cities on the 12x8 grid. Without one, the plain arena.",
+        help="A named arena design (arenas.PRESETS: plains, river, passes, marsh, bay, "
+        "salient, ford, archipelago): terrain, rivers, lakes and cities on the 12x8 grid, "
+        "or islands and a navy on archipelago. Without one, the plain arena.",
     )
     generation.add_argument(
         "--seed",

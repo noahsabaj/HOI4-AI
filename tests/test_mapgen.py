@@ -3,6 +3,7 @@ import re
 import numpy as np
 import pytest
 from PIL import Image
+from scipy import ndimage
 
 from hoi4_arena.mapgen import (
     COLUMNS_PER_HALF,
@@ -553,6 +554,327 @@ def test_a_seed_redraws_a_preset_and_the_report_measures_its_front(preset_arenas
     assert fronts["bay"]["pairs"] < fronts["marsh"]["pairs"] < fronts["salient"]["pairs"]
     assert fronts["marsh"]["share_at_40_or_worse"] >= 0.25
     assert fronts["bay"]["mean_attack"] > fronts["marsh"]["mean_attack"]
+
+
+# The naval arena: islands, ports, sea regions and fleets.
+
+
+@pytest.fixture(scope="module")
+def archipelago(tmp_path_factory):
+    from hoi4_arena.mapgen import audit
+
+    base = tmp_path_factory.mktemp("archipelago")
+    root = base / "archipelago"
+    report = generate(_fixture_game(base), root, preset="archipelago")
+    return root, report, audit(root)
+
+
+def _twin(report):
+    half = report["provinces"] // 2
+    return lambda province: (province + half - 1) % (2 * half) + 1
+
+
+def _neighbours(root, wrap=False):
+    """Province neighbours from the bitmap, and with `wrap` across the map's east-west
+    seam too, where the world joins round."""
+    from hoi4_arena.mapgen import _province_ids, adjacency
+
+    ids, rows = _province_ids(root)
+    neighbours = adjacency(ids, len(rows) - 1)
+    if wrap:
+        for a, b in zip(ids[:, 0].tolist(), ids[:, -1].tolist()):
+            if a != b:
+                neighbours[a].add(b)
+                neighbours[b].add(a)
+    return neighbours
+
+
+def _naval_bases(root):
+    """{province: (state, level)} for every naval base in the state histories."""
+    found = {}
+    for path in sorted((root / "history/states").glob("*.txt")):
+        text = path.read_text()
+        state = int(re.search(r"id = (\d+)", text).group(1))
+        for province, level in re.findall(r"(\d+) = \{ naval_base = (\d+) \}", text):
+            found[int(province)] = (state, int(level))
+    return found
+
+
+def _regions(root):
+    """{region: (provinces, naval terrain or None)} from the strategic region files."""
+    found = {}
+    for path in sorted((root / "map/strategicregions").glob("*.txt")):
+        text = path.read_text()
+        region = int(re.search(r"id = (\d+)", text).group(1))
+        listed = {int(p) for p in re.search(r"provinces = \{ ([\d ]+) \}", text).group(1).split()}
+        terrain = re.search(r"naval_terrain = (\w+)", text)
+        found[region] = (listed, terrain.group(1) if terrain else None)
+    return found
+
+
+def test_the_archipelago_passes_the_audit_with_no_land_between_the_sides(archipelago):
+    """Two main islands and their isles, 8 states and 8 divisions a side, the same 35
+    victory points, and no Blue province touching a Red one: the only way across is by
+    sea."""
+    root, report, checked = archipelago
+    assert checked["problems"] == []
+    assert report["preset"] == "archipelago"
+    assert report["design"]["front"]["pairs"] == 0
+    assert report["states_per_country"] == report["divisions_per_country"] == 8
+    sizes = report["naval"]["island_sizes"]
+    # One main island, and four isles of a few provinces each.
+    assert len(sizes) == 5 and sizes[0] >= 45 and all(2 <= s <= 8 for s in sizes[1:])
+    assert report["land_provinces_per_country"] == sum(sizes)
+    rows = _definitions(root)
+    neighbours = _neighbours(root)
+    blue = set().union(*(_state_provinces(root, s) for s in range(1, 9)))
+    red = set().union(*(_state_provinces(root, s) for s in range(9, 17)))
+    for province in blue:
+        assert not neighbours[province] & red, province
+    for tag in ("BLU", "RED"):
+        assert len(_victory_points(root, tag)) == 4
+        # Every state is garrisoned, and none on water.
+        assert len(_garrison(root, tag)) == 8
+        assert all(rows[p][4] == "land" for p in _garrison(root, tag))
+    # Rivers on the main islands, crossed where they run, a tributary joining one.
+    from hoi4_arena.arenas import RIVER_JOIN
+
+    assert report["design"]["rivers"] == 3
+    rivers = np.asarray(Image.open(root / "map/rivers.bmp"))
+    assert (rivers == RIVER_JOIN).sum() == 2
+    assert ((rivers >= 7) & (rivers <= 11)).any()
+
+
+def test_the_archipelago_mirrors_its_ports_fleets_and_regions(archipelago):
+    """Fairness at sea: every naval base has a twin of the same level in the twin
+    state, the fleets and convoys are the same, and a province's region turned round is
+    its twin's region."""
+    root, report, _ = archipelago
+    twin = _twin(report)
+    bases = _naval_bases(root)
+    assert len(bases) == 2 * len(report["naval"]["naval_bases"]) >= 12
+    for province, (state, level) in bases.items():
+        assert bases[twin(province)] == ((state + 7) % 16 + 1, level)
+    rows = _definitions(root)
+    assert all(rows[p][4] == "land" and rows[p][5] == "true" for p in bases)
+    # The dockyards, the air bases and the oil and steel sit in twin states.
+    states = {
+        int(re.search(r"id = (\d+)", p.read_text()).group(1)): p.read_text()
+        for p in (root / "history/states").glob("*.txt")
+    }
+    for state in range(1, 9):
+        for key in ("air_base", "dockyard", "oil", "steel", "state_category"):
+            mine = re.findall(rf"{key} = (\w+)", states[state])
+            assert mine == re.findall(rf"{key} = (\w+)", states[state + 8]), (state, key)
+    assert "dockyard = 4" in "".join(states.values())
+    # The same fleet in each side's home port, with and without Man the Guns.
+    for kind in ("legacy", "mtg"):
+        blue = (root / f"history/units/BLU_1936_naval_{kind}.txt").read_text()
+        red = (root / f"history/units/RED_1936_naval_{kind}.txt").read_text()
+        port = int(re.search(r"naval_base = (\d+)", blue).group(1))
+        assert bases[port][1] == max(level for _, level in bases.values())
+        assert f"naval_base = {twin(port)}" in red
+        assert blue.count("ship = {") == red.count("ship = {") == 7
+        assert red == blue.replace("BLU", "RED").replace("Blue", "Red").replace(
+            str(port), str(twin(port))
+        )
+    for tag in ("BLU", "RED"):
+        history = (root / f"history/countries/{tag} - Arena.txt").read_text()
+        assert history.count("{") == history.count("}")
+        assert f'set_naval_oob = "{tag}_1936_naval_mtg"' in history
+        assert f'set_naval_oob = "{tag}_1936_naval_legacy"' in history
+        # The transport technology, which a naval invasion needs, under both rules.
+        assert "mtg_transport = 1" in history and " transport = 1" in history
+        assert f"type = convoy_1 amount = 100 producer = {tag}" in history
+
+
+def test_the_archipelago_sea_regions_are_whole_and_turn_with_the_map(archipelago):
+    """Every sea province in exactly one naval region with a naval terrain, no region
+    mixing land and sea, each region one piece of water, and the region of a province's
+    twin the twin of its region."""
+    root, report, _ = archipelago
+    twin = _twin(report)
+    rows = _definitions(root)
+    regions = _regions(root)
+    sea = {i for i, r in rows.items() if r[4] == "sea"}
+    region_of = {p: region for region, (listed, _) in regions.items() for p in listed}
+    assert sum(len(listed) for listed, _ in regions.values()) == len(rows) == len(region_of)
+    seas = [r for r, (listed, _) in regions.items() if listed <= sea]
+    lands = [r for r, (listed, _) in regions.items() if not listed & sea]
+    # All land in one region: several land regions crashed the game at load.
+    assert len(seas) >= 8 and len(lands) == 1 and len(seas) + len(lands) == len(regions)
+    assert all(regions[r][1] in ("water_shallow_sea", "water_deep_ocean") for r in seas)
+    assert all(regions[r][1] is None for r in lands)
+    for province, region in region_of.items():
+        turned = region_of[twin(province)]
+        assert {twin(p) for p in regions[region][0]} == regions[turned][0]
+    # Every state in one region: a state split between two crashed the game at load.
+    for state in range(1, 17):
+        assert len({region_of[p] for p in _state_provinces(root, state)}) == 1, state
+    # One piece of water each, the far ocean joined round the map's wrap.
+    neighbours = _neighbours(root, wrap=True)
+    for region in seas:
+        listed = regions[region][0]
+        start = min(listed)
+        seen, todo = {start}, [start]
+        while todo:
+            for step in neighbours[todo.pop()] & listed:
+                if step not in seen:
+                    seen.add(step)
+                    todo.append(step)
+        assert seen == listed, region
+    # The channel between the islands is the region the AI is told to fight for.
+    strategy = (root / "common/ai_strategy/arena.txt").read_text()
+    channel = int(re.search(r"type = naval_dominance\s+id = (\d+)", strategy).group(1))
+    names = (root / "localisation/english/arena_l_english.yml").read_text(encoding="utf-8-sig")
+    assert f' ARENA_REGION_{channel}:0 "The Channel"' in names
+    assert "type = invade\n\t\tid = RED" in strategy
+
+
+def test_every_archipelago_province_can_be_reached(archipelago):
+    """The sea is one body of water, every land province lies on an island with a naval
+    base (so it can be landed on, supplied and reinforced by sea), and every island's
+    naval bases are on the railway its hubs are on, so a captured port feeds them."""
+    root, report, _ = archipelago
+    rows = _definitions(root)
+    neighbours = _neighbours(root)
+    sea = {i for i, r in rows.items() if r[4] == "sea"}
+    start = min(sea)
+    seen, todo = {start}, [start]
+    while todo:
+        for step in neighbours[todo.pop()] & sea:
+            if step not in seen:
+                seen.add(step)
+                todo.append(step)
+    assert seen == sea
+    from hoi4_arena.arenas import islands_of
+
+    bases = _naval_bases(root)
+    land = {i for i, r in rows.items() if r[4] == "land"}
+    pieces = {}
+    for province, piece in islands_of(land, neighbours).items():
+        pieces.setdefault(piece, set()).add(province)
+    assert len(pieces) == 2 * len(report["naval"]["island_sizes"])
+    links = _rail_links(root)
+    hubs = {int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]}
+    for piece in pieces.values():
+        assert piece & set(bases), min(piece)
+        assert any(rows[p][5] == "true" for p in piece)
+        if piece & hubs:
+            # The main islands: hubs, railways and the ports on them.
+            railed = {p for link in links for p in link}
+            assert set(bases) & piece <= railed
+        else:
+            assert not any(a in piece or b in piece for a, b in links)
+
+
+def test_the_naval_audit_catches_an_unsupplied_island_and_a_port_off_the_railway(
+    archipelago,
+):
+    from hoi4_arena.mapgen import audit
+
+    root, report, _ = archipelago
+    bases = _naval_bases(root)
+    rows = _definitions(root)
+    neighbours = _neighbours(root)
+    from hoi4_arena.arenas import islands_of
+
+    land = {i for i, r in rows.items() if r[4] == "land"}
+    island = islands_of(land, neighbours)
+    hubs = {int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]}
+    main = {island[h] for h in hubs}
+    isle = next(p for p in bases if island[p] not in main)
+    port = next(p for p in bases if island[p] in main and p not in hubs)
+    state_file = root / f"history/states/{bases[isle][0]}-arena.txt"
+    rails = root / "map/railways.txt"
+    original_state, original_rails = state_file.read_text(), rails.read_text()
+    state_file.write_text(re.sub(rf" {isle} = \{{ naval_base = \d+ \}}", "", original_state))
+    rails.write_text(
+        "\n".join(line for line in original_rails.splitlines() if str(port) not in line.split()[2:])
+        + "\n"
+    )
+    try:
+        problems = audit(root)["problems"]
+    finally:
+        state_file.write_text(original_state)
+        rails.write_text(original_rails)
+    assert any("no naval base or supply hub" in p for p in problems), problems
+    assert any(f"naval base {port} is joined by rail to none" in p for p in problems), problems
+    assert any("has no twin of level" in p for p in problems), problems
+
+
+def test_a_seed_redraws_the_archipelago_and_the_same_seed_repeats_it(archipelago, tmp_path):
+    """Determinism: the same seed writes the same map byte for byte, and another seed
+    another map of the same design."""
+    import hashlib
+
+    root, report, _ = archipelago
+    game = _fixture_game(tmp_path)
+    first = generate(game, tmp_path / "a", preset="archipelago", seed=31)
+    second = generate(game, tmp_path / "b", preset="archipelago", seed=31)
+    assert first == second
+
+    def digest(folder, name):
+        return hashlib.sha256((folder / name).read_bytes()).hexdigest()
+
+    files = [
+        "map/provinces.bmp",
+        "map/definition.csv",
+        "map/railways.txt",
+        "map/buildings.txt",
+        "map/heightmap.bmp",
+        "history/units/BLU_1936_naval_mtg.txt",
+        *(f"map/strategicregions/{r}-arena.txt" for r in range(1, 12)),
+        *(f"history/states/{s}-arena.txt" for s in range(1, 17)),
+    ]
+    for name in files:
+        assert digest(tmp_path / "a", name) == digest(tmp_path / "b", name), name
+    assert digest(tmp_path / "a", "map/provinces.bmp") != digest(root, "map/provinces.bmp")
+    assert first["design"]["seed"] == 31 and report["design"]["seed"] == 808
+
+
+def test_every_island_reads_as_land_on_the_political_map(archipelago):
+    """The scripted player counts a pixel as land only above a screen brightness sum of
+    250, about 1.8 times the colour map's sum minus 84. Every island, the smallest isle
+    and the forested one too, must clear it everywhere away from its coast, where the
+    colour map blends into the sea, with a median of 300 or more, as the marsh arena's
+    land does (the sea itself is drawn by the water shader, at a sum of about 137)."""
+    from hoi4_arena.mapgen import MAP_SIZE
+
+    root, _, _ = archipelago
+    width, height = MAP_SIZE
+    raw = np.frombuffer(
+        (root / "map/terrain/colormap_rgb_cityemissivemask_a.dds").read_bytes()[128:], np.uint8
+    )
+    colour = raw.reshape(height // 2, width // 2, 4)[..., [2, 1, 0]].astype(int)
+    rows = _definitions(root)
+    from hoi4_arena.mapgen import _province_ids
+
+    ids, _ = _province_ids(root)
+    land = np.array([False] + [rows[i][4] == "land" for i in range(1, len(rows) + 1)])
+    ground = land[ids[::2, ::2]]
+    inland = ndimage.binary_erosion(ground, iterations=3)
+    labels, count = ndimage.label(ground)
+    assert count == 10
+    for island in range(1, count + 1):
+        inside = inland & (labels == island)
+        assert inside.sum() > 200, island
+        screen = 1.8 * colour[inside].sum(-1) - 84
+        assert (screen >= 250).mean() > 0.99, island
+        assert np.median(screen) >= 300, island
+
+
+def test_the_archipelago_preview_draws_ports_and_sea_regions(archipelago, tmp_path):
+    from hoi4_arena.mapgen import preview
+
+    root, _, _ = archipelago
+    result = preview(root, tmp_path / "archipelago.png", width=900)
+    picture = np.asarray(Image.open(tmp_path / "archipelago.png").convert("RGB")).astype(int)
+    assert result["size"][0] == 900
+    # The naval bases' dark blue discs, drawn at the final size, and the sea regions'
+    # light borders, drawn before the picture is scaled down.
+    assert ((picture == (25, 55, 150)).all(-1)).sum() > 100
+    assert (np.abs(picture - (150, 180, 225)).max(-1) < 12).sum() > 100
 
 
 def test_a_river_on_the_border_leaves_one_ford(preset_arenas):

@@ -95,6 +95,7 @@ MONTH_LAST_DAY = (30, 27, 30, 29, 30, 29, 30, 30, 29, 30, 29, 30)
 # the flag path read them as RGB.
 COUNTRY_COLOUR = {"BLU": (40, 100, 220), "RED": (220, 60, 60)}
 COUNTRY_COLOUR_UI = {"BLU": (70, 130, 255), "RED": (255, 90, 90)}
+SIDE_NAMES = {"BLU": "Blue", "RED": "Red"}
 
 # One field marshal to hold an army group and enough generals to hold armies under it.
 # The portrait is the only generic land-commander sprite the stock interface defines; a
@@ -122,6 +123,60 @@ COLUMNS_PER_HALF, ROWS, OCEAN_RINGS = 32, 24, 2
 # grid exactly: land is COLUMNS_PER_HALF - OCEAN_RINGS columns by ROWS - 2 * OCEAN_RINGS
 # rows, so 30 by 20, cut into 6 by 5 states of 5 by 4 provinces each.
 STATE_COLUMNS, STATE_ROWS = 6, 5
+# A naval arena's ships, per type (the ship's `definition`): its equipment without Man
+# the Guns, and with it the hull and the modules of its one variant. Both are stock 1936
+# ships: the variants copy the Dutch Van Galen and Java classes and the Danish Rota class
+# (minus the Java's seaplane), and the technologies below are what the stock Netherlands
+# starts with for them, plus the transport technology, which raises the four divisions a
+# naval invasion may carry to six. Without Man the Guns the legacy transport technology
+# also carries the invasion capacity the legacy rules still read.
+FLEET_SHIPS = {
+    "light_cruiser": (
+        "light_cruiser_1",
+        "ship_hull_cruiser_1",
+        {
+            "fixed_ship_battery_slot": "ship_light_medium_battery_1",
+            "fixed_ship_anti_air_slot": "ship_anti_air_1",
+            "fixed_ship_fire_control_system_slot": "ship_fire_control_system_0",
+            "fixed_ship_radar_slot": "empty",
+            "fixed_ship_engine_slot": "cruiser_ship_engine_1",
+            "mid_1_custom_slot": "empty",
+            "mid_2_custom_slot": "ship_light_medium_battery_1",
+            "rear_1_custom_slot": "empty",
+        },
+    ),
+    "destroyer": (
+        "destroyer_1",
+        "ship_hull_light_1",
+        {
+            "fixed_ship_battery_slot": "ship_light_battery_1",
+            "fixed_ship_anti_air_slot": "ship_anti_air_1",
+            "fixed_ship_fire_control_system_slot": "ship_fire_control_system_0",
+            "fixed_ship_radar_slot": "empty",
+            "fixed_ship_engine_slot": "light_ship_engine_1",
+            "fixed_ship_torpedo_slot": "ship_torpedo_1",
+            "mid_1_custom_slot": "empty",
+            "rear_1_custom_slot": "ship_depth_charge_1",
+        },
+    ),
+    "submarine": (
+        "submarine_1",
+        "ship_hull_submarine_1",
+        {
+            "fixed_ship_torpedo_slot": "ship_torpedo_sub_1",
+            "fixed_ship_engine_slot": "sub_ship_engine_1",
+            "rear_1_custom_slot": "empty",
+        },
+    ),
+}
+NAVAL_TECHNOLOGY = {
+    False: "early_destroyer early_light_cruiser early_submarine transport",
+    True: "early_ship_hull_light early_ship_hull_cruiser early_ship_hull_submarine "
+    "basic_battery basic_torpedo basic_depth_charges mtg_transport",
+}
+# A naval arena's capital state holds the oil for the fleet's fuel and the steel its
+# dockyards build with, the same on both sides.
+NAVAL_RESOURCES = {"oil": 8, "steel": 8}
 # Even at 88 px a crossing is 626 km, which the infantry archetype's 4 km/h walks in 6.5
 # days against the roughly one day a stock province takes. The rest of the gap is closed
 # with a country spirit rather than by shrinking the provinces further, because province
@@ -172,6 +227,74 @@ def write_dds(path, pixels):
     path.write_bytes(header + pixels[..., [2, 1, 0, 3]].astype(np.uint8).tobytes())
 
 
+def naval_oob(tag, mtg):
+    """The name of a side's naval order of battle, with or without Man the Guns."""
+    return f"{tag}_1936_naval_{'mtg' if mtg else 'legacy'}"
+
+
+def _variant(kind):
+    return f"Arena {kind.replace('_', ' ').title()}"
+
+
+def navy_history(tag, fleet, convoys):
+    """A naval arena's country history lines: the naval technologies, the ship variants
+    and the naval order of battle for the rules in use (as stock countries choose between
+    them with has_dlc), a full fuel tank and the convoys that carry supply and invasions."""
+
+    def technology(mtg):
+        return " ".join(f"{name} = 1" for name in NAVAL_TECHNOLOGY[mtg].split())
+
+    variants = "".join(
+        f'\tcreate_equipment_variant = {{ name = "{_variant(kind)}" type = {FLEET_SHIPS[kind][1]}'
+        " parent_version = 0 modules = { "
+        + " ".join(f"{slot} = {module}" for slot, module in FLEET_SHIPS[kind][2].items())
+        + " } }\n"
+        for kind, _ in fleet
+    )
+    return (
+        'if = {\n\tlimit = { has_dlc = "Man the Guns" }\n'
+        f"\tset_technology = {{ {technology(True)} }}\n"
+        + variants
+        + f'\tset_naval_oob = "{naval_oob(tag, True)}"\n'
+        f"\telse = {{\n\t\tset_technology = {{ {technology(False)} }}\n"
+        f'\t\tset_naval_oob = "{naval_oob(tag, False)}"\n\t}}\n}}\n'
+        "set_fuel_ratio = 1\n"
+        f"add_equipment_to_stockpile = {{ type = convoy_1 amount = {convoys} producer = {tag} }}\n"
+    )
+
+
+def fleet_units(tag, name, port, fleet, mtg):
+    """A side's starting fleet in its home port: the surface ships in one task force and
+    the submarines in another, as stock fleets are split."""
+    groups = {"Surface Group": [], "Submarine Group": []}
+    for kind, count in fleet:
+        legacy, hull, _ = FLEET_SHIPS[kind]
+        equipment = (
+            f'{hull} = {{ amount = 1 owner = {tag} version_name = "{_variant(kind)}" }}'
+            if mtg
+            else f"{legacy} = {{ amount = 1 owner = {tag} }}"
+        )
+        group = "Submarine Group" if kind == "submarine" else "Surface Group"
+        label = kind.replace("_", " ").title()
+        for n in range(1, count + 1):
+            groups[group].append(
+                f'\t\t\tship = {{ name = "{name} {label} {n}" definition = {kind}'
+                f" equipment = {{ {equipment} }} }}\n"
+            )
+    forces = "".join(
+        f'\t\ttask_force = {{\n\t\t\tname = "{name} {group}"\n\t\t\tlocation = {port}\n'
+        + "".join(ships)
+        + "\t\t}\n"
+        for group, ships in groups.items()
+        if ships
+    )
+    return (
+        f'units = {{\n\tfleet = {{\n\t\tname = "{name} Fleet"\n\t\tnaval_base = {port}\n'
+        + forces
+        + "\t}\n}\n"
+    )
+
+
 def adjacency(ids, count):
     """Province neighbours as the engine reads them: shared edges in provinces.bmp."""
     neighbours = {i: set() for i in range(1, count + 1)}
@@ -217,8 +340,10 @@ def generate(
     """Write an arena. Apart from `preset`, the keyword arguments build diagnostics.
 
     `preset` names a design in `arenas.PRESETS`, which also sets the grid (12 by 8
-    provinces a side in 8 states) unless the grid arguments override it. `seed` redraws
-    its noise, province shapes and river courses: the same design, another map.
+    provinces a side in 8 states) unless the grid arguments override it. A naval design
+    (one with islands) draws its own land, states, ports, sea regions and fleets instead.
+    `seed` redraws its noise, province shapes and river courses: the same design, another
+    map.
 
     `undefended` fields no divisions for one side. `victory_points_on_border` moves every
     victory point onto the border column. That does not produce a surrender: capitulation
@@ -325,6 +450,16 @@ def generate(
     column, row = np.divmod(np.arange(half_count), rows)
     half_land = (column >= column0) & (row >= row0) & (row < row0 + land_rows)
     half_kind = np.where(half_land, LAND, SEA)
+    naval = bool(design and design.islands)
+    if naval:
+        # A naval arena's land is its islands, wherever they lie inside the ocean rings.
+        inside = np.flatnonzero(
+            (column >= OCEAN_RINGS) & (row >= OCEAN_RINGS) & (row < rows - OCEAN_RINGS)
+        )
+        where = [to_design(*left[i]) for i in inside]
+        half_land = np.zeros(half_count, bool)
+        half_land[inside[arenas.island_land(design, where, rng)]] = True
+        half_kind = np.where(half_land, LAND, SEA)
     if design:
         # A bay turns land cells to sea and a lake to lake, each with its half turn.
         cells = np.flatnonzero(half_land)
@@ -445,6 +580,27 @@ def generate(
         for i in neighbours
         if land[i - 1] and coastal[i]
     }
+    island = {}
+    naval_bases = {}
+    if naval:
+        # No land may join the two sides: the only way across is by sea.
+        touching = [
+            (a, b)
+            for a in range(1, half_count + 1)
+            for b in neighbours[a]
+            if land[a - 1] and land[b - 1] and owner[a - 1] != owner[b - 1]
+        ]
+        if touching:
+            raise ValueError(f"Blue's and Red's islands touch at provinces {touching[0]}")
+        island = arenas.islands_of(np.flatnonzero(land) + 1, neighbours)
+        west_coast = [i for i in range(1, half_count + 1) if land[i - 1] and coastal[i]]
+        coast_at = np.array([to_design(*anchor[i - 1]) for i in west_coast])
+        for (x, y), level in design.ports:
+            base = west_coast[int(np.argmin(np.hypot(*(coast_at - [x, y]).T)))]
+            if base in naval_bases:
+                raise ValueError(f"two ports of the design share province {base}")
+            naval_bases[base] = level
+            naval_bases[base + half_count] = level
 
     def indexed(name, pixels):
         original = Image.open(game / "map" / name)
@@ -625,14 +781,46 @@ def generate(
     # Lakes belong to the land region, as every stock lake does (56 land regions hold
     # them, no naval one).
     regions = [(1, kind != SEA), (2, kind == SEA)]
+    region_names = {1: "Arena", 2: "Ocean"}
+    sea_terrain = {2: "water_shallow_sea"}
+    if naval:
+        # A naval arena's own regions: each island (lakes with the land, as stock) joins
+        # the land region whose point is nearest its middle, each sea province the nearest
+        # sea one's, and each region's half turn is its twin region. An island goes whole:
+        # a state split between two regions crashed the game at load, dividing by zero,
+        # when the channel coast of each main island fell nearer the isles' region point.
+        regions, region_names, sea_terrain = [], {}, {}
+        seeds = arenas.region_seeds(design.regions, to_pixel, (height, width))
+        terrains = {r.name: r.terrain for r in design.regions}
+        terrains.update({r.twin_name: r.terrain for r in design.regions if r.twin_name})
+        middles = {}
+        for province, piece in island.items():
+            middles.setdefault(piece, []).append(anchor[province - 1])
+        middles = {piece: np.mean(spots, axis=0) for piece, spots in middles.items()}
+        placed_at = np.array(
+            [middles[island[i + 1]] if i + 1 in island else anchor[i] for i in range(len(kind))]
+        )
+        for wanted, mask in (("land", kind != SEA), ("sea", kind == SEA)):
+            own = [k for k, (region_kind, _, _) in enumerate(seeds) if region_kind == wanted]
+            listed = np.flatnonzero(mask)
+            chosen = arenas.nearest_region(placed_at[listed], [seeds[k][2] for k in own], width)
+            for k, index in enumerate(own):
+                region = index + 1
+                regions.append((region, np.isin(np.arange(len(kind)), listed[chosen == k])))
+                region_names[region] = seeds[index][1]
+                if wanted == "sea":
+                    sea_terrain[region] = terrains[seeds[index][1]]
+        regions.sort(key=lambda entry: entry[0])
     for region, mask in regions:
         listed = (np.flatnonzero(mask) + 1).tolist()
+        if not listed:
+            raise ValueError(f"strategic region {region_names[region]} holds no province")
         # A sea region takes its provincial terrain from the region, not definition.csv.
-        naval = "" if region == 1 else "naval_terrain = water_shallow_sea "
+        terrain_line = f"naval_terrain = {sea_terrain[region]} " if region in sea_terrain else ""
         write(
             f"map/strategicregions/{region}-arena.txt",
             f'strategic_region = {{ id = {region} name = "ARENA_REGION_{region}" '
-            f"provinces = {{ {' '.join(map(str, listed))} }} {naval}"
+            f"provinces = {{ {' '.join(map(str, listed))} }} {terrain_line}"
             f"weather = {{ {weather} }} }}",
         )
     # Weather objects belong over their own region, so each one is anchored on provinces
@@ -656,6 +844,14 @@ def generate(
     # One division per row of the border column, so a side actually holds its own front
     # instead of leaving gaps an opponent can walk through unopposed.
     divisions_per_country = land_rows
+    island_state = {}
+    if naval:
+        # A naval arena's states are drawn round the design's seeds, island by island,
+        # and each holds one division: there is no border column to stand on.
+        island_state = arenas.island_states(
+            design.states, left_land, [to_design(*anchor[i - 1]) for i in left_land], island
+        )
+        states_per_country = divisions_per_country = len(design.states)
 
     def state_cell(province):
         """Which state of its own half a land province falls in, counted from zero.
@@ -664,6 +860,8 @@ def generate(
         so the same column-and-row arithmetic places both and the state grid comes out
         rotationally symmetric for free.
         """
+        if island_state:
+            return island_state[(province - 1) % half_count + 1]
         index = (province - 1) % half_count
         column = index // rows - column0
         row = index % rows - row0
@@ -686,6 +884,43 @@ def generate(
 
     states, state_owner, capitals, capital_states, victory_points = {}, {}, [], [], {}
     for half, (tag, province_list) in enumerate([("BLU", left_land), ("RED", right_land)]):
+        for province in province_list:
+            state = state_of(province, half)
+            states.setdefault(state, []).append(province)
+            state_owner[state] = tag
+    if sorted(states) != list(range(1, 2 * states_per_country + 1)):
+        raise ValueError("a state of the design holds no province: move its seed")
+
+    def state_centre(province_list):
+        """The province nearest the middle of a state, used to anchor its hub and slots."""
+        middle = anchor[np.array(province_list) - 1].mean(axis=0)
+        return min(province_list, key=lambda i: np.linalg.norm(anchor[i - 1] - middle))
+
+    def twin(province):
+        return (province + half_count - 1) % total_provinces + 1
+
+    centres = {state: state_centre(listed) for state, listed in states.items()}
+    if design:
+        # A preset's hub stands on the state's city if it has one, or on the easiest
+        # ground near its middle: a hub in the mountains supplies little. Red's are
+        # Blue's turned round.
+        for state in range(1, states_per_country + 1):
+            listed = states[state]
+            middle = anchor[np.array(listed) - 1].mean(axis=0)
+            towns_here = [i for i in listed if terrain_types[i - 1] == "urban"]
+            centres[state] = (
+                towns_here[0]
+                if towns_here
+                else min(
+                    listed,
+                    key=lambda i: (
+                        np.linalg.norm(anchor[i - 1] - middle) / step_x
+                        + 3 * (arenas.RAIL_COST[terrain_types[i - 1]] - 1)
+                    ),
+                )
+            )
+            centres[state + states_per_country] = twin(centres[state])
+    for half, (tag, province_list) in enumerate([("BLU", left_land), ("RED", right_land)]):
         if (land_columns, land_rows) != (full_columns, full_rows):
             centre = points[np.array(province_list) - 1].mean(axis=0)
         elif half == 0:
@@ -706,6 +941,10 @@ def generate(
             ]
             by_seam = touching + [i for i in by_seam if i not in touching]
         border = by_seam[:divisions_per_country]
+        if naval:
+            # No border to hold: a division garrisons each state, at its hub or its isle's
+            # middle.
+            border = [centres[s] for s in sorted(states) if state_owner[s] == tag]
         # A design's cities are its own, capital first; the plain arena's capital is the
         # province nearest the middle of the country.
         towns = [c + 1 + half * half_count for c in city_cells]
@@ -716,10 +955,6 @@ def generate(
         else:
             capital = min(province_list, key=lambda i: np.linalg.norm(points[i - 1] - centre))
         capitals.append(capital)
-        for province in province_list:
-            state = state_of(province, half)
-            states.setdefault(state, []).append(province)
-            state_owner[state] = tag
         capital_states.append(state_of(capital, half))
         # Victory points are not the surrender threshold. A measured match gave Red a
         # single border province carrying all 35 of them; Blue took it on 13 January
@@ -756,8 +991,17 @@ def generate(
                 f"recruit_character = {tag}_general_{n}\n"
                 for n in range(1, GENERALS_PER_COUNTRY + 1)
             )
-            + f"set_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nadd_ideas = arena_march_speed\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n",
+            + f"set_politics = {{ ruling_party = neutrality elections_allowed = no }}\nset_popularities = {{ neutrality = 100 }}\nset_stability = 1\nset_war_support = 1\nadd_ideas = arena_march_speed\nset_technology = {{ infantry_weapons = 1 infantry_weapons1 = 1 basic_train = 1 }}\nadd_equipment_to_stockpile = {{ type = infantry_equipment_1 amount = 50000 producer = {tag} }}\nadd_equipment_to_stockpile = {{ type = train_equipment_1 amount = 50 producer = {tag} }}\n"
+            + (navy_history(tag, design.fleet, design.convoys) if naval else ""),
         )
+        if naval:
+            # The fleet starts in the home port, the design's first.
+            port = next(iter(naval_bases)) + half * half_count
+            for mtg in (False, True):
+                write(
+                    f"history/units/{naval_oob(tag, mtg)}.txt",
+                    fleet_units(tag, SIDE_NAMES[tag], port, design.fleet, mtg),
+                )
         regiments = " ".join(
             f"infantry = {{ x = {x} y = {y} }}" for x in range(2) for y in range(3)
         )
@@ -778,6 +1022,29 @@ def generate(
             flag = root / f"gfx/flags/{sub}{tag}.tga"
             flag.parent.mkdir(parents=True, exist_ok=True)
             Image.new("RGBA", size, (*COUNTRY_COLOUR[tag], 255)).save(flag)
+    extras, category, resources = {}, {}, {}
+    if naval:
+        # A naval arena's buildings: each state's naval bases, the air bases, and the
+        # dockyards in the home port's state (the first port), the same for both sides.
+        home_port = next(iter(naval_bases))
+        at = np.array([to_design(*anchor[i - 1]) for i in left_land])
+        for (x, y), level in design.air_bases:
+            cell = left_land[int(np.argmin(np.hypot(*(at - [x, y]).T)))]
+            for state in (state_of(cell, 0), state_of(cell, 0) + states_per_country):
+                extras.setdefault(state, []).append(f"air_base = {level}")
+        for half in (0, 1):
+            docks = state_of(home_port, 0) + half * states_per_country
+            extras.setdefault(docks, []).append(f"dockyard = {design.dockyards}")
+            # Room for the dockyards: a rural state has two building slots, a large
+            # town five.
+            category[docks] = "large_town"
+            resources[capital_states[half]] = " ".join(
+                f"{name} = {amount}" for name, amount in NAVAL_RESOURCES.items()
+            )
+        for base, level in naval_bases.items():
+            extras.setdefault(state_of(base, int(base > half_count)), []).append(
+                f"{base} = {{ naval_base = {level} }}"
+            )
     # A country's manpower is split across its states rather than repeated in each, so the
     # total stays the roughly one million that twenty divisions can actually draw on.
     for state, province_list in sorted(states.items()):
@@ -787,9 +1054,11 @@ def generate(
             for province, value in victory_points[tag].items()
             if province in set(province_list)
         )
+        built = " ".join(["infrastructure = 4", *extras.get(state, [])])
+        mined = f"resources = {{ {resources[state]} }} " if state in resources else ""
         write(
             f"history/states/{state}-arena.txt",
-            f'state = {{ id = {state} name = "ARENA_STATE_{state}" manpower = {1000000 // states_per_country} state_category = rural history = {{ owner = {tag} add_core_of = {tag} {points_block} buildings = {{ infrastructure = 4 }} }} provinces = {{ {" ".join(map(str, province_list))} }} }}',
+            f'state = {{ id = {state} name = "ARENA_STATE_{state}" manpower = {1000000 // states_per_country} state_category = {category.get(state, "rural")} {mined}history = {{ owner = {tag} add_core_of = {tag} {points_block} buildings = {{ {built} }} }} provinces = {{ {" ".join(map(str, province_list))} }} }}',
         )
     # Marching speed, not province size, is what closes the gap between an 88 px cell and
     # the roughly one day a stock province takes to cross. common/ideas is not replaced,
@@ -869,6 +1138,19 @@ def generate(
         )
         + "}\n",
     )
+
+    def naval_strategy(enemy):
+        """On a naval arena the AI is also told to invade the enemy and to fight for the
+        sea region in the middle of the map, the one between the two islands."""
+        middle = [i for i in range(1, total_provinces + 1) if kind[i - 1] == SEA]
+        middle = min(middle, key=lambda i: np.hypot(*(anchor[i - 1] - [width / 2, height / 2])))
+        channel = next(region for region, mask in regions if mask[middle - 1])
+        return (
+            f"\n\tai_strategy = {{\n\t\ttype = invade\n\t\tid = {enemy}\n\t\tvalue = 200\n\t}}\n"
+            f"\tai_strategy = {{\n\t\ttype = naval_dominance\n\t\tid = {channel}\n"
+            f"\t\tvalue = 100\n\t}}\n"
+        )
+
     # The engine draws the front on its own, but nothing here ever told either AI to
     # execute an order across it, and Red held position for three months of game time
     # against a stationary Blue. front_control is the documented override: execute_order
@@ -885,47 +1167,44 @@ def generate(
             f"\tai_strategy = {{\n\t\ttype = front_control\n\t\ttag = {enemy}\n"
             f"\t\tratio = 0.1\n\t\tpriority = 100\n\t\tordertype = front\n"
             f"\t\texecution_type = rush\n\t\texecute_order = yes\n\t\tmanual_attack = yes\n\t}}\n"
-            f"}}\n"
+            + (naval_strategy(enemy) if naval else "")
+            + "}\n"
             for tag, enemy in [("BLU", "RED"), ("RED", "BLU")]
         ),
     )
 
-    def state_centre(province_list):
-        """The province nearest the middle of a state, used to anchor its hub and slots."""
-        middle = anchor[np.array(province_list) - 1].mean(axis=0)
-        return min(province_list, key=lambda i: np.linalg.norm(anchor[i - 1] - middle))
-
-    def twin(province):
-        return (province + half_count - 1) % total_provinces + 1
-
-    centres = {state: state_centre(listed) for state, listed in states.items()}
-    if design:
-        # A preset's hub stands on the state's city if it has one, or on the easiest
-        # ground near its middle: a hub in the mountains supplies little. Red's are
-        # Blue's turned round.
-        for state in range(1, states_per_country + 1):
-            listed = states[state]
-            middle = anchor[np.array(listed) - 1].mean(axis=0)
-            towns_here = [i for i in listed if terrain_types[i - 1] == "urban"]
-            centres[state] = (
-                towns_here[0]
-                if towns_here
-                else min(
-                    listed,
-                    key=lambda i: (
-                        np.linalg.norm(anchor[i - 1] - middle) / step_x
-                        + 3 * (arenas.RAIL_COST[terrain_types[i - 1]] - 1)
-                    ),
-                )
-            )
-            centres[state + states_per_country] = twin(centres[state])
     # A hub in every state rather than one per country. Supply flow falls off per province
     # travelled and runs out after about two hops, so a single mid-front hub left the ends
     # of the border column out of supply, which caps a division's organisation below the
     # level the AI requires before it will attack with it at all.
     hubs = sorted(set(centres.values()) | set(capitals))
+    if naval:
+        # Only on the capitals' islands, where a railway can reach them. An isle is
+        # supplied through its naval base, which is a supply node of its own: supply goes
+        # by convoy from a naval base joined to the capital by rail.
+        homes = {island[c] for c in capitals}
+        hubs = [hub for hub in hubs if island[hub] in homes]
     write("map/supply_nodes.txt", "\n".join(f"1 {hub}" for hub in hubs) + "\n")
-    if design:
+    if naval:
+        # The island's trunk railway joins the capital, the cities and the hubs, as on the
+        # other presets, and every naval base of the island too. A hub supplies while a
+        # railway joins it to its holder's capital or to a naval base supplied by sea, so
+        # an invader who takes a port feeds the captured hubs its railway reaches, as the
+        # lines across the border do on the other presets. Red's is Blue's turned round.
+        blue_land = {i for i in left_land if island[i] == island[capitals[0]]}
+        links = arenas.trunk_rails(
+            blue_land,
+            neighbours,
+            {i: arenas.RAIL_COST[terrain_types[i - 1]] for i in blue_land},
+            [h for h in hubs if h in blue_land]
+            + [capitals[0]]
+            + [c + 1 for c in city_cells]
+            + [b for b in naval_bases if b in blue_land],
+            [],
+            twin,
+        )
+        rails = [f"1 2 {a} {b}" for a, b in links]
+    elif design:
         # A trunk network, as on the stock map, rather than a line on every adjacency: the
         # cheapest tree joining Blue's capital, cities and hubs, round mountains and marsh
         # where it can, two loops where the tree forces the longest detours, and lines
@@ -1114,8 +1393,7 @@ def generate(
         f' ARENA_DESC:0 "{design.summary if design else DESCRIPTION}"',
         ' ARENA_BLU_HISTORY:0 "Blue holds the western half of the arena."',
         ' ARENA_RED_HISTORY:0 "Red holds the eastern half of the arena."',
-        ' ARENA_REGION_1:0 "Arena"',
-        ' ARENA_REGION_2:0 "Ocean"',
+        *(f' ARENA_REGION_{region}:0 "{name}"' for region, name in sorted(region_names.items())),
         ' arena_focus:0 "Arena"',
         ' arena_training:0 "Army Training"',
         ' arena_training_desc:0 ""',
@@ -1245,6 +1523,28 @@ def generate(
             "river_pixels": sum(len(path) for path, _ in river_paths) // 2,
             "cities": [c + 1 for c in city_cells],
         }
+    if naval:
+        # One side's navy and islands, and the regions both share.
+        pieces = {}
+        for i in left_land:
+            pieces.setdefault(island[i], []).append(i)
+        report["naval"] = {
+            "island_sizes": sorted((len(p) for p in pieces.values()), reverse=True),
+            "naval_bases": {str(p): level for p, level in naval_bases.items() if p <= half_count},
+            "air_bases": [level for _, level in design.air_bases],
+            "dockyards": design.dockyards,
+            "fleet": dict(design.fleet),
+            "convoys": design.convoys,
+            "hubs": sum(1 for h in hubs if h <= half_count),
+            "regions": {
+                str(region): {
+                    "name": region_names[region],
+                    "kind": "sea" if region in sea_terrain else "land",
+                    "provinces": int(mask.sum()),
+                }
+                for region, mask in regions
+            },
+        }
     write("generation.json", json.dumps(report, indent=2))
     return report
 
@@ -1369,10 +1669,88 @@ def _audit_railways(root, holder):
                 f"{tag} has {len(cut)} hubs no railway joins to the rest, first {cut[0]}"
             )
     report = root / "generation.json"
-    if report.exists() and json.loads(report.read_text()).get("preset"):
+    found = json.loads(report.read_text()) if report.exists() else {}
+    # A naval arena has no border to cross: its ports do that job (_audit_naval).
+    if found.get("preset") and not found.get("naval"):
         across = sum(1 for a, b in links if holder.get(a) != holder.get(b))
         if across < 2:
             problems.append(f"{across} railways cross the border, so captured hubs stay dead")
+    return problems
+
+
+def _audit_naval(root, kind, coastal, holder, states):
+    """Ports, fleets and supply by sea on an arena whose sides share no land.
+
+    Every naval base stands on its own state's coastal land, every fleet in one of its
+    country's naval bases, and every island is supplied: an island with supply hubs has a
+    naval base its railway reaches, so whoever takes that port feeds the hubs beyond it
+    (a hub supplies while a railway joins it to its holder's capital or to a naval base
+    supplied by sea), and an island without one is fed through a naval base of its own.
+    On a preset, twin provinces hold the same bases.
+    """
+    problems = []
+    bases, level_of = {}, {}
+    for state, listed in states.items():
+        text = (root / f"history/states/{state}-arena.txt").read_text()
+        for province, level in re.findall(r"(\d+)\s*=\s*\{\s*naval_base\s*=\s*(\d+)", text):
+            province, level = int(province), int(level)
+            level_of[province] = level
+            if province not in listed or kind.get(province) != "land" or not coastal[province]:
+                problems.append(f"naval base {province} is not coastal land of state {state}")
+            bases[province] = holder.get(province)
+    for path in sorted((root / "history/units").glob("*_naval_*.txt")):
+        tag = path.name.split("_", 1)[0]
+        text = path.read_text()
+        docked = re.findall(r"naval_base\s*=\s*(\d+)", text)
+        docked += re.findall(r"location\s*=\s*(\d+)", text)
+        for province in map(int, docked):
+            if bases.get(province) != tag:
+                problems.append(f"{path.name} puts ships at {province}, not a {tag} naval base")
+    ids, _ = _province_ids(root)
+    neighbours = adjacency(ids, len(kind) - 1)
+    rails = {}
+    for line in (root / "map/railways.txt").read_text().splitlines():
+        cells = [int(c) for c in line.split()][2:]
+        for a, b in zip(cells, cells[1:]):
+            rails.setdefault(a, set()).add(b)
+            rails.setdefault(b, set()).add(a)
+    hubs = {int(c) for c in (root / "map/supply_nodes.txt").read_text().split()[1::2]}
+    for tag in sorted(set(holder.values())):
+        own = [p for p, t in holder.items() if t == tag]
+        pieces = {}
+        for province, piece in arenas.islands_of(own, neighbours).items():
+            pieces.setdefault(piece, set()).add(province)
+        for piece in pieces.values():
+            ports = [p for p in piece if p in bases]
+            fed = piece & hubs
+            if not ports and not fed:
+                problems.append(
+                    f"{tag}'s island at {min(piece)} has no naval base or supply hub, so "
+                    "nothing supplies it"
+                )
+            if fed and not ports:
+                problems.append(
+                    f"{tag}'s island at {min(piece)} has hubs but no naval base, so an "
+                    "invader who takes it can never supply them"
+                )
+            for port in ports:
+                if not fed:
+                    continue
+                seen, todo = {port}, [port]
+                while todo:
+                    for step in rails.get(todo.pop(), ()):
+                        if step not in seen and holder.get(step) == tag:
+                            seen.add(step)
+                            todo.append(step)
+                if not seen & fed:
+                    problems.append(f"naval base {port} is joined by rail to none of its hubs")
+    report = root / "generation.json"
+    if report.exists() and json.loads(report.read_text()).get("preset"):
+        count = len(kind) - 1
+        for province, level in level_of.items():
+            twin = (province + count // 2 - 1) % count + 1
+            if level_of.get(twin) != level:
+                problems.append(f"naval base {province} has no twin of level {level} at {twin}")
     return problems
 
 
@@ -1515,6 +1893,12 @@ def audit(root):
     for region, listed in sorted(regions.items()):
         if all(kind.get(p) == "sea" for p in listed) and not naval[region]:
             problems.append(f"sea strategic region {region} has no naval_terrain")
+        # A region is sea or land, as every stock one is: naval missions and air
+        # superiority are both fought over a region.
+        if len({kind.get(p) == "sea" for p in listed}) > 1:
+            problems.append(f"strategic region {region} mixes sea and land provinces")
+    if len(placed) != len(set(placed)):
+        problems.append("a province is in more than one strategic region")
     sizes = {}
     for row in (root / "map/weatherpositions.txt").read_text().splitlines():
         if row.strip():
@@ -1536,6 +1920,9 @@ def audit(root):
             )
             holder.update(dict.fromkeys(_block(text, "provinces"), owner.group(1)))
     problems += _audit_railways(root, holder)
+    report = root / "generation.json"
+    if report.exists() and json.loads(report.read_text()).get("naval"):
+        problems += _audit_naval(root, kind, coastal, holder, states)
     # Per country, not per state: most stock states hold no victory point at all, but a
     # country with none can never be made to capitulate, so the match has no way to end.
     for tag, owned in sorted(owner_points.items()):
@@ -1543,6 +1930,12 @@ def audit(root):
             problems.append(f"{tag} owns no victory point, so it can never capitulate")
     owned = [p for listed in states.values() for p in listed]
     check("history/states", owned)
+    # A state in two strategic regions crashed the game at load (a division by zero,
+    # 2026-09-26, the first archipelago): every stock state lies in one region.
+    region_of = {p: region for region, listed in regions.items() for p in listed}
+    for state, listed in sorted(states.items()):
+        if len({region_of.get(p) for p in listed}) > 1:
+            problems.append(f"state {state} lies in more than one strategic region")
     stateless = sorted(p for p in valid if kind[p] == "land" and p not in owned)
     if stateless:
         problems.append(f"{len(stateless)} land provinces have no state, first {stateless[0]}")
@@ -1755,6 +2148,27 @@ def preview(root, output, width=1800):
         return found
 
     image[edges(crop)] *= 0.82
+    # Where the sea is split into several strategic regions, their borders.
+    region_of, region_names = np.zeros(count + 1, np.int32), {}
+    for path in sorted((root / "map/strategicregions").glob("*.txt")):
+        text = path.read_text()
+        region = int(re.search(r"id\s*=\s*(\d+)", text).group(1))
+        region_of[_block(text, "provinces")] = region
+        region_names[region] = f"ARENA_REGION_{region}"
+    localised = root / "localisation/english/arena_l_english.yml"
+    if localised.exists():
+        for key, name in re.findall(
+            r' (ARENA_REGION_\d+):0 "([^"]*)"', localised.read_text("utf-8-sig")
+        ):
+            region_names[int(key.rsplit("_", 1)[1])] = name
+    sea = np.array([t == "ocean" for t in terrain])
+    sea_regions = sorted(set(region_of[sea].tolist()) - {0})
+    if len(sea_regions) > 1:
+        seas = np.where(sea[crop], region_of[crop], 0)
+        split = np.zeros(seas.shape, bool)
+        split[:-1] |= (seas[:-1] != seas[1:]) & (seas[:-1] > 0) & (seas[1:] > 0)
+        split[:, :-1] |= (seas[:, :-1] != seas[:, 1:]) & (seas[:, :-1] > 0) & (seas[:, 1:] > 0)
+        image[ndimage.binary_dilation(split, iterations=2)] = (150, 180, 225)
     state_edge = ndimage.binary_dilation(edges(states[crop]) & (states[crop] > 0))
     image[state_edge] = image[state_edge] * 0.35
     country = ndimage.binary_dilation(edges(own) & (own > 0), iterations=2)
@@ -1817,6 +2231,65 @@ def preview(root, output, width=1800):
                 font=font,
                 stroke_width=2,
                 stroke_fill=(0, 0, 0),
+            )
+    # A naval arena's ports (anchor blue, with the naval base level), air bases (grey
+    # triangles, with the level), the fleets in port, and the sea regions' names.
+    air_bases = {}
+    for path in sorted((root / "history/states").glob("*.txt")):
+        text = path.read_text()
+        state = int(re.search(r"id\s*=\s*(\d+)", text).group(1))
+        found = re.search(r"air_base\s*=\s*(\d+)", text)
+        if found:
+            air_bases[state] = found.group(1)
+        for province, level in re.findall(r"(\d+)\s*=\s*\{\s*naval_base\s*=\s*(\d+)", text):
+            x, y = at(int(province))
+            x, y = x + 12, y + 10
+            draw.ellipse(
+                (x - 11, y - 11, x + 11, y + 11),
+                fill=(25, 55, 150),
+                outline=(255, 255, 255),
+                width=2,
+            )
+            draw.text((x, y), level, fill=(255, 255, 255), font=font, anchor="mm")
+    for line in (root / "map/buildings.txt").read_text().splitlines():
+        cells = line.split(";")
+        if len(cells) > 4 and cells[1] == "air_base" and int(cells[0]) in air_bases:
+            x = (float(cells[2]) - x0) * scale - 16
+            y = (ids.shape[0] - float(cells[4]) - y0) * scale + 14
+            draw.polygon(
+                [(x, y - 12), (x - 11, y + 8), (x + 11, y + 8)],
+                fill=(200, 200, 205),
+                outline=(30, 30, 30),
+            )
+            draw.text(
+                (x, y + 1), air_bases[int(cells[0])], fill=(20, 20, 20), font=font, anchor="mm"
+            )
+    for path in sorted((root / "history/units").glob("*_naval_legacy.txt")):
+        for province in re.findall(r"naval_base\s*=\s*(\d+)", path.read_text()):
+            x, y = at(int(province))
+            x, y = x + 30, y - 18
+            hull = [(x - 18, y - 4), (x + 18, y - 4), (x + 11, y + 6), (x - 11, y + 6)]
+            draw.polygon(hull, fill=(35, 35, 45), outline=(240, 240, 240))
+            draw.rectangle(
+                (x - 3, y - 13, x + 5, y - 4), fill=(35, 35, 45), outline=(240, 240, 240)
+            )
+    for region in sea_regions if len(sea_regions) > 1 else ():
+        spots = np.array([at(p) for p in np.flatnonzero(region_of == region) if p in anchors])
+        inside = spots[
+            (spots[:, 0] > 40)
+            & (spots[:, 0] < picture.width - 40)
+            & (spots[:, 1] > 50)
+            & (spots[:, 1] < picture.height - 20)
+        ]
+        if len(inside) >= 3:
+            draw.text(
+                tuple(inside.mean(axis=0)),
+                region_names[region],
+                fill=(215, 228, 250),
+                font=font,
+                anchor="mm",
+                stroke_width=2,
+                stroke_fill=(30, 45, 80),
             )
     report = root / "generation.json"
     title = root.name

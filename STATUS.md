@@ -201,9 +201,11 @@ every rule below came from a crash dump or the stock files.
 
 ## Arena maps (2026-09-24)
 
-`generate-map --preset <name>` writes one of seven named arenas (`arenas.PRESETS`), and
-`preview-map` draws one from its files. Every one keeps the playable grid (12×8
-provinces a side, states 1–8 Blue and 9–16 Red, named "West n" and "East n"), the 35
+`generate-map --preset <name>` writes one of eight named arenas (`arenas.PRESETS`; the
+eighth, `archipelago`, is the naval one, described in its own section below), and
+`preview-map` draws one from its files. Every land one keeps the playable grid (12×8
+provinces a side), and all eight keep states 1–8 Blue and 9–16 Red, named "West n" and
+"East n", the 35
 victory points a side and every rule. Each is an exact half-turn mirror, and `audit()`
 checks that, province by province and pixel by pixel.
 
@@ -217,6 +219,7 @@ checks that, province by province and pixel by pixel.
 | `bay` | The sea cuts in from north and south at the border, leaving a four-province isthmus | 7 | -7% |
 | `salient` | The border itself bends: Blue holds a bulge into Red in the north, Red one into Blue in the south | 23 | -1% |
 | `ford` | A large river runs along the whole border, except at one ford in the middle | 15 | -56% |
+| `archipelago` | Two islands and eight isles, no land between the sides: every attack is a naval invasion (see "A naval arena") | 0 | none |
 
 "Front" counts the pairs of Blue and Red provinces that touch. "Attack across it" is the
 mean penalty for attacking into the defender's province there: the stock terrain
@@ -282,6 +285,120 @@ hands before the surrender; most plain-arena games were a single sweep of 8.
   models among farmland, rivers and single railway lines.
 - Also fixed on the way: `marsh-v3` could not pick Red (the capital was off the picker's
   screen), and `marsh-v4` could not draw a front on dark ground.
+
+## A naval arena: `archipelago` (2026-09-26)
+
+`generate-map --preset archipelago` brings in the navy. Each side holds a main island of
+56 provinces and four isles of 3-5, 73 provinces in all, and no Blue province touches a
+Red one: the only way across is by sea. It is an exact half-turn mirror like the other
+presets, and keeps what the tools rely on: 8 states a side (four on the island, one on
+each isle, named "West n" and "East n"), 35 victory points (the capital 20, the home
+port, a western town and the channel isle 5 each), 8 divisions (one garrisoning each
+state) and the capital mid-island.
+
+- **The islands:** the two main islands face each other across a channel about five
+  provinces wide. In it each side has a channel isle, its stepping stone toward the
+  other, with a city, a port and an airfield; the other isles lie off the channel's
+  mouths, behind the island and off its far coast. Islands are drawn as shapes anywhere
+  inside the ocean rings (`Preset.islands`), not cut out of the 12x8 block.
+- **Rivers:** a large river runs from the north of each main island past the capital to
+  its south coast, with a tributary from the east, and a small river drains the hills
+  to the north-west coast. They follow the other presets' rules: on province borders,
+  sources at free ends, a join pixel where the tributary meets.
+- **Ports and bases:** seven naval bases a side, mirrored level for level: the home port
+  on the channel (level 6, where the fleet starts, in a large-town state with 4
+  dockyards), a western (3) and a northern (2) port, and one on every isle (3 on the
+  channel isle, 2, 2 and 1). Air bases: 3 in the capital's state, 2 on the channel isle,
+  1 on the northern isle. The capital's state holds 8 oil and 8 steel.
+- **Sea regions:** 3 land and 10 sea strategic regions, each sea province joining the
+  nearest region's point: The Channel between the islands, the North and South Sounds
+  at its mouths, each side's Approaches, four deep-ocean seas at the corners and the Far
+  Ocean round the map's east-west wrap, the back way from one island to the other.
+- **The navy, the same for both:** a light cruiser, four destroyers and two submarines
+  in the home port, 100 convoys, a full fuel tank and the transport technology, written
+  for both rule sets as stock countries are: Man the Guns ship variants (copied from
+  stock 1936 Dutch and Danish classes) when that DLC is on, legacy ships when not. This
+  PC has no Man the Guns; the second PC's DLCs are unchecked.
+- **The AI** gets, besides the land offensive every arena has, a strategy to invade the
+  enemy and one to fight for The Channel.
+
+**How the war is won: naval invasion, with no land bridge.** HOI4 does not need one.
+Surrender is by occupation, as on every arena, and a naval invasion needs no more than a
+friendly naval base, convoys and naval superiority on the way. The engine's base cap is
+4 divisions an invasion, 1 invasion at a time, 60 days to prepare; the transport
+technology both sides start with makes that 6 divisions, and 3 invasions and 30 days
+(legacy) or 2 and 50 days (Man the Guns). Once a port is taken, more divisions can
+cross by naval transfer, which has no cap. A strait or isthmus between the islands would
+have let the land-only players win here, but also made the navy optional, which is what
+the arena exists to test.
+
+**Supply across the sea** (from the stock defines, `NSupply`): a supply hub supplies
+while a railway joins it to its holder's capital or to a naval base ("a naval node"),
+and supply moves from one naval base to another by convoy route. So each island's trunk
+railway joins its capital, cities and hubs and every naval base on it; the isles have no
+hubs and are fed through their own naval base. An invader who takes a port on the enemy
+island feeds the captured hubs its railway reaches, which is the job the lines across
+the border do on the other presets. The audit checks this on an arena with no land
+border (`_audit_naval`): every naval base stands on coastal land of its own state, every
+fleet in its country's naval base, every island has a naval base, every naval base is on
+the railway of its island's hubs, and twin provinces hold the same bases. It has not been
+seen in a game yet that supply actually reaches a captured island.
+
+**Tests** (`test_mapgen.py`): the mirror (terrain, states, victory points, garrisons,
+naval bases and their levels, dockyards, air bases, resources, fleets, sea regions); the
+same seed writing the same files byte for byte and another seed another map; the sea
+one body of water, each sea region one piece (the Far Ocean joined across the wrap),
+every land province on an island with a naval base; the audit catching an isle with no
+port and a port off the railway; every island reading as land on the political map
+(inland screen brightness at least 250, median at least 300); the preview's ports and
+region borders. The other presets write the same files as before, byte for byte.
+
+**What the current players do here.** Neither can use a navy yet, so both will probably
+time out or lose to the AI:
+- The scripted player builds an army and draws a front line on the enemy border. With no
+  land border there is no front to draw (the game refuses the Front Line tool), so it
+  cannot plan anything; its vision also assumes one connected arena
+  (`vision.country_pixels` keeps the largest patch, `recentre` centres on it, and the
+  state layout's land box spans all the islands while the screen's covers one).
+- The learned player learned from the scripted player's land games and has never seen a
+  naval screen.
+- The game's AI can invade (it is told to, and has the technology), so an AI side may
+  win against a passive scripted one. AI-against-AI games may well stall.
+
+**What the player code needs for naval play** (not built):
+1. Vision: the arena as several pieces (every island's land, the sea between), a camera
+   that frames both main islands, and front detection that does not need a land border.
+2. Naval invasion orders: the battle plan bar's naval invasion tool, from a friendly port
+   to an enemy coast, with the army's divisions (at most 6), then waiting out the
+   preparation and executing it; and naval transfers of more divisions to a taken port.
+3. Fleet missions: the naval screen, the fleets and task forces, their missions (patrol,
+   strike force, convoy raiding and escort, invasion support) and the regions they
+   cover, and reading naval superiority in each region.
+4. The port and naval UI: naval bases and ports on the map, the supply map's sea routes
+   and convoy counts, and the production screen's dockyard lines (ships and convoys).
+5. The true state: the daily `ARENA day` log reports divisions per state but nothing at
+   sea; ships, convoys and superiority per region would have to be added for a planner
+   or a win predictor.
+6. Data: scripted naval games first, so the learned player has demonstrations of all of
+   the above.
+
+**Several land strategic regions crash the archipelago at load** (division by zero, just
+after the state categories load, with nothing in the error log). The first archipelago drew
+land regions province by province and split the home-port state between two; drawing them
+island by island, with every state in one region, still crashed on the second PC. One land
+region with the designed sea regions loads, as bisected on the training PC, so all land is
+now one region, as on every other arena. The audit still checks that every state lies in
+one region (every stock state does).
+
+**The arena test queue is not served any more.** `artifacts/arenas/queue` was played by
+`record-ai --arena-queue` run here with `--peer`. Since the second PC runs only through
+fleet (#131, #134), nothing runs that: the station (`scripts/station.py`) runs drills on
+the plan's `arenas` (or its own `ARENAS` list) with `hoi4-arena drills --arenas`, and a
+recording run only when the plan has a `record` entry, with no `--arena-queue`. The
+arena folders it plays are shipped by `collect_station.py deploy`
+(`station_arenas()`: `station.ARENAS`, the plan's `arenas` and the recording's `--mod`s),
+and the worker writes each one's `.mod` descriptor into the game's mod folder at launch.
+Drills do not count map errors; only record-ai reads them from the worker's report.
 
 ## The model and its data (2026-09-23)
 
