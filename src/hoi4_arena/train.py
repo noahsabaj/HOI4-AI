@@ -381,6 +381,8 @@ def _train_bc(
     rung=None,
     fast_perception=False,
     probe=None,
+    dagger=0.0,
+    dagger_data=(),
 ):
     """Behaviour cloning on recordings, read straight from their video.
 
@@ -432,7 +434,15 @@ def _train_bc(
     each step reaches "loaded", "device", "forward", "backward" and "optimizer", and its
     `step(step, batch, row, modules)` after each step; when that returns true, training
     stops there, with no validation and no checkpoint.
+
+    `dagger_data` are folders of practice games read beside `data`, and `dagger` > 0
+    trains every practice game that has the scripted player's labels (dagger.relabel) on
+    them, each labelled decision weighing `dagger` (dataset.session_labels): DAgger's
+    aggregate, the learner's own states with the expert's actions, mixed into the base
+    data at that weight.
     """
+    if dagger > 0 and "policy" not in sources:
+        raise ValueError("--dagger trains practice games: add policy to --sources")
     if carry:
         burn_in = 0
     if not 0 < idm_weight <= 1:
@@ -470,6 +480,8 @@ def _train_bc(
         "gpu_views": gpu_views,
         "balance": balance,
         "rung": rung,
+        "dagger": dagger,
+        "more": tuple(dagger_data),
     }
     if tower_cache is not None and train_last != 0:
         raise ValueError("a tower cache stands for a frozen tower: train with --train-last 0")
@@ -589,6 +601,9 @@ def _train_bc(
     if fast_perception:
         # Only when on, so that runs saved before the option existed still resume.
         config["fast_perception"] = True
+    if dagger or dagger_data:
+        # Named only when used, so a run from before resumes with the same settings.
+        config.update(dagger=dagger, dagger_data=[str(Path(p).resolve()) for p in dagger_data])
     output.mkdir(parents=True, exist_ok=True)
     # The loader's workers are not the model's, but a resume needs the same (Progress).
     progress = Progress(output, {**config, "workers": workers}, every=save_every, resume=resume)

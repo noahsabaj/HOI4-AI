@@ -86,6 +86,16 @@ def rung_save(start, rung):
     return WORDS[rung] + stem
 
 
+def default_start(arena, country):
+    """The start save's name practice.drill_saves and the load dialog's templates expect:
+    arenav4blu and arenav4red on the main arena, else ai_games.save_name's."""
+    from .ai_games import save_name
+
+    if arena == MAIN_ARENA:
+        return f"arenav4{country.lower()}"
+    return save_name(arena, country)
+
+
 def start_saves(station):
     """{(arena, country): start save} on `station` ("here" or "peer"): its registry, with the
     main arena's hand-made saves (arenav4blu, arenav4red) where it names none."""
@@ -93,7 +103,7 @@ def start_saves(station):
 
     saves = known_saves(start_saves_path(station))
     for country in ("BLU", "RED"):
-        saves.setdefault((MAIN_ARENA, country), f"arenav4{country.lower()}")
+        saves.setdefault((MAIN_ARENA, country), default_start(MAIN_ARENA, country))
     return saves
 
 
@@ -202,12 +212,14 @@ def make_ladder(
     rungs=("S1", "S2", "S3"),
     rules="artifacts/calibration-1080p/rules.json",
     seed=None,
+    fresh_starts=False,
 ):
     """The rung saves of every arena and country on a PC (the second PC with `peer`, else
     this one), made from each start save by the scripted player's own setup steps while the
     game stays paused, a save after each. An arena and side with no start save gets one
-    first, through the menus (start_game's save_as), registered in saves-<station>.json.
-    Each rung's screen is kept in `output`, and ladder.json there lists what was made."""
+    first, through the menus (start_game's save_as), registered in saves-<station>.json;
+    with `fresh_starts`, every arena and side does (a start save copied from another PC
+    need not load: one showed a red "!" in the load dialog and stayed unloaded). Each rung's screen is kept in `output`, and ladder.json there lists what was made."""
     from PIL import Image
 
     from .ai_games import (
@@ -216,7 +228,6 @@ def make_ladder(
         focus,
         known_saves,
         remember_save,
-        save_name,
         screen,
         start_game,
     )
@@ -242,11 +253,12 @@ def make_ladder(
                 entry = {"arena": arena, "country": country, "rungs": {}}
                 failure_shot = out_root / f"{arena}-{country}-start-failed.png"
                 try:
-                    base = start_saves(name).get((arena, country)) or save_name(arena, country)
-                    fresh = base not in saves_on(station)
+                    base = start_saves(name).get((arena, country)) or default_start(arena, country)
+                    if fresh_starts:
+                        base = default_start(arena, country)
+                    fresh = fresh_starts or base not in saves_on(station)
                     if fresh:
                         # No start save yet: through the menus, saving the start first.
-                        base = save_name(arena, country)
                         station.quit()
                         station.launch(arena)
                         time.sleep(25)
@@ -265,7 +277,10 @@ def make_ladder(
                             desk, screen_rules, failure_shot, country, 5, observe=False,
                             saved=not fresh, save_as=base if fresh else None,
                         )  # fmt: skip
-                        if fresh and (arena, country) not in known_saves(start_saves_path(name)):
+                        if (
+                            fresh
+                            and known_saves(start_saves_path(name)).get((arena, country)) != base
+                        ):
                             remember_save(start_saves_path(name), arena, country, base)
                         plan = {**best_plan(rng), "attack": "broad"}
                         planner = Planner(country, plan, buttons, screen_rules, 5, lambda: 0,

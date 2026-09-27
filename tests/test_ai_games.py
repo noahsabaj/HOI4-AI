@@ -467,6 +467,35 @@ def test_the_menu_opens_through_a_win_s_conference_and_its_popups(tmp_path, monk
     assert (tmp_path / "g-menu-failed.png").exists()
 
 
+@pytest.mark.parametrize("loads", [True, False])
+def test_a_save_that_does_not_load_is_not_taken_for_the_new_game(monkeypatch, tmp_path, loads):
+    from hoi4_arena import ai_games
+
+    dialog = {"open": False}
+
+    def click(desk, x, y):
+        if (x, y) == ai_games.MENU_LOAD_GAME:
+            dialog["open"] = True
+        elif (x, y) == ai_games.LOAD_BUTTON and loads:
+            dialog["open"] = False
+
+    shows = {"load-dialog-load": lambda: dialog["open"], "save-arenav4red": lambda: True}
+    monkeypatch.setattr(ai_games, "open_menu", lambda desk, templates: True)
+    monkeypatch.setattr(ai_games, "screen", lambda desk: np.zeros((1080, 1920, 3), np.uint8))
+    monkeypatch.setattr(ai_games, "shown", lambda rgb, name, threshold=0.9: (
+        (0.4, 0.4) if shows.get(name, lambda: False)() else None))  # fmt: skip
+    monkeypatch.setattr(ai_games, "click", click)
+    monkeypatch.setattr(ai_games, "act", lambda desk, events, pause=0.15: None)
+    monkeypatch.setattr(ai_games, "wait_paused", lambda *a: None)
+    monkeypatch.setattr(ai_games.time, "sleep", lambda s: None)
+    if loads:
+        ai_games.load_in_game(None, "arenav4red", [], None, tmp_path / "g-start-failed.png")
+    else:
+        # The paused game behind the dialog must not pass for the save loaded.
+        with pytest.raises(RuntimeError, match="stayed open"):
+            ai_games.load_in_game(None, "arenav4red", [], None, tmp_path / "g-start-failed.png")
+
+
 class ToyMap:
     """A 1080p view of a toy arena for the camera, 2400 x 800 world units: Blue's land to
     the left of FRONT_X, Red's to its right, sea around. Wheel notches zoom about the

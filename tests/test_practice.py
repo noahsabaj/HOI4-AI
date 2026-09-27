@@ -253,3 +253,64 @@ def test_a_takeover_that_left_its_step_undone_teaches_nothing(tmp_path, front, t
     path.write_text(json.dumps(manifest))
     labels = session_labels(tmp_path / "game", sources=("policy",), lead_in=0)
     assert (labels["weight"] > 0).any() == teaches
+
+
+def test_practice_plays_each_arena_from_its_own_save_in_blocks(monkeypatch, tmp_path):
+    import contextlib
+
+    loads = []
+
+    class Station:
+        def __init__(self, name, peer=None):
+            self.name = name
+
+        @contextlib.contextmanager
+        def connect(self):
+            yield object()
+
+        def quit(self):
+            pass
+
+    class Actor:
+        digest, held_previous = "d", False
+
+        def __init__(self, *a, **k):
+            pass
+
+    def load(station, arena, save, running, *rest):
+        loads.append((arena, save, running))
+        return False
+
+    def played(desk, actor, root, **k):
+        return "timeout", None, {"frames": 1, "arena": k["arena_name"]}
+
+    monkeypatch.setattr("hoi4_arena.ai_games.Station", Station)
+    monkeypatch.setattr("hoi4_arena.ai_games.focus", lambda desk: True)
+    monkeypatch.setattr("hoi4_arena.ai_games.start_game", lambda *a, **k: None)
+    monkeypatch.setattr("hoi4_arena.runner.Actor", Actor)
+    monkeypatch.setattr("hoi4_arena.play.play_policy_game", played)
+    monkeypatch.setattr("hoi4_arena.vision.ScreenRules", lambda path: None)
+    monkeypatch.setattr("hoi4_arena.practice.load_or_launch", load)
+    monkeypatch.setattr("hoi4_arena.practice.Coach", lambda *a, **k: _Coach())
+    monkeypatch.setattr(
+        "PIL.Image.open", lambda path: __import__("PIL.Image").Image.new("RGB", (2, 2))
+    )
+    monkeypatch.setattr(
+        "hoi4_arena.practice.drill_saves",
+        lambda: {(a, c): f"{a}-{c}" for a in ("main", "river") for c in ("BLU", "RED")},
+    )
+    out = practice.practice(
+        "ckpt", tmp_path, episodes=4, minutes=60, arenas=("main", "river"), block=2
+    )
+    assert [e["arena"] for e in out["episodes"]] == ["main", "main", "river", "river"]
+    assert loads == [("main", "main-BLU", False), ("main", "main-RED", True),
+                     ("river", "river-BLU", False), ("river", "river-RED", True)]  # fmt: skip
+    with pytest.raises(ValueError, match="no start save"):
+        practice.practice("ckpt", tmp_path, arenas=("bay",))
+
+
+class _Coach:
+    coached, failures = [], []
+
+    def score(self):
+        return {"steps": {}, "own": 0, "coached": 0}
