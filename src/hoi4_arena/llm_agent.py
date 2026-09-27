@@ -202,6 +202,15 @@ TOOLS = [
 ]
 
 
+REMEMBER = next(t for t in TOOLS if t["function"]["name"] == "remember")
+CONSOLIDATE = (
+    "The turn is ending, and your notebook is all you will keep of it. Call remember now "
+    "with your whole notebook: what you learned this turn (where things are, what each "
+    "control did, what failed), what you have done so far in the game, and your plan. "
+    "Keep what is still true from before."
+)
+
+
 def encode(picture):
     buffer = io.BytesIO()
     picture.save(buffer, format="JPEG", quality=85)
@@ -281,7 +290,7 @@ class Agent:
             "thinking": {"type": "enabled" if brain.thinking else "disabled"},
         }
         if tools:
-            body["tools"] = TOOLS
+            body["tools"] = TOOLS if tools is True else tools
         began = time.monotonic()
         reply = brain._post(body)
         usage = reply.get("usage") or {}
@@ -436,6 +445,7 @@ def play_turn(desk, agent, root, book, system, country, turn, ran):
         f"{ran:.0f} s.\n\nYour notebook:\n{agent.notebook or '(empty)'}\n\nThe screen now:"
     )
     picture = view(rgb)
+    notebook = agent.notebook
     messages = [system, screenshot_message(status, picture)]
     picture.save(root / "steps" / f"{turn:04d}-00.jpg", quality=75)
     for step in range(1, MAX_STEPS + 1):
@@ -475,14 +485,37 @@ def play_turn(desk, agent, root, book, system, country, turn, ran):
         book.write(json.dumps(record) + "\n")
         book.flush()
         if end is not None:
+            consolidate(agent, messages, notebook, book, turn)
             return end
         if newest is not None:
             picture, label = newest
             picture.save(root / "steps" / f"{turn:04d}-{step:02d}.jpg", quality=75)
             messages.append(screenshot_message(label, picture))
             prune(messages)
-    note = "(the turn ran out of actions)"
-    return FORCED_RUN, note
+    consolidate(agent, messages, notebook, book, turn)
+    return FORCED_RUN, "(the turn ran out of actions)"
+
+
+def consolidate(agent, messages, notebook, book, turn):
+    """At a turn's end, if the model left its notebook as it was, ask it once to write
+    down what the turn taught it: without this it explored for a whole turn, kept
+    nothing, and began the next turn exploring again (2026-09-27)."""
+    if agent.notebook != notebook:
+        return
+    messages.append({"role": "user", "content": CONSOLIDATE})
+    message, usage, usd, seconds = agent.call(messages, tools=[REMEMBER])
+    text = None
+    for call in message.get("tool_calls") or []:
+        if call["function"]["name"] == "remember":
+            try:
+                text = json.loads(call["function"].get("arguments") or "{}").get("text")
+            except json.JSONDecodeError:
+                text = None
+    text = text or (message.get("content") or "").strip()
+    if text:
+        agent.notebook = str(text)[:NOTEBOOK]
+    book.write(json.dumps({"turn": turn, "step": "notebook", "text": agent.notebook,
+                           "usd": round(usd, 5), "usage": usage}) + "\n")  # fmt: skip
 
 
 def do(desk, agent, name, args, rgb):
