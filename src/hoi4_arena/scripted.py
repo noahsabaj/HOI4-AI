@@ -70,7 +70,7 @@ from pathlib import Path
 import numpy as np
 
 from .ai_games import LOOK, MAP_BOTTOM, MAP_TOP, act, recentre, run_at, screen, tap
-from .intents import doing, tagged
+from .intents import Intent, doing, tagged
 from .vision import country_pixels
 
 # The least normalised correlation (TM_CCOEFF_NORMED, 1 an exact copy) at which a button
@@ -362,6 +362,15 @@ class Planner:
         self.debug_dir, self.kept = None, 0
         # Whether water cut the border in two at the start (draw_front).
         self.split_border = False
+        # A strategist deciding at decision points (strategist.Strategist), the game's
+        # numbers for it (a callable returning strategist.ArenaState's snapshot), and the
+        # bookkeeping of its decisions: how many, the game day of the next and of the last,
+        # the states seen changing hands and an event not yet decided on, and the time and
+        # frames spent waiting for them.
+        self.strategist = self.state = None
+        self.decisions, self.decide_day, self.decided_day = 0, 0.0, None
+        self.controls_seen, self.changed_day, self.pending_event = 0, None, None
+        self.waited, self.waiting_since, self.waits = 0.0, None, []
         # The setup's steps the game started with done (a rung save): setup skips them.
         self.done = frozenset()
 
@@ -664,12 +673,13 @@ class Planner:
         act(desk, [{**press, "down": True}, *moves, {**press, "down": False}], pause=0.08)
         time.sleep(0.8)
 
-    def broad_line(self, front, box, depth=BROAD_DEPTH):
+    def broad_line(self, front, box, depth=BROAD_DEPTH, rows=None):
         """Points across the whole front, `depth` of the way on to the enemy's far edge.
 
         One for each band of rows from the land's top to its bottom: the front's pixel
         furthest into the enemy within the band, moved on into enemy land. So the line
-        follows the front's bends, and the whole front moves forward to it.
+        follows the front's bends, and the whole front moves forward to it. With `rows`,
+        (from, to) as fractions of the land's height, only that part of the front pushes.
         """
         top, left, bottom, right = box
         sign = 1 if self.enemy == "RED" else -1
@@ -677,8 +687,14 @@ class Planner:
         xs = np.array([p[0] for p in front])
         ys = np.array([p[1] for p in front])
         height = bottom - top
+        first, last, count = top + height / 20, bottom - height / 20, 9
+        if rows:
+            low, high = sorted(min(1.0, max(0.0, float(r))) for r in rows)
+            first = max(first, top + low * height)
+            last = max(first + height / 10, min(last, top + high * height))
+            count = 5
         points = []
-        for y in np.linspace(top + height / 20, bottom - height / 20, 9):
+        for y in np.linspace(first, last, count):
             band = np.abs(ys - y) < height / 16
             if band.any():
                 x = xs[band].max() if sign > 0 else xs[band].min()
@@ -702,7 +718,9 @@ class Planner:
             raise RuntimeError("no front or enemy land on screen")
         aim = self.state_point(box, target_state) if target_state else None
         if attack == "broad" and aim is None:
-            line = self.broad_line(front, box, self.plan.get("depth", BROAD_DEPTH))
+            line = self.broad_line(
+                front, box, self.plan.get("depth", BROAD_DEPTH), self.plan.get("rows")
+            )
             if len(line) < 2:
                 raise RuntimeError("no front to draw a broad offensive along")
             self.drag(desk, [self.screen_point(rgb, *p) for p in line], steps=3)
@@ -898,7 +916,8 @@ class Planner:
     def setup(self, desk):
         """While paused: the army, its general, its front, its offensive; then run. The
         steps in `done` (a game from a rung save, curriculum.DONE) are skipped; the map is
-        still looked at once, for the land held at the start (incursion)."""
+        still looked at once, for the land held at the start (incursion). With a
+        strategist, it decides after the front, in place of the offensive."""
         done = self.done
         if "army" not in done:
             self.form_army(desk)
@@ -908,7 +927,9 @@ class Planner:
             self.draw_front(desk)
         else:
             self.overview(desk)
-        if self.plan["attack"] in OFFENSIVES and "offensive" not in done:
+        if getattr(self, "strategist", None) is not None:
+            self.consult(desk, "start")
+        elif self.plan["attack"] in OFFENSIVES and "offensive" not in done:
             self.draw_offensive(desk)
         with doing(desk, "run"):
             run_at(desk, self.rules, self.speed)
@@ -919,7 +940,7 @@ class Planner:
     def start(self, now):
         """The later orders' times, from the moment the game runs. The redraws start with
         the attack (step): while the front holds, the plan stands."""
-        if self.plan["attack"] != "none":
+        if self.plan["attack"] != "none" and self.plan.get("wait") is not None:
             self.activate_at = now + self.plan["wait"]
         if self.plan.get("conscription") in LAWS[1:]:
             # About 150 political power after half a minute at speed 5.
@@ -935,7 +956,7 @@ class Planner:
             self.activate_at, self.redraw_at, self.law_at, self.recruit_at, self.reinforce_at,
             self.check_at,
         )  # fmt: skip
-        return min(waits) <= now
+        return min(waits) <= now or self.decision_due() is not None
 
     def step(self, desk):
         """The next due order, once the game runs. True if the camera was moved.
@@ -947,6 +968,13 @@ class Planner:
         the front line under the divisions, and the AI broke through before the attack.
         """
         now = time.monotonic()
+        # A strategist's decision waits for a plan due to execute: in the first strategist
+        # games (2026-09-26) decisions every 20 game days (8 s) and the events between them
+        # kept coming first, and a counter-attack ordered at one never executed.
+        reason = self.decision_due() if now < self.activate_at else None
+        if reason is not None:
+            self.consult(desk, reason)
+            return True
         if now >= self.activate_at:
             # The hold is over: from now on every new plan is executed.
             self.attacking = True
@@ -976,13 +1004,7 @@ class Planner:
             # at speed 5 in which the army has no plan, a third of an attack's time.
             paused = bool(self.plan.get("pause_redraw")) and self.pause(desk, True)
             try:
-                self.clear_orders(desk)
-                rear = self.draw_front(desk, guard=self.guard_share())
-                if rear and not self.defending:
-                    self.pocket = []  # A new incursion to clear.
-                self.defending = bool(rear)
-                if self.plan["attack"] in OFFENSIVES and not rear:
-                    self.draw_offensive(desk)
+                self.replan(desk)
             finally:
                 if paused:
                     self.pause(desk, False)
@@ -1006,6 +1028,222 @@ class Planner:
             # A full army (24) leaves the alert up: then stop trying.
             self.reinforce_at = now + 20 if not alert or self.reinforce(desk) else math.inf
         return False
+
+    def replan(self, desk):
+        """Every order deleted, then the front (round an incursion, if the guard sees one)
+        and the offensive drawn afresh. True if the front went round an incursion."""
+        self.clear_orders(desk)
+        # A strategist's choices, when it made any; the scripted plan leaves them to the hand.
+        front = {"front_state": self.plan["front_state"]} if self.plan.get("front_state") else {}
+        rear = self.draw_front(desk, guard=self.guard_share(), **front)
+        if rear and not self.defending:
+            self.pocket = []  # A new incursion to clear.
+        self.defending = bool(rear)
+        if self.plan["attack"] in OFFENSIVES and not rear:
+            aim = self.plan.get("target_state")
+            self.draw_offensive(desk, **({"target_state": aim} if aim else {}))
+        return rear
+
+    def decision_due(self):
+        """Why the strategist should decide now, or None: "periodic" once the game day
+        of the next decision comes, "lost_state" or "took_state" when a state changes
+        hands (at least strategist.EVENT_GAP days after the last decision), or "stalled"
+        when an executing attack has taken nothing for strategist.STALL_DAYS."""
+        from .strategist import EVENT_GAP, STALL_DAYS
+
+        if getattr(self, "strategist", None) is None or self.state is None or not self.running:
+            return None
+        snap = self.state()
+        day = snap.get("day")
+        if day is None:
+            return None
+        if day >= self.decide_day:
+            return "periodic"
+        since = day - (self.decided_day if self.decided_day is not None else -math.inf)
+        controls = snap.get("controls", [])
+        new, self.controls_seen = controls[self.controls_seen :], len(controls)
+        if new:
+            self.changed_day = new[-1].get("day") or day
+            lost = any(c.get("from") == self.country for c in new)
+            if lost or self.pending_event is None:
+                self.pending_event = "lost_state" if lost else "took_state"
+        if self.pending_event and since >= EVENT_GAP:
+            return self.pending_event  # Cleared by consult.
+        # Quiet since the last change of hands, or since the start: an attack's first
+        # STALL_DAYS count from the decision before it at the latest.
+        quiet = day - (self.changed_day if self.changed_day is not None else 0.0)
+        if self.attacking and self.active and min(quiet, since) >= STALL_DAYS:
+            return "stalled"
+        return None
+
+    def idle(self):
+        """Seconds spent waiting for the strategist, the wait under way included: the game
+        stands paused meanwhile, so they do not count toward its time."""
+        waiting = time.monotonic() - self.waiting_since if self.waiting_since else 0.0
+        return self.waited + waiting
+
+    def consult(self, desk, reason):
+        """A decision point: the game paused, a full view of the map and the game's numbers
+        handed to the strategist, its decision carried out, and the game run again."""
+        from .strategist import DECIDE_EVERY
+
+        self.decisions += 1
+        n = self.decisions
+        # A decision covers every event so far.
+        self.pending_event = None
+        paused = self.running and self.pause(desk, True)
+        try:
+            rgb, blue, red, _ = self.overview(desk)
+            held = None
+            if blue is not None and self.home is not None:
+                held = round(incursion(blue, red, self.country, self.home), 3)
+            snap = self.state() if self.state else {}
+            # The decision sees every state that has changed hands so far.
+            self.controls_seen = len(snap.get("controls", []))
+            since = self.waits[-1]["to_frame"] if self.waits else -1
+            request = {
+                "n": n,
+                "reason": reason,
+                "game": Path(self.debug_dir).name if self.debug_dir else None,
+                "country": self.country,
+                "state": snap,
+                "incursion": held,
+                "planner": {
+                    "attacking": self.attacking, "executing": self.active,
+                    "defending": self.defending, "law": LAWS[self.law_step],
+                    "running": self.running, "plan": self.plan,
+                },
+                "orders_since": [o for o in self.orders if o["frame"] >= since][-30:],
+                "failures_since": [f for f in self.failures if f["frame"] >= since][-10:],
+            }  # fmt: skip
+            if n == 1 and self.layout is not None:
+                request["layout"] = coarse_layout(self.layout)
+            stem = f"{request['game'] or 'game'}-{n:03d}"
+            started, first = time.monotonic(), self.frame()
+            self.waiting_since = started
+            try:
+                decision = self.strategist.ask(stem, request, rgb)
+            finally:
+                waited = time.monotonic() - started
+                self.waited += waited
+                self.waiting_since = None
+                self.waits.append({"n": n, "from_frame": first, "to_frame": self.frame()})
+            # The game stood paused: every timer moves on by the wait.
+            for name in TIMERS:
+                if getattr(self, name) != math.inf:
+                    setattr(self, name, getattr(self, name) + waited)
+            applied, errors = self.decide(desk, decision or {})
+            day = snap.get("day")
+            every = max(5.0, float((decision or {}).get("next_days", DECIDE_EVERY)))
+            if day is not None:
+                self.decided_day, self.decide_day = day, day + every
+            elif not self.running:
+                # The start, before the log's first day: the game's days count from 0.
+                self.decided_day, self.decide_day = 0.0, every
+            self.order("decision", n=n, reason=reason, applied=applied, errors=errors)
+            if self.debug_dir is not None:
+                try:
+                    self.strategist.keep(stem, Path(self.debug_dir) / "strategist", {
+                        "n": n, "reason": reason, "date": snap.get("date"), "day": day,
+                        "frame": first, "waited_s": round(waited, 1), "request": request,
+                        "decision": decision, "applied": applied, "errors": errors,
+                    })  # fmt: skip
+                except OSError as error:  # The game matters more than its paperwork.
+                    self.failures.append({"frame": self.frame(), "error": f"keep: {error}"})
+        finally:
+            if paused:
+                self.pause(desk, False)
+
+    def decide(self, desk, decision):
+        """A strategist's decision carried out: its plan settings, then its intents in
+        order. Returns what was done and what could not be, as lists of strings."""
+        applied, errors = [], []
+        changes = decision.get("plan") or {}
+        for key, value in changes.items():
+            if key not in PLAN_KEYS:
+                errors.append(f"unknown plan setting {key}")
+                continue
+            self.plan[key] = value
+            applied.append(f"plan.{key}={value}")
+        if "conscription" in changes:
+            self.want_law(changes["conscription"], errors)
+        replanned = False
+        for raw in decision.get("intents") or []:
+            try:
+                intent = Intent.from_json({"intent": raw} if isinstance(raw, str) else raw)
+            except (KeyError, TypeError, ValueError) as error:
+                errors.append(f"{raw}: {error}")
+                continue
+            kind, arg = intent.name, intent.arg
+            if arg("army") not in (None, 0):
+                errors.append(f"{kind}: there is only the first army")
+                continue
+            try:
+                if kind == "wait":
+                    pass
+                elif kind == "form_army":
+                    self.form_army(desk)
+                elif kind == "assign_general":
+                    self.assign_general(desk)
+                elif kind == "draw_front":
+                    # The army holds its front: every order deleted, a front alone drawn,
+                    # nothing executing, no redraws until an offensive is ordered again.
+                    self.plan["front_state"] = arg("front_state")
+                    self.clear_orders(desk)
+                    self.defending = self.draw_front(
+                        desk, guard=self.guard_share(), front_state=arg("front_state")
+                    )
+                    self.attacking = self.active = False
+                    self.activate_at = self.redraw_at = math.inf
+                    self.plan["attack"] = "none"
+                elif kind in ("draw_offensive", "redraw"):
+                    if kind == "draw_offensive" or arg("target_state") is not None:
+                        # None aims where the attack kind says (broad: the whole front).
+                        self.plan["target_state"] = arg("target_state")
+                    if arg("attack") is not None:
+                        self.plan["attack"] = arg("attack")
+                    elif self.plan["attack"] not in OFFENSIVES:
+                        self.plan["attack"] = "broad"
+                    if arg("front_state") is not None:
+                        self.plan["front_state"] = arg("front_state")
+                    if isinstance(arg("guard"), (int, float)) and not isinstance(
+                        arg("guard"), bool
+                    ):
+                        self.plan["guard"] = arg("guard")
+                    if arg("line") is not None:
+                        errors.append(f"{kind}: a drawn line is not supported; the hand draws")
+                    self.replan(desk)
+                    replanned = True
+                    if self.attacking:
+                        self.activate_at = time.monotonic() + PLANNING
+                elif kind == "execute":
+                    self.activate_at = time.monotonic() + (PLANNING if replanned else 0)
+                elif kind == "set_law":
+                    self.plan["conscription"] = arg("law")
+                    self.want_law(arg("law"), errors)
+                elif kind == "recruit":
+                    self.plan["recruit"] = int(arg("slots") or 2)
+                    self.recruit_at, self.recruit_tries = time.monotonic(), 0
+                elif kind == "reinforce":
+                    self.reinforce_at = time.monotonic()
+                else:
+                    errors.append(f"{kind} is the hand's, not the strategist's")
+                    continue
+                applied.append(kind)
+            except RuntimeError as error:
+                errors.append(f"{kind}: {error}")
+        return applied, errors
+
+    def want_law(self, law, errors):
+        """The conscription ladder climbed toward `law` from now on (raise_conscription);
+        before the game runs, from start()'s first step."""
+        if law not in LAWS:
+            errors.append(f"unknown law {law}")
+            return
+        if LAWS.index(law) > self.law_step:
+            self.law_fails = 0
+            if self.running:
+                self.law_at = time.monotonic()
 
     def law(self, rgb):
         """The conscription law the political screen's slot shows, or None."""
@@ -1135,6 +1373,28 @@ class Planner:
             return self.law_step >= goal
         self.law_fails += 1
         return self.law_fails >= LAW_TRIES
+
+
+# What a strategist's decision may set (strategist.py): plan settings, and the intents of
+# the shared vocabulary that belong to the hand alone.
+PLAN_KEYS = (
+    "conscription", "attack", "depth", "rows", "target_state", "front_state", "redraw",
+    "guard", "recruit", "pause_redraw",
+)  # fmt: skip
+# The planner's timers, which a strategist's pause moves on by its length.
+TIMERS = ("activate_at", "redraw_at", "law_at", "recruit_at", "reinforce_at", "check_at")
+
+
+def coarse_layout(layout, columns=24, rows=8):
+    """The arena's state ids on a small grid, a text row each (0 is water), for a
+    strategist to find states by."""
+    height, width = layout.shape
+    lines = []
+    for r in range(rows):
+        y = min(height - 1, int((r + 0.5) * height / rows))
+        xs = (min(width - 1, int((c + 0.5) * width / columns)) for c in range(columns))
+        lines.append(" ".join(f"{int(layout[y, x]):2d}" for x in xs))
+    return lines
 
 
 def ashore(front, blue, red, box, rgb=None, reach=11):

@@ -1325,15 +1325,29 @@ def play(
     if log_from is not None:
         # A game loaded inside a running one: the log holds the games before it.
         arena.offset = log_from
+    if planner is not None and settings.get("strategist"):
+        from .strategist import ArenaState, Strategist
+
+        # A strategist decides at decision points, from the map and the game's numbers
+        # (strategist.py); the game stands paused while it thinks.
+        planner.strategist = Strategist(
+            settings["strategist"], timeout=settings.get("strategist_timeout") or 1200
+        )
+        planner.state = ArenaState(arena, country).snapshot
     start = deadline = next_poll = time.monotonic()
     late, ending = 0, None
+
+    def idle():
+        return planner.idle() if planner is not None else 0.0
+
     # Each mod line with the number of frames recorded when it was read, which aligns the
     # arena's daily reports (v3) with the video: at speed 5 a day passes in about 0.4 s.
     stamped = []
     try:
         rec.append(first)
         mover.start()
-        while time.monotonic() - start < settings["cap_minutes"] * 60:
+        # A strategist's thinking time, the game paused, does not count toward the cap.
+        while time.monotonic() - start - idle() < settings["cap_minutes"] * 60:
             if rec.streamed:
                 # The worker keeps the clock and records every frame itself (--codec
                 # nvenc); this loop follows its frames and looks at the screen when it must.
@@ -1353,6 +1367,9 @@ def play(
                     raise RuntimeError(f"the scripted player's setup failed: {planner.error}")
                 if planner.running and arena.silence is None:
                     arena.silence, arena.last_week = WEEK_SILENCE, arena.clock()
+                if planner.waiting_since is not None:
+                    # Paused for the strategist: no weekly report is due.
+                    arena.last_week = arena.clock()
             if now - deadline > 1:
                 late += 1
                 deadline = now
@@ -1414,7 +1431,8 @@ def play(
             declarer=arena.declarer,
             players=arena.players or ([country] if start_save else []),
             start_save=start_save,
-            seconds=round(time.monotonic() - start),
+            # The game's own time: a strategist's pauses to think are left out.
+            seconds=round(time.monotonic() - start - idle()),
             late_ticks=late,
             arena=Path(settings["mod"]).name,
             driver=(
@@ -1438,6 +1456,14 @@ def play(
                 planner_errors=planner.failures,
                 screenshots={k: str(v) for k, v in shots.items()},
             )
+            if planner.strategist is not None:
+                # The decisions are kept in the game's strategist/ folder; the frames
+                # recorded while the game stood paused for one carry no play.
+                rec.manifest.update(
+                    strategist_decisions=planner.decisions,
+                    strategist_seconds=round(planner.waited),
+                    strategist_waits=planner.waits,
+                )
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
 
@@ -1770,9 +1796,12 @@ def pick_plan(rng, arena, settings, request=None):
     tuning.Tuner) for the best plan with its next settings, unless the arena is in
     settings["tune_skip"]. A tuner that cannot answer leaves the exploring plan."""
     from .scripted import best_plan, choose_plan
+    from .strategist import strategist_plan
 
     if request:
         return best_plan(rng)
+    if settings.get("strategist"):
+        return strategist_plan()
     plan = choose_plan(rng)
     tuner = settings.get("tuner")
     if tuner is not None and plan["variant"] == "explore" and arena not in settings["tune_skip"]:
@@ -2021,6 +2050,8 @@ def record_ai_games(
     tune=None,
     tune_skip=None,
     camera_kicks=None,
+    strategist=None,
+    strategist_timeout=None,
 ):
     """Record on this PC, the second PC, or both at once, until `minutes` run out.
 
@@ -2046,6 +2077,10 @@ def record_ai_games(
 
     `camera_kicks`, (low, high) seconds, knocks the camera astray that often, unrecorded,
     so the recordings show it finding the front again (camera's `kick`).
+
+    With `strategist`, a folder, the scripted player asks a strategist there at decision
+    points and carries out its decisions (strategist.py); it waits `strategist_timeout`
+    seconds for each.
     """
     from .scripted import TEMPLATES, load_templates
 
@@ -2079,6 +2114,8 @@ def record_ai_games(
         "tuner": None,
         "tune_skip": set(tune_skip or ()),
         "camera_kicks": tuple(camera_kicks) if camera_kicks else None,
+        "strategist": strategist if player == "scripted" else None,
+        "strategist_timeout": strategist_timeout,
     }
     if tune and player == "scripted":
         from .tuning import Tuner
