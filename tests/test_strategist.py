@@ -167,6 +167,38 @@ def test_decision_points_come_every_few_game_days_and_on_events(monkeypatch):
     assert planner.decision_due() == "stalled"
 
 
+def test_a_plan_due_to_execute_goes_before_the_next_decision(monkeypatch):
+    # In the first live games decisions every 20 game days kept coming first, and a
+    # counter-attack ordered at one never executed.
+    clock = [100.0]
+    planner, _ = planner_with_stubs(monkeypatch, clock)
+    planner.running = True
+    planner.strategist, planner.state = object(), lambda: {"day": 90.0, "controls": []}
+    consulted = []
+    planner.consult = lambda desk, reason: consulted.append(reason)
+    planner.activate = lambda desk: setattr(planner, "active", True) or True
+    planner.activate_at = 99.0
+    assert planner.decision_due() == "periodic" and planner.due()
+    assert planner.step(None) is False and consulted == [] and planner.attacking
+    assert planner.step(None) is True and consulted == ["periodic"]
+
+
+def test_the_start_decision_counts_the_game_days_from_zero(monkeypatch, tmp_path):
+    clock = [0.0]
+    planner, calls = planner_with_stubs(monkeypatch, clock)
+    planner.debug_dir = tmp_path / "game-2"
+    planner.overview = lambda desk: (None, None, None, None)
+    planner.state = lambda: {"day": None, "controls": []}
+    planner.strategist = Strategist(
+        tmp_path / "ask", timeout=1, sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+        clock=lambda: clock[0],
+    )  # fmt: skip
+    planner.consult(None, "start")
+    # No stall is called before the attack has run STALL_DAYS; the files left the folder.
+    assert planner.decided_day == 0.0 and planner.decide_day == 45.0
+    assert (tmp_path / "game-2" / "strategist" / "log.jsonl").exists()
+
+
 def test_a_consult_pauses_asks_carries_out_and_moves_the_timers_on(monkeypatch, tmp_path):
     clock = [50.0]
     planner, calls = planner_with_stubs(monkeypatch, clock)

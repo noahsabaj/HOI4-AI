@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -181,6 +182,7 @@ class Strategist:
         for suffix in (".png", ".request.json", ".decision.json"):
             source = self.folder / f"{stem}{suffix}"
             if source.exists():
-                os.replace(source, archive / source.name)
+                # The folders may be on different drives, which os.replace refuses.
+                shutil.move(source, archive / source.name)
         with (archive / "log.jsonl").open("a") as out:
             out.write(json.dumps(entry, default=str) + "\n")

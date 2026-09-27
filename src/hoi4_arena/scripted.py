@@ -957,11 +957,14 @@ class Planner:
         and Extensive at 146 s, against 41 s and 65 s in the wins), every redraw deleted
         the front line under the divisions, and the AI broke through before the attack.
         """
-        reason = self.decision_due()
+        now = time.monotonic()
+        # A strategist's decision waits for a plan due to execute: in the first strategist
+        # games (2026-09-26) decisions every 20 game days (8 s) and the events between them
+        # kept coming first, and a counter-attack ordered at one never executed.
+        reason = self.decision_due() if now < self.activate_at else None
         if reason is not None:
             self.consult(desk, reason)
             return True
-        now = time.monotonic()
         if now >= self.activate_at:
             # The hold is over: from now on every new plan is executed.
             self.attacking = True
@@ -1054,7 +1057,9 @@ class Planner:
                 self.pending_event = "lost_state" if lost else "took_state"
         if self.pending_event and since >= EVENT_GAP:
             return self.pending_event  # Cleared by consult.
-        quiet = day - (self.changed_day if self.changed_day is not None else -math.inf)
+        # Quiet since the last change of hands, or since the start: an attack's first
+        # STALL_DAYS count from the decision before it at the latest.
+        quiet = day - (self.changed_day if self.changed_day is not None else 0.0)
         if self.attacking and self.active and min(quiet, since) >= STALL_DAYS:
             return "stalled"
         return None
@@ -1081,6 +1086,8 @@ class Planner:
             if blue is not None and self.home is not None:
                 held = round(incursion(blue, red, self.country, self.home), 3)
             snap = self.state() if self.state else {}
+            # The decision sees every state that has changed hands so far.
+            self.controls_seen = len(snap.get("controls", []))
             since = self.waits[-1]["to_frame"] if self.waits else -1
             request = {
                 "n": n,
@@ -1119,14 +1126,18 @@ class Planner:
             if day is not None:
                 self.decided_day, self.decide_day = day, day + every
             elif not self.running:
-                self.decide_day = every
+                # The start, before the log's first day: the game's days count from 0.
+                self.decided_day, self.decide_day = 0.0, every
             self.order("decision", n=n, reason=reason, applied=applied, errors=errors)
             if self.debug_dir is not None:
-                self.strategist.keep(stem, Path(self.debug_dir) / "strategist", {
-                    "n": n, "reason": reason, "date": snap.get("date"), "day": day,
-                    "frame": first, "waited_s": round(waited, 1), "request": request,
-                    "decision": decision, "applied": applied, "errors": errors,
-                })  # fmt: skip
+                try:
+                    self.strategist.keep(stem, Path(self.debug_dir) / "strategist", {
+                        "n": n, "reason": reason, "date": snap.get("date"), "day": day,
+                        "frame": first, "waited_s": round(waited, 1), "request": request,
+                        "decision": decision, "applied": applied, "errors": errors,
+                    })  # fmt: skip
+                except OSError as error:  # The game matters more than its paperwork.
+                    self.failures.append({"frame": self.frame(), "error": f"keep: {error}"})
         finally:
             if paused:
                 self.pause(desk, False)
