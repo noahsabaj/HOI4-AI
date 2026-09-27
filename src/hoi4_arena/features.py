@@ -91,33 +91,99 @@ def camera_targets(root, decisions):
     return zoom, since
 
 
+# The session_labels options a train-bc config records, which make its labels.
+LABEL_OPTIONS = ("lead_in", "drop_keys", "look_before_click", "drop_parking", "press_weight",
+                 "setup_weight")  # fmt: skip
+
+
+def labels_as_trained(config):
+    """The session_labels options a policy was trained with, from its checkpoint's config."""
+    options = {key: config[key] for key in LABEL_OPTIONS if config.get(key) is not None}
+    if "drop_keys" in options:
+        options["drop_keys"] = tuple(options["drop_keys"])
+    return options
+
+
+def tower_stamp(checkpoint):
+    """tower_cache.fingerprint of a checkpoint's tower as saved (float32): load_policy halves
+    the frozen weights, which would change it."""
+    import hashlib
+
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)["policy"]
+    digest = hashlib.sha256()
+    for name, value in sorted((k[len("encoder.") :], v) for k, v in saved.items()
+                              if k.startswith("encoder.")):  # fmt: skip
+        digest.update(name.encode())
+        digest.update(value.detach().float().cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
 @torch.no_grad()
-def cache_features(data, checkpoint, output, *, model_path=None, sources=("ai",), device=None):
+def cache_features(
+    data,
+    checkpoint,
+    output,
+    *,
+    model_path=None,
+    sources=("ai",),
+    device=None,
+    names=None,
+    label_options=None,
+    as_trained=False,
+    tower=None,
+):
     """What a behaviour-cloned policy's frozen perception reads, at every decision.
 
     For each complete recording from `sources`, in every split, writes to
     output/<recording>/: `summary` (N, encoder dim), `cells` (N, 1024, 256), `centre`
     (N, 256), all float16, and `labels.npz` with the actions, validity, outcome, speed,
-    the pointer, the camera's zoom and time since its recentre. N counts the decisions
-    whose frames exist. About 0.5 MB a decision, nearly all of it cells.
+    the pointer, the camera's zoom and time since its recentre, and each decision's
+    training weight and time. N counts the decisions whose frames exist. About 0.5 MB a
+    decision, nearly all of it cells.
+
+    A `splits.json` in `data` overrides each recording's split, as for training. `names`
+    keeps only those recordings (folder names). `label_options` pass to
+    dataset.session_labels, so the labels are the ones the policy was trained on (e.g.
+    lead_in, drop_keys, look_before_click, drop_parking, press_weight, setup_weight);
+    `as_trained` takes them from the checkpoint's own training config (labels_as_trained).
+    With `tower`, a tower cache (tower_cache.py) made from this policy's frozen tower, a
+    recording it holds is read from it instead of running the tower, which is most of the
+    time here; the others run the tower.
     """
+    from .dataset import recording_splits
     from .runner import load_policy
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     output = Path(output)
     policy, config, digest = load_policy(checkpoint, model_path, device)
     policy.eval()
+    if as_trained:
+        label_options = {**labels_as_trained(config), **(label_options or {})}
     autocast = {"device_type": device, "dtype": torch.bfloat16, "enabled": device == "cuda"}
+    splits = recording_splits(data)
+    stamp = tower_stamp(checkpoint) if tower is not None else None
     written = []
     for manifest_path in sorted(Path(data).glob("*/manifest.json")):
         manifest = json.loads(manifest_path.read_text())
         if not manifest.get("complete") or manifest.get("source") not in sources:
             continue
         root = manifest_path.parent
+        if names is not None and root.name not in names:
+            continue
         target = output / root.name
         if (target / "labels.npz").exists():
             continue
-        labels = session_labels(root, sources=sources)
+        labels = session_labels(root, sources=sources, **(label_options or {}))
+        if tower is not None:
+            from .tower_cache import tower_paths
+
+            paths = tower_paths(tower, root)
+            if paths is not None:
+                if paths["tower"] != stamp:
+                    raise ValueError(
+                        "the tower cache was made from another tower than this policy's"
+                    )
+                labels["tower"] = paths
         count = int(labels["readable"].sum())
         window = 16
         starts = cover_starts(labels, window)
@@ -138,11 +204,18 @@ def cache_features(data, checkpoint, output, *, model_path=None, sources=("ai",)
                     batch = batch_to_device(default_collate([piece]), device)
                     clips = batch.get("clips")
                     with torch.autocast(**autocast):
-                        seen = policy.perceive(
-                            None if clips is None else clips[0],
-                            batch["quadrants"][0],
-                            batch["fovea"][0],
-                        )
+                        if "tower_summary" in batch:
+                            cached = (batch["tower_summary"], batch["tower_grid"])
+                            seen = policy.perceive_window(
+                                None, batch["quadrants"], batch["fovea"], tower=cached
+                            )
+                            seen = tuple(x[0] for x in seen)
+                        else:
+                            seen = policy.perceive(
+                                None if clips is None else clips[0],
+                                batch["quadrants"][0],
+                                batch["fovea"][0],
+                            )
                     s, c, f = (x.float().cpu().numpy().astype(np.float16) for x in seen)
                     summary[start : start + window] = s
                     cells[start : start + window] = c
@@ -168,10 +241,15 @@ def cache_features(data, checkpoint, output, *, model_path=None, sources=("ai",)
             zoom=zoom,
             since_recentre=since,
             winner=np.float32({"BLU": 1.0, "RED": -1.0}.get(manifest.get("winner"), np.nan)),
+            weight=labels["weight"][:count],
+            decisions=decisions,
+            frame_ids=frame_ids,
         )
         meta = {
             "recording": str(root.resolve()),
-            "split": manifest["split"],
+            "source": manifest["source"],
+            "split": splits.get(root.name, manifest.get("split", "train")),
+            "tower_cache": bool(labels.get("tower")),
             "decisions": count,
             "checkpoint": digest,
             "seconds": round(time.monotonic() - began, 1),
@@ -194,6 +272,9 @@ class CachedGame:
         labels = np.load(root / "labels.npz")
         self.labels = {key: labels[key] for key in labels.files}
         self.length = len(self.summary)
+        # Each decision's share of the imitation loss (session_labels' `weight`, times any
+        # offline RL weight); a cache made before it was kept weighs every decision 1.
+        self.labels.setdefault("weight", np.ones(self.length, np.float32))
 
     def piece(self, start, length):
         """Steps [start, start + length), padded past the end with invalid steps."""
@@ -219,6 +300,7 @@ class CachedGame:
             "previous": torch.from_numpy(prev),
             "speed": padded(self.labels["speed"]),
             "valid": torch.from_numpy(valid),
+            "weight": padded(self.labels["weight"].astype(np.float32)),
         }
 
 
@@ -236,16 +318,17 @@ def load_cache(cache, split):
 class MemoryHead(nn.Module):
     """Everything of a Policy after its perception: the layers models.fuse uses, the
     memory, the action head and the value. The names are Policy's, so a GRU trained here
-    loads into a Policy with the perception it was cached from."""
+    loads into a Policy with the perception it was cached from. `look` is the action
+    head's (a policy trained with look_before_click has it)."""
 
-    def __init__(self, summary_dim, memory="gru", memory_dim=512):
+    def __init__(self, summary_dim, memory="gru", memory_dim=512, look=False):
         super().__init__()
         self.previous_action = nn.Linear(SLOTS * 3, 64)
         self.speed = nn.Embedding(SPEEDS, 32)
         self.read = nn.Linear(memory_dim, CELL_DIM)
         self.fusion = nn.Linear(summary_dim + 3 * CELL_DIM + 64 + 32, memory_dim)
         self.memory = build_memory(memory, memory_dim)
-        self.actor = ActionHead(memory_dim)
+        self.actor = ActionHead(memory_dim, look=look)
         self.value = nn.Linear(memory_dim, 1)
         self.memory_dim = memory_dim
 
@@ -586,6 +669,7 @@ class _Loader:
             "previous": ((SLOTS, 3), np.dtype(np.int64)),
             "speed": (first.labels["speed"].shape[1:], first.labels["speed"].dtype),
             "valid": ((), np.dtype(bool)),
+            "weight": ((), np.dtype(np.float32)),
         }
         self.pool = ThreadPoolExecutor(readers, thread_name_prefix="cells")
         self.local = threading.local()
@@ -688,6 +772,7 @@ class _Loader:
                 ("actions", labels["actions"]),
                 ("speed", labels["speed"]),
                 ("valid", labels["valid"]),
+                ("weight", labels["weight"]),
             ):
                 host[key][row, :n] = source[start:stop]
                 host[key][row, n:] = 0

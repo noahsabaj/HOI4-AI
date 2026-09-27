@@ -907,7 +907,46 @@ def build_parser():
     cache.add_argument("checkpoint")
     cache.add_argument("output")
     cache.add_argument("--model")
-    cache.add_argument("--sources", nargs="+", choices=["human", "ai", "scripted"], default=["ai"])
+    cache.add_argument(
+        "--sources", nargs="+", choices=["human", "ai", "scripted", "policy"], default=["ai"]
+    )
+    cache.add_argument("--names", nargs="+", help="Only these recordings (folder names)")
+    cache.add_argument(
+        "--tower-cache",
+        dest="tower",
+        help="Read the frozen tower's output from this cache (cache-tower) where it holds a "
+        "recording, instead of running the tower",
+    )
+    cache.add_argument(
+        "--as-trained",
+        action="store_true",
+        help="Label as the checkpoint was trained (its lead-in, dropped keys, parking, "
+        "press and setup weights), for offline RL on the cache (train-offline)",
+    )
+    offline = sub.add_parser(
+        "train-offline",
+        help="Offline RL on cached features (cache-features --as-trained): train a policy's "
+        "memory and action head again with each decision weighted by how it went "
+        "(offline_heads.py); writes a playable checkpoint",
+    )
+    offline.add_argument("cache")
+    offline.add_argument("init", help="The policy the cache was made from")
+    offline.add_argument("output")
+    offline.add_argument("--weighting", choices=["bc", "filtered", "awr"], default="awr")
+    offline.add_argument(
+        "--state-value", help="The win predictor (train-state-value) awr weighs scripted games by"
+    )
+    offline.add_argument("--beta", type=float, default=0.05, help="Scripted games' temperature")
+    offline.add_argument(
+        "--practice-beta", type=float, default=0.1, help="Practice episodes' temperature"
+    )
+    offline.add_argument("--max-weight", type=float, default=20.0)
+    offline.add_argument("--n-step", type=int, default=25)
+    offline.add_argument("--epochs", type=int, default=2)
+    offline.add_argument("--lr", type=float, default=1e-4)
+    offline.add_argument("--window", type=int, default=256)
+    offline.add_argument("--decisions", type=int, default=1024, help="Decisions per update")
+    offline.add_argument("--seed", type=int, default=0)
     memory = sub.add_parser(
         "train-memory",
         help="Train the memory and action head on cached features, and score it on "
@@ -1442,7 +1481,14 @@ def _dispatch(command, args):
             args["output"],
             model_path=args["model"],
             sources=tuple(args["sources"]),
+            names=set(args["names"]) if args["names"] else None,
+            as_trained=args["as_trained"],
+            tower=args["tower"],
         )
+    elif command == "train-offline":
+        from .offline_heads import train_offline
+
+        result = train_offline(args.pop("cache"), args.pop("init"), args.pop("output"), **args)
     elif command == "train-memory":
         from .features import train_memory
 

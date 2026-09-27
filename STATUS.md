@@ -1516,6 +1516,19 @@ hand-recorded play.
    (`train-state-value`), weight the scripted games' decisions by advantage
    (`advantage --state-value`), and train the policy on them (`train-bc --advantage`).
    Judge it by win rate against the AI and against the scripted player, not by loss.
+   A cheaper form trains only the layers after a policy's frozen perception, on a cache
+   of what it read (`cache-features --as-trained [--tower-cache]`, then `train-offline
+   --weighting bc|filtered|awr`, offline_heads.py): a run takes minutes, not an epoch
+   of video. Besides the scripted games' wins and losses, it weighs practice episodes
+   by the setup steps the policy did itself (army, general, front), so the policy
+   imitates its own successes from the states it reaches, not only the coach's rescues.
+   The win predictor on the logged state, fitted on scripted-v6 (5-fold by game, 200
+   games with a result), names the winner 75% of the time in a game's first third
+   (always naming the commoner winner: 57%), 84% in its second and 89% in its last;
+   Brier 0.17, 0.12, 0.09 against 0.25. On the 11 held-out games it is 73%, 76% and
+   80%, where the commoner winner alone scores 72%, and it is poorly calibrated there
+   (expected calibration error ~0.2, against 0.07-0.17 across folds). Not yet run: the three weightings side by side, and their
+   practice score.
 3. **Rerun the memory study with a live memory.** Its GRU arms were dead (see "The
    memory study"), so which memory to use, and whether to carry it, are open again. First
    normalise the summary in `fuse`, and record each run's memory movement and gate

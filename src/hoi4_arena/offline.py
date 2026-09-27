@@ -48,7 +48,9 @@ def player_side(manifest):
     return 1.0 if players[0] == "BLU" else -1.0
 
 
-def advantage_weights(values, outcome, side, valid, *, n_step=25, beta=0.05, max_weight=20.0):
+def advantage_weights(
+    values, outcome, side, valid, *, n_step=25, beta=0.05, max_weight=20.0, normalize=True
+):
     """Each decision's advantage and its weight, from the critic's values over one game.
 
     `values` are the critic's returns from Blue's side, one per decision; `outcome` the
@@ -58,6 +60,9 @@ def advantage_weights(values, outcome, side, valid, *, n_step=25, beta=0.05, max
     look n ahead looks to the outcome, or to the last value when the game has none.
     Weights are exp(advantage / beta), capped at `max_weight`, then scaled to average one
     over the valid decisions, so the loss keeps its size and only its emphasis moves.
+    Without `normalize` they are not scaled: a caller that scales many games together
+    keeps the difference between a won game and a lost one, which scaling each game to
+    average one takes away.
     """
     v = side * np.asarray(values, np.float64)
     count = len(v)
@@ -69,7 +74,7 @@ def advantage_weights(values, outcome, side, valid, *, n_step=25, beta=0.05, max
     weight = np.exp(np.minimum(advantage / beta, np.log(max_weight)))
     ok = np.asarray(valid, bool) & np.isfinite(weight)
     weight = np.where(ok, weight, 0.0)
-    if ok.any():
+    if normalize and ok.any():
         weight = weight / weight[ok].mean()
     return advantage.astype(np.float32), weight.astype(np.float32)
 
