@@ -1295,7 +1295,9 @@ def play(
     planner = None
     shots = {}
     if player:
-        planner = Planner(
+        # An intent policy's planner (intent_policy.make_intent_planner) chooses the orders
+        # itself; the scripted one follows its plan.
+        planner = (settings.get("planner_class") or Planner)(
             country, player["plan"], player["templates"], player["rules"], speed,
             frame=lambda: rec.manifest["frames"], layout=arena_layout(settings["mod"]),
         )  # fmt: skip
@@ -1464,6 +1466,12 @@ def play(
                     strategist_seconds=round(planner.waited),
                     strategist_waits=planner.waits,
                 )
+            if hasattr(planner, "intent_log"):
+                # The intent policy's choices, each second the hand was free.
+                rec.manifest.update(intent_decisions=planner.intent_log)
+            if hasattr(getattr(planner, "hand", None), "log"):
+                # Each intent a learned skill carried out, and whether it was done.
+                rec.manifest.update(learned_skills=planner.hand.log)
         rec.close(complete=reason is None, reason=reason)
     return outcome, reason, rec.manifest
 
@@ -1802,6 +1810,9 @@ def pick_plan(rng, arena, settings, request=None):
         return best_plan(rng)
     if settings.get("strategist"):
         return strategist_plan()
+    if settings.get("intent_plan"):
+        # The intent policy chooses when; the hand draws and steps as the best plan does.
+        return {**best_plan(rng), "best": False, "variant": "intent-policy"}
     plan = choose_plan(rng)
     tuner = settings.get("tuner")
     if tuner is not None and plan["variant"] == "explore" and arena not in settings["tune_skip"]:
@@ -2052,6 +2063,11 @@ def record_ai_games(
     camera_kicks=None,
     strategist=None,
     strategist_timeout=None,
+    intent_policy=None,
+    intent_tower=None,
+    intent_threshold=None,
+    learned_skills=None,
+    learned_intents=(),
 ):
     """Record on this PC, the second PC, or both at once, until `minutes` run out.
 
@@ -2081,6 +2097,14 @@ def record_ai_games(
     With `strategist`, a folder, the scripted player asks a strategist there at decision
     points and carries out its decisions (strategist.py); it waits `strategist_timeout`
     seconds for each.
+
+    With `intent_policy` (intent_policy.train's network), the scripted player's orders are
+    the policy's: once a second it reads the screen through the tower of the checkpoint
+    `intent_tower` and chooses an intent, which the scripted hand carries out with the
+    best plan's settings (intent_policy.make_intent_planner). `intent_threshold` acts once
+    the chance of waiting falls below it; by default acting is drawn from that chance.
+    `learned_skills`, a checkpoint trained with train-bc --skills, carries out the
+    `learned_intents` from the screen in place of the scripted hand (hand.LearnedHand).
     """
     from .scripted import TEMPLATES, load_templates
 
@@ -2121,6 +2145,42 @@ def record_ai_games(
         from .tuning import Tuner
 
         settings["tuner"] = Tuner(tune)
+    if intent_policy:
+        if player != "scripted":
+            raise ValueError("an intent policy plays with --player scripted")
+        import torch
+
+        from . import intent_policy as policy
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        hand = None
+        if learned_skills:
+            from .hand import LearnedHand
+            from .runner import Actor
+            from .train import SkillHead
+
+            actor = Actor(
+                learned_skills, game_speed=5, device=device, lean=True, graph=False,
+                compile_head=False,
+            )  # fmt: skip
+            skill_head = SkillHead(actor.policy.memory_dim)
+            weights = Path(learned_skills).with_name(
+                Path(learned_skills).name.replace("epoch-", "skill-head-")
+            )
+            skill_head.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True))
+
+            def hand(scripted):
+                return LearnedHand(scripted, actor, skill_head, learned_intents)
+
+        net = policy.load(intent_policy, "cpu")
+        settings["planner_class"] = policy.make_intent_planner(
+            net,
+            # One that reads no pixels (the ablation) needs no tower.
+            policy.Eyes(intent_tower, device) if net.pixels else None,
+            threshold=intent_threshold,
+            hand=hand,
+        )
+        settings["intent_plan"] = True
     stations = [] if peer_only else [Station("here")]
     if peer:
         stations.append(Station("peer", peer))

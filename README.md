@@ -168,6 +168,14 @@ Strategy and execution can also be learned apart (`intents.py`). A high-level po
 .venv\Scripts\hoi4-arena.exe intents C:\hoi4-data\scripted-v6
 ```
 
+The intent policy (`intent_policy.py`) is the high-level half. Once a second, while the hand is free, it reads the frozen tower's summary of the screen and its own record of what it has done, and picks what to do next: `wait` most of the time. `intent-data` builds its data from relabelled recordings and a tower cache, and `train-intents` trains it on the CPU in minutes and reports it on held-out games. `record-ai --player scripted --intent-policy P --intent-tower CKPT` has it play, with the scripted hand doing the clicking. The learned hand is `train-bc --skills`: the policy's action head conditioned on the skill it carries out, through an embedding that starts at zero, so a fine-tune starts exactly where its checkpoint was. `--skills-only` trains on the procedures alone. `record-ai --learned-skills CKPT --learned-intents form_army ...` swaps learned skills in one at a time, and every other intent stays with the scripted hand.
+
+```powershell
+.venv\Scripts\hoi4-arena.exe intent-data C:\hoi4-data\scripted-v6 C:\hoi4-cache\tower-v2s5 artifacts\intent\v6-steps.npz
+.venv\Scripts\hoi4-arena.exe train-intents artifacts\intent\v6-steps.npz artifacts\intent\full --epochs 200
+.venv\Scripts\hoi4-arena.exe record-ai artifacts\intent-games --minutes 60 --player scripted --speeds 5 --mod artifacts\mods\arena-12x8-v4 --intent-policy artifacts\intent\full\intent-policy.pt --intent-tower artifacts\learned\bc5\epoch-0000.pt
+```
+
 Video from elsewhere (a friend's recording, a published video) has no inputs and no pointer position. `pointer` saves the pointer image the game is showing (repeat it for the game's other pointers), and `import-video` turns a video into a recording: times from its frame rate, the pointer found in each frame by matching those images. `label` then gives it inputs. The worker draws the pointer into every frame it captures, so recordings made here show it the way such videos do.
 
 ```powershell

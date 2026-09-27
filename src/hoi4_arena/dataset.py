@@ -393,6 +393,9 @@ def session_labels(
     held_previous=False,
     rung=None,
     dagger=0.0,
+    skills=False,
+    skills_only=False,
+    skill_margin=5,
 ):
     """Everything about a recording except its pixels: times, pointer, actions per decision.
 
@@ -444,6 +447,12 @@ def session_labels(
     expert labelled weighs `dagger` and learns the expert's action, a coach's takeover
     teaches its own inputs as before, and the rest weighs nothing. What each decision reads
     as its previous action stays what the policy did: that is what it saw when it acted.
+
+    `skills` adds each decision's skill (`skill`, an index into intents.SKILLS, or
+    len(SKILLS) outside every segment) from the recording relabelled into intents
+    (intents.relabel), for a policy conditioned on the skill it carries out (the learned
+    hand). `skills_only` keeps only the decisions within `skill_margin` decisions of a
+    planner skill's segment: the procedures, not the camera between them.
     """
     source = Path(source)
     manifest = json.loads((source / "manifest.json").read_text())
@@ -599,6 +608,16 @@ def session_labels(
             excluded.append({"decision": int(d), "reason": "capture gap"})
         valid &= ~spans
     extra = {}
+    if skills or skills_only:
+        extra["skill"] = decision_skills(source, decisions)
+        if skills_only:
+            from .intents import PLANNER_SKILLS, SKILLS
+
+            planner = np.isin(extra["skill"], [SKILLS.index(s) for s in PLANNER_SKILLS])
+            near = np.convolve(planner, np.ones(2 * skill_margin + 1), mode="same") > 0
+            for d in np.flatnonzero(valid & ~near):
+                excluded.append({"decision": int(d), "reason": "outside the skills"})
+            valid &= near
     if state:
         from .privileged import decision_states
 
@@ -631,6 +650,19 @@ def session_labels(
         "label_source": label_source,
         "parking": len(parked),
     }
+
+
+def decision_skills(root, decisions):
+    """Per decision, the skill whose segment is in progress over its interval (an index
+    into intents.SKILLS; len(SKILLS) in none), from the recording at `root` relabelled
+    into intents. The relabel reads all of the recording's inputs, whatever training
+    leaves out of its labels (the space bar, parking moves)."""
+    from .intents import SKILLS, decision_intents, load_events, relabel
+
+    events, times, manifest = load_events(root)
+    segments = relabel(events, manifest, times)
+    _, skills, _ = decision_intents(segments, decisions, PERIOD_NS)
+    return np.where(skills < 0, len(SKILLS), skills).astype(np.int64)
 
 
 def recording_splits(root):
@@ -793,7 +825,7 @@ class _Stream:
             "outcome": torch.from_numpy(labels["outcome"][start : start + n].copy()),
             "start": start,
         }
-        for key in ("state", "order_kind", "order_eta"):
+        for key in ("state", "order_kind", "order_eta", "skill"):
             if key in labels:
                 window[key] = torch.from_numpy(labels[key][start : start + n].copy())
         if self.tower is not None:
@@ -1057,6 +1089,8 @@ class VideoSessions(_Resumable, IterableDataset):
         rung=None,
         dagger=0.0,
         more=(),
+        skills=False,
+        skills_only=False,
     ):
         if clips and lead_in is not None and lead_in < CLIP_FRAMES + 1:
             raise ValueError(
@@ -1101,6 +1135,8 @@ class VideoSessions(_Resumable, IterableDataset):
                     held_previous=held_previous,
                     rung=rung,
                     dagger=dagger,
+                    skills=skills,
+                    skills_only=skills_only,
                 )
             )
         if balance:

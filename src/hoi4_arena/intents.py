@@ -229,6 +229,10 @@ FULL_ZOOM = 20
 # A planner step's gestures come at most this far apart (its longest sleep is 1.2 s, and
 # a screen search can take a second more on the second PC).
 STEP_GAP = 3.0
+# After its full view of the map the planner waits for the camera to settle (up to eight
+# looks 0.3 s apart) and reads the land: 3.2 s on the second PC before a front's Z
+# (2026-09-26, the first recordings with skill tags).
+SURVEY_GAP = 6.0
 NEAR = 0.012
 
 
@@ -382,12 +386,10 @@ class _Parser:
         self.g = found
         self.segments = []
 
-    def close(self, i, j):
+    def close(self, i, j, gap=STEP_GAP):
         """Whether gesture j follows gesture i within a planner step's gap."""
         return (
-            0 <= i < len(self.g)
-            and j < len(self.g)
-            and (self.g[j].t0 - self.g[i].t1) / 1e9 <= STEP_GAP
+            0 <= i < len(self.g) and j < len(self.g) and (self.g[j].t0 - self.g[i].t1) / 1e9 <= gap
         )
 
     def skip_parks(self, i):
@@ -416,10 +418,11 @@ class _Parser:
         survey_end = self.survey(i)
         if survey_end is not None:
             j = self.skip_parks(survey_end + 1)
-            if j < len(g) and self.close(survey_end, j):
+            if j < len(g) and self.close(survey_end, j, SURVEY_GAP):
                 if _card_click(g[j]):
                     j = self.skip_parks(j + 1)
-                inner = self.procedure(j) if j < len(g) and self.close(j - 1, j) else None
+                ready = j < len(g) and self.close(j - 1, j, SURVEY_GAP)
+                inner = self.procedure(j) if ready else None
                 if inner is not None and inner.skill in ("draw_front", "draw_offensive", "recruit"):
                     inner.first = start
                     return inner
@@ -577,7 +580,7 @@ class _Parser:
                         k = self.skip_parks(k + 1)
                 if (
                     k < len(g)
-                    and self.close(k - 1, k)
+                    and self.close(k - 1, k, SURVEY_GAP)
                     and g[k].kind == "tap"
                     and g[k].vk == FRONT_KEY
                 ):
@@ -593,7 +596,7 @@ class _Parser:
                     k = self.skip_parks(k + 1)
                 if (
                     k < len(g)
-                    and self.close(k - 1, k)
+                    and self.close(k - 1, k, SURVEY_GAP)
                     and g[k].kind == "tap"
                     and g[k].vk == FRONT_KEY
                 ):

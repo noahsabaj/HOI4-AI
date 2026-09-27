@@ -314,3 +314,100 @@ def test_a_state_s_centre_lies_in_that_state():
         u, v = state_centre(state)
         assert state_at(u, v) == state
     assert state_centre(99) is None
+
+
+def test_a_learned_hand_runs_its_skills_in_turn_and_leaves_the_rest_scripted(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import hoi4_arena.ai_games as ai_games
+    from hoi4_arena.actions import SLOTS
+    from hoi4_arena.hand import LearnedHand, ScriptedHand
+    from hoi4_arena.train import SkillHead
+
+    monkeypatch.setattr(ai_games, "on_screen", lambda frame: frame)
+
+    class Frame:
+        rgb = np.zeros((4, 4, 3), np.uint8)
+        meta = {"cursor": [10, 10], "t_ns": 0}
+
+    class Desk:
+        def __init__(self):
+            self.applied = []
+
+        def capture(self, full=None):
+            return Frame()
+
+        def arm(self, setup=False):
+            pass
+
+        def apply(self, events, at_ms=None):
+            self.applied.extend(events)
+            return {"t_ns": 1}
+
+        def release(self):
+            pass
+
+    class Head(torch.nn.Module):
+        noise_dim = 4
+
+        def __init__(self):
+            super().__init__()
+            self.read = torch.nn.Linear(8, 1)
+            self.seen = []
+
+        def forward(self, memory, cells, **kwargs):
+            self.seen.append(memory.clone())
+            return memory, None, None
+
+    class Policy:
+        actor = Head()
+
+    class Actor:
+        policy = Policy()
+
+        def __init__(self):
+            self.decisions = 0
+
+        def reset_episode(self):
+            pass
+
+        def act(self, rgb, t_ns, cursor=None):
+            self.decisions += 1
+            self.policy.actor(torch.zeros(1, 8), None)
+            action = np.zeros((SLOTS, 3), np.int64)
+            action[0] = (1, 100, 100)  # A move every decision.
+            return action, None
+
+    class Planner:
+        orders = []
+
+        def order(self, kind, **details):
+            self.orders.append(kind)
+
+    planner = Planner()
+    scripted = ScriptedHand(planner)
+    scripted_calls = []
+    monkeypatch.setattr(scripted, "execute", lambda desk, intent: scripted_calls.append(intent))
+    actor, skill_head = Actor(), SkillHead(8)
+    inner = actor.policy.actor
+    with torch.no_grad():
+        skill_head.embedding.weight[intents.SKILLS.index("draw_front")] = 1.0
+    hand = LearnedHand(scripted, actor, skill_head, ["redraw"], burn_in=2)
+    monkeypatch.setattr("hoi4_arena.hand.SKILL_SECONDS", dict.fromkeys(intents.SKILLS, 1.2))
+    checks = []
+
+    def check(desk, skill, rgb):
+        checks.append(skill)
+        return skill != "draw_offensive"
+
+    hand.check = check
+    desk = Desk()
+    assert not hand.execute(desk, Intent("redraw"))
+    entry = hand.log[-1]
+    assert [s["skill"] for s in entry["steps"]] == ["clear_orders", "draw_front", "draw_offensive"]
+    assert [s["done"] for s in entry["steps"]] == [True, True, False]
+    assert planner.orders == ["clear", "draw_front"]
+    # The draw_front skill read its memory with its embedding added.
+    assert any(float(m.sum()) == 8.0 for m in inner.seen)
+    assert desk.applied and all(e["kind"] == "move" for e in desk.applied)
+    hand.execute(desk, Intent("set_law", {"law": "service"}))
+    assert [i.name for i in scripted_calls] == ["set_law"]
