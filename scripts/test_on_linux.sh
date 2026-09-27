@@ -25,7 +25,7 @@ if [ "$(cat .venv/built-from-lock 2>/dev/null)" != "$lock" ]; then
         > .venv/lock.txt
     cpu=
     for name in torch torchvision; do
-        version=$(grep "^$name==" .venv/lock.txt | cut -d= -f3 | cut -d+ -f1 | cut -d' ' -f1)
+        version=$(grep -m1 "^$name==" .venv/lock.txt | cut -d= -f3 | cut -d+ -f1 | cut -d' ' -f1)
         cpu="$cpu $name==$version+cpu"
     done
     grep -Ev '^(torch==|torchvision==|triton|nvidia-|cuda-)' .venv/lock.txt > .venv/cpu.txt

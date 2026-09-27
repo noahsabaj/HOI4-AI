@@ -14,6 +14,10 @@ dependencies = [
     "pillow>=11",
     "gymnasium>=1",
     "torch>=2.7",
+    # timm imports it. Named here only so that Linux takes it from the same CUDA index as
+    # torch ([tool.uv.sources]): PyPI's Linux build is made for PyPI's torch, and beside the
+    # cu128 one its operators never register (torchvision::nms does not exist).
+    "torchvision>=0.22",
     "transformers>=5,<6",
     "huggingface-hub>=1",
     "einops>=0.8",
@@ -64,3 +68,5 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
+# Linux only: on Windows PyPI's build is the one the lock has always had, and it works.
+torchvision = { index = "pytorch", marker = "sys_platform == 'linux'" }
