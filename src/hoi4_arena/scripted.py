@@ -927,7 +927,7 @@ class Planner:
             self.draw_front(desk)
         else:
             self.overview(desk)
-        if self.strategist is not None:
+        if getattr(self, "strategist", None) is not None:
             self.consult(desk, "start")
         elif self.plan["attack"] in OFFENSIVES and "offensive" not in done:
             self.draw_offensive(desk)
@@ -1033,13 +1033,15 @@ class Planner:
         """Every order deleted, then the front (round an incursion, if the guard sees one)
         and the offensive drawn afresh. True if the front went round an incursion."""
         self.clear_orders(desk)
-        front_state = self.plan.get("front_state")
-        rear = self.draw_front(desk, guard=self.guard_share(), front_state=front_state)
+        # A strategist's choices, when it made any; the scripted plan leaves them to the hand.
+        front = {"front_state": self.plan["front_state"]} if self.plan.get("front_state") else {}
+        rear = self.draw_front(desk, guard=self.guard_share(), **front)
         if rear and not self.defending:
             self.pocket = []  # A new incursion to clear.
         self.defending = bool(rear)
         if self.plan["attack"] in OFFENSIVES and not rear:
-            self.draw_offensive(desk, target_state=self.plan.get("target_state"))
+            aim = self.plan.get("target_state")
+            self.draw_offensive(desk, **({"target_state": aim} if aim else {}))
         return rear
 
     def decision_due(self):
@@ -1049,7 +1051,7 @@ class Planner:
         when an executing attack has taken nothing for strategist.STALL_DAYS."""
         from .strategist import EVENT_GAP, STALL_DAYS
 
-        if self.strategist is None or self.state is None or not self.running:
+        if getattr(self, "strategist", None) is None or self.state is None or not self.running:
             return None
         snap = self.state()
         day = snap.get("day")
