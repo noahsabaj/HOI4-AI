@@ -480,3 +480,83 @@ def test_a_carried_memory_resumes_where_it_was_and_the_run_goes_on_bit_for_bit(
     assert "empty one" in caplog.text and "predates recording the loader's workers" in caplog.text
     after = {step: row for step, row in steps("old").items() if step > 2}
     assert after != {step: row for step, row in steps("whole").items() if step > 2}
+
+
+def test_a_probe_times_each_step_and_can_stop_the_run(tmp_path, monkeypatch):
+    """train_bc's `probe` (scripts/bench_train.py) sees every phase of every step, and a
+    run it stops ends there: no validation, no checkpoint."""
+    import json
+    import shutil
+
+    from test_dataset import _recording
+
+    import hoi4_arena.train as train
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("needs ffmpeg")
+    data = tmp_path / "data"
+    data.mkdir()
+    for name, split in (("a", "train"), ("b", "train"), ("c", "validation")):
+        _recording(data / name, [8, 6])
+        manifest = data / name / "manifest.json"
+        manifest.write_text(json.dumps({**json.loads(manifest.read_text()), "split": split}))
+    monkeypatch.setattr(train, "build_encoder", lambda path, variant: _Screen())
+
+    class Probe:
+        def __init__(self):
+            self.marks, self.steps = [], []
+
+        def mark(self, name):
+            self.marks.append(name)
+
+        def step(self, step, batch, row, modules):
+            self.steps.append((step, tuple(batch["actions"].shape[:2]), row["step"]))
+            assert "policy" in modules
+            return len(self.steps) == 2
+
+    probe = Probe()
+    common = {"sequence": 2, "batch_size": 2, "workers": 0, "carry": True, "probe": probe}
+    train.train_bc(data, "model", tmp_path / "out", **common)
+    assert probe.steps == [(0, (2, 2), 0), (1, (2, 2), 1)]
+    assert probe.marks == ["loaded", "device", "forward", "backward", "optimizer"] * 2
+    assert not (tmp_path / "out" / "epoch-0000.pt").exists()
+    rows = [json.loads(line) for line in (tmp_path / "out" / "metrics.jsonl").open()]
+    assert [row["step"] for row in rows] == [0, 1]
+
+
+def test_the_fast_readers_change_nothing_without_autocast_and_little_with_it():
+    """models.Stage `low` (train-bc --fast-perception) keeps the maps in bfloat16 under
+    autocast only: without it the reader is the very same, and with it on a card its
+    output stays within bfloat16's rounding of the float32 maps'."""
+    from hoi4_arena.models import DetailEncoder, Stage
+
+    def low(module, on):
+        for part in module.modules():
+            if isinstance(part, Stage):
+                part.low = on
+
+    torch.manual_seed(28)
+    reader = DetailEncoder(width=32)
+    images = torch.randn(3, 3, 64, 96)
+    plain = reader(images)
+    low(reader, True)
+    assert torch.equal(reader(images), plain)
+    if not torch.cuda.is_available():
+        return
+    reader, images = reader.cuda(), images.cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        fast = reader(images).float()
+        low(reader, False)
+        exact = reader(images).float()
+    assert not torch.equal(fast, exact)
+    assert (fast - exact).abs().max() <= 0.05 * exact.abs().max()
+
+
+def test_loader_workers_are_spawned_on_every_system():
+    """A forked worker that starts its threads can deadlock in OpenMP on Linux (a CPU run
+    hung at its first batch, 2026-09-26): workers start as Windows starts them."""
+    from hoi4_arena.dataset import sequence_loader, window_loader
+
+    for loader in (sequence_loader([], workers=1), window_loader([], 2, workers=1)):
+        assert loader.multiprocessing_context.get_start_method() == "spawn"
+    assert sequence_loader([], workers=0).multiprocessing_context is None

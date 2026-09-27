@@ -1302,6 +1302,7 @@ def window_loader(dataset, batch_size, *, workers=0, device="cpu", drop_last=Fal
         pin_memory=bool(workers) and torch.device(device).type == "cuda",
         worker_init_fn=worker_threads if workers else None,
         persistent_workers=bool(workers),
+        multiprocessing_context=WORKER_START if workers else None,
     )
 
 
@@ -1315,8 +1316,16 @@ def sequence_loader(sequences, *, workers=0, device="cpu"):
         pin_memory=bool(workers) and torch.device(device).type == "cuda",
         worker_init_fn=worker_threads if workers else None,
         persistent_workers=bool(workers),
+        multiprocessing_context=WORKER_START if workers else None,
     )
 
+
+# How loader workers start: spawned, on every system, as Windows always does. On Linux the
+# default forks the training process, and a forked worker that then starts its
+# WORKER_THREADS threads can deadlock in OpenMP, whose threads the parent had already
+# started: a CPU run on a Linux laptop hung for good at its first batch (2026-09-26),
+# while one thread a worker, or no worker, ran.
+WORKER_START = "spawn"
 
 # Threads a loader worker computes its views with. A DataLoader worker gets one, and the
 # views of a 1080p frame then took 50 ms; with 2, 31 ms; with 4, 18 ms, and more gained

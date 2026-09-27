@@ -21,6 +21,7 @@ from .models import (
     CHUNK,
     Policy,
     PredictiveAuxiliary,
+    Stage,
     VideoEncoder,
     build_encoder,
     reads_clip,
@@ -378,6 +379,8 @@ def _train_bc(
     gpu_views=False,
     balance=False,
     rung=None,
+    fast_perception=False,
+    probe=None,
     dagger=0.0,
     dagger_data=(),
 ):
@@ -421,6 +424,16 @@ def _train_bc(
     `batch_size` games side by side (dataset.GameSequences), by truncated
     backpropagation through time, instead of from empty in shuffled windows after a
     burn-in; validation is carried through each held-out game the same way.
+
+    `fast_perception` is a fast mode, opt-in because it does not compute the same bits: the
+    detail and fovea readers keep their maps in bfloat16 (models.Stage `low`). Measured on
+    the 4060 Ti with scripts/bench_train.py (bench/training-ledger.tsv), bc6's configuration
+    with --gpu-views went from ~50 decisions a second to ~67 with it.
+
+    `probe` is for measuring a run (scripts/bench_train.py): its `mark(name)` is called as
+    each step reaches "loaded", "device", "forward", "backward" and "optimizer", and its
+    `step(step, batch, row, modules)` after each step; when that returns true, training
+    stops there, with no validation and no checkpoint.
 
     `dagger_data` are folders of practice games read beside `data`, and `dagger` > 0
     trains every practice game that has the scripted player's labels (dagger.relabel) on
@@ -507,6 +520,12 @@ def _train_bc(
                 if hasattr(layer, "reset_parameters"):
                     layer.reset_parameters()
     policy = policy.to(device)
+    if fast_perception:
+        # Fast mode, opt-in: the detail and fovea readers keep their maps in bfloat16
+        # (models.Stage `low`), which rounds differently from the float32 maps.
+        for module in policy.modules():
+            if isinstance(module, Stage):
+                module.low = True
     if tower_cache is not None:
         from .tower_cache import fingerprint
 
@@ -579,6 +598,9 @@ def _train_bc(
         # Only when set, so runs saved before it existed still resume.
         **({"rung": rung} if rung else {}),
     }
+    if fast_perception:
+        # Only when on, so that runs saved before the option existed still resume.
+        config["fast_perception"] = True
     if dagger or dagger_data:
         # Named only when used, so a run from before resumes with the same settings.
         config.update(dagger=dagger, dagger_data=[str(Path(p).resolve()) for p in dagger_data])
@@ -621,9 +643,13 @@ def _train_bc(
                 if "skipped" in batch:
                     raise RuntimeError("the loader passed over a batch this run has not trained")
                 wait_while_paused(output)
+                if probe is not None:
+                    probe.mark("loaded")
                 slots = batch.pop("slot").tolist() if carry else None
                 fresh = batch.pop("fresh").tolist() if carry else None
                 batch = batch_to_device(batch, device)
+                if probe is not None:
+                    probe.mark("device")
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(**autocast):
                     if carry:
@@ -655,11 +681,17 @@ def _train_bc(
                             batch["order_eta"][:, burn_in:],
                         )
                         loss = loss + order_weight * plan
+                if probe is not None:
+                    probe.mark("forward")
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training objective")
                 loss.backward()
+                if probe is not None:
+                    probe.mark("backward")
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()
+                if probe is not None:
+                    probe.mark("optimizer")
                 if carry:
                     for slot, value in zip(slots, last.detach().float(), strict=True):
                         store[slot] = value
@@ -677,6 +709,8 @@ def _train_bc(
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 progress.tick(epoch, step + 1, modules, optimizer, store if carry else None)
+                if probe is not None and probe.step(step, batch, row, modules):
+                    return config
             policy.eval()
             validation_losses, acting, predicted, truths = [], [], [], []
             order_right, order_known = 0, 0
