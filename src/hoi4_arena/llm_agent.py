@@ -116,8 +116,10 @@ The lessons you started the game with:
 Rewrite the lessons document for your next game on this map, so that you play faster and \
 win. Keep what is still true, correct what was wrong, add what you learned: how the \
 interface works (where things are, which keys and clicks do what, what failed), and what \
-wins against this AI. Be concrete and brief, at most {limit} characters. Answer with the \
-document only."""
+wins against this AI. Facts of how you play, which you cannot change: the game is paused \
+while you act and runs only when you call end_turn (at most {max_run:.0f} seconds a turn); \
+space, the speed keys and + and - are not yours to press. Be concrete and brief, at most \
+{limit} characters. Answer with the document only."""
 
 
 def _tool(name, description, properties, required):
@@ -312,7 +314,8 @@ class Agent:
         last = "\n".join(f"turn {t}: {n}" for t, n in self.notes[-12:]) or "(none)"
         prompt = REFLECT.format(country=country, outcome=outcome, turns=turns, seconds=seconds,
                                 notebook=self.notebook or "(empty)", last=last,
-                                lessons=self.lessons or "(none)", limit=LESSONS)  # fmt: skip
+                                lessons=self.lessons or "(none)", limit=LESSONS,
+                                max_run=MAX_RUN)  # fmt: skip
         message, _usage, usd, _ = self.call([{"role": "user", "content": prompt}], tools=False)
         lessons = (message.get("content") or "").strip()[:LESSONS]
         if lessons:
